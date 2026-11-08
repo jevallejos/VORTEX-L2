@@ -587,8 +587,8 @@ fn render_trades_and_executive_dashboard() {
             bar_95, goal_anchor_usdt, goal_pct, (95.0 - goal_anchor_usdt).max(0.0)
         ),
         format!(
-            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1f332} PART: {} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} (  0.0%)",
-            total, wins, (wins as f64 * 100.0) / denom_t, partials, (partials as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses
+            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1f332} PART: {} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} ({:>5.1}%)",
+            total, wins, (wins as f64 * 100.0) / denom_t, partials, (partials as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses, (losses as f64 * 100.0) / denom_t
         ),
         format!(
             "   \u{2022} Balance (bps)  : Bruto: {:>+8.2} bps  \u{2502} Fees: {:>-8.2} bps  \u{2502} Neto: {:>+8.2} bps ({:+.2}% @10x)",
@@ -935,12 +935,23 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .map(TimestampNs)
                         .unwrap_or(now_t);
 
+                    let cur_m = arena
+                        .slot(s_idx)
+                        .and_then(|s| s.read_snapshot(4))
+                        .map(|sn| sn.mark_price.0)
+                        .unwrap_or(0);
                     let q_fl = defensive_zero_loss_maker_exit_price(side_p, avg_t);
                     let tp_t = dynamic_maker_floor_price(side_p, avg_t, ScaledBps(520));
                     let sl_d = ((avg_t.0 * 18_500) / 1_000_000).max(4);
                     let sl_t = match side_p {
-                        Side::Bid => PriceTicks((avg_t.0 - sl_d).max(1)),
-                        Side::Ask => PriceTicks(avg_t.0 + sl_d),
+                        Side::Bid => {
+                            let base_b = if cur_m > 0 { avg_t.0.min(cur_m) } else { avg_t.0 };
+                            PriceTicks((base_b - sl_d).max(1))
+                        }
+                        Side::Ask => {
+                            let base_b = if cur_m > 0 { avg_t.0.max(cur_m) } else { avg_t.0 };
+                            PriceTicks(base_b + sl_d)
+                        }
                     };
                     engines[s_idx].last_opened_ts = opened_ns;
                     engines[s_idx].peristaltic_cycles_count = u64::from(p_cycles);
@@ -1207,8 +1218,101 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         ));
                     }
                 }
-                OrderLifecycleState::PositionOpenMakerExit { side, open_lots, .. } => {
+                OrderLifecycleState::PositionOpenMakerExit {
+                    side,
+                    avg_price_ticks,
+                    ..
+                } => {
                     open_count += 1;
+                    if let Some(ref client) = live_client {
+                        let q_fl = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+                        let (vac_lvl, surf_px, _) =
+                            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(side, &snap, q_fl);
+                        if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
+                            engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_500_000_000;
+                            let (still_open, real_sz_s, _, _) =
+                                client.get_open_position_info(sym_name);
+                            if !still_open {
+                                client.cancel_all_symbol_orders(sym_name);
+                                let exit_px = if snap.last_trade_price.0 > 0 {
+                                    match side {
+                                        Side::Bid => PriceTicks(snap.last_trade_price.0.max(q_fl.0)),
+                                        Side::Ask => PriceTicks(snap.last_trade_price.0.min(q_fl.0).max(1)),
+                                    }
+                                } else {
+                                    q_fl
+                                };
+                                engines[s_idx].last_exit_sub_reason = if vac_lvl >= 2 {
+                                    ExitSubReason::LvdbsDeepVacuumSurf
+                                } else {
+                                    ExitSubReason::AdverseScratchEscape
+                                };
+                                let summary = engines[s_idx].finalize_close(
+                                    ClosedTradeKind::MakerPassiveUnwind,
+                                    side,
+                                    avg_price_ticks,
+                                    exit_px,
+                                    now_ns,
+                                    &mut ledger,
+                                );
+                                gov.observe_closed_trade(
+                                    s_idx,
+                                    summary.side,
+                                    summary.net_scaled_bps,
+                                    summary.is_maker_exit,
+                                    now_ns,
+                                );
+                                arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
+                                append_closed_trade_logs(
+                                    s_idx,
+                                    &summary,
+                                    &engines[s_idx],
+                                    &entry_forensics[s_idx],
+                                    &snap,
+                                    &ledger,
+                                    now_ns,
+                                );
+                                engines[s_idx].sync_to_shm_telemetry(arena);
+                                save_open_positions_state(&engines);
+                                let net_f = (summary.net_scaled_bps.raw() as f64) / 100.0;
+                                let (_, icon, lbl) = classify_pnl_badge(net_f);
+                                let _ = tg_tx.send(format!(
+                                    "{} [VORTEX-L3 {} #{}] {} {:?} | Net: {:+.2} bps | Reserva 30%: {:+.2}bp | Blindado 70%: {:+.2}bp",
+                                    icon,
+                                    lbl.trim(),
+                                    ledger.closed_trades_count,
+                                    sym_name,
+                                    summary.side,
+                                    net_f,
+                                    (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
+                                    (ledger.vault_locked_profit_bps_x100 as f64) / 100.0
+                                ));
+                            } else {
+                                let real_lots = spec.parse_lot_qty(&real_sz_s).max(LotQty(1));
+                                if let OrderLifecycleState::PositionOpenMakerExit {
+                                    open_lots: ref mut op_l,
+                                    tp_maker_price: ref mut tp_p,
+                                    ..
+                                } = engines[s_idx].state
+                                {
+                                    *op_l = real_lots;
+                                    *tp_p = surf_px;
+                                }
+                                let _ = client.place_post_only_order(
+                                    spec,
+                                    side.opposite(),
+                                    surf_px,
+                                    real_lots,
+                                    None,
+                                    true,
+                                );
+                                engines[s_idx].sync_to_shm_telemetry(arena);
+                            }
+                        } else {
+                            engines[s_idx].sync_to_shm_telemetry(arena);
+                        }
+                        continue;
+                    }
                     let prev_tranche1 = matches!(
                         engines[s_idx].state,
                         OrderLifecycleState::PositionOpenMakerExit {
@@ -1220,23 +1324,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     if let Some(summary) =
                         engines[s_idx].step_open_position(&snap, &btc_snap, &gov, &mut ledger)
                     {
-                        if let Some(ref client) = live_client {
-                            if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
-                                engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 900_000_000;
-                                let (still_open, _, _, _) = client.get_open_position_info(sym_name);
-                                if still_open {
-                                    client.cancel_all_symbol_orders(sym_name);
-                                    let _ = client.place_post_only_order(
-                                        spec,
-                                        side.opposite(),
-                                        summary.exit_price,
-                                        open_lots,
-                                        None,
-                                        true,
-                                    );
-                                }
-                            }
-                        }
                         gov.observe_closed_trade(
                             s_idx,
                             summary.side,
