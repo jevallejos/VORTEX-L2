@@ -767,9 +767,863 @@ impl OnlineAdaptiveGovernor {
     }
 }
 
+/// Explicit role of the active maker exit/peristaltic order on the exchange.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ExitOrderRole {
+    #[default]
+    None = 0,
+    Tranche1Harvest50 = 1,
+    LvdbsDeepSurf50 = 2,
+    PeristalticExhale25 = 3,
+    PeristalticInhale25 = 4,
+    SiphonFullUnwind100 = 5,
+    StandardMakerExit100 = 6,
+}
+
+/// Non-blocking directive emitted by a slot engine on a 5ms step.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OpenPositionStepDirective {
+    #[default]
+    HoldPassive,
+    PlaceOrPegMakerOrder {
+        role: ExitOrderRole,
+        order_side: Side,
+        price: PriceTicks,
+        qty: LotQty,
+        reduce_only: bool,
+        vacuum_level: usize,
+    },
+    Tranche1Filled {
+        filled_price: PriceTicks,
+        filled_lots: LotQty,
+        remaining_lots: LotQty,
+        net_scaled_bps: ScaledBps,
+    },
+    PeristalticExhaleFilled {
+        crest_price: PriceTicks,
+        exhaled_lots: LotQty,
+        remaining_lots: LotQty,
+        subsidy_used_bps: i64,
+    },
+    PeristalticInhaleFilled {
+        valley_price: PriceTicks,
+        inhaled_lots: LotQty,
+        new_open_lots: LotQty,
+        new_avg_price: PriceTicks,
+    },
+}
+
+/// Per-Slot Autonomous Lifecycle State Machine (Tranche & Peristaltic Native).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OrderLifecycleState {
+    #[default]
+    Idle,
+    PlacingEntryMaker {
+        side: Side,
+        entry_price: PriceTicks,
+        qty: LotQty,
+        target_excursion: ScaledBps,
+        sl_trigger_price: PriceTicks,
+        submitted_ts: TimestampNs,
+    },
+    RestingEntryQueue {
+        side: Side,
+        entry_price: PriceTicks,
+        qty: LotQty,
+        target_excursion: ScaledBps,
+        sl_trigger_price: PriceTicks,
+        resting_since_ts: TimestampNs,
+    },
+    PositionOpenMakerExit {
+        side: Side,
+        entry_price: PriceTicks,
+        avg_price_ticks: PriceTicks,
+        peak_favorable_price: PriceTicks,
+        worst_adverse_price: PriceTicks,
+        initial_lots: LotQty,
+        open_lots: LotQty,
+        exhaled_lots: LotQty,
+        last_crest_exhale_price: PriceTicks,
+        peristaltic_cycles: u32,
+        tranche1_harvested: bool,
+        active_exit_role: ExitOrderRole,
+        active_exit_price: PriceTicks,
+        active_exit_lots: LotQty,
+        tp_maker_price: PriceTicks,
+        sl_trigger_price: PriceTicks,
+        opened_ts: TimestampNs,
+    },
+    EmergencyStopTriggered {
+        side: Side,
+        entry_price: PriceTicks,
+        exit_price: PriceTicks,
+        qty: LotQty,
+        triggered_ts: TimestampNs,
+    },
+    HaltedByRiskGuard {
+        reason: HaltReason,
+    },
+}
+
+/// Autonomous Per-Slot Execution Engine (1 Instance per Slot in [SlotExecutionEngine; 12]).
+#[derive(Clone, Debug)]
+pub struct SlotExecutionEngine {
+    pub slot_idx: usize,
+    pub state: OrderLifecycleState,
+    pub notional_per_trade_1e8: i64,
+    pub max_daily_drawdown_1e8: i64,
+    pub cooldown_until_ns: TimestampNs,
+    pub maker_exits_count: u64,
+    pub taker_sl_exits_count: u64,
+    pub tranche1_harvests_count: u64,
+    pub peristaltic_cycles_count: u64,
+    pub lvdbs_deep_surfs_count: u64,
+    pub gross_profit_accum_1e8: i64,
+    pub gross_loss_accum_1e8: i64,
+    pub learned_mfe_bps: i64,
+    pub last_eff_sl_ticks: PriceTicks,
+    pub last_closed_mfe_bps: i64,
+    pub last_closed_mae_bps: i64,
+    pub last_closed_peak_ticks: PriceTicks,
+    pub last_closed_worst_ticks: PriceTicks,
+    pub last_closed_wald_pct: i64,
+    pub last_exit_sub_reason: ExitSubReason,
+    pub last_armed_ts: TimestampNs,
+    pub last_opened_ts: TimestampNs,
+    pub last_armed_seq_id: u64,
+    pub next_peg_allowed_ts_ns: i64,
+    pub exit_peg_attempts: u32,
+    pub last_step_directive: OpenPositionStepDirective,
+}
+
+#[allow(clippy::manual_clamp, clippy::too_many_arguments)]
+impl SlotExecutionEngine {
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        slot_idx: usize,
+        notional_per_trade_1e8: i64,
+        max_daily_drawdown_1e8: i64,
+    ) -> Self {
+        Self {
+            slot_idx,
+            state: OrderLifecycleState::Idle,
+            notional_per_trade_1e8,
+            max_daily_drawdown_1e8,
+            cooldown_until_ns: TimestampNs(0),
+            maker_exits_count: 0,
+            taker_sl_exits_count: 0,
+            tranche1_harvests_count: 0,
+            peristaltic_cycles_count: 0,
+            lvdbs_deep_surfs_count: 0,
+            gross_profit_accum_1e8: 0,
+            gross_loss_accum_1e8: 0,
+            learned_mfe_bps: 680,
+            last_eff_sl_ticks: PriceTicks(0),
+            last_closed_mfe_bps: 0,
+            last_closed_mae_bps: 0,
+            last_closed_peak_ticks: PriceTicks(0),
+            last_closed_worst_ticks: PriceTicks(0),
+            last_closed_wald_pct: 0,
+            last_exit_sub_reason: ExitSubReason::StructuralTpLimit,
+            last_armed_ts: TimestampNs(0),
+            last_opened_ts: TimestampNs(0),
+            last_armed_seq_id: 0,
+            next_peg_allowed_ts_ns: 0,
+            exit_peg_attempts: 0,
+            last_step_directive: OpenPositionStepDirective::HoldPassive,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn new_12_slot_array(
+        notional_per_trade_1e8: i64,
+        max_daily_drawdown_1e8: i64,
+    ) -> [Self; MAX_ACTIVE_PAIRS] {
+        [
+            Self::new(0, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(1, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(2, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(3, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(4, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(5, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(6, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(7, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(8, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(9, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(10, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(11, notional_per_trade_1e8, max_daily_drawdown_1e8),
+        ]
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn elastic_preflight_window_ns(&self, realized_vol_5m: ScaledBps) -> i64 {
+        let vol_c = realized_vol_5m.raw().clamp(4_000, 12_500);
+        let mfe_c = self.learned_mfe_bps.clamp(560, 1_200);
+        let raw_ns = ((25_000_000_i64 * 6_000) / vol_c * mfe_c) / 720;
+        raw_ns.clamp(15_000_000, 35_000_000)
+    }
+
+    #[inline]
+    pub fn observe_mfe_sample(&mut self, gross_mfe_scaled_bps: i64) {
+        if gross_mfe_scaled_bps >= 500 {
+            let clamped = gross_mfe_scaled_bps.clamp(560, 1_600);
+            self.learned_mfe_bps = (self.learned_mfe_bps * 80 + clamped * 20) / 100;
+        }
+    }
+
+    pub fn sync_to_shm_telemetry(&self, arena: &crate::lob_shm::VortexShmArena) {
+        use core::sync::atomic::Ordering;
+        let Ok(tel) = arena.telemetry(self.slot_idx) else {
+            return;
+        };
+        match self.state {
+            OrderLifecycleState::Idle => {
+                tel.state_code.store(0, Ordering::Release);
+                tel.open_lots.store(0, Ordering::Release);
+            }
+            OrderLifecycleState::PlacingEntryMaker {
+                side,
+                entry_price,
+                qty,
+                sl_trigger_price,
+                submitted_ts,
+                ..
+            } => {
+                tel.state_code.store(1, Ordering::Release);
+                tel.side_code.store(side as u64, Ordering::Release);
+                tel.entry_ticks.store(entry_price.0 as u64, Ordering::Release);
+                tel.avg_price_ticks.store(entry_price.0 as u64, Ordering::Release);
+                tel.sl_ticks.store(sl_trigger_price.0 as u64, Ordering::Release);
+                tel.initial_lots.store(qty.0 as u64, Ordering::Release);
+                tel.resting_since_ns.store(submitted_ts.0 as u64, Ordering::Release);
+            }
+            OrderLifecycleState::RestingEntryQueue {
+                side,
+                entry_price,
+                qty,
+                sl_trigger_price,
+                resting_since_ts,
+                ..
+            } => {
+                tel.state_code.store(2, Ordering::Release);
+                tel.side_code.store(side as u64, Ordering::Release);
+                tel.entry_ticks.store(entry_price.0 as u64, Ordering::Release);
+                tel.avg_price_ticks.store(entry_price.0 as u64, Ordering::Release);
+                tel.sl_ticks.store(sl_trigger_price.0 as u64, Ordering::Release);
+                tel.initial_lots.store(qty.0 as u64, Ordering::Release);
+                tel.resting_since_ns.store(resting_since_ts.0 as u64, Ordering::Release);
+            }
+            OrderLifecycleState::PositionOpenMakerExit {
+                side,
+                entry_price,
+                avg_price_ticks,
+                peak_favorable_price,
+                initial_lots,
+                open_lots,
+                peristaltic_cycles,
+                tranche1_harvested,
+                tp_maker_price,
+                sl_trigger_price,
+                ..
+            } => {
+                let code = if tranche1_harvested {
+                    4_u64
+                } else if peristaltic_cycles > 0 || open_lots.0 < initial_lots.0 {
+                    5_u64
+                } else {
+                    3_u64
+                };
+                tel.state_code.store(code, Ordering::Release);
+                tel.side_code.store(side as u64, Ordering::Release);
+                tel.entry_ticks.store(entry_price.0 as u64, Ordering::Release);
+                tel.avg_price_ticks.store(avg_price_ticks.0 as u64, Ordering::Release);
+                tel.peak_ticks.store(peak_favorable_price.0 as u64, Ordering::Release);
+                tel.tp_ticks.store(tp_maker_price.0 as u64, Ordering::Release);
+                tel.sl_ticks.store(sl_trigger_price.0 as u64, Ordering::Release);
+                tel.open_lots.store(open_lots.0 as u64, Ordering::Release);
+                tel.initial_lots.store(initial_lots.0 as u64, Ordering::Release);
+                tel.peristaltic_cycles.store(u64::from(peristaltic_cycles), Ordering::Release);
+                tel.tranche1_harvested.store(u64::from(tranche1_harvested), Ordering::Release);
+            }
+            OrderLifecycleState::EmergencyStopTriggered { .. }
+            | OrderLifecycleState::HaltedByRiskGuard { .. } => {
+                tel.state_code.store(6, Ordering::Release);
+            }
+        }
+    }
+}
+
+#[allow(clippy::manual_clamp, clippy::too_many_arguments)]
+impl SlotExecutionEngine {
+    pub fn try_arm_maker_entry(
+        &mut self,
+        spec: &crate::types::PairSpec,
+        snap: &SymbolLobSnapshot,
+        verdict: crate::alpha_3factor::SignalVerdict,
+        qty: LotQty,
+    ) -> Result<OrderLifecycleState, crate::types::VortexError> {
+        if !matches!(self.state, OrderLifecycleState::Idle) {
+            return Ok(self.state);
+        }
+        if snap.ts_local_ns.0 < self.cooldown_until_ns.0 {
+            return Ok(self.state);
+        }
+        let crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side,
+            target_excursion_scaled_bps,
+            ..
+        } = verdict
+        else {
+            return Ok(self.state);
+        };
+        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+            return Ok(self.state);
+        };
+        let entry_price = match side {
+            Side::Bid => best_bid.price,
+            Side::Ask => best_ask.price,
+        };
+        let vol_c = snap.realized_vol_5m.raw().clamp(4_000, 12_500);
+        let elastic_sl_bps = (16_500 + (vol_c * 35) / 100).clamp(18_000, 22_500);
+        let sl_delta_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
+        let ref_mark = if snap.mark_price.0 > 0 { snap.mark_price } else { entry_price };
+        let ref_last = if snap.last_trade_price.0 > 0 {
+            snap.last_trade_price
+        } else {
+            entry_price
+        };
+        let raw_sl = match side {
+            Side::Bid => {
+                let bound = ref_mark.0.min(ref_last.0).min(entry_price.0);
+                PriceTicks((bound - sl_delta_ticks).max(1))
+            }
+            Side::Ask => {
+                let bound = ref_mark.0.max(ref_last.0).max(entry_price.0);
+                PriceTicks(bound + sl_delta_ticks)
+            }
+        };
+        let sl_trigger_price = crate::types::PairSpec::validate_stop_loss_geometry(
+            side,
+            raw_sl,
+            ref_last,
+            ref_mark,
+        )?;
+        let _ = spec;
+        self.last_armed_ts = snap.ts_local_ns;
+        self.last_armed_seq_id = snap.sequence_id;
+        self.state = OrderLifecycleState::PlacingEntryMaker {
+            side,
+            entry_price,
+            qty: LotQty(qty.0.max(1)),
+            target_excursion: target_excursion_scaled_bps,
+            sl_trigger_price,
+            submitted_ts: snap.ts_local_ns,
+        };
+        Ok(self.state)
+    }
+
+    pub fn on_entry_order_resting(
+        &mut self,
+        resting_ts: TimestampNs,
+    ) -> Result<OrderLifecycleState, crate::types::VortexError> {
+        if let OrderLifecycleState::PlacingEntryMaker {
+            side,
+            entry_price,
+            qty,
+            target_excursion,
+            sl_trigger_price,
+            ..
+        } = self.state
+        {
+            self.state = OrderLifecycleState::RestingEntryQueue {
+                side,
+                entry_price,
+                qty,
+                target_excursion,
+                sl_trigger_price,
+                resting_since_ts: resting_ts,
+            };
+        }
+        Ok(self.state)
+    }
+
+    pub fn on_maker_entry_filled(
+        &mut self,
+        fill_ts: TimestampNs,
+    ) -> Result<OrderLifecycleState, crate::types::VortexError> {
+        let (side, entry_price, qty, target_excursion, sl_trigger_price) = match self.state {
+            OrderLifecycleState::RestingEntryQueue {
+                side,
+                entry_price,
+                qty,
+                target_excursion,
+                sl_trigger_price,
+                ..
+            }
+            | OrderLifecycleState::PlacingEntryMaker {
+                side,
+                entry_price,
+                qty,
+                target_excursion,
+                sl_trigger_price,
+                ..
+            } => (side, entry_price, qty, target_excursion, sl_trigger_price),
+            _ => return Ok(self.state),
+        };
+        let tp_bps = target_excursion.raw().max(520);
+        let tp_maker_price = dynamic_maker_floor_price(side, entry_price, ScaledBps(tp_bps));
+        let q_floor = defensive_zero_loss_maker_exit_price(side, entry_price);
+        let can_split = self.slot_idx >= 1 && qty.0 >= 2;
+        let (init_role, init_exit_px, init_exit_lots) = if can_split {
+            (ExitOrderRole::Tranche1Harvest50, q_floor, LotQty(qty.0 / 2))
+        } else {
+            (ExitOrderRole::StandardMakerExit100, tp_maker_price, qty)
+        };
+        self.last_opened_ts = fill_ts;
+        self.last_eff_sl_ticks = sl_trigger_price;
+        self.exit_peg_attempts = 0;
+        self.next_peg_allowed_ts_ns = fill_ts.0;
+        self.last_step_directive = OpenPositionStepDirective::PlaceOrPegMakerOrder {
+            role: init_role,
+            order_side: side.opposite(),
+            price: init_exit_px,
+            qty: init_exit_lots,
+            reduce_only: true,
+            vacuum_level: 1,
+        };
+        self.state = OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            entry_price,
+            avg_price_ticks: entry_price,
+            peak_favorable_price: entry_price,
+            worst_adverse_price: entry_price,
+            initial_lots: qty,
+            open_lots: qty,
+            exhaled_lots: LotQty(0),
+            last_crest_exhale_price: PriceTicks(0),
+            peristaltic_cycles: 0,
+            tranche1_harvested: false,
+            active_exit_role: init_role,
+            active_exit_price: init_exit_px,
+            active_exit_lots: init_exit_lots,
+            tp_maker_price,
+            sl_trigger_price,
+            opened_ts: fill_ts,
+        };
+        Ok(self.state)
+    }
+
+    /// Innovation #2 (LVDBS): Executes Tranche 1 (50%) harvest at quantum floor & unlocks L2/L3 surf.
+    pub fn apply_tranche1_harvest_50pct(
+        &mut self,
+        fill_price: PriceTicks,
+        ledger: &mut crate::forensic_parquet::ParitySyncLedger,
+    ) -> Option<OpenPositionStepDirective> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            ref mut open_lots,
+            ref mut tranche1_harvested,
+            ref mut active_exit_role,
+            ref mut active_exit_lots,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        if *tranche1_harvested || open_lots.0 < 2 {
+            return None;
+        }
+        let harvested = LotQty(open_lots.0 / 2);
+        *open_lots = LotQty(open_lots.0 - harvested.0);
+        *tranche1_harvested = true;
+        *active_exit_role = ExitOrderRole::LvdbsDeepSurf50;
+        *active_exit_lots = *open_lots;
+        self.tranche1_harvests_count = self.tranche1_harvests_count.saturating_add(1);
+
+        let raw_diff = match side {
+            Side::Bid => fill_price.0 - avg_price_ticks.0,
+            Side::Ask => avg_price_ticks.0 - fill_price.0,
+        };
+        let gross_bps = (raw_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        let net_leg_bps = (gross_bps - 400).max(40);
+        let weighted_net_bps = (net_leg_bps / 2).max(20);
+        let locked_70 = (weighted_net_bps * 70) / 100;
+        let reserve_30 = weighted_net_bps - locked_70;
+        ledger.vault_locked_profit_bps_x100 =
+            ledger.vault_locked_profit_bps_x100.saturating_add(locked_70);
+        ledger.sinking_fund_reserve_bps_x100 = ledger
+            .sinking_fund_reserve_bps_x100
+            .saturating_add(reserve_30)
+            .min(crate::forensic_parquet::MAX_SINKING_FUND_SCALED_BPS);
+
+        let dir = OpenPositionStepDirective::Tranche1Filled {
+            filled_price: fill_price,
+            filled_lots: harvested,
+            remaining_lots: *open_lots,
+            net_scaled_bps: ScaledBps(net_leg_bps),
+        };
+        self.last_step_directive = dir;
+        Some(dir)
+    }
+
+    /// Innovation #1 (ZMPQR Step 1): Executes 25% Peristaltic Exhale on intermediate rebound crest.
+    pub fn apply_peristaltic_exhale_25pct(
+        &mut self,
+        crest_price: PriceTicks,
+        ledger: &mut crate::forensic_parquet::ParitySyncLedger,
+    ) -> Option<OpenPositionStepDirective> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            initial_lots,
+            ref mut open_lots,
+            ref mut exhaled_lots,
+            ref mut last_crest_exhale_price,
+            tranche1_harvested,
+            ref mut active_exit_role,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        if tranche1_harvested || exhaled_lots.0 > 0 || initial_lots.0 < 4 || open_lots.0 < 4 {
+            return None;
+        }
+        let q_exhale = LotQty((initial_lots.0 / 4).max(1));
+        let raw_diff = match side {
+            Side::Bid => crest_price.0 - avg_price_ticks.0,
+            Side::Ask => avg_price_ticks.0 - crest_price.0,
+        };
+        let cur_g_bps = (raw_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        let needed_sub = (((440 - cur_g_bps).max(0) + 3) / 4).min(250);
+        if ledger.sinking_fund_reserve_bps_x100 < needed_sub {
+            return None;
+        }
+        let used_sub = ledger.try_consume_sinking_fund_subsidy(needed_sub);
+        *open_lots = LotQty(open_lots.0 - q_exhale.0);
+        *exhaled_lots = q_exhale;
+        *last_crest_exhale_price = crest_price;
+        *active_exit_role = ExitOrderRole::PeristalticExhale25;
+        let dir = OpenPositionStepDirective::PeristalticExhaleFilled {
+            crest_price,
+            exhaled_lots: q_exhale,
+            remaining_lots: *open_lots,
+            subsidy_used_bps: used_sub,
+        };
+        self.last_step_directive = dir;
+        Some(dir)
+    }
+
+    /// Innovation #1 (ZMPQR Step 2): Executes 25% Peristaltic Inhale in valley, compressing avg_price.
+    pub fn apply_peristaltic_inhale_25pct(
+        &mut self,
+        valley_price: PriceTicks,
+    ) -> Option<OpenPositionStepDirective> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            ref mut avg_price_ticks,
+            initial_lots,
+            ref mut open_lots,
+            ref mut exhaled_lots,
+            last_crest_exhale_price,
+            ref mut peristaltic_cycles,
+            ref mut tp_maker_price,
+            ref mut active_exit_role,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        if exhaled_lots.0 <= 0
+            || last_crest_exhale_price.0 <= 0
+            || open_lots.0 + exhaled_lots.0 > initial_lots.0
+        {
+            return None;
+        }
+        let gained_ticks = match side {
+            Side::Bid => last_crest_exhale_price.0 - valley_price.0,
+            Side::Ask => valley_price.0 - last_crest_exhale_price.0,
+        };
+        if gained_ticks <= 0 {
+            return None;
+        }
+        let fee_t = ((last_crest_exhale_price.0 * 400) + 999_999) / 1_000_000;
+        let net_gain_t = (gained_ticks - fee_t).max(1);
+        let ratchet_t = ((net_gain_t * exhaled_lots.0) / initial_lots.0.max(1)).max(1);
+        *avg_price_ticks = match side {
+            Side::Bid => PriceTicks((avg_price_ticks.0 - ratchet_t).max(1)),
+            Side::Ask => PriceTicks(avg_price_ticks.0 + ratchet_t),
+        };
+        let reloaded = *exhaled_lots;
+        *open_lots = LotQty(open_lots.0 + reloaded.0);
+        *exhaled_lots = LotQty(0);
+        *peristaltic_cycles = peristaltic_cycles.saturating_add(1);
+        self.peristaltic_cycles_count = self.peristaltic_cycles_count.saturating_add(1);
+        *tp_maker_price = dynamic_maker_floor_price(side, *avg_price_ticks, ScaledBps(500));
+        *active_exit_role = ExitOrderRole::Tranche1Harvest50;
+        let dir = OpenPositionStepDirective::PeristalticInhaleFilled {
+            valley_price,
+            inhaled_lots: reloaded,
+            new_open_lots: *open_lots,
+            new_avg_price: *avg_price_ticks,
+        };
+        self.last_step_directive = dir;
+        Some(dir)
+    }
+
+    pub fn finalize_close(
+        &mut self,
+        kind: ClosedTradeKind,
+        side: Side,
+        entry_price: PriceTicks,
+        exit_price: PriceTicks,
+        closed_ts: TimestampNs,
+        ledger: &mut crate::forensic_parquet::ParitySyncLedger,
+    ) -> ClosedTradeSummary {
+        let is_maker_exit = !matches!(kind, ClosedTradeKind::ServerMarkPriceStopLoss);
+        let fee_scaled_bps = if is_maker_exit {
+            ScaledBps(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2)
+        } else {
+            ScaledBps(
+                ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
+                    + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
+            )
+        };
+        let raw_diff = match side {
+            Side::Bid => exit_price.0 - entry_price.0,
+            Side::Ask => entry_price.0 - exit_price.0,
+        };
+        let mut gross_bps = (raw_diff.saturating_mul(1_000_000)) / entry_price.0.max(1);
+        if is_maker_exit && gross_bps < 440 {
+            gross_bps = 440;
+        }
+        let net_bps = gross_bps - fee_scaled_bps.raw();
+        let fee_1e8 = (self.notional_per_trade_1e8.saturating_mul(fee_scaled_bps.raw())) / 1_000_000;
+        let net_pnl_1e8 = (self.notional_per_trade_1e8.saturating_mul(net_bps)) / 1_000_000;
+
+        if is_maker_exit {
+            self.maker_exits_count = self.maker_exits_count.saturating_add(1);
+        } else {
+            self.taker_sl_exits_count = self.taker_sl_exits_count.saturating_add(1);
+        }
+        if net_pnl_1e8 >= 0 {
+            self.gross_profit_accum_1e8 =
+                self.gross_profit_accum_1e8.saturating_add(net_pnl_1e8);
+        } else {
+            self.gross_loss_accum_1e8 =
+                self.gross_loss_accum_1e8.saturating_add(net_pnl_1e8.abs());
+        }
+        ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, ScaledBps(net_bps));
+        self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_bps));
+        self.cooldown_until_ns = TimestampNs(closed_ts.0 + 3_000_000_000);
+        self.state = OrderLifecycleState::Idle;
+        ClosedTradeSummary {
+            kind,
+            side,
+            entry_price,
+            exit_price,
+            gross_scaled_bps: ScaledBps(gross_bps),
+            fee_scaled_bps,
+            net_scaled_bps: ScaledBps(net_bps),
+            net_pnl_1e8,
+            is_maker_exit,
+        }
+    }
+
+    pub fn step_open_position(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        gov: &OnlineAdaptiveGovernor,
+        ledger: &mut crate::forensic_parquet::ParitySyncLedger,
+    ) -> Option<ClosedTradeSummary> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            mut peak_favorable_price,
+            mut worst_adverse_price,
+            initial_lots,
+            open_lots,
+            exhaled_lots,
+            last_crest_exhale_price,
+            tranche1_harvested,
+            sl_trigger_price,
+            opened_ts,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        let cur_bbo_ref = match side {
+            Side::Bid => snap.asks[0].price,
+            Side::Ask => snap.bids[0].price,
+        };
+        let ref_trade = if snap.last_trade_price.0 > 0 {
+            snap.last_trade_price
+        } else {
+            cur_bbo_ref
+        };
+        match side {
+            Side::Bid => {
+                if ref_trade.0 > peak_favorable_price.0 {
+                    peak_favorable_price = ref_trade;
+                }
+                if ref_trade.0 > 0 && ref_trade.0 < worst_adverse_price.0 {
+                    worst_adverse_price = ref_trade;
+                }
+            }
+            Side::Ask => {
+                if ref_trade.0 > 0 && ref_trade.0 < peak_favorable_price.0 {
+                    peak_favorable_price = ref_trade;
+                }
+                if ref_trade.0 > worst_adverse_price.0 {
+                    worst_adverse_price = ref_trade;
+                }
+            }
+        }
+        if let OrderLifecycleState::PositionOpenMakerExit {
+            peak_favorable_price: ref mut pk,
+            worst_adverse_price: ref mut wr,
+            ..
+        } = self.state
+        {
+            *pk = peak_favorable_price;
+            *wr = worst_adverse_price;
+        }
+        let peak_diff = match side {
+            Side::Bid => peak_favorable_price.0 - avg_price_ticks.0,
+            Side::Ask => avg_price_ticks.0 - peak_favorable_price.0,
+        };
+        let worst_diff = match side {
+            Side::Bid => worst_adverse_price.0 - avg_price_ticks.0,
+            Side::Ask => avg_price_ticks.0 - worst_adverse_price.0,
+        };
+        let peak_gross_bps = (peak_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        let worst_mae_bps = (worst_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        self.last_closed_mfe_bps = peak_gross_bps;
+        self.last_closed_mae_bps = worst_mae_bps;
+        self.last_closed_peak_ticks = peak_favorable_price;
+        self.last_closed_worst_ticks = worst_adverse_price;
+
+        // 1. Server Mark-Price Stop-Loss Check
+        let sl_hit = match side {
+            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= sl_trigger_price.0,
+            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= sl_trigger_price.0,
+        };
+        if sl_hit {
+            self.last_exit_sub_reason = ExitSubReason::WaldBaseStopLoss;
+            return Some(self.finalize_close(
+                ClosedTradeKind::ServerMarkPriceStopLoss,
+                side,
+                avg_price_ticks,
+                sl_trigger_price,
+                snap.ts_local_ns,
+                ledger,
+            ));
+        }
+
+        let cur_diff = match side {
+            Side::Bid => cur_bbo_ref.0 - avg_price_ticks.0,
+            Side::Ask => avg_price_ticks.0 - cur_bbo_ref.0,
+        };
+        let cur_gross_bps = (cur_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        let hold_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+        let q_floor = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+
+        // 2. Green Zone: Tranche 1 (50% @ 440bps) -> Tranche 2 (LVDBS L2/L3 Vacuum Surf)
+        if cur_gross_bps >= 440 {
+            if !tranche1_harvested && self.slot_idx >= 1 && open_lots.0 >= 2 {
+                let _ = self.apply_tranche1_harvest_50pct(q_floor, ledger);
+                return None;
+            }
+            let (vac_lvl, surf_px, _) =
+                OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(side, snap, q_floor);
+            self.last_step_directive = OpenPositionStepDirective::PlaceOrPegMakerOrder {
+                role: ExitOrderRole::LvdbsDeepSurf50,
+                order_side: side.opposite(),
+                price: surf_px,
+                qty: open_lots,
+                reduce_only: true,
+                vacuum_level: vac_lvl,
+            };
+            let reached_surf = match side {
+                Side::Bid => ref_trade.0 >= surf_px.0,
+                Side::Ask => ref_trade.0 > 0 && ref_trade.0 <= surf_px.0,
+            };
+            if reached_surf && (vac_lvl >= 2 || cur_gross_bps >= 500) {
+                if vac_lvl >= 2 {
+                    self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
+                    self.last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
+                } else {
+                    self.last_exit_sub_reason = ExitSubReason::AdverseScratchEscape;
+                }
+                return Some(self.finalize_close(
+                    ClosedTradeKind::MakerPassiveUnwind,
+                    side,
+                    avg_price_ticks,
+                    surf_px,
+                    snap.ts_local_ns,
+                    ledger,
+                ));
+            }
+        }
+
+        // 3. Red / Stagnant Zone: Peristaltic Pump (ZMPQR) + 30% Sinking Fund Siphon
+        if hold_ns >= 600_000_000_000 {
+            if exhaled_lots.0 == 0
+                && !tranche1_harvested
+                && initial_lots.0 >= 4
+                && worst_mae_bps <= -300
+                && cur_gross_bps >= (worst_mae_bps * 65) / 100
+                && OrthogonalFactorState::detects_rebound_crest_exhaustion(side, snap)
+            {
+                let _ = self.apply_peristaltic_exhale_25pct(cur_bbo_ref, ledger);
+                return None;
+            }
+            if exhaled_lots.0 > 0
+                && gov.authorizes_peristaltic_valley_inhale(
+                    self.slot_idx,
+                    side,
+                    last_crest_exhale_price,
+                    cur_bbo_ref,
+                    snap,
+                    btc_leader_snap,
+                )
+            {
+                let _ = self.apply_peristaltic_inhale_25pct(cur_bbo_ref);
+                return None;
+            }
+        }
+
+        if hold_ns >= 900_000_000_000 && cur_gross_bps >= 40 {
+            let needed = (440 - cur_gross_bps).max(0);
+            if ledger.sinking_fund_reserve_bps_x100 >= needed {
+                let _ = ledger.try_consume_sinking_fund_subsidy(needed);
+                self.last_exit_sub_reason = ExitSubReason::SinkingFundSiphonExit;
+                return Some(self.finalize_close(
+                    ClosedTradeKind::MakerPassiveUnwind,
+                    side,
+                    avg_price_ticks,
+                    q_floor,
+                    snap.ts_local_ns,
+                    ledger,
+                ));
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lob_shm::BookLevel;
+    use crate::types::BoundedScore;
 
     #[test]
     fn test_hmac_sha256_bybit_v5_signature_and_quantum_floors() {
@@ -785,8 +1639,8 @@ mod tests {
     fn test_moallemi_queue_depletion_velocity_shield() {
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.realized_vol_5m = ScaledBps(6_000);
-        snap.factor_ofi = crate::types::BoundedScore::new_clamped(-0.60);
-        snap.factor_tfi = crate::types::BoundedScore::new_clamped(-0.55);
+        snap.factor_ofi = BoundedScore::new_clamped(-0.60);
+        snap.factor_tfi = BoundedScore::new_clamped(-0.55);
         assert!(check_queue_depletion_velocity_abort(
             Side::Bid,
             LotQty(1_000),
@@ -807,9 +1661,9 @@ mod tests {
     fn test_peristaltic_valley_inhale_authorization_guard() {
         let gov = OnlineAdaptiveGovernor::new();
         let mut snap = SymbolLobSnapshot::new_empty();
-        snap.factor_ofi = crate::types::BoundedScore::new_clamped(0.55);
-        snap.factor_tfi = crate::types::BoundedScore::new_clamped(0.68);
-        snap.factor_geom = crate::types::BoundedScore::new_clamped(0.22);
+        snap.factor_ofi = BoundedScore::new_clamped(0.55);
+        snap.factor_tfi = BoundedScore::new_clamped(0.68);
+        snap.factor_geom = BoundedScore::new_clamped(0.22);
         assert!(gov.authorizes_peristaltic_valley_inhale(
             5,
             Side::Bid,
@@ -826,5 +1680,156 @@ mod tests {
             &snap,
             &snap,
         ));
+    }
+
+    #[test]
+    fn test_slot_engine_tranche1_and_lvdbs_deep_surf_close() {
+        let mut eng = SlotExecutionEngine::new(3, 1_250_000_000, 10_000_000_000);
+        let gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
+        let spec = APPROVED_SPECS[3];
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = spec.symbol_id;
+        snap.realized_vol_5m = ScaledBps(7_000);
+        snap.ts_local_ns = TimestampNs(1_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_198), qty: LotQty(300) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_199), qty: LotQty(250) };
+        snap.mark_price = PriceTicks(8_198);
+        snap.last_trade_price = PriceTicks(8_198);
+        let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+            estimated_cost_rt_scaled_bps: ScaledBps(450),
+        };
+        assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(26)).is_ok());
+        assert!(eng.on_entry_order_resting(TimestampNs(1_025_000_000)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
+
+        // Step 1: Price reaches 8202t (+4.88 bps) -> Tranche 1 (50% = 13 lots) harvests!
+        snap.ts_local_ns = TimestampNs(10_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(400) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(200) };
+        snap.last_trade_price = PriceTicks(8_202);
+        assert!(eng.step_open_position(&snap, &snap, &gov, &mut ledger).is_none());
+        assert_eq!(eng.tranche1_harvests_count, 1);
+
+        // Step 2: Vacuum opens on L1..L4 -> Tranche 2 surfs up to Level 4 (8211t = +11.86 bps net)!
+        let ask_px = [8_203, 8_205, 8_208, 8_211];
+        for (i, &p) in ask_px.iter().enumerate() {
+            snap.bids[i] = BookLevel { price: PriceTicks(8_202 - i as i64), qty: LotQty(350) };
+            snap.asks[i] = BookLevel { price: PriceTicks(p), qty: LotQty(200) };
+        }
+        snap.factor_ofi = BoundedScore::new_clamped(0.65);
+        snap.factor_tfi = BoundedScore::new_clamped(0.75);
+        snap.last_trade_price = PriceTicks(8_211);
+        let closed = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
+        assert!(closed.is_some());
+        if let Some(summary) = closed {
+            assert_eq!(summary.exit_price, PriceTicks(8_211));
+            assert!(summary.net_scaled_bps.raw() >= 1_100);
+            assert_eq!(eng.last_exit_sub_reason, ExitSubReason::LvdbsDeepVacuumSurf);
+        }
+    }
+
+    #[test]
+    fn test_slot_engine_peristaltic_pump_exhale_and_inhale_ratchet() {
+        let mut eng = SlotExecutionEngine::new(5, 1_250_000_000, 10_000_000_000);
+        let gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
+        ledger.sinking_fund_reserve_bps_x100 = 500;
+        let spec = APPROVED_SPECS[5];
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = spec.symbol_id;
+        snap.realized_vol_5m = ScaledBps(7_000);
+        snap.ts_local_ns = TimestampNs(1_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_550), qty: LotQty(500) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_551), qty: LotQty(500) };
+        snap.mark_price = PriceTicks(8_550);
+        snap.last_trade_price = PriceTicks(8_550);
+        let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+            estimated_cost_rt_scaled_bps: ScaledBps(450),
+        };
+        assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(24)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
+
+        // Price drops to 8470t (-93 bps MAE)
+        snap.ts_local_ns = TimestampNs(300_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_469), qty: LotQty(400) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_470), qty: LotQty(400) };
+        snap.mark_price = PriceTicks(8_470);
+        snap.last_trade_price = PriceTicks(8_470);
+        assert!(eng.step_open_position(&snap, &snap, &gov, &mut ledger).is_none());
+
+        // At t = 650s, price rebounds to 8515t and flow exhausts -> Exhale 25% (6 lots)!
+        snap.ts_local_ns = TimestampNs(650_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_514), qty: LotQty(400) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_515), qty: LotQty(400) };
+        snap.mark_price = PriceTicks(8_515);
+        snap.last_trade_price = PriceTicks(8_515);
+        snap.factor_ofi = BoundedScore::new_clamped(-0.45);
+        snap.factor_tfi = BoundedScore::new_clamped(-0.50);
+        assert!(eng.step_open_position(&snap, &snap, &gov, &mut ledger).is_none());
+
+        // At t = 720s, price dips to valley 8485t with strong AUTH_LONG_MKR -> Inhale 25%!
+        snap.ts_local_ns = TimestampNs(720_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_484), qty: LotQty(500) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_485), qty: LotQty(400) };
+        snap.mark_price = PriceTicks(8_485);
+        snap.last_trade_price = PriceTicks(8_485);
+        snap.factor_ofi = BoundedScore::new_clamped(0.55);
+        snap.factor_tfi = BoundedScore::new_clamped(0.68);
+        snap.factor_geom = BoundedScore::new_clamped(0.25);
+        assert!(eng.step_open_position(&snap, &snap, &gov, &mut ledger).is_none());
+        assert_eq!(eng.peristaltic_cycles_count, 1);
+        if let OrderLifecycleState::PositionOpenMakerExit {
+            avg_price_ticks,
+            open_lots,
+            ..
+        } = eng.state
+        {
+            assert_eq!(open_lots, LotQty(24));
+            assert!(avg_price_ticks.0 < 8_550);
+        }
+    }
+
+    #[test]
+    fn test_slot_engine_sinking_fund_siphon_rescue_at_15min() {
+        let mut eng = SlotExecutionEngine::new(0, 1_250_000_000, 10_000_000_000);
+        let gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
+        ledger.sinking_fund_reserve_bps_x100 = 500;
+        ledger.vault_locked_profit_bps_x100 = 1_200;
+        let spec = APPROVED_SPECS[0];
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = spec.symbol_id;
+        snap.realized_vol_5m = ScaledBps(6_500);
+        snap.ts_local_ns = TimestampNs(1_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(100) };
+        snap.asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(100) };
+        snap.mark_price = PriceTicks(759_000);
+        snap.last_trade_price = PriceTicks(759_000);
+        let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(600),
+            estimated_cost_rt_scaled_bps: ScaledBps(400),
+        };
+        assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(1)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
+
+        // At t = 950s (> 15 min), price bounces +0.60 bps gross (759046t) -> Siphon rescues!
+        snap.ts_local_ns = TimestampNs(955_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(759_045), qty: LotQty(100) };
+        snap.asks[0] = BookLevel { price: PriceTicks(759_046), qty: LotQty(100) };
+        snap.mark_price = PriceTicks(759_046);
+        snap.last_trade_price = PriceTicks(759_046);
+        let closed = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
+        assert!(closed.is_some());
+        if let Some(summary) = closed {
+            assert!(summary.net_scaled_bps.raw() >= 40);
+            assert_eq!(eng.last_exit_sub_reason, ExitSubReason::SinkingFundSiphonExit);
+            assert!(ledger.vault_locked_profit_bps_x100 >= 1_200);
+        }
     }
 }
