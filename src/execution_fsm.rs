@@ -893,7 +893,6 @@ pub struct SlotExecutionEngine {
     pub slot_idx: usize,
     pub state: OrderLifecycleState,
     pub notional_per_trade_1e8: i64,
-    pub max_daily_drawdown_1e8: i64,
     pub cooldown_until_ns: TimestampNs,
     pub maker_exits_count: u64,
     pub taker_sl_exits_count: u64,
@@ -910,9 +909,7 @@ pub struct SlotExecutionEngine {
     pub last_closed_worst_ticks: PriceTicks,
     pub last_closed_wald_pct: i64,
     pub last_exit_sub_reason: ExitSubReason,
-    pub last_armed_ts: TimestampNs,
     pub last_opened_ts: TimestampNs,
-    pub last_armed_seq_id: u64,
     pub next_peg_allowed_ts_ns: i64,
     pub exit_peg_attempts: u32,
     pub last_step_directive: OpenPositionStepDirective,
@@ -927,11 +924,11 @@ impl SlotExecutionEngine {
         notional_per_trade_1e8: i64,
         max_daily_drawdown_1e8: i64,
     ) -> Self {
+        let _ = max_daily_drawdown_1e8;
         Self {
             slot_idx,
             state: OrderLifecycleState::Idle,
             notional_per_trade_1e8,
-            max_daily_drawdown_1e8,
             cooldown_until_ns: TimestampNs(0),
             maker_exits_count: 0,
             taker_sl_exits_count: 0,
@@ -948,9 +945,7 @@ impl SlotExecutionEngine {
             last_closed_worst_ticks: PriceTicks(0),
             last_closed_wald_pct: 0,
             last_exit_sub_reason: ExitSubReason::AdverseScratchEscape,
-            last_armed_ts: TimestampNs(0),
             last_opened_ts: TimestampNs(0),
-            last_armed_seq_id: 0,
             next_peg_allowed_ts_ns: 0,
             exit_peg_attempts: 0,
             last_step_directive: OpenPositionStepDirective::HoldPassive,
@@ -1063,8 +1058,9 @@ impl SlotExecutionEngine {
                 tel.entry_ticks.store(entry_price.0 as u64, Ordering::Release);
                 tel.avg_price_ticks.store(avg_price_ticks.0 as u64, Ordering::Release);
                 tel.peak_ticks.store(peak_favorable_price.0 as u64, Ordering::Release);
+                let eff_sl = if self.last_eff_sl_ticks.0 > 0 { self.last_eff_sl_ticks.0 } else { sl_trigger_price.0 };
                 tel.tp_ticks.store(tp_maker_price.0 as u64, Ordering::Release);
-                tel.sl_ticks.store(sl_trigger_price.0 as u64, Ordering::Release);
+                tel.sl_ticks.store(eff_sl as u64, Ordering::Release);
                 tel.open_lots.store(open_lots.0 as u64, Ordering::Release);
                 tel.initial_lots.store(initial_lots.0 as u64, Ordering::Release);
                 tel.peristaltic_cycles.store(u64::from(peristaltic_cycles), Ordering::Release);
@@ -1130,8 +1126,6 @@ impl SlotExecutionEngine {
             ref_mark,
         )?;
         let _ = spec;
-        self.last_armed_ts = snap.ts_local_ns;
-        self.last_armed_seq_id = snap.sequence_id;
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side,
             entry_price,

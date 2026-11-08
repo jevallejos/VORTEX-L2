@@ -21,7 +21,7 @@ use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{
     check_queue_depletion_velocity_abort, defensive_zero_loss_maker_exit_price,
     dynamic_maker_floor_price, sign_bybit_v5_hmac_sha256, ClosedTradeKind,
-    ClosedTradeSummary, ExitOrderRole, OnlineAdaptiveGovernor,
+    ClosedTradeSummary, ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor,
     OpenPositionStepDirective, OrderLifecycleState, SlotExecutionEngine,
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
@@ -459,8 +459,10 @@ fn render_trades_and_executive_dashboard() {
     let mut rows_out = Vec::new();
     let mut total = 0_usize;
     let mut wins = 0_usize;
+    let mut partials = 0_usize;
     let mut scratches = 0_usize;
     let mut losses = 0_usize;
+    let mut maker_closes = 0_usize;
     let mut cum_gross = 0.0_f64;
     let mut cum_fee = 0.0_f64;
     let mut cum_net = 0.0_f64;
@@ -491,7 +493,13 @@ fn render_trades_and_executive_dashboard() {
             let sub_r = v.get("exit_sub_reason").and_then(|s| s.as_str()).unwrap_or("MakerExit");
             let mkr = v.get("maker_exit").and_then(|b| b.as_bool()).unwrap_or(true);
 
-            if n_bps >= 1.00 {
+            if mkr {
+                maker_closes += 1;
+            }
+            let is_partial = sub_r.contains("Tranche1Harvest50") || sub_r.contains("Partial");
+            if is_partial {
+                partials += 1;
+            } else if n_bps >= 1.00 {
                 wins += 1;
             } else if n_bps >= -0.50 {
                 scratches += 1;
@@ -504,7 +512,6 @@ fn render_trades_and_executive_dashboard() {
             sum_mfe += mfe;
             sum_mae += mae;
             sum_hold_s += (hold_ms as f64) / 1_000.0;
-            let is_partial = sub_r.contains("Tranche1Harvest50") || sub_r.contains("Partial");
             let (col, icon, lbl) = classify_trade_badge(n_bps, is_partial);
             rows_out.push(format!(
                 "{}{} [TRADE #{:<3} {}] {:<10} {:<3} \u{2502} {:>7}t->{:<7}t \u{2502} G:{:>+6.2} F:{:>4.2} N:{:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{:>+6.2} MAE:{:>+6.2} \u{2502} {:>4}s \u{2502} {} (Mkr={}){}",
@@ -521,19 +528,33 @@ fn render_trades_and_executive_dashboard() {
         .and_then(BybitV5LiveClient::fetch_wallet_and_equity_usdt)
         .unwrap_or((70.8005, 70.8005, 70.8005, 0.0));
 
+    let eff_notional_usdt = (w_usdt * 0.29).max(18.0);
+    let bps_to_usdt = eff_notional_usdt / 10_000.0;
     let reserve_bps = (cum_net.max(0.0)) * 0.30;
     let locked_bps = (cum_net.max(0.0)) * 0.70;
-    let net_usdt = cum_net * 0.00125;
-    let gross_usdt = cum_gross * 0.00125;
-    let fee_usdt = cum_fee * 0.00125;
+    let net_usdt = cum_net * bps_to_usdt;
+    let gross_usdt = cum_gross * bps_to_usdt;
+    let fee_usdt = cum_fee * bps_to_usdt;
+
+    let prog_25 = total.min(25);
+    let pct_25 = ((prog_25 as f64) / 25.0) * 100.0;
+    let bars_25 = ((pct_25 / 5.0).round() as usize).min(20);
+    let bar_25_str = format!("{}{}", "\u{2588}".repeat(bars_25), "\u{2591}".repeat(20 - bars_25));
+    let rem_25 = 25_usize.saturating_sub(prog_25);
+    let mkr_pct = if total > 0 {
+        (maker_closes as f64 * 100.0) / (total as f64)
+    } else {
+        100.0
+    };
+
     let goal_anchor_usdt = w_usdt.max(eq_usdt);
     let goal_pct = ((goal_anchor_usdt / 95.0) * 100.0).clamp(0.0, 100.0);
     let filled_bars = ((goal_pct / 5.0).round() as usize).min(20);
     let bar_95 = format!("{}{}", "\u{2588}".repeat(filled_bars), "\u{2591}".repeat(20 - filled_bars));
 
     let sec_summary = vec![format!(
-        "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} {}\u{1fa75} Scratches: {}{} \u{2502} \u{1f534} Losses: {}) \u{2502} CumGross: {:+.2} \u{2502} CumFee: -{:.2} \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
-        ANSI_GREEN, total, wins, ANSI_SKY_BLUE, scratches, ANSI_GREEN, losses, cum_gross, cum_fee, cum_net, cum_net / 10.0, ANSI_RESET
+        "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} {}\u{1f332} Partials: {}{} \u{2502} {}\u{1fa75} Scratches: {}{} \u{2502} \u{1f534} Losses: {}) \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
+        ANSI_GREEN, total, wins, ANSI_DARK_GREEN, partials, ANSI_GREEN, ANSI_SKY_BLUE, scratches, ANSI_GREEN, losses, cum_net, cum_net / 10.0, ANSI_RESET
     )];
     let sec_dash_hdr = vec![format!(
         "{}\u{1f48e} VORTEX-L3 EXECUTIVE DASHBOARD \u{2014} CAPITAL REAL (BYBIT UTA V5 LIVE) & DATOS CONSOLIDADOS{}",
@@ -551,19 +572,23 @@ fn render_trades_and_executive_dashboard() {
         ),
         format!(
             "   \u{2022} Nocional Compuesto (10x) : {:>9.4} USDT \u{2502} Margen Base/Tiro   : {:>9.4} USDT",
-            (w_usdt * 0.29).max(18.0), (w_usdt * 0.029).max(1.8)
+            eff_notional_usdt, eff_notional_usdt * 0.10
         ),
     ];
     let denom_t = (total.max(1)) as f64;
     let sec_perf = vec![
         "\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESION]".to_string(),
         format!(
+            "   \u{2022} Meta 25 Tiros  : [{}] {:>2}/25 ({:>5.1}%) \u{2502} Faltan: {:>2} tiros \u{2502} Salidas Maker: {:.1}%",
+            bar_25_str, prog_25, pct_25, rem_25, mkr_pct
+        ),
+        format!(
             "   \u{2022} Meta 95 USDT   : [{}] {:.4}/95.00 ({:>5.1}%) \u{2502} Faltan: {:.4} USDT (Anclada a Wallet)",
             bar_95, goal_anchor_usdt, goal_pct, (95.0 - goal_anchor_usdt).max(0.0)
         ),
         format!(
-            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} (  0.0%)",
-            total, wins, (wins as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses
+            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1f332} PART: {} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} (  0.0%)",
+            total, wins, (wins as f64 * 100.0) / denom_t, partials, (partials as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses
         ),
         format!(
             "   \u{2022} Balance (bps)  : Bruto: {:>+8.2} bps  \u{2502} Fees: {:>-8.2} bps  \u{2502} Neto: {:>+8.2} bps ({:+.2}% @10x)",
@@ -575,7 +600,7 @@ fn render_trades_and_executive_dashboard() {
         ),
         format!(
             "   \u{2022} Fondo Saneam.  : Reserva (30%): {:+.2} bps ({:+.4} USDT) \u{2502} Blindado (70%): {:+.2} bps ({:+.4} USDT)",
-            reserve_bps, reserve_bps * 0.00125, locked_bps, locked_bps * 0.00125
+            reserve_bps, reserve_bps * bps_to_usdt, locked_bps, locked_bps * bps_to_usdt
         ),
         format!(
             "   \u{2022} Excursiones    : MFE Medio: {:+.2} bps \u{2502} MAE Medio: {:+.2} bps \u{2502} Custodia Media: {:.1} s",
@@ -629,6 +654,18 @@ fn rehydrate_shadow_ledger(
     gov: &mut OnlineAdaptiveGovernor,
     arena: &VortexShmArena,
 ) {
+    if let Ok(seed_f) = fs::File::open("deploy/forensic_vault_171.seed") {
+        let reader = BufReader::new(seed_f);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                let sym = v.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                let mfe_f = v.get("mfe_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
+                if let Some(s_idx) = slot_from_symbol_name(sym) {
+                    engines[s_idx].observe_mfe_sample((mfe_f * 100.0).round() as i64);
+                }
+            }
+        }
+    }
     let mut count = 0_u64;
     if let Ok(file) = fs::File::open(SHADOW_LEDGER_PATH) {
         let reader = BufReader::new(file);
@@ -812,6 +849,8 @@ fn append_closed_trade_logs(
         "kin_accel_net_bps": entry_f.kin_accel_net_bps,
         "kin_energy_in_bps": entry_f.kin_energy_in_bps,
         "req_kin_energy_in_bps": entry_f.req_kin_energy_in_bps,
+        "exit_peg_attempts": eng.exit_peg_attempts,
+        "wald_contraction_pct": eng.last_closed_wald_pct,
         "peristaltic_cycles": eng.peristaltic_cycles_count,
         "lvdbs_surfs": eng.lvdbs_deep_surfs_count,
     })
@@ -958,6 +997,10 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
             if let Some(ref client) = live_client {
                 if let Some((w_f, _, _, _)) = client.fetch_wallet_and_equity_usdt() {
                     wallet_1e8 = (w_f * 100_000_000.0).round() as i64;
+                    let comp_notional = ((wallet_1e8 * 29) / 100).clamp(1_800_000_000, 25_000_000_000);
+                    for eng in &mut engines {
+                        eng.notional_per_trade_1e8 = comp_notional;
+                    }
                 }
             }
         }
@@ -1255,6 +1298,37 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                         true,
                                     );
                                 }
+                                let avg_en = match engines[s_idx].state {
+                                    OrderLifecycleState::PositionOpenMakerExit {
+                                        avg_price_ticks,
+                                        ..
+                                    } => avg_price_ticks,
+                                    _ => filled_price,
+                                };
+                                engines[s_idx].last_exit_sub_reason = ExitSubReason::Tranche1Harvest50;
+                                ledger.closed_trades_count = ledger.closed_trades_count.saturating_add(1);
+                                arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
+                                let p_pnl = (engines[s_idx].notional_per_trade_1e8 * net_scaled_bps.raw()) / 2_000_000;
+                                let p_summary = ClosedTradeSummary {
+                                    kind: ClosedTradeKind::MakerPassiveUnwind,
+                                    side,
+                                    entry_price: avg_en,
+                                    exit_price: filled_price,
+                                    gross_scaled_bps: ScaledBps(net_scaled_bps.raw() + 400),
+                                    fee_scaled_bps: ScaledBps(400),
+                                    net_scaled_bps,
+                                    net_pnl_1e8: p_pnl,
+                                    is_maker_exit: true,
+                                };
+                                append_closed_trade_logs(
+                                    s_idx,
+                                    &p_summary,
+                                    &engines[s_idx],
+                                    &entry_forensics[s_idx],
+                                    &snap,
+                                    &ledger,
+                                    now_ns,
+                                );
                                 println!(
                                     "{}\u{1f332} [TRANCHE 1 PARTIAL HARVEST 50%] {} {:?} qty={} @ {}t (+{:.2} bps net locked){}",
                                     ANSI_DARK_GREEN,
