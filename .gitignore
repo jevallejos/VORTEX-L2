@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+*.mmap
+*.parquet
+.env
+data/*.jsonl
+data/vault/*.jsonl
+data/vault/*.json
+data/vault/*.lock
+*.csv
