@@ -251,7 +251,8 @@ impl OrthogonalFactorState {
             0
         };
 
-        let base_exc = ((composite.abs() * (snap.realized_vol_5m.raw() as f64) * 0.38)
+        let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
+        let base_exc = ((composite.abs() * (snap.realized_vol_5m.raw() as f64) * flow_boost)
             .round() as i64)
             .saturating_add(lead_lag_bonus_bps);
         let expected_excursion = ScaledBps(base_exc);
