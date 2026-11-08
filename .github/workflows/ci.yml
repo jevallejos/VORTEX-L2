@@ -23,7 +23,7 @@ jobs:
       - name: Gate 1 — Static Linter (Zero Warnings, Zero Unwraps/Panics)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Gate 2 — Unit & Integration Test Suite
+      - name: Gate 2 — Unit & Integration Test Suite (16/16)
         run: cargo test --all-targets
 
       - name: Gate 3 — Build LTO Release Binaries (x86_64 Linux)
@@ -45,6 +45,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vortex-linux-x86_64
+          overwrite: true
           path: |
             COMMIT_SHA
             vortex-linux-x86_64.tar.gz
