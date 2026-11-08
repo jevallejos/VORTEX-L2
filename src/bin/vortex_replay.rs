@@ -471,6 +471,7 @@ fn replay_live_parquet_ring() {
     let mut fills = 0_u64;
     let mut closed = 0_u64;
     let mut cum_net_bps = 0_i64;
+    let mut last_event_ts_ns = 0_i64;
 
     for f_path in &files {
         let Ok((batch, _)) = ColumnarParquetBatch::read_from_file(f_path) else {
@@ -483,6 +484,13 @@ fn replay_live_parquet_ring() {
             let Some(s_idx) = row.symbol_id.slot_index() else {
                 continue;
             };
+            if last_event_ts_ns > 0
+                && row.ts_local_ns.0.saturating_sub(last_event_ts_ns) > 60_000_000_000
+            {
+                engines = SlotExecutionEngine::new_12_slot_array(1_250_000_000, 10_000_000_000);
+                gov = OnlineAdaptiveGovernor::new();
+            }
+            last_event_ts_ns = row.ts_local_ns.0;
             total_events += 1;
             match row.event_kind {
                 MarketEventKind::L2BookSnapshot => l2_events += 1,

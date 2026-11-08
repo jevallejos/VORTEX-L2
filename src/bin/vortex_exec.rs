@@ -1276,6 +1276,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     avg_price_ticks,
                     mut peak_favorable_price,
                     mut worst_adverse_price,
+                    sl_trigger_price,
                     opened_ts,
                     ..
                 } => {
@@ -1322,10 +1323,38 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
                         let s_ofi = snap.factor_ofi.get() * dir_s;
                         let s_tfi = snap.factor_tfi.get() * dir_s;
+                        let s_geom = snap.factor_geom.get() * dir_s;
+                        let signed_flow = 0.55 * s_ofi + 0.45 * s_tfi;
                         let joint_adverse = s_ofi < -0.18 && s_tfi < -0.18;
                         let strong_trend = s_ofi > 0.20 || s_tfi > 0.25;
 
-                        // Regimen de Techos Elasticos: WIN Ceiling (>=520..680 bps) vs SCRATCH Escape (>=25s)
+                        // 1. Contraccion Continua de Abraham Wald (hasta 48%) activa en vivo
+                        let time_c = (hold_s / 60).min(18) * 12;
+                        let flow_c = if signed_flow < -0.35 {
+                            ((-signed_flow - 0.35) * 280.0).round() as i64
+                        } else {
+                            0
+                        };
+                        let depth_c = if s_geom < -0.25 {
+                            ((-s_geom - 0.25) * 180.0).round() as i64
+                        } else {
+                            0
+                        };
+                        let wald_pct = ((time_c + flow_c + depth_c) / 10).clamp(0, 48);
+                        let base_sl_dist = (avg_price_ticks.0 - sl_trigger_price.0).abs().max(4);
+                        let contracted_dist = ((base_sl_dist * (100 - wald_pct)) / 100).max(3);
+                        let eff_sl_px = if s_idx != 7 && wald_pct >= 32 && signed_flow <= -0.55 {
+                            match side {
+                                Side::Bid => PriceTicks((avg_price_ticks.0 - contracted_dist).max(1)),
+                                Side::Ask => PriceTicks(avg_price_ticks.0 + contracted_dist),
+                            }
+                        } else {
+                            sl_trigger_price
+                        };
+                        engines[s_idx].last_eff_sl_ticks = eff_sl_px;
+                        engines[s_idx].last_closed_wald_pct = wald_pct;
+
+                        // 2. Regimen de Techos Elasticos: WIN Ceiling (>=520..680 bps) vs SCRATCH Escape (>=25s)
                         let vol_fl = (snap.realized_vol_5m.raw() / 10).clamp(540, 740);
                         let mfe_lrn = engines[s_idx].learned_mfe_bps.clamp(560, 920);
                         let base_win_target = (vol_fl * 60 + mfe_lrn * 40) / 100;
@@ -1352,27 +1381,38 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     OrderLifecycleState::PositionOpenMakerExit { tp_maker_price, .. } => tp_maker_price,
                                     _ => active_floor_px,
                                 };
-                                let exit_px = if prev_tp.0 > 0 {
-                                    match side {
-                                        Side::Bid => PriceTicks(prev_tp.0.max(q_fl.0)),
-                                        Side::Ask => PriceTicks(prev_tp.0.min(q_fl.0).max(1)),
+                                let mkt_ref = if snap.mark_price.0 > 0 { snap.mark_price } else { ref_px };
+                                let sl_triggered = match side {
+                                    Side::Bid => mkt_ref.0 > 0 && mkt_ref.0 < avg_price_ticks.0 - 2,
+                                    Side::Ask => mkt_ref.0 > avg_price_ticks.0 + 2,
+                                };
+                                let (close_kind, exit_px) = if sl_triggered {
+                                    engines[s_idx].last_exit_sub_reason = ExitSubReason::WaldBaseStopLoss;
+                                    (ClosedTradeKind::ServerMarkPriceStopLoss, mkt_ref)
+                                } else {
+                                    let tp_fill_px = if prev_tp.0 > 0 {
+                                        match side {
+                                            Side::Bid => PriceTicks(prev_tp.0.max(q_fl.0)),
+                                            Side::Ask => PriceTicks(prev_tp.0.min(q_fl.0).max(1)),
+                                        }
+                                    } else {
+                                        active_floor_px
+                                    };
+                                    let raw_d = match side {
+                                        Side::Bid => tp_fill_px.0 - avg_price_ticks.0,
+                                        Side::Ask => avg_price_ticks.0 - tp_fill_px.0,
+                                    };
+                                    let realized_g_bps = (raw_d.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+                                    if realized_g_bps >= 500 || vac_lvl >= 2 {
+                                        engines[s_idx].lvdbs_deep_surfs_count = engines[s_idx].lvdbs_deep_surfs_count.saturating_add(1);
+                                        engines[s_idx].last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
+                                    } else {
+                                        engines[s_idx].last_exit_sub_reason = ExitSubReason::AdverseScratchEscape;
                                     }
-                                } else {
-                                    active_floor_px
+                                    (ClosedTradeKind::MakerPassiveUnwind, tp_fill_px)
                                 };
-                                let raw_d = match side {
-                                    Side::Bid => exit_px.0 - avg_price_ticks.0,
-                                    Side::Ask => avg_price_ticks.0 - exit_px.0,
-                                };
-                                let realized_g_bps = (raw_d.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
-                                if realized_g_bps >= 500 || vac_lvl >= 2 {
-                                    engines[s_idx].lvdbs_deep_surfs_count = engines[s_idx].lvdbs_deep_surfs_count.saturating_add(1);
-                                    engines[s_idx].last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
-                                } else {
-                                    engines[s_idx].last_exit_sub_reason = ExitSubReason::AdverseScratchEscape;
-                                }
                                 let summary = engines[s_idx].finalize_close(
-                                    ClosedTradeKind::MakerPassiveUnwind,
+                                    close_kind,
                                     side,
                                     avg_price_ticks,
                                     exit_px,

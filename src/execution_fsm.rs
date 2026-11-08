@@ -493,12 +493,7 @@ impl OnlineAdaptiveGovernor {
         let d_sign = if matches!(side, Side::Bid) { 1_i64 } else { -1_i64 };
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
-        let over_extended = if snr_abs >= 0.66 && s_drift >= 200 {
-            s_ext > (s_drift * 125) / 100 + 45 || s_ext < -40
-        } else {
-            s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115
-        };
-        if s_drift < -80 || s_ext > 2_400 || over_extended {
+        if s_drift < -80 || s_ext > 1_200 || (s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115) {
             return Err("VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
         }
         let d = Self::dir_idx(side);
@@ -511,11 +506,7 @@ impl OnlineAdaptiveGovernor {
         let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 120.0).round() as i64;
         let snr_contrib = ((snr_abs - 0.42).max(0.0) * 120.0).round() as i64;
         let e_kin = if accel_net <= 0 {
-            if snr_abs >= 0.66 && s_drift >= 200 && accel_net >= -420 {
-                (s_drift / 6) + geom_contrib + snr_contrib * 3
-            } else {
-                accel_net
-            }
+            accel_net
         } else {
             accel_net + geom_contrib + snr_contrib
         };
