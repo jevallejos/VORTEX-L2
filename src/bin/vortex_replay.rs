@@ -276,7 +276,6 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
         let verdict = SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(680),
-            estimated_cost_rt_scaled_bps: ScaledBps(440),
         };
         let lots = spec.compute_compounding_kelly_lots(7_088_000_000, PriceTicks(base_px), 280, false);
         let _ = eng.try_arm_maker_entry(&spec, &snap, verdict, lots);

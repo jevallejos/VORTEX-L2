@@ -13,7 +13,6 @@ pub enum SignalVerdict {
     AuthorizeMakerEntry {
         side: Side,
         target_excursion_scaled_bps: ScaledBps,
-        estimated_cost_rt_scaled_bps: ScaledBps,
     },
 }
 
@@ -196,11 +195,6 @@ impl OrthogonalFactorState {
             + 0.20 * snap.factor_geom.get()
     }
 
-    #[inline]
-    #[must_use]
-    pub fn evaluate_entry_signal(spec: PairSpec, snap: &SymbolLobSnapshot) -> SignalVerdict {
-        Self::evaluate_entry_signal_with_leader(spec, snap, snap)
-    }
 
     #[must_use]
     pub fn evaluate_entry_signal_with_leader(
@@ -225,8 +219,11 @@ impl OrthogonalFactorState {
             return SignalVerdict::SpoofingVeto;
         }
 
+        let vol_ratio = (snap.realized_vol_5m.raw().clamp(3_500, 14_000) as f64) / 6_500.0;
+        let nu_sigma = vol_ratio.sqrt().clamp(0.85, 1.25);
+        let elastic_snr_floor = (0.40 * nu_sigma).clamp(0.38, 0.48);
         let composite = Self::snr_composite_score(snap);
-        if composite.abs() < 0.42 {
+        if composite.abs() < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
 
@@ -260,10 +257,9 @@ impl OrthogonalFactorState {
         let expected_excursion = ScaledBps(base_exc);
 
         match spec.passes_3x_friction_barrier(mid_ticks, expected_excursion) {
-            Ok(req_3x) => SignalVerdict::AuthorizeMakerEntry {
+            Ok(_) => SignalVerdict::AuthorizeMakerEntry {
                 side,
                 target_excursion_scaled_bps: expected_excursion,
-                estimated_cost_rt_scaled_bps: ScaledBps(req_3x.0 / 3),
             },
             Err(_) => SignalVerdict::NeutralNoAction,
         }
@@ -313,13 +309,15 @@ impl OrthogonalFactorState {
         quantum_floor_price: PriceTicks,
     ) -> (usize, PriceTicks, f64) {
         let vac_idx = Self::compute_vacuum_index_l2_l3(open_side, snap);
+        let vol_ratio = (snap.realized_vol_5m.raw().clamp(4_000, 12_500) as f64) / 6_500.0;
+        let nu_v = vol_ratio.sqrt().clamp(0.88, 1.15);
         let dir_s = if matches!(open_side, Side::Bid) { 1.0 } else { -1.0 };
         let signed_tfi = snap.factor_tfi.get() * dir_s;
-        let level_idx = if vac_idx >= 2.20 && signed_tfi >= 0.45 {
+        let level_idx = if vac_idx >= (2.15 * nu_v) && signed_tfi >= 0.42 {
             3_usize
-        } else if vac_idx >= 1.45 && signed_tfi >= 0.20 {
+        } else if vac_idx >= (1.42 * nu_v) && signed_tfi >= 0.18 {
             2_usize
-        } else if vac_idx >= 1.05 {
+        } else if vac_idx >= (1.04 * nu_v) {
             1_usize
         } else {
             0_usize

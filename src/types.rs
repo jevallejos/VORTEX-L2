@@ -3,12 +3,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ANSI_RESET: &str = "\x1b[0m";
-pub const ANSI_GREEN: &str = "\x1b[1;32m";
+pub const ANSI_GREEN: &str = "\x1b[1;38;5;118m";
+pub const ANSI_DARK_GREEN: &str = "\x1b[1;38;5;28m";
+pub const ANSI_SKY_BLUE: &str = "\x1b[1;38;5;51m";
 pub const ANSI_ORANGE: &str = "\x1b[1;38;5;208m";
 pub const ANSI_RED: &str = "\x1b[1;31m";
 pub const ANSI_YELLOW: &str = "\x1b[1;33m";
 pub const ANSI_GRAY: &str = "\x1b[38;5;245m";
-pub const ANSI_PURPLE: &str = "\x1b[1;35m";
 pub const ANSI_BLUE: &str = "\x1b[1;36m";
 
 #[repr(transparent)]
@@ -28,17 +29,10 @@ pub struct TimestampNs(pub i64);
 pub struct ScaledBps(pub i64);
 
 impl ScaledBps {
-    pub const ZERO: Self = Self(0);
     pub const MAX_ALLOWED_TICK_BPS: Self = Self(150);
     pub const MIN_REQUIRED_VOL_5M_BPS: Self = Self(3_500);
     pub const BYBIT_VIP0_MAKER_FEE_BPS: Self = Self(200);
     pub const BYBIT_VIP0_TAKER_FEE_BPS: Self = Self(550);
-
-    #[inline]
-    #[must_use]
-    pub const fn from_whole_bps(bps: i64) -> Self {
-        Self(bps.saturating_mul(100))
-    }
 
     #[inline]
     #[must_use]
@@ -604,18 +598,6 @@ pub const APPROVED_SPECS: [PairSpec; 12] = [
     },
 ];
 
-#[inline]
-#[must_use]
-pub const fn spec_for_symbol(sym: SymbolId) -> Option<(usize, PairSpec)> {
-    let mut i = 0;
-    while i < APPROVED_SPECS.len() {
-        if APPROVED_SPECS[i].symbol_id.0 == sym.0 {
-            return Some((i, APPROVED_SPECS[i]));
-        }
-        i += 1;
-    }
-    None
-}
 
 #[inline]
 #[must_use]
@@ -638,15 +620,30 @@ pub fn side_from_str(s: &str) -> Side {
     }
 }
 
+/// Classifies PnL into Light Green (WIN), Sky Blue / Celeste (SCRATCH), or Red (LOSS).
 #[inline]
 #[must_use]
 pub fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str) {
     if net_bps >= 1.00 {
         (ANSI_GREEN, "\u{1f7e2}", "WIN    ")
     } else if net_bps >= -0.50 {
-        (ANSI_ORANGE, "\u{1f7e0}", "SCRATCH")
+        (ANSI_SKY_BLUE, "\u{1fa75}", "SCRATCH")
     } else {
         (ANSI_RED, "\u{1f534}", "LOSS   ")
+    }
+}
+
+/// Classifies trade with Dark Green for Partial Harvests (50%), Light Green for Wins, Celeste for Scratches.
+#[inline]
+#[must_use]
+pub fn classify_trade_badge(
+    net_bps: f64,
+    is_partial_harvest: bool,
+) -> (&'static str, &'static str, &'static str) {
+    if is_partial_harvest {
+        (ANSI_DARK_GREEN, "\u{1f332}", "PARTIAL")
+    } else {
+        classify_pnl_badge(net_bps)
     }
 }
 

@@ -5,21 +5,6 @@ use crate::lob_shm::{SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
 use crate::types::{LotQty, PriceTicks, ScaledBps, Side, TimestampNs, APPROVED_SPECS};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BybitRetCode {
-    OkZero,
-    SlGeometryError10001,
-    InsufficientMargin110007,
-    OrderNotExistsOrAlreadyClosed110017,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum HaltReason {
-    InsufficientMargin110007,
-    AccountingParityDrift,
-    MaxDailyDrawdownBreached,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
     MakerStructuralTp,
     MakerPassiveUnwind,
@@ -28,19 +13,11 @@ pub enum ClosedTradeKind {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExitSubReason {
-    StructuralTpLimit,
-    FreeRideConvexRatchet,
+    Tranche1Harvest50,
     LvdbsDeepVacuumSurf,
-    PeristalticExhale25,
-    Zone1ProtectiveRatchet,
-    FlowReversalUnwind,
-    EarlyHarvestDecay,
+    PeristalticHarmonicExit,
     AdverseScratchEscape,
-    StrugglingRescue,
-    ZombieBreakevenEscape,
-    StagnantTimerUnwind,
     SinkingFundSiphonExit,
-    WaldSevereStopLoss,
     WaldBaseStopLoss,
 }
 
@@ -595,12 +572,40 @@ impl OnlineAdaptiveGovernor {
                 }
                 self.global_dir_win_streak[d] = 0;
             }
-            let breather_secs = if w >= 3 { 300_i64 } else if w == 2 { 120_i64 } else { 45_i64 };
-            let win_breather_ns = ts_ns.0.saturating_add(breather_secs * 1_000_000_000);
+            let breather_secs = ((320 - edge_clamped / 3) * (w.min(3) as i64)) / 3;
+            let win_breather_ns = ts_ns.0.saturating_add(breather_secs.clamp(45, 320) * 1_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
             }
+            if self.sl_streak[slot_idx][d] > 0
+                && w >= 5
+                && self.cum_net_bps_x100[slot_idx][d] >= -1_500
+            {
+                self.sl_streak[slot_idx][d] -= 1;
+                self.win_streak[slot_idx][d] = 0;
+            }
+            if self.global_dir_sl_streak[d] > 0 && self.global_dir_debt_bps_x100[d] >= -3_000 {
+                self.global_dir_sl_streak[d] -= 1;
+            }
         }
+    }
+
+    /// Records a pre-fill queue abort to prevent repeated toxic re-arming at the same level.
+    #[inline]
+    pub fn observe_entry_abort(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        aborted_price: PriceTicks,
+        ts_ns: TimestampNs,
+    ) {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return;
+        }
+        let d = Self::dir_idx(side);
+        self.abort_streak[slot_idx][d] = self.abort_streak[slot_idx][d].saturating_add(1).min(8);
+        self.abort_anchor_px_1e4[slot_idx][d] = aborted_price.0.saturating_mul(10_000);
+        self.abort_last_ts_ns[slot_idx][d] = ts_ns.0;
     }
 
     #[must_use]
@@ -664,18 +669,42 @@ impl OnlineAdaptiveGovernor {
         } else if signed_geom < 0.15 {
             return false;
         }
+        let sl_s = self.sl_streak[slot_idx][d] as f64;
+        let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
+        let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
+        let debt_penalty = if debt_bps < 0.0 {
+            ((-debt_bps) / 16_000.0).min(0.28)
+        } else {
+            0.0
+        };
+        let global_debt_bps = self.global_dir_debt_bps_x100[d] as f64;
+        let global_penalty = if global_debt_bps < -2_000.0 {
+            ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14)
+        } else {
+            0.0
+        };
+        let staircase_penalty = if win_s >= 2.0 { 0.05 * (win_s - 1.0) } else { 0.0 };
+        let learned_edge = (self.ewma_net_bps_x100[slot_idx][d].clamp(0, 450) as f64) / 10_000.0;
+        if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.40 {
+            return false;
+        }
         if slot_idx > 0 {
             let btc_comp = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
             let btc_ofi = btc_leader_snap.factor_ofi.get() * dir_s;
             let btc_tfi = btc_leader_snap.factor_tfi.get() * dir_s;
-            if btc_ofi < 0.05 || btc_tfi < 0.05 || btc_comp < 0.14 {
+            let min_req_btc = 0.14 + 0.10 * sl_s + 0.55 * (debt_penalty + global_penalty);
+            if btc_ofi < 0.05 || btc_tfi < 0.05 || btc_comp < min_req_btc {
                 return false;
             }
         }
-        cand_comp >= 0.42
+        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty + global_penalty
+            + staircase_penalty
+            - learned_edge)
+            .clamp(0.38, 0.80);
+        cand_comp >= adaptive_threshold
     }
 
-    /// Innovation #1 (ZMPQR): Validates 25% Peristaltic Valley Inhale (Reload) at range bottom.
+    /// Innovation #1 (ZMPQR): Validates 25% Peristaltic Valley Inhale with Elastic Discount.
     #[inline]
     #[must_use]
     pub fn authorizes_peristaltic_valley_inhale(
@@ -700,7 +729,9 @@ impl OnlineAdaptiveGovernor {
         };
         let discount_bps =
             (discount_ticks.saturating_mul(1_000_000)) / last_exhale_crest_price.0.max(1);
-        if discount_bps < 1_400 {
+        let vol_c = snap.realized_vol_5m.raw().clamp(3_500, 14_000);
+        let elastic_min_discount_bps = (1_100 + (vol_c / 24)).clamp(1_250, 1_850);
+        if discount_bps < elastic_min_discount_bps {
             return false;
         }
         let dir_s = if matches!(open_side, Side::Bid) { 1.0 } else { -1.0 };
@@ -854,16 +885,6 @@ pub enum OrderLifecycleState {
         sl_trigger_price: PriceTicks,
         opened_ts: TimestampNs,
     },
-    EmergencyStopTriggered {
-        side: Side,
-        entry_price: PriceTicks,
-        exit_price: PriceTicks,
-        qty: LotQty,
-        triggered_ts: TimestampNs,
-    },
-    HaltedByRiskGuard {
-        reason: HaltReason,
-    },
 }
 
 /// Autonomous Per-Slot Execution Engine (1 Instance per Slot in [SlotExecutionEngine; 12]).
@@ -926,7 +947,7 @@ impl SlotExecutionEngine {
             last_closed_peak_ticks: PriceTicks(0),
             last_closed_worst_ticks: PriceTicks(0),
             last_closed_wald_pct: 0,
-            last_exit_sub_reason: ExitSubReason::StructuralTpLimit,
+            last_exit_sub_reason: ExitSubReason::AdverseScratchEscape,
             last_armed_ts: TimestampNs(0),
             last_opened_ts: TimestampNs(0),
             last_armed_seq_id: 0,
@@ -1048,10 +1069,6 @@ impl SlotExecutionEngine {
                 tel.initial_lots.store(initial_lots.0 as u64, Ordering::Release);
                 tel.peristaltic_cycles.store(u64::from(peristaltic_cycles), Ordering::Release);
                 tel.tranche1_harvested.store(u64::from(tranche1_harvested), Ordering::Release);
-            }
-            OrderLifecycleState::EmergencyStopTriggered { .. }
-            | OrderLifecycleState::HaltedByRiskGuard { .. } => {
-                tel.state_code.store(6, Ordering::Release);
             }
         }
     }
@@ -1510,10 +1527,40 @@ impl SlotExecutionEngine {
         self.last_closed_peak_ticks = peak_favorable_price;
         self.last_closed_worst_ticks = worst_adverse_price;
 
-        // 1. Server Mark-Price Stop-Loss Check
+        let hold_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0);
+        let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
+        let signed_flow = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+        let signed_geom = snap.factor_geom.get() * dir_s;
+
+        // 1. Continuous Abraham Wald SPRT Stop-Loss Contraction (up to 48% when adverse cascade)
+        let time_c = (hold_ns / 60_000_000_000).min(18) * 12;
+        let flow_c = if signed_flow < -0.35 {
+            ((-signed_flow - 0.35) * 280.0).round() as i64
+        } else {
+            0
+        };
+        let depth_c = if signed_geom < -0.25 {
+            ((-signed_geom - 0.25) * 180.0).round() as i64
+        } else {
+            0
+        };
+        let wald_pct = ((time_c + flow_c + depth_c) / 10).clamp(0, 48);
+        let base_sl_dist = (avg_price_ticks.0 - sl_trigger_price.0).abs().max(4);
+        let contracted_dist = ((base_sl_dist * (100 - wald_pct)) / 100).max(3);
+        let eff_sl_price = if wald_pct >= 32 && signed_flow <= -0.55 {
+            match side {
+                Side::Bid => PriceTicks((avg_price_ticks.0 - contracted_dist).max(1)),
+                Side::Ask => PriceTicks(avg_price_ticks.0 + contracted_dist),
+            }
+        } else {
+            sl_trigger_price
+        };
+        self.last_eff_sl_ticks = eff_sl_price;
+        self.last_closed_wald_pct = wald_pct;
+
         let sl_hit = match side {
-            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= sl_trigger_price.0,
-            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= sl_trigger_price.0,
+            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_price.0,
+            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_price.0,
         };
         if sl_hit {
             self.last_exit_sub_reason = ExitSubReason::WaldBaseStopLoss;
@@ -1521,7 +1568,7 @@ impl SlotExecutionEngine {
                 ClosedTradeKind::ServerMarkPriceStopLoss,
                 side,
                 avg_price_ticks,
-                sl_trigger_price,
+                eff_sl_price,
                 snap.ts_local_ns,
                 ledger,
             ));
@@ -1532,8 +1579,9 @@ impl SlotExecutionEngine {
             Side::Ask => avg_price_ticks.0 - cur_bbo_ref.0,
         };
         let cur_gross_bps = (cur_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
-        let hold_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
         let q_floor = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+        let vol_c = snap.realized_vol_5m.raw().clamp(4_000, 12_500);
+        let mfe_c = self.learned_mfe_bps.clamp(540, 1_250);
 
         // 2. Green Zone: Tranche 1 (50% @ 440bps) -> Tranche 2 (LVDBS L2/L3 Vacuum Surf)
         if cur_gross_bps >= 440 {
@@ -1543,6 +1591,7 @@ impl SlotExecutionEngine {
             }
             let (vac_lvl, surf_px, _) =
                 OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(side, snap, q_floor);
+            self.exit_peg_attempts = self.exit_peg_attempts.saturating_add(1);
             self.last_step_directive = OpenPositionStepDirective::PlaceOrPegMakerOrder {
                 role: ExitOrderRole::LvdbsDeepSurf50,
                 order_side: side.opposite(),
@@ -1555,10 +1604,13 @@ impl SlotExecutionEngine {
                 Side::Bid => ref_trade.0 >= surf_px.0,
                 Side::Ask => ref_trade.0 > 0 && ref_trade.0 <= surf_px.0,
             };
-            if reached_surf && (vac_lvl >= 2 || cur_gross_bps >= 500) {
+            let elastic_l1_harvest_bps = (460 + (mfe_c - 540) / 18).clamp(460, 500);
+            if reached_surf && (vac_lvl >= 2 || cur_gross_bps >= elastic_l1_harvest_bps) {
                 if vac_lvl >= 2 {
                     self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
                     self.last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
+                } else if self.peristaltic_cycles_count > 0 {
+                    self.last_exit_sub_reason = ExitSubReason::PeristalticHarmonicExit;
                 } else {
                     self.last_exit_sub_reason = ExitSubReason::AdverseScratchEscape;
                 }
@@ -1573,8 +1625,13 @@ impl SlotExecutionEngine {
             }
         }
 
-        // 3. Red / Stagnant Zone: Peristaltic Pump (ZMPQR) + 30% Sinking Fund Siphon
-        if hold_ns >= 600_000_000_000 {
+        // 3. Elastic Red / Stagnant Zone Horizons (coupled to vol_5m & learned_mfe_bps)
+        let elastic_peri_window_ns =
+            (((580_000_000_000_i64 * 6_500) / vol_c) * mfe_c / 680).clamp(420_000_000_000, 640_000_000_000);
+        let elastic_siphon_window_ns =
+            (((880_000_000_000_i64 * 6_500) / vol_c) * mfe_c / 680).clamp(680_000_000_000, 940_000_000_000);
+
+        if hold_ns >= elastic_peri_window_ns {
             if exhaled_lots.0 == 0
                 && !tranche1_harvested
                 && initial_lots.0 >= 4
@@ -1600,7 +1657,7 @@ impl SlotExecutionEngine {
             }
         }
 
-        if hold_ns >= 900_000_000_000 && cur_gross_bps >= 40 {
+        if hold_ns >= elastic_siphon_window_ns && cur_gross_bps >= 40 {
             let needed = (440 - cur_gross_bps).max(0);
             if ledger.sinking_fund_reserve_bps_x100 >= needed {
                 let _ = ledger.try_consume_sinking_fund_subsidy(needed);
@@ -1699,7 +1756,6 @@ mod tests {
         let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
-            estimated_cost_rt_scaled_bps: ScaledBps(450),
         };
         assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(26)).is_ok());
         assert!(eng.on_entry_order_resting(TimestampNs(1_025_000_000)).is_ok());
@@ -1749,7 +1805,6 @@ mod tests {
         let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
-            estimated_cost_rt_scaled_bps: ScaledBps(450),
         };
         assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(24)).is_ok());
         assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
@@ -1813,7 +1868,6 @@ mod tests {
         let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(600),
-            estimated_cost_rt_scaled_bps: ScaledBps(400),
         };
         assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(1)).is_ok());
         assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());

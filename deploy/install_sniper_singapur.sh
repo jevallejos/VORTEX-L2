@@ -92,7 +92,7 @@ if [ "${OFFSET_NS:-0}" -gt 1000000 ]; then
     sudo chronyc makestep >/dev/null 2>&1 || true
     echo "  🟠 [2/5 CHRONY SYNC] Offset (${OFFSET_NS} ns > 1ms) auto-stepped to AWS Atomic Clock!"
 else
-    echo "  �� [2/5 CHRONY SYNC] Atomic NTP Offset: ${OFFSET_NS:-0} ns (< 1,000,000 ns gate)"
+    echo "  🟢 [2/5 CHRONY SYNC] Atomic NTP Offset: ${OFFSET_NS:-0} ns (< 1,000,000 ns gate)"
 fi
 sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 sudo sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true

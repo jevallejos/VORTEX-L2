@@ -29,9 +29,9 @@ use vortex_rs::lob_shm::{
     MappedShmRegion, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS,
 };
 use vortex_rs::types::{
-    classify_pnl_badge, now_epoch_ns, print_auto_aligned_box, side_from_str,
+    classify_pnl_badge, classify_trade_badge, now_epoch_ns, print_auto_aligned_box, side_from_str,
     slot_from_symbol_name, LotQty, PairSpec, PriceTicks, ScaledBps, Side,
-    TimestampNs, ANSI_BLUE, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RESET,
+    TimestampNs, ANSI_BLUE, ANSI_DARK_GREEN, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RESET, ANSI_SKY_BLUE,
     ANSI_YELLOW, APPROVED_SPECS,
 };
 
@@ -504,7 +504,8 @@ fn render_trades_and_executive_dashboard() {
             sum_mfe += mfe;
             sum_mae += mae;
             sum_hold_s += (hold_ms as f64) / 1_000.0;
-            let (col, icon, lbl) = classify_pnl_badge(n_bps);
+            let is_partial = sub_r.contains("Tranche1Harvest50") || sub_r.contains("Partial");
+            let (col, icon, lbl) = classify_trade_badge(n_bps, is_partial);
             rows_out.push(format!(
                 "{}{} [TRADE #{:<3} {}] {:<10} {:<3} \u{2502} {:>7}t->{:<7}t \u{2502} G:{:>+6.2} F:{:>4.2} N:{:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{:>+6.2} MAE:{:>+6.2} \u{2502} {:>4}s \u{2502} {} (Mkr={}){}",
                 col, icon, total, lbl, sym, side, en_t, ex_t, g_bps, f_bps, n_bps, n_bps / 10.0, mfe, mae, hold_ms / 1_000, sub_r, mkr, ANSI_RESET
@@ -531,8 +532,8 @@ fn render_trades_and_executive_dashboard() {
     let bar_95 = format!("{}{}", "\u{2588}".repeat(filled_bars), "\u{2591}".repeat(20 - filled_bars));
 
     let sec_summary = vec![format!(
-        "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} \u{1f7e0} Scratches: {} \u{2502} \u{1f534} Losses: {}) \u{2502} CumGross: {:+.2} \u{2502} CumFee: -{:.2} \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
-        ANSI_GREEN, total, wins, scratches, losses, cum_gross, cum_fee, cum_net, cum_net / 10.0, ANSI_RESET
+        "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} {}\u{1fa75} Scratches: {}{} \u{2502} \u{1f534} Losses: {}) \u{2502} CumGross: {:+.2} \u{2502} CumFee: -{:.2} \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
+        ANSI_GREEN, total, wins, ANSI_SKY_BLUE, scratches, ANSI_GREEN, losses, cum_gross, cum_fee, cum_net, cum_net / 10.0, ANSI_RESET
     )];
     let sec_dash_hdr = vec![format!(
         "{}\u{1f48e} VORTEX-L3 EXECUTIVE DASHBOARD \u{2014} CAPITAL REAL (BYBIT UTA V5 LIVE) & DATOS CONSOLIDADOS{}",
@@ -561,7 +562,7 @@ fn render_trades_and_executive_dashboard() {
             bar_95, goal_anchor_usdt, goal_pct, (95.0 - goal_anchor_usdt).max(0.0)
         ),
         format!(
-            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1f7e0} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} (  0.0%)",
+            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} (  0.0%)",
             total, wins, (wins as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses
         ),
         format!(
@@ -1078,8 +1079,33 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     resting_since_ts,
                     ..
                 } => {
+                    let live_l1_q = match side {
+                        Side::Bid => {
+                            if snap.bids[0].price == entry_price {
+                                snap.bids[0].qty.0
+                            } else {
+                                0
+                            }
+                        }
+                        Side::Ask => {
+                            if snap.asks[0].price == entry_price {
+                                snap.asks[0].qty.0
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    if live_l1_q < cur_q_ahead[s_idx].0 {
+                        cur_q_ahead[s_idx] = LotQty(live_l1_q.max(0));
+                    }
+                    if let Ok(tel) = arena.telemetry(s_idx) {
+                        tel.queue_ahead_lots.store(cur_q_ahead[s_idx].0 as u64, Ordering::Release);
+                    }
+                    let vol_q = snap.realized_vol_5m.raw().clamp(4_000, 12_500);
+                    let elastic_queue_timeout_ns =
+                        ((12_000_000_000_i64 * 6_500) / vol_q).clamp(8_000_000_000, 18_000_000_000);
                     if drain_active
-                        || now_ns.0.saturating_sub(resting_since_ts.0) >= 12_000_000_000
+                        || now_ns.0.saturating_sub(resting_since_ts.0) >= elastic_queue_timeout_ns
                         || check_queue_depletion_velocity_abort(
                             side,
                             init_q_ahead[s_idx],
@@ -1105,6 +1131,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 continue;
                             }
                         }
+                        gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
                         engines[s_idx].state = OrderLifecycleState::Idle;
                         arena.exec_abort_count.fetch_add(1, Ordering::Relaxed);
                         engines[s_idx].sync_to_shm_telemetry(arena);
@@ -1211,8 +1238,36 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         );
                         if cur_tranche1 && !prev_tranche1 {
                             save_open_positions_state(&engines);
+                            if let OpenPositionStepDirective::Tranche1Filled {
+                                filled_price,
+                                filled_lots,
+                                net_scaled_bps,
+                                ..
+                            } = engines[s_idx].last_step_directive
+                            {
+                                if let Some(ref client) = live_client {
+                                    let _ = client.place_post_only_order(
+                                        spec,
+                                        side.opposite(),
+                                        filled_price,
+                                        filled_lots,
+                                        None,
+                                        true,
+                                    );
+                                }
+                                println!(
+                                    "{}\u{1f332} [TRANCHE 1 PARTIAL HARVEST 50%] {} {:?} qty={} @ {}t (+{:.2} bps net locked){}",
+                                    ANSI_DARK_GREEN,
+                                    sym_name,
+                                    side,
+                                    spec.format_lot_qty_str(filled_lots),
+                                    filled_price.0,
+                                    (net_scaled_bps.raw() as f64) / 100.0,
+                                    ANSI_RESET
+                                );
+                            }
                             let _ = tg_tx.send(format!(
-                                "\u{1f7e2} [VORTEX-L3 TRANCHE 1 (50%)] {} {:?} harvested at quantum floor! 2nd half surfing L2/L3 vacuum.",
+                                "\u{1f332} [VORTEX-L3 PARTIAL 50%] {} {:?} harvested at quantum floor! 2nd half surfing L2/L3 vacuum.",
                                 sym_name, side
                             ));
                         } else if engines[s_idx].peristaltic_cycles_count > prev_peristaltic {
@@ -1253,7 +1308,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         engines[s_idx].sync_to_shm_telemetry(arena);
                     }
                 }
-                _ => {}
             }
         }
 
