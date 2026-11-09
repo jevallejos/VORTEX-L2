@@ -37,7 +37,7 @@ use vortex_rs::types::{
 
 const DEFAULT_WALLET_EQUITY_1E8: i64 = 7_080_000_000;
 const BASE_NOTIONAL_1E8: i64 = 1_250_000_000;
-const MAX_CONCURRENT_OPEN_SLOTS: usize = 8;
+const MAX_CONCURRENT_OPEN_SLOTS: usize = 9;
 const SHADOW_LEDGER_PATH: &str = "data/vortex_shadow_trades.jsonl";
 const AI_FORENSIC_VAULT_PATH: &str = "data/vault/vortex_ai_forensic_vault.jsonl";
 const RED_LOSS_BOX_PATH: &str = "data/vault/vortex_red_loss_box.jsonl";
@@ -779,7 +779,7 @@ fn render_trades_and_executive_dashboard() {
     let eff_notional_usdt = (w_usdt * 0.29).max(18.0);
     let bps_to_usdt = eff_notional_usdt / 10_000.0;
     let total_pos_bps = inherited_pos_bps.max(cum_net.max(0.0));
-    let reserve_bps = (total_pos_bps * 0.30).min(35.0);
+    let reserve_bps = (total_pos_bps * 0.30).min(250.0);
     let locked_bps = total_pos_bps * 0.70;
     let net_usdt = cum_net * bps_to_usdt;
     let gross_usdt = cum_gross * bps_to_usdt;
@@ -1785,9 +1785,15 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 || (hold_s >= 30 && !strong_trend)
                         };
 
+                        let crest_bonus =
+                            if signed_flow >= 0.30 && cur_gross_bps <= -180 {
+                                2_u64
+                            } else {
+                                0_u64
+                            };
                         let target_amort =
-                            if !tranche1_harvested && cur_gross_bps <= -120 {
-                                ((hold_s / 1_800) as u64).min(8)
+                            if !tranche1_harvested && cur_gross_bps <= -90 {
+                                (((hold_s / 900) as u64) + crest_bonus).min(16)
                             } else {
                                 0
                             };
@@ -1822,10 +1828,14 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             }
                         }
 
+                        let early_phase_siphon = hold_s >= 35
+                            && peak_gross_bps <= 120
+                            && (cur_gross_bps <= -40 || worst_mae_bps <= -60);
+                        let deep_stagnant_siphon =
+                            hold_s >= 180 && worst_mae_bps <= -120;
                         let siphon_eligible = !tranche1_harvested
-                            && hold_s >= 600
-                            && worst_mae_bps <= -180
-                            && ledger.sinking_fund_reserve_bps_x100 >= 120;
+                            && (early_phase_siphon || deep_stagnant_siphon)
+                            && ledger.sinking_fund_reserve_bps_x100 >= 100;
                         let siphon_sub_cap =
                             (ledger.sinking_fund_reserve_bps_x100 / 2).clamp(0, 360);
                         let siphon_floor_bps = (440 - siphon_sub_cap).clamp(80, 440);
@@ -2204,7 +2214,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     &btc_snap,
                 );
                 if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
-                    if gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap) {
+                    let harvester_ok = open_count < 6
+                        || (snap.factor_ofi.get().abs() >= 0.45
+                            && snap.factor_tfi.get().abs() >= 0.55);
+                    if harvester_ok
+                        && gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap)
+                    {
                         let (edge_bps, _, _) = gov.slot_direction_diagnostics(s_idx, side);
                         let in_debt = gov.is_in_scar_debt(s_idx, side);
                         let lots = spec.compute_compounding_kelly_lots(
@@ -2303,14 +2318,22 @@ mod tests {
     #[test]
     fn test_forensic_persistence_and_peristaltic_siphon_amortization() {
         let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
-        ledger.record_closed_trade_with_sinking_split(
-            50_000_000,
-            4_000_000,
-            ScaledBps(1_200),
-        );
-        assert!(ledger.sinking_fund_reserve_bps_x100 >= 300);
+        for _ in 0..40 {
+            ledger.record_closed_trade_with_sinking_split(
+                50_000_000,
+                4_000_000,
+                ScaledBps(1_000),
+            );
+        }
+        assert_eq!(ledger.sinking_fund_reserve_bps_x100, 12_000);
         let vaulted_before = ledger.vault_locked_profit_bps_x100;
         assert_eq!(ledger.try_consume_sinking_fund_subsidy(100), 100);
         assert_eq!(ledger.vault_locked_profit_bps_x100, vaulted_before);
+        let entry_avax = PriceTicks(8_030);
+        let sub_cap = (ledger.sinking_fund_reserve_bps_x100 / 2).clamp(0, 360);
+        let siphon_floor_bps = (440 - sub_cap).clamp(80, 440);
+        assert_eq!(siphon_floor_bps, 80);
+        let req_t = ((entry_avax.0 * siphon_floor_bps + 999_999) / 1_000_000).max(1);
+        assert_eq!(req_t, 1);
     }
 }
