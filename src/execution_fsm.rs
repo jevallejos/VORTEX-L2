@@ -496,20 +496,23 @@ impl OnlineAdaptiveGovernor {
             180
         };
         let accel_net = s_drift - s_ext;
-        let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 260.0).round() as i64;
-        let snr_contrib = if snr_abs >= 0.46 {
-            ((snr_abs - 0.45).max(0.0) * 560.0).round() as i64
+        let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 240.0).round() as i64;
+        let snr_contrib = ((snr_abs - 0.42).max(0.0) * 280.0).round() as i64;
+        let fresh_init_bonus = if s_drift >= 0
+            && s_drift <= 105
+            && s_ext >= -10
+            && s_ext < 110
+            && s_ext <= s_drift + 35
+            && snr_abs >= 0.45
+        {
+            95_i64
         } else {
-            ((snr_abs - 0.42).max(0.0) * 120.0).round() as i64
+            0_i64
         };
-        let e_kin = if accel_net <= 0 {
-            if s_drift >= 0 && s_ext.abs() < 115 && snr_abs >= 0.48 {
-                (s_drift / 2) + geom_contrib + snr_contrib
-            } else {
-                accel_net
-            }
+        let e_kin = if accel_net < -35 {
+            accel_net
         } else {
-            accel_net + geom_contrib + snr_contrib
+            accel_net.max(0) + geom_contrib + snr_contrib + fresh_init_bonus
         };
         let req_e_min = (125 + ((200 - learned_edge).max(0) / 4)).clamp(110, 260);
         if e_kin < req_e_min {
@@ -654,21 +657,17 @@ impl OnlineAdaptiveGovernor {
         let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
         let signed_geom = candidate_snap.factor_geom.get() * dir_s;
         let cand_comp = OrthogonalFactorState::snr_composite_score(candidate_snap).abs();
-        if self.price_sample_count[slot_idx] >= 3 {
-            if self
-                .evaluate_kinematic_energy_surface(
-                    slot_idx,
-                    side,
-                    self_drift_bps,
-                    self_ext_bps,
-                    signed_geom,
-                    cand_comp,
-                )
-                .is_err()
-            {
-                return false;
-            }
-        } else if signed_geom < 0.15 {
+        if self
+            .evaluate_kinematic_energy_surface(
+                slot_idx,
+                side,
+                self_drift_bps,
+                self_ext_bps,
+                signed_geom,
+                cand_comp,
+            )
+            .is_err()
+        {
             return false;
         }
         let sl_s = self.sl_streak[slot_idx][d] as f64;
@@ -685,7 +684,7 @@ impl OnlineAdaptiveGovernor {
         } else {
             0.0
         };
-        let staircase_penalty = if win_s >= 2.0 { 0.05 * (win_s - 1.0) } else { 0.0 };
+        let staircase_penalty = if win_s >= 2.0 { 0.03 * (win_s - 1.0) } else { 0.0 };
         let learned_edge = (self.ewma_net_bps_x100[slot_idx][d].clamp(0, 450) as f64) / 10_000.0;
         if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.40 {
             return false;
@@ -694,9 +693,16 @@ impl OnlineAdaptiveGovernor {
             let btc_comp = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
             let btc_ofi = btc_leader_snap.factor_ofi.get() * dir_s;
             let btc_tfi = btc_leader_snap.factor_tfi.get() * dir_s;
-            let min_req_btc = 0.14 + 0.10 * sl_s + 0.55 * (debt_penalty + global_penalty);
-            if btc_ofi < 0.05 || btc_tfi < 0.05 || btc_comp < min_req_btc {
-                return false;
+            let strong_independent = cand_comp >= 0.50 && sl_s == 0.0 && debt_penalty == 0.0;
+            if strong_independent {
+                if btc_comp < -0.08 || (btc_ofi < -0.18 && btc_tfi < -0.18) {
+                    return false;
+                }
+            } else {
+                let min_req_btc = 0.10 + 0.10 * sl_s + 0.55 * (debt_penalty + global_penalty);
+                if btc_ofi < 0.0 || btc_tfi < 0.0 || btc_comp < min_req_btc {
+                    return false;
+                }
             }
         }
         let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty + global_penalty

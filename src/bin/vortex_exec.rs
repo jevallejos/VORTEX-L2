@@ -1082,15 +1082,21 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     if now_ns.0.saturating_sub(submitted_ts.0) < wait_ns {
                         continue;
                     }
-                    let l1_intact = match side {
-                        Side::Bid => snap.bids[0].price == entry_price,
-                        Side::Ask => snap.asks[0].price == entry_price,
+                    let cur_l1_px = match side {
+                        Side::Bid => snap.bids[0].price,
+                        Side::Ask => snap.asks[0].price,
                     };
-                    if !l1_intact {
+                    let sig_still_valid = matches!(
+                        OrthogonalFactorState::evaluate_entry_signal_with_leader(spec, &snap, &btc_snap),
+                        SignalVerdict::AuthorizeMakerEntry { side: s_now, .. } if s_now == side
+                    );
+                    let drift_ticks = (cur_l1_px.0 - entry_price.0).abs();
+                    if cur_l1_px.0 <= 0 || drift_ticks > 8 || !sig_still_valid {
                         engines[s_idx].state = OrderLifecycleState::Idle;
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         continue;
                     }
+                    let entry_price = cur_l1_px;
                     if let Some(ref client) = live_client {
                         let rc = client.place_post_only_order(
                             spec,
