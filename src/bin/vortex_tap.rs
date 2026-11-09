@@ -3,7 +3,9 @@
     clippy::manual_clamp,
     clippy::manual_range_contains,
     clippy::needless_range_loop,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    dead_code,
+    unused_imports
 )]
 
 use core::sync::atomic::Ordering;
@@ -214,6 +216,16 @@ fn discover_latest_parquet_seq() -> u64 {
     max_seq
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
+    loop {
+        let local_ns = now_epoch_ns();
+        arena.heartbeat_ns.store(local_ns.0 as u64, Ordering::Release);
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
     let mut factor_states = [OrthogonalFactorState::new(); MAX_ACTIVE_PAIRS];
     let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];

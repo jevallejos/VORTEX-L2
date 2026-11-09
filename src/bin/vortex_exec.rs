@@ -339,6 +339,7 @@ impl BybitV5LiveClient {
         let body = serde_json::json!({
             "category": "linear",
             "symbol": symbol,
+            "orderFilter": "Order",
         })
         .to_string();
         let _ = self.post_v5("/v5/order/cancel-all", &body);
@@ -1741,14 +1742,16 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             hold_s >= 90 && joint_adverse
                         } else {
                             recovered_from_red
+                                || hold_s >= 45
+                                || worst_mae_bps <= -120
                                 || (hold_s >= 18 && joint_adverse)
-                                || (hold_s >= 40 && !strong_trend)
+                                || (hold_s >= 30 && !strong_trend)
                         };
 
-                        let siphon_eligible = hold_s >= 600
-                            && worst_mae_bps <= -200
-                            && ledger.sinking_fund_reserve_bps_x100 >= 150
-                            && cur_gross_bps >= 40;
+                        let siphon_eligible = !tranche1_harvested
+                            && hold_s >= 600
+                            && worst_mae_bps <= -180
+                            && ledger.sinking_fund_reserve_bps_x100 >= 120;
                         let siphon_sub_cap =
                             (ledger.sinking_fund_reserve_bps_x100 / 2).clamp(0, 360);
                         let siphon_floor_bps = (440 - siphon_sub_cap).clamp(80, 440);
@@ -1773,11 +1776,18 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         } else {
                             ScaledBps((base_win_target - time_relax).clamp(525, 740))
                         };
-                        let active_floor_px = dynamic_maker_floor_price(
-                            side,
-                            avg_price_ticks,
-                            target_floor_bps,
-                        );
+                        let req_delta_t = ((avg_price_ticks
+                            .0
+                            .saturating_mul(target_floor_bps.raw())
+                            + 999_999)
+                            / 1_000_000)
+                            .max(1);
+                        let active_floor_px = match side {
+                            Side::Bid => PriceTicks(avg_price_ticks.0 + req_delta_t),
+                            Side::Ask => {
+                                PriceTicks((avg_price_ticks.0 - req_delta_t).max(1))
+                            }
+                        };
                         let (raw_vac_lvl, raw_surf_px, _) =
                             OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(
                                 side,
