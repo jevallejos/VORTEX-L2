@@ -1,0 +1,28 @@
+name: VORTEX-L3 Linux x86_64 Release Binary
+on:
+  push:
+    branches: [ "main" ]
+permissions:
+  contents: write
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL dev headers
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Run Clippy & Unit Tests
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+      - name: Build LTO Release Binaries
+        run: |
+          cargo build --release
+          tar -czf vortex-linux-x86_64.tar.gz -C target/release vortex_tap vortex_replay vortex_exec
+          git rev-parse HEAD > COMMIT_SHA
+      - name: Publish Rolling Release latest-linux-x86_64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-linux-x86_64 --yes --cleanup-tag || true
+          gh release create latest-linux-x86_64 vortex-linux-x86_64.tar.gz COMMIT_SHA --title "VORTEX-L3 Latest Linux x86_64" --notes "Automated SHA-locked build for ${{ github.sha }}"

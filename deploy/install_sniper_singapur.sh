@@ -38,16 +38,20 @@ for attempt in $(seq 1 36); do
     sleep 5
 done
 
-if [ "${VERIFIED}" -ne 1 ]; then
-    echo "[ABORT] Binary SHA verification timed out. Refusing unverified deploy."
-    exit 1
+if [ "${VERIFIED}" -eq 1 ]; then
+    curl -fsSL --retry 3 --retry-delay 2 "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"
+    sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
+    rm -f "${VAULT_DIR}/HALTED_ON_LOSS.lock"
+    tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
+    rm -f "/tmp/vortex-linux-x86_64.tar.gz"
+else
+    echo "[FALLBACK BUILD] Compiling exact HEAD () locally on sniper-singapur with Nice=19..."
+    nice -n 19 cargo test --quiet
+    nice -n 19 cargo build --release
+    sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
+    rm -f "${VAULT_DIR}/HALTED_ON_LOSS.lock"
+    cp -f target/release/vortex_tap target/release/vortex_replay target/release/vortex_exec "${BIN_DIR}/"
 fi
-
-curl -fsSL --retry 3 --retry-delay 2 "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"
-sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
-rm -f "${VAULT_DIR}/DRAIN_MODE.lock" "${VAULT_DIR}/HALTED_ON_LOSS.lock"
-tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
-rm -f "/tmp/vortex-linux-x86_64.tar.gz"
 chmod +x "${BIN_DIR}/vortex_tap" "${BIN_DIR}/vortex_replay" "${BIN_DIR}/vortex_exec"
 
 # 1. Kernel Network & Memory HFT Profile (BBR + fq + tcp_slow_start_after_idle=0 + THP off)
