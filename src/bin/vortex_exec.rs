@@ -1222,12 +1222,11 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .and_then(|n| n.as_i64())
                         .map(LotQty)
                         .unwrap_or(lots);
-                    let exh_l = saved
-                        .as_ref()
-                        .and_then(|v| v.get("exhaled_lots"))
-                        .and_then(|n| n.as_i64())
-                        .map(LotQty)
-                        .unwrap_or(LotQty(0));
+                    let exh_l = if init_l.0 > lots.0 {
+                        LotQty(init_l.0 - lots.0)
+                    } else {
+                        LotQty(0)
+                    };
                     let crest_t = saved
                         .as_ref()
                         .and_then(|v| v.get("crest_ticks"))
@@ -2125,13 +2124,22 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     } else if exhaled_lots.0 > 0
                                         && real_lots.0 >= eff_init_lots.0
                                     {
-                                        let _ = engines[s_idx].apply_peristaltic_inhale_25pct(cur_bbo);
-                                        if let Ok(bybit_new_avg) = spec.parse_price_ticks(&real_avg_s) {
-                                            if let OrderLifecycleState::PositionOpenMakerExit {
-                                                avg_price_ticks: ref mut avg_p,
-                                                ..
-                                            } = engines[s_idx].state
-                                            {
+                                        let was_inhaling =
+                                            matches!(active_exit_role, ExitOrderRole::PeristalticInhale25);
+                                        let inhaled_res =
+                                            engines[s_idx].apply_peristaltic_inhale_25pct(cur_bbo);
+                                        if let OrderLifecycleState::PositionOpenMakerExit {
+                                            avg_price_ticks: ref mut avg_p,
+                                            exhaled_lots: ref mut exh_ref,
+                                            active_exit_role: ref mut role_ref,
+                                            ..
+                                        } = engines[s_idx].state
+                                        {
+                                            *exh_ref = LotQty(0);
+                                            if matches!(*role_ref, ExitOrderRole::PeristalticInhale25) {
+                                                *role_ref = ExitOrderRole::Tranche1Harvest50;
+                                            }
+                                            if let Ok(bybit_new_avg) = spec.parse_price_ticks(&real_avg_s) {
                                                 *avg_p = match side {
                                                     Side::Bid => PriceTicks(avg_p.0.min(bybit_new_avg.0)),
                                                     Side::Ask => PriceTicks(avg_p.0.max(bybit_new_avg.0)),
@@ -2139,10 +2147,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                             }
                                         }
                                         let _ = last_crest_exhale_price;
-                                        println!(
-                                            "{}\u{1f7e2} [ZMPQR 25% INHALE FILLED] {} {:?} reloaded 25% in valley @ {}t (avg compressed!){}",
-                                            ANSI_GREEN, sym_name, side, cur_bbo.0, ANSI_RESET
-                                        );
+                                        if was_inhaling && inhaled_res.is_some() {
+                                            println!(
+                                                "{}\u{1f7e2} [ZMPQR 25% INHALE FILLED] {} {:?} reloaded 25% in valley @ {}t (avg compressed!){}",
+                                                ANSI_GREEN, sym_name, side, cur_bbo.0, ANSI_RESET
+                                            );
+                                        }
                                     }
                                 }
                                 if let OrderLifecycleState::PositionOpenMakerExit {
