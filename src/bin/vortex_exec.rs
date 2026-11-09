@@ -135,7 +135,7 @@ impl BybitV5LiveClient {
 
     pub fn get_v5(&self, endpoint: &str, query: &str) -> Option<serde_json::Value> {
         let ts = Self::now_ms_str();
-        let recv_win = "5000";
+        let recv_win = "10000";
         let prehash = format!("{}{}{}{}", ts, self.api_key, recv_win, query);
         let sign = sign_bybit_v5_hmac_sha256(&self.api_secret, &prehash);
         let url = if query.is_empty() {
@@ -165,7 +165,7 @@ impl BybitV5LiveClient {
 
     pub fn post_v5(&self, endpoint: &str, body_json: &str) -> Option<serde_json::Value> {
         let ts = Self::now_ms_str();
-        let recv_win = "5000";
+        let recv_win = "10000";
         let prehash = format!("{}{}{}{}", ts, self.api_key, recv_win, body_json);
         let sign = sign_bybit_v5_hmac_sha256(&self.api_secret, &prehash);
         let url = format!("{}{}", self.base_url, endpoint);
@@ -271,19 +271,20 @@ impl BybitV5LiveClient {
         }
     }
 
-    pub fn get_resting_exit_order_info(&self, spec: PairSpec) -> (PriceTicks, LotQty) {
+    pub fn get_resting_exit_order_info(
+        &self,
+        spec: PairSpec,
+    ) -> Option<(PriceTicks, LotQty)> {
         let sym = spec.symbol_id.name();
         let q = format!("category=linear&symbol={}", sym);
-        let Some(val) = self.get_v5("/v5/order/realtime", &q) else {
-            return (PriceTicks(0), LotQty(0));
-        };
-        let Some(list) = val
+        let val = self.get_v5("/v5/order/realtime", &q)?;
+        if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
+            return None;
+        }
+        let list = val
             .get("result")
             .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())
-        else {
-            return (PriceTicks(0), LotQty(0));
-        };
+            .and_then(|l| l.as_array())?;
         for item in list {
             let ro = item
                 .get("reduceOnly")
@@ -294,32 +295,44 @@ impl BybitV5LiveClient {
                 let qt_s = item.get("qty").and_then(|v| v.as_str()).unwrap_or("0");
                 if let Ok(pt) = spec.parse_price_ticks(px_s) {
                     let lq = spec.parse_lot_qty(qt_s);
-                    return (pt, lq);
+                    return Some((pt, lq));
                 }
             }
         }
-        (PriceTicks(0), LotQty(0))
+        Some((PriceTicks(0), LotQty(0)))
+    }
+
+    pub fn query_open_position_verified(
+        &self,
+        symbol: &str,
+    ) -> Option<(bool, String, Side, String)> {
+        let q = format!("category=linear&symbol={}", symbol);
+        let val = self.get_v5("/v5/position/list", &q)?;
+        if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
+            return None;
+        }
+        let list = val
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())?;
+        for pos in list {
+            let sz_s = pos.get("size").and_then(|v| v.as_str()).unwrap_or("0");
+            let side_s = pos.get("side").and_then(|v| v.as_str()).unwrap_or("Buy");
+            let avg_s = pos.get("avgPrice").and_then(|v| v.as_str()).unwrap_or("0");
+            let Ok(sz_f) = sz_s.parse::<f64>() else {
+                return None;
+            };
+            let side = if side_s == "Sell" { Side::Ask } else { Side::Bid };
+            if sz_f > 0.0 {
+                return Some((true, sz_s.to_string(), side, avg_s.to_string()));
+            }
+        }
+        Some((false, "0".to_string(), Side::Bid, "0".to_string()))
     }
 
     pub fn get_open_position_info(&self, symbol: &str) -> (bool, String, Side, String) {
-        let q = format!("category=linear&symbol={}", symbol);
-        let Some(val) = self.get_v5("/v5/position/list", &q) else {
-            return (false, "0".to_string(), Side::Bid, "0".to_string());
-        };
-        let Some(pos) = val
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())
-            .and_then(|a| a.first())
-        else {
-            return (false, "0".to_string(), Side::Bid, "0".to_string());
-        };
-        let sz_s = pos.get("size").and_then(|v| v.as_str()).unwrap_or("0");
-        let side_s = pos.get("side").and_then(|v| v.as_str()).unwrap_or("Buy");
-        let avg_s = pos.get("avgPrice").and_then(|v| v.as_str()).unwrap_or("0");
-        let sz_f = sz_s.parse::<f64>().unwrap_or(0.0);
-        let side = if side_s == "Sell" { Side::Ask } else { Side::Bid };
-        (sz_f > 0.0, sz_s.to_string(), side, avg_s.to_string())
+        self.query_open_position_verified(symbol)
+            .unwrap_or((false, "0".to_string(), Side::Bid, "0".to_string()))
     }
 
     pub fn cancel_all_symbol_orders(&self, symbol: &str) {
@@ -1809,8 +1822,24 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         if rest_ready {
                             last_rest_call_ns = now_ns.0;
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_350_000_000;
-                            let (still_open, real_sz_s, _, _) =
-                                client.get_open_position_info(sym_name);
+                            let Some((mut still_open, mut real_sz_s, _, _)) =
+                                client.query_open_position_verified(sym_name)
+                            else {
+                                engines[s_idx].sync_to_shm_telemetry(arena);
+                                continue;
+                            };
+                            if !still_open && cur_gross_bps < 0 {
+                                match client.query_open_position_verified(sym_name) {
+                                    Some((confirmed_open, sz2, _, _)) => {
+                                        still_open = confirmed_open;
+                                        real_sz_s = sz2;
+                                    }
+                                    None => {
+                                        engines[s_idx].sync_to_shm_telemetry(arena);
+                                        continue;
+                                    }
+                                }
+                            }
                             if !still_open {
                                 client.cancel_all_symbol_orders(sym_name);
                                 let q_fl = defensive_zero_loss_maker_exit_price(
@@ -1983,8 +2012,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 } else {
                                     real_lots
                                 };
-                                let (resting_tp, resting_qty) =
-                                    client.get_resting_exit_order_info(spec);
+                                let Some((resting_tp, resting_qty)) =
+                                    client.get_resting_exit_order_info(spec)
+                                else {
+                                    engines[s_idx].sync_to_shm_telemetry(arena);
+                                    continue;
+                                };
                                 let tp_diff_ticks = (surf_px.0 - resting_tp.0).abs();
                                 let moving_closer = match side {
                                     Side::Bid => {
