@@ -22,7 +22,7 @@ use vortex_rs::execution_fsm::{
     check_queue_depletion_velocity_abort, defensive_zero_loss_maker_exit_price,
     dynamic_maker_floor_price, sign_bybit_v5_hmac_sha256, ClosedTradeKind,
     ClosedTradeSummary, ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor,
-    OpenPositionStepDirective, OrderLifecycleState, SlotExecutionEngine,
+    OrderLifecycleState, SlotExecutionEngine,
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{
@@ -343,6 +343,24 @@ impl BybitV5LiveClient {
         })
         .to_string();
         let _ = self.post_v5("/v5/order/cancel-all", &body);
+    }
+
+    pub fn set_position_trading_stop(&self, spec: PairSpec, sl_ticks: PriceTicks) {
+        if sl_ticks.0 <= 0 {
+            return;
+        }
+        let (sw, sf) = spec.format_price_usdt_parts(sl_ticks);
+        let sl_str = format!("{}.{:04}", sw, sf);
+        let body = serde_json::json!({
+            "category": "linear",
+            "symbol": spec.symbol_id.name(),
+            "stopLoss": sl_str,
+            "slTriggerBy": "MarkPrice",
+            "tpslMode": "Full",
+            "positionIdx": 0,
+        })
+        .to_string();
+        let _ = self.post_v5("/v5/position/trading-stop", &body);
     }
 
     pub fn place_post_only_order(
@@ -934,7 +952,9 @@ fn rehydrate_shadow_ledger(
         }
     }
     let mut count = 0_u64;
-    if let Ok(file) = fs::File::open(SHADOW_LEDGER_PATH) {
+    let vault_or_shadow = fs::File::open(AI_FORENSIC_VAULT_PATH)
+        .or_else(|_| fs::File::open(SHADOW_LEDGER_PATH));
+    if let Ok(file) = vault_or_shadow {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -1234,14 +1254,31 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             PriceTicks(base_b + sl_d)
                         }
                     };
+                    let peak_t = saved
+                        .as_ref()
+                        .and_then(|v| v.get("peak_ticks"))
+                        .and_then(|n| n.as_i64())
+                        .filter(|&p| p > 0)
+                        .map(PriceTicks)
+                        .unwrap_or(avg_t);
+                    let worst_t = saved
+                        .as_ref()
+                        .and_then(|v| v.get("worst_ticks"))
+                        .and_then(|n| n.as_i64())
+                        .filter(|&w| w > 0)
+                        .map(PriceTicks)
+                        .unwrap_or(avg_t);
+                    client.set_position_trading_stop(*spec, sl_t);
+                    entry_forensics[s_idx].armed_ts_ns = opened_ns.0;
+                    entry_forensics[s_idx].init_q_lots = init_l.0;
                     engines[s_idx].last_opened_ts = opened_ns;
                     engines[s_idx].peristaltic_cycles_count = u64::from(p_cycles);
                     engines[s_idx].state = OrderLifecycleState::PositionOpenMakerExit {
                         side: side_p,
                         entry_price: bybit_avg_t,
                         avg_price_ticks: avg_t,
-                        peak_favorable_price: avg_t,
-                        worst_adverse_price: avg_t,
+                        peak_favorable_price: peak_t,
+                        worst_adverse_price: worst_t,
                         initial_lots: init_l.max(lots),
                         open_lots: lots,
                         exhaled_lots: exh_l,
@@ -1615,7 +1652,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 }
                 OrderLifecycleState::PositionOpenMakerExit {
                     side,
-                    avg_price_ticks,
+                    mut avg_price_ticks,
                     mut peak_favorable_price,
                     mut worst_adverse_price,
                     initial_lots,
@@ -1747,6 +1784,43 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 || (hold_s >= 18 && joint_adverse)
                                 || (hold_s >= 30 && !strong_trend)
                         };
+
+                        let target_amort =
+                            if !tranche1_harvested && cur_gross_bps <= -120 {
+                                ((hold_s / 1_800) as u64).min(8)
+                            } else {
+                                0
+                            };
+                        while engines[s_idx].peristaltic_cycles_count < target_amort
+                            && ledger.sinking_fund_reserve_bps_x100 >= 200
+                        {
+                            if ledger.try_consume_sinking_fund_subsidy(100) > 0 {
+                                let step_t =
+                                    ((avg_price_ticks.0 * 100) / 1_000_000).max(1);
+                                avg_price_ticks = match side {
+                                    Side::Bid => {
+                                        PriceTicks((avg_price_ticks.0 - step_t).max(1))
+                                    }
+                                    Side::Ask => PriceTicks(avg_price_ticks.0 + step_t),
+                                };
+                                let next_c = engines[s_idx]
+                                    .peristaltic_cycles_count
+                                    .saturating_add(1);
+                                engines[s_idx].peristaltic_cycles_count = next_c;
+                                let cyc_u32 = next_c as u32;
+                                if let OrderLifecycleState::PositionOpenMakerExit {
+                                    avg_price_ticks: ref mut ap_mut,
+                                    peristaltic_cycles: ref mut pc_mut,
+                                    ..
+                                } = engines[s_idx].state
+                                {
+                                    *ap_mut = avg_price_ticks;
+                                    *pc_mut = cyc_u32;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
 
                         let siphon_eligible = !tranche1_harvested
                             && hold_s >= 600
@@ -2085,153 +2159,9 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         }
                         continue;
                     }
-                    let prev_tranche1 = matches!(
-                        engines[s_idx].state,
-                        OrderLifecycleState::PositionOpenMakerExit {
-                            tranche1_harvested: true,
-                            ..
-                        }
-                    );
-                    let prev_peristaltic = engines[s_idx].peristaltic_cycles_count;
-                    if let Some(summary) =
-                        engines[s_idx].step_open_position(&snap, &btc_snap, &gov, &mut ledger)
-                    {
-                        gov.observe_closed_trade(
-                            s_idx,
-                            summary.side,
-                            summary.net_scaled_bps,
-                            summary.is_maker_exit,
-                            now_ns,
-                        );
-                        arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
-                        append_closed_trade_logs(
-                            s_idx,
-                            &summary,
-                            &engines[s_idx],
-                            &entry_forensics[s_idx],
-                            &snap,
-                            &ledger,
-                            now_ns,
-                        );
-                        engines[s_idx].sync_to_shm_telemetry(arena);
-                        save_open_positions_state(&engines);
-                        let _ = tg_tx.send(format_telegram_close_message(
-                            spec,
-                            &summary,
-                            engines[s_idx].last_exit_sub_reason,
-                            ledger.closed_trades_count,
-                            &ledger,
-                        ));
-                    } else {
-                        let cur_tranche1 = matches!(
-                            engines[s_idx].state,
-                            OrderLifecycleState::PositionOpenMakerExit {
-                                tranche1_harvested: true,
-                                ..
-                            }
-                        );
-                        if cur_tranche1 && !prev_tranche1 {
-                            save_open_positions_state(&engines);
-                            if let OpenPositionStepDirective::Tranche1Filled {
-                                filled_price,
-                                filled_lots,
-                                net_scaled_bps,
-                                ..
-                            } = engines[s_idx].last_step_directive
-                            {
-                                if let Some(ref client) = live_client {
-                                    let _ = client.place_post_only_order(
-                                        spec,
-                                        side.opposite(),
-                                        filled_price,
-                                        filled_lots,
-                                        None,
-                                        true,
-                                    );
-                                }
-                                let avg_en = match engines[s_idx].state {
-                                    OrderLifecycleState::PositionOpenMakerExit {
-                                        avg_price_ticks,
-                                        ..
-                                    } => avg_price_ticks,
-                                    _ => filled_price,
-                                };
-                                engines[s_idx].last_exit_sub_reason = ExitSubReason::Tranche1Harvest50;
-                                ledger.closed_trades_count = ledger.closed_trades_count.saturating_add(1);
-                                arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
-                                let p_pnl = (engines[s_idx].notional_per_trade_1e8 * net_scaled_bps.raw()) / 2_000_000;
-                                let p_summary = ClosedTradeSummary {
-                                    kind: ClosedTradeKind::MakerPassiveUnwind,
-                                    side,
-                                    entry_price: avg_en,
-                                    exit_price: filled_price,
-                                    gross_scaled_bps: ScaledBps(net_scaled_bps.raw() + 400),
-                                    fee_scaled_bps: ScaledBps(400),
-                                    net_scaled_bps,
-                                    net_pnl_1e8: p_pnl,
-                                    is_maker_exit: true,
-                                };
-                                append_closed_trade_logs(
-                                    s_idx,
-                                    &p_summary,
-                                    &engines[s_idx],
-                                    &entry_forensics[s_idx],
-                                    &snap,
-                                    &ledger,
-                                    now_ns,
-                                );
-                                println!(
-                                    "{}\u{1f332} [TRANCHE 1 PARTIAL HARVEST 50%] {} {:?} qty={} @ {}t (+{:.2} bps net locked){}",
-                                    ANSI_DARK_GREEN,
-                                    sym_name,
-                                    side,
-                                    spec.format_lot_qty_str(filled_lots),
-                                    filled_price.0,
-                                    (net_scaled_bps.raw() as f64) / 100.0,
-                                    ANSI_RESET
-                                );
-                            }
-                            let _ = tg_tx.send(format!(
-                                "\u{1f332} [VORTEX-L3 PARTIAL 50%] {} {:?} harvested at quantum floor! 2nd half surfing L2/L3 vacuum.",
-                                sym_name, side
-                            ));
-                        } else if engines[s_idx].peristaltic_cycles_count > prev_peristaltic {
-                            save_open_positions_state(&engines);
-                            let _ = tg_tx.send(format!(
-                                "\u{1f7e3} [VORTEX-L3 ZMPQR CYCLE #{}] {} {:?} completed 25% valley reload & compressed avg_price!",
-                                engines[s_idx].peristaltic_cycles_count, sym_name, side
-                            ));
-                        }
-                        if let Some(ref client) = live_client {
-                            if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
-                                if let OpenPositionStepDirective::PlaceOrPegMakerOrder {
-                                    order_side,
-                                    price,
-                                    qty,
-                                    reduce_only,
-                                    vacuum_level,
-                                    ..
-                                } = engines[s_idx].last_step_directive
-                                {
-                                    let cooldown_ns = if vacuum_level >= 2 {
-                                        800_000_000_i64
-                                    } else {
-                                        1_500_000_000_i64
-                                    };
-                                    engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + cooldown_ns;
-                                    let _ = client.place_post_only_order(
-                                        spec,
-                                        order_side,
-                                        price,
-                                        qty,
-                                        None,
-                                        reduce_only,
-                                    );
-                                }
-                            }
-                        }
-                        engines[s_idx].sync_to_shm_telemetry(arena);
-                    }
+                    let _ = engines[s_idx]
+                        .step_open_position(&snap, &btc_snap, &gov, &mut ledger);
+                    engines[s_idx].sync_to_shm_telemetry(arena);
                 }
             }
         }
@@ -2368,5 +2298,19 @@ mod tests {
             assert_eq!(eng.slot_idx, idx);
             assert_eq!(eng.state, OrderLifecycleState::Idle);
         }
+    }
+
+    #[test]
+    fn test_forensic_persistence_and_peristaltic_siphon_amortization() {
+        let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        ledger.record_closed_trade_with_sinking_split(
+            50_000_000,
+            4_000_000,
+            ScaledBps(1_200),
+        );
+        assert!(ledger.sinking_fund_reserve_bps_x100 >= 300);
+        let vaulted_before = ledger.vault_locked_profit_bps_x100;
+        assert_eq!(ledger.try_consume_sinking_fund_subsidy(100), 100);
+        assert_eq!(ledger.vault_locked_profit_bps_x100, vaulted_before);
     }
 }
