@@ -999,6 +999,63 @@ impl SlotExecutionEngine {
         }
     }
 
+    /// Ley 2: Potencial hiperbolico C2 para el Sifon del 30% sin vaciamiento por rafaga multi-slot.
+    #[inline]
+    #[must_use]
+    pub fn compute_hyperbolic_siphon_subsidy_bps(
+        reserve_bps_x100: i64,
+        underwater_slots_count: usize,
+        hold_secs: i64,
+        siphon_window_secs: i64,
+    ) -> i64 {
+        if reserve_bps_x100 <= 0 || hold_secs <= 0 {
+            return 0;
+        }
+        let denom = (underwater_slots_count as i64).max(1) + 1;
+        let max_slot_share = (reserve_bps_x100 / denom).clamp(0, 360);
+        let win_s = siphon_window_secs.max(180);
+        let ratio_x100 = ((hold_secs.min(win_s * 2) * 100) / win_s).clamp(0, 200);
+        let ramp_permille = ((ratio_x100 * ratio_x100 * 1_000) / (10_000 + ratio_x100 * ratio_x100)).clamp(0, 1_000);
+        ((max_slot_share * ramp_permille) / 1_000).clamp(0, 360)
+    }
+
+    /// Ley 4: Trinquete unidireccional de Stop-Loss en LIVE ADOPT (prohibido alejar el SL sobre cur_m).
+    #[inline]
+    #[must_use]
+    pub fn clamp_adopted_stop_loss_unidirectional(
+        side: Side,
+        avg_price_ticks: PriceTicks,
+        saved_sl_ticks: PriceTicks,
+        mark_price_ticks: PriceTicks,
+    ) -> PriceTicks {
+        let max_sl_dist = ((avg_price_ticks.0 * 9_500) / 1_000_000).max(4);
+        let anchor_sl = match side {
+            Side::Bid => PriceTicks((avg_price_ticks.0 - max_sl_dist).max(1)),
+            Side::Ask => PriceTicks(avg_price_ticks.0 + max_sl_dist),
+        };
+        if saved_sl_ticks.0 <= 0 {
+            return match side {
+                Side::Bid => {
+                    let safe_bound = if mark_price_ticks.0 > 0 && mark_price_ticks.0 <= anchor_sl.0 {
+                        (mark_price_ticks.0 - 4).max(1)
+                    } else {
+                        anchor_sl.0
+                    };
+                    PriceTicks(safe_bound)
+                }
+                Side::Ask => {
+                    let safe_bound = if mark_price_ticks.0 > 0 && mark_price_ticks.0 >= anchor_sl.0 {
+                        mark_price_ticks.0 + 4
+                    } else {
+                        anchor_sl.0
+                    };
+                    PriceTicks(safe_bound)
+                }
+            };
+        }
+        saved_sl_ticks
+    }
+
     pub fn sync_to_shm_telemetry(&self, arena: &crate::lob_shm::VortexShmArena) {
         use core::sync::atomic::Ordering;
         let Ok(tel) = arena.telemetry(self.slot_idx) else {
@@ -1111,7 +1168,7 @@ impl SlotExecutionEngine {
             Side::Ask => best_ask.price,
         };
         let vol_c = snap.realized_vol_5m.raw().clamp(4_000, 12_500);
-        let elastic_sl_bps = (16_500 + (vol_c * 35) / 100).clamp(18_000, 22_500);
+        let elastic_sl_bps = (11_500 + (vol_c * 25) / 100).clamp(12_500, 16_500);
         let sl_delta_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let ref_mark = if snap.mark_price.0 > 0 { snap.mark_price } else { entry_price };
         let ref_last = if snap.last_trade_price.0 > 0 {
