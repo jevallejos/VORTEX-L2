@@ -369,7 +369,13 @@ impl PairSpec {
         in_scar_debt: bool,
     ) -> LotQty {
         if self.symbol_id.0 == 1 {
-            if wallet_usdt_1e8 >= 26_000_000_000 && !in_scar_debt {
+            if wallet_usdt_1e8 >= 52_000_000_000 && !in_scar_debt {
+                return LotQty(2);
+            }
+            return LotQty(1);
+        }
+        if self.symbol_id.0 == 2 {
+            if wallet_usdt_1e8 >= 14_655_000_000 && !in_scar_debt {
                 return LotQty(2);
             }
             return LotQty(1);
@@ -417,6 +423,24 @@ impl PairSpec {
         let bounded = if raw_lots < min_lots { min_lots } else { raw_lots };
         let even_lots = if (bounded & 1) != 0 { bounded + 1 } else { bounded };
         LotQty(even_lots)
+    }
+
+    /// Ley 2 (Big Bang V4.0): Verifica que el lote minimo del par no supere 1.35x el presupuesto Kelly (BTC = Faro hasta Wallet >= $257.72).
+    #[inline]
+    #[must_use]
+    pub const fn passes_strict_kelly_lot_cap(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+    ) -> bool {
+        let px_safe = if entry_price.0 > 1 { entry_price.0 } else { 1 };
+        let min_lot_notional_1e8 = ((px_safe as i128)
+            * (self.tick_size_1e8 as i128)
+            * (self.lot_step_1e8 as i128))
+            / 100_000_000;
+        let kelly_budget_1e8 = ((wallet_usdt_1e8 as i128) * 29) / 100;
+        let max_allowed_1e8 = (kelly_budget_1e8 * 135) / 100;
+        min_lot_notional_1e8 <= max_allowed_1e8
     }
 
     #[inline]
@@ -649,6 +673,19 @@ pub fn classify_trade_badge(
 
 #[inline]
 #[must_use]
+pub fn portable_temp_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "wasi")]
+    {
+        std::path::PathBuf::from("/tmp")
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+#[inline]
+#[must_use]
 pub fn now_epoch_ns() -> TimestampNs {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => TimestampNs(d.as_nanos() as i64),
@@ -734,7 +771,10 @@ mod tests {
             let lots_200 = spec.compute_compounding_kelly_lots(wallet_200_usdt, px, 350, false);
             assert!(lots_70.0 >= 1);
             assert!(lots_200.0 >= lots_70.0);
-            if idx >= 1 {
+            if idx == 1 {
+                assert_eq!(lots_70.0, 1);
+                assert_eq!(lots_200.0, 2);
+            } else if idx >= 2 {
                 assert_eq!(lots_70.0 % 2, 0);
                 assert_eq!(lots_200.0 % 2, 0);
             }

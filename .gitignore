@@ -9,3 +9,5 @@ data/vault/*.jsonl
 data/vault/*.json
 data/vault/*.lock
 *.csv
+
+data/*.csv

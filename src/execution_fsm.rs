@@ -1129,6 +1129,159 @@ impl SlotExecutionEngine {
         extra_35
     }
 
+    /// Ley 1 y Ley 2 (Big Bang): Evaluador puro de ventana rapida de 250ms para cazar mechas sin spam REST.
+    #[inline]
+    #[must_use]
+    pub const fn evaluate_fast_wick_gate(
+        now_ns: TimestampNs,
+        last_fast_poll_ns: TimestampNs,
+        regular_ready: bool,
+        cur_gross_bps: i64,
+        lock_l1_now: bool,
+    ) -> bool {
+        if regular_ready {
+            return true;
+        }
+        if cur_gross_bps >= 445 || lock_l1_now {
+            return now_ns.0.saturating_sub(last_fast_poll_ns.0) >= 250_000_000;
+        }
+        false
+    }
+
+    /// Ley 1 y Ley 2 (Big Bang): Disparador de fase a 250ms con cerrojo atomico por slot (max 4 Hz).
+    #[inline]
+    #[must_use]
+    pub fn authorizes_fast_wick_repeg_bypass(
+        slot_idx: usize,
+        now_ns: TimestampNs,
+        regular_ready: bool,
+        cur_gross_bps: i64,
+        lock_l1_now: bool,
+    ) -> bool {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static LAST_FAST_WICK_NS: [AtomicI64; 12] = [
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+            AtomicI64::new(0),
+        ];
+        let Some(cell) = LAST_FAST_WICK_NS.get(slot_idx) else {
+            return regular_ready;
+        };
+        let prev_ns = TimestampNs(cell.load(Ordering::Relaxed));
+        if Self::evaluate_fast_wick_gate(now_ns, prev_ns, regular_ready, cur_gross_bps, lock_l1_now) {
+            cell.store(now_ns.0, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ley 4 (Big Bang): Validador unidireccional para transmitir la contraccion de SL de Wald al servidor de Bybit.
+    #[inline]
+    #[must_use]
+    pub const fn authorizes_server_sl_ratchet_tightening(
+        side: Side,
+        current_sl_ticks: PriceTicks,
+        candidate_sl_ticks: PriceTicks,
+        cur_bbo_ticks: PriceTicks,
+    ) -> bool {
+        if candidate_sl_ticks.0 <= 0 || cur_bbo_ticks.0 <= 0 {
+            return false;
+        }
+        let min_safe_gap = ((cur_bbo_ticks.0 * 2_500) / 1_000_000) + 3;
+        match side {
+            Side::Bid => {
+                let improves = candidate_sl_ticks.0 >= current_sl_ticks.0 + 4;
+                let safe_below_mkt = candidate_sl_ticks.0 + min_safe_gap < cur_bbo_ticks.0;
+                improves && safe_below_mkt
+            }
+            Side::Ask => {
+                let improves = candidate_sl_ticks.0 + 4 <= current_sl_ticks.0;
+                let safe_above_mkt = candidate_sl_ticks.0 > cur_bbo_ticks.0 + min_safe_gap;
+                improves && safe_above_mkt
+            }
+        }
+    }
+
+    /// Ley 2 y Ley 3 (Campeon V4.0): Escalera Convexa Monotonica de 2 Peldaños (+9.80 -> +6.40 @ 20s -> +4.42 @ 48s) sin Ping-Pong.
+    #[inline]
+    #[must_use]
+    pub const fn compute_monotonic_glide_floor_bps(
+        hold_secs: i64,
+        cur_gross_bps: i64,
+        peak_gross_bps: i64,
+        worst_mae_bps: i64,
+    ) -> ScaledBps {
+        // Si ya cayo bajo -85 ScaledBps (-0.85 bps) y lleva >= 24s, o supero los 48s, cerrojo irreversible en Scratch +4.42 bps
+        if hold_secs >= 48 || (hold_secs >= 24 && worst_mae_bps <= -850) {
+            return ScaledBps(442);
+        }
+        // Candado rapido de retroceso de mecha: si toco >= +5.40 bps y retrocede >= 0.45 bps, asegura ganancia en L1
+        if peak_gross_bps >= 540 && cur_gross_bps >= 450 && cur_gross_bps <= peak_gross_bps - 45 {
+            let locked = if cur_gross_bps > 640 { 640 } else { cur_gross_bps };
+            return ScaledBps(locked);
+        }
+        // Peldaño 2 (20s..48s): +6.40 bps brutos (+2.40 bps netos)
+        if hold_secs >= 20 {
+            return ScaledBps(640);
+        }
+        // Peldaño 1 (0..20s): +9.80 bps brutos (+5.80 bps netos)
+        ScaledBps(980)
+    }
+
+    /// Ley 2 y Ley 4 (Campeon V4.0): Acota el Stop-Loss inicial de servidor a maximo -56.00 bps (-5600 ScaledBps) sobre la entrada.
+    #[inline]
+    #[must_use]
+    pub const fn clamp_initial_sl_to_56bps(
+        side: Side,
+        entry_ticks: PriceTicks,
+        raw_sl_ticks: PriceTicks,
+    ) -> PriceTicks {
+        let max_dist = ((entry_ticks.0 * 5_600) / 1_000_000) + 2;
+        match side {
+            Side::Bid => {
+                let cap_sl = entry_ticks.0 - max_dist;
+                let safe_cap = if cap_sl > 1 { cap_sl } else { 1 };
+                if raw_sl_ticks.0 < safe_cap {
+                    PriceTicks(safe_cap)
+                } else {
+                    raw_sl_ticks
+                }
+            }
+            Side::Ask => {
+                let cap_sl = entry_ticks.0 + max_dist;
+                if raw_sl_ticks.0 == 0 || raw_sl_ticks.0 > cap_sl {
+                    PriceTicks(cap_sl)
+                } else {
+                    raw_sl_ticks
+                }
+            }
+        }
+    }
+
+    /// Ley 4 (Campeon V4.0): Guillotina temporal anti-zombi a los 240s cuando la posicion sigue subacuatica sin traccion.
+    #[inline]
+    #[must_use]
+    pub const fn triggers_wald_240s_guillotine(
+        hold_secs: i64,
+        cur_gross_bps: i64,
+        signed_flow_x100: i64,
+    ) -> bool {
+        if hold_secs < 240 {
+            return false;
+        }
+        cur_gross_bps <= -650 || (hold_secs >= 300 && cur_gross_bps < 180 && signed_flow_x100 < 0)
+    }
+
     pub fn sync_to_shm_telemetry(&self, arena: &crate::lob_shm::VortexShmArena) {
         use core::sync::atomic::Ordering;
         let Ok(tel) = arena.telemetry(self.slot_idx) else {
@@ -1983,6 +2136,66 @@ mod tests {
             assert_eq!(open_lots, LotQty(24));
             assert!(avg_price_ticks.0 < 8_550);
         }
+    }
+
+    #[test]
+    fn test_v4_champion_glide_kelly_cap_funding_and_crowding_veto() {
+        // 1. Escalera monotonica V4.0: 980 -> 640 @ 20s -> 442 @ 48s
+        assert_eq!(
+            SlotExecutionEngine::compute_monotonic_glide_floor_bps(5, 120, 120, 0),
+            ScaledBps(980)
+        );
+        assert_eq!(
+            SlotExecutionEngine::compute_monotonic_glide_floor_bps(25, 120, 120, -200),
+            ScaledBps(640)
+        );
+        assert_eq!(
+            SlotExecutionEngine::compute_monotonic_glide_floor_bps(50, -100, 120, -400),
+            ScaledBps(442)
+        );
+        // 2. Kelly Lot-Cap: a $66.3256 USDT, BTCUSDT ($74.74 min lot) es rechazado como orden y actua solo como Faro; ETHUSDT ($21.25) pasa!
+        let w_bigbang = 6_632_564_713_i64;
+        assert!(!APPROVED_SPECS[0].passes_strict_kelly_lot_cap(w_bigbang, PriceTicks(747_400)));
+        assert!(APPROVED_SPECS[1].passes_strict_kelly_lot_cap(w_bigbang, PriceTicks(212_500)));
+        assert!(APPROVED_SPECS[0].passes_strict_kelly_lot_cap(26_500_000_000, PriceTicks(747_400)));
+        // 3. Escudo Funding UTC y Guillotina 240s
+        let ts_0800_utc_ns = 1_794_211_200_000_000_000_i64; // 08:00:00 UTC exacto
+        assert!(crate::alpha_3factor::OrthogonalFactorState::is_in_toxic_utc_funding_window(ts_0800_utc_ns));
+        assert!(!crate::alpha_3factor::OrthogonalFactorState::is_in_toxic_utc_funding_window(
+            ts_0800_utc_ns + 35 * 60 * 1_000_000_000
+        ));
+        assert!(SlotExecutionEngine::triggers_wald_240s_guillotine(245, -1_200, -30));
+        assert!(!SlotExecutionEngine::triggers_wald_240s_guillotine(120, -1_200, -30));
+    }
+
+    #[test]
+    fn test_bigbang_fast_wick_bypass_and_server_sl_ratchet() {
+        assert!(SlotExecutionEngine::evaluate_fast_wick_gate(
+            TimestampNs(1_300_000_000),
+            TimestampNs(1_000_000_000),
+            false,
+            465,
+            false,
+        ));
+        assert!(!SlotExecutionEngine::evaluate_fast_wick_gate(
+            TimestampNs(1_150_000_000),
+            TimestampNs(1_000_000_000),
+            false,
+            465,
+            false,
+        ));
+        assert!(SlotExecutionEngine::authorizes_server_sl_ratchet_tightening(
+            Side::Bid,
+            PriceTicks(8_400),
+            PriceTicks(8_450),
+            PriceTicks(8_520),
+        ));
+        assert!(!SlotExecutionEngine::authorizes_server_sl_ratchet_tightening(
+            Side::Bid,
+            PriceTicks(8_450),
+            PriceTicks(8_420),
+            PriceTicks(8_520),
+        ));
     }
 
     #[test]

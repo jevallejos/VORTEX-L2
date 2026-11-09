@@ -406,7 +406,7 @@ mod tests {
             geom_bps: 3500,
         };
         assert!(batch.push_row(&row).is_ok());
-        let tmp_p = std::env::temp_dir().join("vortex_l3_step2_par1.parquet");
+        let tmp_p = crate::types::portable_temp_dir().join("vortex_l3_step2_par1.parquet");
         let c1 = batch.write_to_file(&tmp_p);
         assert!(c1.is_ok());
         let loaded = ColumnarParquetBatch::read_from_file(&tmp_p);

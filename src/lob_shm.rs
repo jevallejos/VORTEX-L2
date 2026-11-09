@@ -366,7 +366,7 @@ impl MappedShmRegion {
         if dev_shm.exists() {
             dev_shm.join("vortex_lob.mmap")
         } else {
-            std::env::temp_dir().join("vortex_lob.mmap")
+            crate::types::portable_temp_dir().join("vortex_lob.mmap")
         }
     }
 
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_shm_v12_12slots_and_deep_l1_l5_volume() {
-        let shm_path = std::env::temp_dir().join("vortex_l3_step1_test.mmap");
+        let shm_path = crate::types::portable_temp_dir().join("vortex_l3_step1_test.mmap");
         let region = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(region.is_ok());
         if let Ok(reg) = region {
