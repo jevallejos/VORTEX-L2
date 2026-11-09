@@ -1087,20 +1087,20 @@ impl SlotExecutionEngine {
         crest_exhausted: bool,
         already_resting_exhale: bool,
     ) -> bool {
-        if exhaled_lots.0 > 0 || tranche1_harvested || eff_init_lots.0 < 4 || hold_secs < 180 {
+        if exhaled_lots.0 > 0 || tranche1_harvested || eff_init_lots.0 < 2 || hold_secs < 180 {
             return false;
         }
         if worst_mae_bps > -150 || cur_gross_bps >= 0 {
             return false;
         }
-        let required_quarter_subsidy = ((440 - cur_gross_bps) + 3) / 4;
-        if required_quarter_subsidy > sinking_fund_reserve_bps_x100 || required_quarter_subsidy > 320 {
+        let raw_sub = ((440 - cur_gross_bps) + 3) / 4; let capped_subsidy_needed = if raw_sub > 250 { 250 } else { raw_sub };
+        if sinking_fund_reserve_bps_x100 < capped_subsidy_needed {
             return false;
         }
         let rebound_threshold = if already_resting_exhale {
-            (worst_mae_bps * 78) / 100
+            (worst_mae_bps * 82) / 100
         } else {
-            (worst_mae_bps * 68) / 100
+            (worst_mae_bps * 72) / 100
         };
         if cur_gross_bps < rebound_threshold {
             return false;
@@ -1442,7 +1442,7 @@ impl SlotExecutionEngine {
         else {
             return None;
         };
-        if tranche1_harvested || exhaled_lots.0 > 0 || initial_lots.0 < 4 || open_lots.0 < 4 {
+        if tranche1_harvested || exhaled_lots.0 > 0 || initial_lots.0 < 2 || open_lots.0 < 2 {
             return None;
         }
         let q_exhale = LotQty((initial_lots.0 / 4).max(1));

@@ -654,22 +654,42 @@ fn render_live_hud(arena: &VortexShmArena) {
         let (bw, bf) = spec.format_price_usdt_parts(snap.bids[0].price);
         let (aw, af) = spec.format_price_usdt_parts(snap.asks[0].price);
         let spr = (snap.asks[0].price.0 - snap.bids[0].price.0).max(0);
-        let verdict_str = match OrthogonalFactorState::evaluate_entry_signal_with_leader(
-            spec,
-            &snap,
-            &btc_snap,
-        ) {
-            SignalVerdict::SpoofingVeto => {
-                format!("{}\u{1f7e0} SPOOF_VETO     {}", ANSI_ORANGE, ANSI_RESET)
+        let verdict_str = if is_slot_open {
+            if let Ok(tel) = arena.telemetry(s_idx) {
+                let tp_t = PriceTicks(tel.tp_ticks.load(Ordering::Acquire) as i64);
+                let z_cyc = tel.peristaltic_cycles.load(Ordering::Acquire);
+                let st_c = tel.state_code.load(Ordering::Acquire);
+                let (tw, tf) = spec.format_price_usdt_parts(tp_t);
+                let tag = if st_c == 5 {
+                    "ZMPQR"
+                } else if st_c == 4 {
+                    "SURF2"
+                } else {
+                    "TP_L1"
+                };
+                let raw_v = format!("\u{1f3af} {}:{}.{:04}(Z{})", tag, tw, tf, z_cyc);
+                format!("{}{}{}", ANSI_SKY_BLUE, pad_visible_right(&raw_v, 17), ANSI_RESET)
+            } else {
+                format!("{}\u{1f3af} OPEN_CUSTODY   {}", ANSI_SKY_BLUE, ANSI_RESET)
             }
-            SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => {
-                format!("{}\u{1f7e1} AUTH_LONG_MKR  {}", ANSI_YELLOW, ANSI_RESET)
-            }
-            SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => {
-                format!("{}\u{1f7e1} AUTH_SHORT_MKR {}", ANSI_YELLOW, ANSI_RESET)
-            }
-            SignalVerdict::NeutralNoAction => {
-                format!("{}\u{26aa} NEUTRAL_WAIT   {}", ANSI_GRAY, ANSI_RESET)
+        } else {
+            match OrthogonalFactorState::evaluate_entry_signal_with_leader(
+                spec,
+                &snap,
+                &btc_snap,
+            ) {
+                SignalVerdict::SpoofingVeto => {
+                    format!("{}\u{1f7e0} SPOOF_VETO     {}", ANSI_ORANGE, ANSI_RESET)
+                }
+                SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => {
+                    format!("{}\u{1f7e1} AUTH_LONG_MKR  {}", ANSI_YELLOW, ANSI_RESET)
+                }
+                SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => {
+                    format!("{}\u{1f7e1} AUTH_SHORT_MKR {}", ANSI_YELLOW, ANSI_RESET)
+                }
+                SignalVerdict::NeutralNoAction => {
+                    format!("{}\u{26aa} NEUTRAL_WAIT   {}", ANSI_GRAY, ANSI_RESET)
+                }
             }
         };
         sec_rows.push(format!(
@@ -798,7 +818,19 @@ fn render_trades_and_executive_dashboard() {
     }
     let eff_notional_usdt = (w_usdt * 0.29).max(18.0);
     let bps_to_usdt = eff_notional_usdt / 10_000.0;
-    let total_pos_bps = inherited_pos_bps.max(cum_net.max(0.0));
+    let mut vault_pos_bps = 0.0_f64;
+    if let Ok(vf) = fs::File::open(AI_FORENSIC_VAULT_PATH) {
+        let rdr = BufReader::new(vf);
+        for l in rdr.lines().map_while(Result::ok) {
+            if let Ok(vv) = serde_json::from_str::<serde_json::Value>(&l) {
+                let nb = vv.get("net_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
+                if nb > 0.0 {
+                    vault_pos_bps += nb;
+                }
+            }
+        }
+    }
+    let total_pos_bps = if vault_pos_bps > 0.0 { vault_pos_bps } else { inherited_pos_bps.max(cum_net.max(0.0)) };
     let reserve_bps = (total_pos_bps * 0.30).min(250.0);
     let locked_bps = total_pos_bps * 0.70;
     let net_usdt = cum_net * bps_to_usdt;
