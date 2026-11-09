@@ -1015,7 +1015,7 @@ impl SlotExecutionEngine {
         let max_slot_share = (reserve_bps_x100 / denom).clamp(0, 360);
         let win_s = siphon_window_secs.max(180);
         let ratio_x100 = ((hold_secs.min(win_s * 2) * 100) / win_s).clamp(0, 200);
-        let ramp_permille = ((ratio_x100 * ratio_x100 * 1_000) / (10_000 + ratio_x100 * ratio_x100)).clamp(0, 1_000);
+        let ramp_permille = ((ratio_x100 * ratio_x100 * 1_000) / (2_500 + ratio_x100 * ratio_x100)).clamp(0, 1_000);
         ((max_slot_share * ramp_permille) / 1_000).clamp(0, 360)
     }
 
@@ -1054,6 +1054,23 @@ impl SlotExecutionEngine {
             };
         }
         saved_sl_ticks
+    }
+
+    /// Ley 1 y Ley 2 (Mision 2): Escudo de fase direccional de Kuramoto contra contagio multi-slot en vivo.
+    #[inline]
+    #[must_use]
+    pub const fn authorizes_kuramoto_directional_concentration(
+        same_dir_open_count: usize,
+        same_dir_underwater_count: usize,
+        same_dir_all_in_green: bool,
+    ) -> bool {
+        if same_dir_underwater_count >= 2 {
+            return false;
+        }
+        if same_dir_open_count >= 4 && !same_dir_all_in_green {
+            return false;
+        }
+        true
     }
 
     pub fn sync_to_shm_telemetry(&self, arena: &crate::lob_shm::VortexShmArena) {
@@ -1910,6 +1927,18 @@ mod tests {
             assert_eq!(open_lots, LotQty(24));
             assert!(avg_price_ticks.0 < 8_550);
         }
+    }
+
+    #[test]
+    fn test_mission2_kuramoto_directional_shield_and_hyperbolic_siphon() {
+        assert!(SlotExecutionEngine::authorizes_kuramoto_directional_concentration(1, 0, false));
+        assert!(SlotExecutionEngine::authorizes_kuramoto_directional_concentration(2, 1, false));
+        assert!(!SlotExecutionEngine::authorizes_kuramoto_directional_concentration(2, 2, false));
+        assert!(!SlotExecutionEngine::authorizes_kuramoto_directional_concentration(4, 0, false));
+        assert!(SlotExecutionEngine::authorizes_kuramoto_directional_concentration(4, 0, true));
+
+        let sub_1 = SlotExecutionEngine::compute_hyperbolic_siphon_subsidy_bps(12_554, 4, 600, 540);
+        assert!((200..=360).contains(&sub_1));
     }
 
     #[test]

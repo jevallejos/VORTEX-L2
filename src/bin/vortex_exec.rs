@@ -1845,9 +1845,9 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let step_15s = (hold_s / 15).clamp(0, 6);
                         let win_exc = (base_win_target - 500).max(0);
                         let time_relax = (step_15s * win_exc) / 6;
-                        let target_floor_bps = if siphon_eligible && cur_gross_bps >= siphon_subsidized_floor_bps - 35 {
+                        let target_floor_bps = if siphon_eligible {
                             ScaledBps(siphon_subsidized_floor_bps)
-                        } else if allow_scratch_floor || siphon_eligible {
+                        } else if allow_scratch_floor {
                             ScaledBps(if tranche1_harvested { 465 } else { 440 })
                         } else if use_tranche1_50 {
                             ScaledBps(465)
@@ -1912,7 +1912,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         if rest_ready {
                             last_rest_call_ns = now_ns.0;
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_350_000_000;
-                            let Some((mut still_open, mut real_sz_s, _, _)) =
+                            let Some((mut still_open, mut real_sz_s, _, mut real_avg_s)) =
                                 client.query_open_position_verified(sym_name)
                             else {
                                 engines[s_idx].sync_to_shm_telemetry(arena);
@@ -1920,7 +1920,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             };
                             if !still_open && cur_gross_bps < 0 {
                                 match client.query_open_position_verified(sym_name) {
-                                    Some((confirmed_open, sz2, _, _)) => {
+                                    Some((confirmed_open, sz2, _, avg2)) => { real_avg_s = avg2;
                                         still_open = confirmed_open;
                                         real_sz_s = sz2;
                                     }
@@ -2081,19 +2081,55 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 let eff_init_lots = if prev_tp_state.0 == 0 {
                                     real_lots
                                 } else {
-                                    initial_lots
+                                    initial_lots.max(real_lots)
                                 };
-                                if !tranche1_harvested
-                                    && prev_tp_state.0 > 0
-                                    && eff_init_lots.0 >= 2
-                                    && real_lots.0 < eff_init_lots.0
-                                    && hold_s >= 2
+                                let mut zmpqr_active_mode: u8 = 0;
+                                let mut zmpqr_target_lots = real_lots;
+                                let mut zmpqr_target_px = surf_px;
+                                if let OrderLifecycleState::PositionOpenMakerExit {
+                                    exhaled_lots,
+                                    last_crest_exhale_price,
+                                    active_exit_role,
+                                    ..
+                                } = engines[s_idx].state
                                 {
-                                    tranche1_harvested = true;
-                                    engines[s_idx].tranche1_harvests_count =
-                                        engines[s_idx]
-                                            .tranche1_harvests_count
-                                            .saturating_add(1);
+                                    let expected_after_exhale =
+                                        (eff_init_lots.0 - (eff_init_lots.0 / 4).max(1)).max(1);
+                                    if exhaled_lots.0 == 0
+                                        && matches!(active_exit_role, ExitOrderRole::PeristalticExhale25)
+                                        && real_lots.0 <= expected_after_exhale
+                                    {
+                                        let crest_ref = if prev_tp_state.0 > 0 { prev_tp_state } else { cur_bbo };
+                                        let _ = engines[s_idx].apply_peristaltic_exhale_25pct(
+                                            crest_ref,
+                                            &mut ledger,
+                                        );
+                                        println!(
+                                            "{}\u{1f7e1} [ZMPQR 25% EXHALE FILLED] {} {:?} discharged 25% @ {}t (rem={} lots){}",
+                                            ANSI_YELLOW, sym_name, side, crest_ref.0, real_lots.0, ANSI_RESET
+                                        );
+                                    } else if exhaled_lots.0 > 0
+                                        && real_lots.0 >= eff_init_lots.0
+                                    {
+                                        let _ = engines[s_idx].apply_peristaltic_inhale_25pct(cur_bbo);
+                                        if let Ok(bybit_new_avg) = spec.parse_price_ticks(&real_avg_s) {
+                                            if let OrderLifecycleState::PositionOpenMakerExit {
+                                                avg_price_ticks: ref mut avg_p,
+                                                ..
+                                            } = engines[s_idx].state
+                                            {
+                                                *avg_p = match side {
+                                                    Side::Bid => PriceTicks(avg_p.0.min(bybit_new_avg.0)),
+                                                    Side::Ask => PriceTicks(avg_p.0.max(bybit_new_avg.0)),
+                                                };
+                                            }
+                                        }
+                                        let _ = last_crest_exhale_price;
+                                        println!(
+                                            "{}\u{1f7e2} [ZMPQR 25% INHALE FILLED] {} {:?} reloaded 25% in valley @ {}t (avg compressed!){}",
+                                            ANSI_GREEN, sym_name, side, cur_bbo.0, ANSI_RESET
+                                        );
+                                    }
                                 }
                                 if let OrderLifecycleState::PositionOpenMakerExit {
                                     exhaled_lots,
@@ -2112,71 +2148,86 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                             &btc_snap,
                                         )
                                     {
-                                        let rc_in = client.place_post_only_order(
-                                            spec,
-                                            side,
-                                            cur_bbo,
-                                            exhaled_lots,
-                                            None,
-                                            false,
-                                        );
-                                        if rc_in == 0 {
-                                            let _ = engines[s_idx].apply_peristaltic_inhale_25pct(cur_bbo);
-                                        }
+                                        zmpqr_active_mode = 2;
+                                        zmpqr_target_lots = exhaled_lots;
+                                        zmpqr_target_px = match side {
+                                            Side::Bid => snap.bids[0].price.max(PriceTicks(1)),
+                                            Side::Ask => snap.asks[0].price.max(PriceTicks(1)),
+                                        };
                                     } else if exhaled_lots.0 == 0
                                         && !tranche1_harvested
                                         && eff_init_lots.0 >= 4
                                         && hold_s >= 180
                                         && worst_mae_bps <= -150
                                         && cur_gross_bps < 0
-                                        && cur_gross_bps >= (worst_mae_bps * 65) / 100
+                                        && cur_gross_bps >= (worst_mae_bps * 68) / 100
                                         && OrthogonalFactorState::detects_rebound_crest_exhaustion(side, &snap)
                                     {
-                                        let q_ex = LotQty((eff_init_lots.0 / 4).max(1));
-                                        client.cancel_all_symbol_orders(sym_name);
-                                        let rc_ex = client.place_post_only_order(
-                                            spec,
-                                            side.opposite(),
-                                            l1_non_crossing,
-                                            q_ex,
-                                            None,
-                                            true,
-                                        );
-                                        if rc_ex == 0 {
-                                            let _ = engines[s_idx].apply_peristaltic_exhale_25pct(
-                                                l1_non_crossing,
-                                                &mut ledger,
-                                            );
+                                        zmpqr_active_mode = 1;
+                                        zmpqr_target_lots = LotQty((eff_init_lots.0 / 4).max(1));
+                                        zmpqr_target_px = match side {
+                                            Side::Bid => snap.asks[0].price.max(PriceTicks(1)),
+                                            Side::Ask => snap.bids[0].price.max(PriceTicks(1)),
+                                        };
+                                    }
+                                }
+                                if !tranche1_harvested
+                                    && zmpqr_active_mode == 0
+                                    && prev_tp_state.0 > 0
+                                    && eff_init_lots.0 >= 2
+                                    && real_lots.0 < eff_init_lots.0
+                                    && hold_s >= 2
+                                {
+                                    if let OrderLifecycleState::PositionOpenMakerExit {
+                                        exhaled_lots,
+                                        ..
+                                    } = engines[s_idx].state
+                                    {
+                                        if exhaled_lots.0 == 0 {
+                                            tranche1_harvested = true;
+                                            engines[s_idx].tranche1_harvests_count =
+                                                engines[s_idx]
+                                                    .tranche1_harvests_count
+                                                    .saturating_add(1);
                                         }
                                     }
                                 }
-                                let order_lots_target = if !tranche1_harvested
-                                    && real_lots.0 >= 2
-                                    && !allow_scratch_floor
-                                    && !siphon_eligible
-                                {
-                                    LotQty((real_lots.0 / 2).max(1))
-                                } else {
-                                    real_lots
-                                };
+                                let (eff_order_side, eff_reduce_only, eff_target_px, order_lots_target) =
+                                    if zmpqr_active_mode == 2 {
+                                        (side, false, zmpqr_target_px, zmpqr_target_lots)
+                                    } else if zmpqr_active_mode == 1 {
+                                        (side.opposite(), true, zmpqr_target_px, zmpqr_target_lots)
+                                    } else {
+                                        let std_lots = if !tranche1_harvested
+                                            && real_lots.0 >= 2
+                                            && !allow_scratch_floor
+                                            && !siphon_eligible
+                                        {
+                                            LotQty((real_lots.0 / 2).max(1))
+                                        } else {
+                                            real_lots
+                                        };
+                                        (side.opposite(), true, surf_px, std_lots)
+                                    };
                                 let Some((resting_tp, resting_qty)) =
                                     client.get_resting_exit_order_info(spec)
                                 else {
                                     engines[s_idx].sync_to_shm_telemetry(arena);
                                     continue;
                                 };
-                                let tp_diff_ticks = (surf_px.0 - resting_tp.0).abs();
+                                let tp_diff_ticks = (eff_target_px.0 - resting_tp.0).abs();
                                 let moving_closer = match side {
                                     Side::Bid => {
-                                        resting_tp.0 == 0 || surf_px.0 < resting_tp.0
+                                        resting_tp.0 == 0 || eff_target_px.0 < resting_tp.0
                                     }
                                     Side::Ask => {
-                                        resting_tp.0 == 0 || surf_px.0 > resting_tp.0
+                                        resting_tp.0 == 0 || eff_target_px.0 > resting_tp.0
                                     }
                                 };
                                 let qty_changed = resting_qty != order_lots_target;
                                 let should_repeg = resting_tp.0 == 0
                                     || qty_changed
+                                    || (zmpqr_active_mode > 0 && tp_diff_ticks >= 1)
                                     || (moving_closer
                                         && tp_diff_ticks >= 1
                                         && (lock_l1_now || tp_diff_ticks >= 2))
@@ -2187,15 +2238,15 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     client.cancel_all_symbol_orders(sym_name);
                                     let rc = client.place_post_only_order(
                                         spec,
-                                        side.opposite(),
-                                        surf_px,
+                                        eff_order_side,
+                                        eff_target_px,
                                         order_lots_target,
                                         None,
-                                        true,
+                                        eff_reduce_only,
                                     );
                                     engines[s_idx].exit_peg_attempts =
                                         engines[s_idx].exit_peg_attempts.saturating_add(1);
-                                    if rc == 0 { surf_px } else { PriceTicks(0) }
+                                    if rc == 0 { eff_target_px } else { PriceTicks(0) }
                                 } else {
                                     resting_tp
                                 };
@@ -2203,6 +2254,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     initial_lots: ref mut in_l,
                                     open_lots: ref mut op_l,
                                     tranche1_harvested: ref mut t1_h,
+                                    active_exit_role: ref mut ax_role,
                                     active_exit_lots: ref mut ax_l,
                                     tp_maker_price: ref mut tp_p,
                                     ..
@@ -2211,6 +2263,11 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     *in_l = eff_init_lots;
                                     *op_l = real_lots;
                                     *t1_h = tranche1_harvested;
+                                    if zmpqr_active_mode == 1 {
+                                        *ax_role = ExitOrderRole::PeristalticExhale25;
+                                    } else if zmpqr_active_mode == 2 {
+                                        *ax_role = ExitOrderRole::PeristalticInhale25;
+                                    }
                                     *ax_l = order_lots_target;
                                     *tp_p = active_tp_now;
                                 }
@@ -2267,9 +2324,46 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     &btc_snap,
                 );
                 if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
-                    let harvester_ok = open_count < 6
+                    let mut same_dir_open = 0_usize;
+                    let mut same_dir_underwater = 0_usize;
+                    let mut same_dir_all_green = true;
+                    for (other_idx, other_eng) in engines.iter().enumerate() {
+                        if let OrderLifecycleState::PositionOpenMakerExit {
+                            side: o_side,
+                            avg_price_ticks: o_avg,
+                            ..
+                        } = other_eng.state
+                        {
+                            if o_side == side {
+                                same_dir_open += 1;
+                                let o_snap = cached_snaps[other_idx];
+                                let o_bbo = match o_side {
+                                    Side::Bid => o_snap.asks[0].price.0,
+                                    Side::Ask => o_snap.bids[0].price.0,
+                                };
+                                let o_diff = match o_side {
+                                    Side::Bid => o_bbo - o_avg.0,
+                                    Side::Ask => o_avg.0 - o_bbo,
+                                };
+                                let o_gross = (o_diff.saturating_mul(1_000_000)) / o_avg.0.max(1);
+                                if o_gross <= -50 {
+                                    same_dir_underwater += 1;
+                                }
+                                if o_gross < 440 {
+                                    same_dir_all_green = false;
+                                }
+                            }
+                        }
+                    }
+                    let kuramoto_ok = SlotExecutionEngine::authorizes_kuramoto_directional_concentration(
+                        same_dir_open,
+                        same_dir_underwater,
+                        same_dir_all_green,
+                    );
+                    let harvester_ok = (open_count < 6
                         || (snap.factor_ofi.get().abs() >= 0.45
-                            && snap.factor_tfi.get().abs() >= 0.55);
+                            && snap.factor_tfi.get().abs() >= 0.55))
+                        && kuramoto_ok;
                     if harvester_ok
                         && gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap)
                     {
