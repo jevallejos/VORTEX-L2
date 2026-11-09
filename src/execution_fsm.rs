@@ -486,7 +486,7 @@ impl OnlineAdaptiveGovernor {
         let d_sign = if matches!(side, Side::Bid) { 1_i64 } else { -1_i64 };
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
-        if s_drift < -80 || s_ext > 1_200 || (s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115) {
+        if s_drift < -15 || s_ext > 1_200 || (s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115) {
             return Err("VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
         }
         let d = Self::dir_idx(side);

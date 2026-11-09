@@ -217,6 +217,8 @@ fn discover_latest_parquet_seq() -> u64 {
 fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
     let mut factor_states = [OrthogonalFactorState::new(); MAX_ACTIVE_PAIRS];
     let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    let mut vol_anchor_px = [0_i64; MAX_ACTIVE_PAIRS];
+    let mut vol_anchor_ts_ns = [0_i64; MAX_ACTIVE_PAIRS];
     let mut batch = ColumnarParquetBatch::new();
     let mut parquet_seq = discover_latest_parquet_seq();
 
@@ -320,6 +322,22 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                             PriceTicks((snap.bids[0].price.0 + snap.asks[0].price.0) / 2);
                         if snap.last_trade_price.0 <= 0 {
                             snap.last_trade_price = snap.mark_price;
+                        }
+                        let dt_v = local_ns.0.saturating_sub(vol_anchor_ts_ns[slot_idx]);
+                        if vol_anchor_px[slot_idx] <= 0 {
+                            vol_anchor_px[slot_idx] = snap.mark_price.0;
+                            vol_anchor_ts_ns[slot_idx] = local_ns.0;
+                        } else if dt_v >= 5_000_000_000 {
+                            let a_px = vol_anchor_px[slot_idx].max(1);
+                            let dp = (snap.mark_price.0 - a_px).abs();
+                            let ret_5s = (dp.saturating_mul(1_000_000)) / a_px;
+                            let inst_v = (ret_5s.saturating_mul(12)).clamp(4_200, 12_500);
+                            let prev_v = snap.realized_vol_5m.raw();
+                            let next_v = ((prev_v * 92 + inst_v * 8) / 100)
+                                .clamp(4_200, 12_500);
+                            snap.realized_vol_5m = ScaledBps(next_v);
+                            vol_anchor_px[slot_idx] = snap.mark_price.0;
+                            vol_anchor_ts_ns[slot_idx] = local_ns.0;
                         }
                     }
                     snap.ts_exchange_ns = exch_ns;
