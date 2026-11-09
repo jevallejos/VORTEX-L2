@@ -1073,6 +1073,62 @@ impl SlotExecutionEngine {
         true
     }
 
+    /// Ley 2 y Ley 4 (Mision 3): Autorizador de Espiracion Peristaltica 100% respaldada por Reserva 30% y con histeresis en cola FIFO.
+    #[inline]
+    #[must_use]
+    pub const fn authorizes_funded_peristaltic_exhale(
+        exhaled_lots: LotQty,
+        tranche1_harvested: bool,
+        eff_init_lots: LotQty,
+        hold_secs: i64,
+        worst_mae_bps: i64,
+        cur_gross_bps: i64,
+        sinking_fund_reserve_bps_x100: i64,
+        crest_exhausted: bool,
+        already_resting_exhale: bool,
+    ) -> bool {
+        if exhaled_lots.0 > 0 || tranche1_harvested || eff_init_lots.0 < 4 || hold_secs < 180 {
+            return false;
+        }
+        if worst_mae_bps > -150 || cur_gross_bps >= 0 {
+            return false;
+        }
+        let required_quarter_subsidy = ((440 - cur_gross_bps) + 3) / 4;
+        if required_quarter_subsidy > sinking_fund_reserve_bps_x100 || required_quarter_subsidy > 320 {
+            return false;
+        }
+        let rebound_threshold = if already_resting_exhale {
+            (worst_mae_bps * 78) / 100
+        } else {
+            (worst_mae_bps * 68) / 100
+        };
+        if cur_gross_bps < rebound_threshold {
+            return false;
+        }
+        already_resting_exhale || crest_exhausted
+    }
+
+    /// Ley 2 (Mision 3): Rebalanceador dinamico 65% Reserva / 35% Blindado cuando existen carriles estancados (>= 900s).
+    #[inline]
+    pub fn boost_sinking_fund_for_stagnant_rescue(
+        ledger: &mut crate::forensic_parquet::ParitySyncLedger,
+        net_scaled_bps: ScaledBps,
+        stagnant_slots_open: usize,
+    ) -> i64 {
+        let n_bps = net_scaled_bps.raw();
+        if n_bps <= 0 || stagnant_slots_open == 0 {
+            return 0;
+        }
+        let extra_35 = ((n_bps * 35) / 100).min(ledger.vault_locked_profit_bps_x100);
+        if extra_35 <= 0 {
+            return 0;
+        }
+        ledger.vault_locked_profit_bps_x100 -= extra_35;
+        ledger.sinking_fund_reserve_bps_x100 = (ledger.sinking_fund_reserve_bps_x100 + extra_35)
+            .min(crate::forensic_parquet::MAX_SINKING_FUND_SCALED_BPS);
+        extra_35
+    }
+
     pub fn sync_to_shm_telemetry(&self, arena: &crate::lob_shm::VortexShmArena) {
         use core::sync::atomic::Ordering;
         let Ok(tel) = arena.telemetry(self.slot_idx) else {
@@ -1927,6 +1983,56 @@ mod tests {
             assert_eq!(open_lots, LotQty(24));
             assert!(avg_price_ticks.0 < 8_550);
         }
+    }
+
+    #[test]
+    fn test_mission3_funded_exhale_hysteresis_and_65_35_harvester_boost() {
+        assert!(SlotExecutionEngine::authorizes_funded_peristaltic_exhale(
+            LotQty(0),
+            false,
+            LotQty(20),
+            600,
+            -300,
+            -180,
+            250,
+            true,
+            false,
+        ));
+        assert!(SlotExecutionEngine::authorizes_funded_peristaltic_exhale(
+            LotQty(0),
+            false,
+            LotQty(20),
+            600,
+            -300,
+            -210,
+            250,
+            false,
+            true,
+        ));
+        assert!(!SlotExecutionEngine::authorizes_funded_peristaltic_exhale(
+            LotQty(0),
+            false,
+            LotQty(20),
+            600,
+            -900,
+            -600,
+            120,
+            true,
+            false,
+        ));
+
+        let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
+        ledger.record_closed_trade_with_sinking_split(200_000, 40_000, ScaledBps(200));
+        assert_eq!(ledger.sinking_fund_reserve_bps_x100, 60);
+        assert_eq!(ledger.vault_locked_profit_bps_x100, 140);
+        let boosted = SlotExecutionEngine::boost_sinking_fund_for_stagnant_rescue(
+            &mut ledger,
+            ScaledBps(200),
+            2,
+        );
+        assert_eq!(boosted, 70);
+        assert_eq!(ledger.sinking_fund_reserve_bps_x100, 130);
+        assert_eq!(ledger.vault_locked_profit_bps_x100, 70);
     }
 
     #[test]

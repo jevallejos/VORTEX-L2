@@ -2011,6 +2011,15 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     }
                                     (ClosedTradeKind::MakerPassiveUnwind, unified_px)
                                 };
+                                let stagnant_open_others = engines
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(idx, e)| {
+                                        *idx != s_idx
+                                            && matches!(e.state, OrderLifecycleState::PositionOpenMakerExit { .. })
+                                            && now_ns.0.saturating_sub(e.last_opened_ts.0) >= 900_000_000_000
+                                    })
+                                    .count();
                                 let summary = engines[s_idx].finalize_close(
                                     close_kind,
                                     side,
@@ -2018,6 +2027,11 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     exit_px,
                                     now_ns,
                                     &mut ledger,
+                                );
+                                let _ = SlotExecutionEngine::boost_sinking_fund_for_stagnant_rescue(
+                                    &mut ledger,
+                                    summary.net_scaled_bps,
+                                    stagnant_open_others,
                                 );
                                 gov.observe_closed_trade(
                                     s_idx,
@@ -2134,9 +2148,14 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 if let OrderLifecycleState::PositionOpenMakerExit {
                                     exhaled_lots,
                                     last_crest_exhale_price,
+                                    active_exit_role,
                                     ..
                                 } = engines[s_idx].state
                                 {
+                                    let already_exhaling =
+                                        matches!(active_exit_role, ExitOrderRole::PeristalticExhale25);
+                                    let crest_exh =
+                                        OrthogonalFactorState::detects_rebound_crest_exhaustion(side, &snap);
                                     if exhaled_lots.0 > 0
                                         && real_lots.0 < eff_init_lots.0
                                         && gov.authorizes_peristaltic_valley_inhale(
@@ -2154,15 +2173,17 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                             Side::Bid => snap.bids[0].price.max(PriceTicks(1)),
                                             Side::Ask => snap.asks[0].price.max(PriceTicks(1)),
                                         };
-                                    } else if exhaled_lots.0 == 0
-                                        && !tranche1_harvested
-                                        && eff_init_lots.0 >= 4
-                                        && hold_s >= 180
-                                        && worst_mae_bps <= -150
-                                        && cur_gross_bps < 0
-                                        && cur_gross_bps >= (worst_mae_bps * 68) / 100
-                                        && OrthogonalFactorState::detects_rebound_crest_exhaustion(side, &snap)
-                                    {
+                                    } else if SlotExecutionEngine::authorizes_funded_peristaltic_exhale(
+                                        exhaled_lots,
+                                        tranche1_harvested,
+                                        eff_init_lots,
+                                        hold_s,
+                                        worst_mae_bps,
+                                        cur_gross_bps,
+                                        ledger.sinking_fund_reserve_bps_x100,
+                                        crest_exh,
+                                        already_exhaling,
+                                    ) {
                                         zmpqr_active_mode = 1;
                                         zmpqr_target_lots = LotQty((eff_init_lots.0 / 4).max(1));
                                         zmpqr_target_px = match side {
