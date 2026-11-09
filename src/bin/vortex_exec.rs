@@ -338,8 +338,19 @@ fn save_open_positions_state(engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS]) 
     }
 }
 
+fn pad_visible_right(s: &str, target_w: usize) -> String {
+    let w = vortex_rs::types::visible_terminal_width(s);
+    let pad = target_w.saturating_sub(w);
+    format!("{}{}", s, " ".repeat(pad))
+}
+
 fn fmt_3col(c1: String, c2: String, c3: String) -> String {
-    format!("   \u{2022} {:<58} \u{2502} {:<41} \u{2502} {}", c1, c2, c3)
+    format!(
+        "   \u{2022} {} \u{2502} {} \u{2502} {}",
+        pad_visible_right(&c1, 58),
+        pad_visible_right(&c2, 41),
+        c3
+    )
 }
 
 fn format_telegram_close_message(
@@ -399,7 +410,7 @@ fn render_live_hud(arena: &VortexShmArena) {
         arena.version, hb_age_ms
     )];
     let sec_hdr = vec![
-        "SLOT  \u{2502} SYMBOL     \u{2502}       SEQ_ID \u{2502}     BEST_BID \u{2502}     BEST_ASK \u{2502} SPR_T \u{2502}  X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT            ".to_string(),
+        "SLOT  \u{2502} SYMBOL     \u{2502}      PyG (UPL) \u{2502}       SEQ_ID \u{2502}     BEST_BID \u{2502}     BEST_ASK \u{2502} SPR_T \u{2502}  X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT           ".to_string(),
     ];
     let mut sec_rows = Vec::with_capacity(MAX_ACTIVE_PAIRS);
     let mut active_cells: Vec<String> = Vec::new();
@@ -423,6 +434,7 @@ fn render_live_hud(arena: &VortexShmArena) {
             .unwrap_or(0);
         let is_slot_open = tel_state >= 3 && tel_state <= 5;
         let is_slot_queued = tel_state == 1 || tel_state == 2;
+        let mut pyg_col_cell = format!("{}{:>14}{}", ANSI_GRAY, "-", ANSI_RESET);
         if is_slot_open {
             open_slots_count += 1;
             if let Ok(tel) = arena.telemetry(s_idx) {
@@ -450,20 +462,28 @@ fn render_live_hud(arena: &VortexShmArena) {
                 } else {
                     vortex_rs::types::ANSI_RED
                 };
-                active_cells.push(format!(
-                    "{:<10}({:<3}) @{:>6}t [TP:{:>6} SL:{:>6} L:{:>2}] PyG:{}{:>13}{}",
-                    spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l, pyg_col, pyg_raw, ANSI_RESET
+                pyg_col_cell = format!("{}{:>14}{}", pyg_col, pyg_raw, ANSI_RESET);
+                active_cells.push(pad_visible_right(
+                    &format!(
+                        "{:<10}({:<3}) @{:>6}t [TP:{:>6} SL:{:>6} L:{:>2}] {}{}{}",
+                        spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l, pyg_col, pyg_raw, ANSI_RESET
+                    ),
+                    64,
                 ));
             }
         } else if is_slot_queued {
             queued_slots_count += 1;
+            pyg_col_cell = format!("{}{:>14}{}", ANSI_SKY_BLUE, "IN_QUEUE_L1", ANSI_RESET);
             if let Ok(tel) = arena.telemetry(s_idx) {
                 let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
                 let en_t = tel.entry_ticks.load(Ordering::Acquire);
                 let q_l = tel.queue_ahead_lots.load(Ordering::Acquire);
-                active_cells.push(format!(
-                    "Q:{:<8}({:<3}) @{:>6}t [Queue Ahead: {:>8} lots | Resting L1   ]",
-                    spec.symbol_id.name(), sd, en_t, q_l
+                active_cells.push(pad_visible_right(
+                    &format!(
+                        "Q:{:<8}({:<3}) @{:>6}t [Queue Ahead: {:>8} lots]",
+                        spec.symbol_id.name(), sd, en_t, q_l
+                    ),
+                    64,
                 ));
             }
         }
@@ -496,9 +516,10 @@ fn render_live_hud(arena: &VortexShmArena) {
             }
         };
         sec_rows.push(format!(
-            "{} \u{2502} {:<10} \u{2502} {:>12} \u{2502} {:>7}.{:04} \u{2502} {:>7}.{:04} \u{2502} {:>5} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {}",
+            "{} \u{2502} {:<10} \u{2502} {} \u{2502} {:>12} \u{2502} {:>7}.{:04} \u{2502} {:>7}.{:04} \u{2502} {:>5} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {}",
             slot_col,
             spec.symbol_id.name(),
+            pyg_col_cell,
             snap.sequence_id,
             bw,
             bf,
@@ -523,8 +544,8 @@ fn render_live_hud(arena: &VortexShmArena) {
     };
     let mut sec_footer = Vec::new();
     sec_footer.push(format!(
-        "[EXEC FSM LIVE] State: {:<48} \u{2502} [FLOW] \u{1f7e1}Arm:{:<3} \u{1f7e0}Abr:{:<3} \u{1f7e1}Fil:{:<3} \u{1f7e2}Cls:{:<3}",
-        state_banner,
+        "[EXEC FSM LIVE] State: {} \u{2502} [FLOW] \u{1f7e1}Arm:{:<3} \u{1f7e0}Abr:{:<3} \u{1f7e1}Fil:{:<3} \u{1f7e2}Cls:{:<3}",
+        pad_visible_right(&state_banner, 45),
         arena.exec_armed_count.load(Ordering::Acquire),
         arena.exec_abort_count.load(Ordering::Acquire),
         arena.exec_fill_count.load(Ordering::Acquire),
@@ -540,7 +561,7 @@ fn render_live_hud(arena: &VortexShmArena) {
                 let right = &active_cells[idx + 1];
                 sec_footer.push(format!("  \u{2022} {} \u{2502} \u{2022} {}", left, right));
             } else {
-                sec_footer.push(format!("  \u{2022} {} \u{2502}   {}", left, " ".repeat(69)));
+                sec_footer.push(format!("  \u{2022} {} \u{2502}   {}", left, " ".repeat(64)));
             }
             idx += 2;
         }
@@ -571,7 +592,7 @@ fn render_trades_and_executive_dashboard() {
             };
             if v.get("event").and_then(|e| e.as_str()) != Some("TRADE_CLOSE") {
                 continue;
-            }
+            };
             total += 1;
             let sym = v.get("symbol").and_then(|s| s.as_str()).unwrap_or("UNKNOWN");
             let side = v.get("side").and_then(|s| s.as_str()).unwrap_or("Bid");
@@ -677,23 +698,28 @@ fn render_trades_and_executive_dashboard() {
     let rem_95 = (95.0 - goal_anchor_usdt).max(0.0);
 
     let sec_summary = vec![format!(
-        "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} {}\u{1f332} Partials: {}{} \u{2502} {}\u{1fa75} Scratches: {}{} \u{2502} \u{1f534} Losses: {}) \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
-        ANSI_GREEN, total, wins, ANSI_DARK_GREEN, partials, ANSI_GREEN, ANSI_SKY_BLUE, scratches, ANSI_GREEN, losses, cum_net, cum_net / 10.0, ANSI_RESET
+        "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} {}\u{1f332} Partials: {}{} \u{2502} {}\u{1fa75} Scratches: {}{} \u{2502} {}\u{1f534} Losses: {}{}) \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
+        ANSI_GREEN, total, wins, ANSI_DARK_GREEN, partials, ANSI_GREEN, ANSI_SKY_BLUE, scratches, ANSI_GREEN, vortex_rs::types::ANSI_RED, losses, ANSI_GREEN, cum_net, cum_net / 10.0, ANSI_RESET
     )];
     let sec_dash_hdr = vec![format!(
         "{}\u{1f48e} VORTEX-L3 EXECUTIVE DASHBOARD \u{2014} CAPITAL REAL (BYBIT UTA V5 LIVE) & DATOS CONSOLIDADOS{}",
         ANSI_BLUE, ANSI_RESET
     )];
+    let upl_col = if upl_usdt < 0.0 {
+        vortex_rs::types::ANSI_RED
+    } else {
+        ANSI_GREEN
+    };
     let sec_wallet = vec![
         "\u{1f4b0} [1. DINERO REAL EN BILLETERA Y GESTION DE MARGEN (USDT)]".to_string(),
         fmt_3col(
-            format!("Saldo Billetera (Wallet) : {:>10.4} USDT", w_usdt),
-            format!("Equity Total Vivo     : {:>10.4} USDT", eq_usdt),
+            format!("{}Saldo Billetera (Wallet) : {:>10.4} USDT{}", ANSI_GREEN, w_usdt, ANSI_RESET),
+            format!("{}Equity Total Vivo     : {:>10.4} USDT{}", ANSI_YELLOW, eq_usdt, ANSI_RESET),
             "Estado Cuenta  : ACTIVA (10x)".to_string(),
         ),
         fmt_3col(
             format!("Margen Disponible Libre  : {:>10.4} USDT", av_usdt),
-            format!("PnL Abierto (UPL)     : {:>+10.4} USDT", upl_usdt),
+            format!("{}PnL Abierto (UPL)     : {:>+10.4} USDT{}", upl_col, upl_usdt, ANSI_RESET),
             "Modo Operativo : Multi-Slot L3".to_string(),
         ),
         fmt_3col(
@@ -736,8 +762,12 @@ fn render_trades_and_executive_dashboard() {
             format!("Custodia Media : {:>6.1} s", sum_hold_s / denom_t),
         ),
         format!(
-            "   \u{2022} Conteo Tiros   : Total: {:<3} \u{2502} \u{1f7e2} WIN: {:<3} ({:>5.1}%) \u{2502} \u{1f332} PART: {:<3} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {:<3} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {:<3} ({:>5.1}%)",
-            total, wins, (wins as f64 * 100.0) / denom_t, partials, (partials as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses, (losses as f64 * 100.0) / denom_t
+            "   \u{2022} Conteo Tiros   : Total: {:<3} \u{2502} {}\u{1f7e2} WIN: {:<3} ({:>5.1}%){} \u{2502} {}\u{1f332} PART: {:<3} ({:>5.1}%){} \u{2502} {}\u{1fa75} SCR: {:<3} ({:>5.1}%){} \u{2502} {}\u{1f534} LOSS: {:<3} ({:>5.1}%){}",
+            total,
+            ANSI_GREEN, wins, (wins as f64 * 100.0) / denom_t, ANSI_RESET,
+            ANSI_DARK_GREEN, partials, (partials as f64 * 100.0) / denom_t, ANSI_RESET,
+            ANSI_SKY_BLUE, scratches, (scratches as f64 * 100.0) / denom_t, ANSI_RESET,
+            vortex_rs::types::ANSI_RED, losses, (losses as f64 * 100.0) / denom_t, ANSI_RESET
         ),
     ];
     print_auto_aligned_box(&[rows_out, sec_summary, sec_dash_hdr, sec_wallet, sec_perf]);
