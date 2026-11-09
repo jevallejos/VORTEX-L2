@@ -467,8 +467,11 @@ fn render_live_hud(arena: &VortexShmArena) {
                 let upl_usdt = (diff_t as f64) * (op_l as f64) * unit_usdt;
                 let upl_pct = ((diff_t as f64) / (avg_t.max(1) as f64)) * 1_000.0;
                 let pyg_raw = format!("{:+.2}({:+.1}%)", upl_usdt, upl_pct);
-                let pyg_col = if upl_usdt >= 0.0 {
+                let gross_bps_live = (diff_t.saturating_mul(1_000_000)) / avg_t.max(1);
+                let pyg_col = if gross_bps_live >= 440 {
                     ANSI_GREEN
+                } else if diff_t >= 0 {
+                    ANSI_YELLOW
                 } else {
                     vortex_rs::types::ANSI_RED
                 };
@@ -1571,21 +1574,55 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         engines[s_idx].last_eff_sl_ticks = eff_sl_px;
                         engines[s_idx].last_closed_wald_pct = wald_pct;
 
-                        // 2. Regimen de Techos Elasticos: WIN Ceiling (>=520..680 bps) vs SCRATCH Escape (>=25s)
-                        let vol_fl = (snap.realized_vol_5m.raw() / 10).clamp(540, 740);
-                        let mfe_lrn = engines[s_idx].learned_mfe_bps.clamp(560, 920);
+                        // 2. Regimen de Cosecha sin Churn FIFO: Trinquete Unidireccional + Lock en Verde
+                        let cur_diff_bbo = match side {
+                            Side::Bid => cur_bbo.0 - avg_price_ticks.0,
+                            Side::Ask => avg_price_ticks.0 - cur_bbo.0,
+                        };
+                        let cur_gross_bps = (cur_diff_bbo.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+                        let peak_gross_bps = engines[s_idx].last_closed_mfe_bps;
+                        let worst_mae_bps = engines[s_idx].last_closed_mae_bps;
+                        let recovered_from_red = worst_mae_bps <= -150 && cur_gross_bps >= 440;
+                        let mfe_pullback_lock = (peak_gross_bps >= 520
+                            && (cur_gross_bps <= peak_gross_bps - 35 || signed_flow < 0.08))
+                            || (cur_gross_bps >= 455 && hold_s >= 6 && signed_flow < 0.05);
+                        let allow_scratch_floor = recovered_from_red
+                            || (hold_s >= 18 && joint_adverse)
+                            || (hold_s >= 40 && !strong_trend);
+                        let vol_fl = (snap.realized_vol_5m.raw() / 10).clamp(520, 700);
+                        let mfe_lrn = engines[s_idx].learned_mfe_bps.clamp(540, 880);
                         let base_win_target = (vol_fl * 60 + mfe_lrn * 40) / 100;
-                        let time_relax = (hold_s.clamp(0, 120) * (base_win_target - 520).max(0)) / 90;
-                        let allow_scratch_floor = (hold_s >= 25 && joint_adverse)
-                            || (hold_s >= 60 && !strong_trend);
+                        let step_15s = (hold_s / 15).clamp(0, 6);
+                        let time_relax = (step_15s * (base_win_target - 500).max(0)) / 6;
                         let target_floor_bps = if allow_scratch_floor {
                             ScaledBps(440)
+                        } else if mfe_pullback_lock {
+                            ScaledBps(cur_gross_bps.clamp(445, 510))
                         } else {
-                            ScaledBps((base_win_target - time_relax).clamp(520, 780))
+                            ScaledBps((base_win_target - time_relax).clamp(500, 720))
                         };
                         let active_floor_px = dynamic_maker_floor_price(side, avg_price_ticks, target_floor_bps);
-                        let (vac_lvl, surf_px, _) =
+                        let (raw_vac_lvl, raw_surf_px, _) =
                             OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(side, &snap, active_floor_px);
+                        let lock_l1_immediately = allow_scratch_floor || mfe_pullback_lock || cur_gross_bps >= 440;
+                        let (vac_lvl, cand_surf_px) = if lock_l1_immediately {
+                            (1_usize, active_floor_px)
+                        } else {
+                            (raw_vac_lvl, raw_surf_px)
+                        };
+                        let prev_tp_cur = match engines[s_idx].state {
+                            OrderLifecycleState::PositionOpenMakerExit { tp_maker_price, .. } => tp_maker_price,
+                            _ => PriceTicks(0),
+                        };
+                        // Trinquete Unidireccional: cuando el precio ya se acerca a verde (>=320 bps), prohibido alejar el TP
+                        let surf_px = if prev_tp_cur.0 > 0 && cur_gross_bps >= 320 {
+                            match side {
+                                Side::Bid => PriceTicks(cand_surf_px.0.min(prev_tp_cur.0).max(active_floor_px.0)),
+                                Side::Ask => PriceTicks(cand_surf_px.0.max(prev_tp_cur.0).min(active_floor_px.0).max(1)),
+                            }
+                        } else {
+                            cand_surf_px
+                        };
 
                         if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_500_000_000;
@@ -1686,7 +1723,15 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     *op_l = real_lots;
                                     *tp_p = surf_px;
                                 }
-                                if surf_px != prev_tp {
+                                let tp_diff_ticks = (surf_px.0 - prev_tp.0).abs();
+                                let moving_closer = match side {
+                                    Side::Bid => prev_tp.0 == 0 || surf_px.0 < prev_tp.0,
+                                    Side::Ask => prev_tp.0 == 0 || surf_px.0 > prev_tp.0,
+                                };
+                                let should_repeg = prev_tp.0 == 0
+                                    || (moving_closer && tp_diff_ticks >= 1 && (lock_l1_immediately || tp_diff_ticks >= 2))
+                                    || (!moving_closer && cur_gross_bps < 250 && tp_diff_ticks >= 3);
+                                if should_repeg {
                                     client.cancel_all_symbol_orders(sym_name);
                                     let _ = client.place_post_only_order(
                                         spec,
@@ -1697,6 +1742,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                         true,
                                     );
                                     engines[s_idx].exit_peg_attempts = engines[s_idx].exit_peg_attempts.saturating_add(1);
+                                } else if let OrderLifecycleState::PositionOpenMakerExit {
+                                    tp_maker_price: ref mut tp_keep,
+                                    ..
+                                } = engines[s_idx].state
+                                {
+                                    *tp_keep = prev_tp;
                                 }
                                 engines[s_idx].sync_to_shm_telemetry(arena);
                             }
