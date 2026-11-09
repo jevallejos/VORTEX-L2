@@ -425,7 +425,7 @@ impl PairSpec {
         LotQty(even_lots)
     }
 
-    /// Ley 2 (Big Bang V4.0): Verifica que el lote minimo del par no supere 1.35x el presupuesto Kelly (BTC = Faro hasta Wallet >= $257.72).
+    /// Arquitectura V9.2: BTC (< $257.72) y ETH (< $146.55) operan como Doble Faro Lider mientras su lote minimo impida division asimetrica.
     #[inline]
     #[must_use]
     pub const fn passes_strict_kelly_lot_cap(
@@ -433,6 +433,9 @@ impl PairSpec {
         wallet_usdt_1e8: i64,
         entry_price: PriceTicks,
     ) -> bool {
+        if self.symbol_id.0 == 2 && wallet_usdt_1e8 < 14_655_000_000 {
+            return false;
+        }
         let px_safe = if entry_price.0 > 1 { entry_price.0 } else { 1 };
         let min_lot_notional_1e8 = ((px_safe as i128)
             * (self.tick_size_1e8 as i128)
@@ -441,6 +444,46 @@ impl PairSpec {
         let kelly_budget_1e8 = ((wallet_usdt_1e8 as i128) * 29) / 100;
         let max_allowed_1e8 = (kelly_budget_1e8 * 135) / 100;
         min_lot_notional_1e8 <= max_allowed_1e8
+    }
+
+    /// Arquitectura V9.2: Divide el presupuesto Kelly en (Sonda Inicial ~36%, Reserva de Valle ~64%) garantizando >= $5.80 USDT por tramo.
+    #[inline]
+    #[must_use]
+    pub const fn compute_asymmetric_probe_and_valley_lots(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+        learned_edge_bps_x100: i64,
+        in_scar_debt: bool,
+    ) -> (LotQty, LotQty) {
+        let total_lots = self
+            .compute_compounding_kelly_lots(
+                wallet_usdt_1e8,
+                entry_price,
+                learned_edge_bps_x100,
+                in_scar_debt,
+            )
+            .0;
+        if total_lots <= 1 {
+            return (LotQty(1), LotQty(0));
+        }
+        let px_safe = if entry_price.0 > 1 { entry_price.0 } else { 1 };
+        let lot_usdt_1e4 = ((px_safe as i128)
+            * (self.tick_size_1e8 as i128)
+            * (self.lot_step_1e8 as i128))
+            / 1_000_000_000_000;
+        let step_1e4 = if lot_usdt_1e4 > 1 { lot_usdt_1e4 as i64 } else { 1 };
+        let min_bybit_lots = (58_000 + step_1e4 - 1) / step_1e4;
+        let min_probe = if min_bybit_lots > 1 { min_bybit_lots } else { 1 };
+        let raw_probe = (total_lots * 36 + 50) / 100;
+        let probe = if raw_probe < min_probe {
+            if min_probe <= total_lots { min_probe } else { total_lots }
+        } else {
+            raw_probe
+        };
+        let rem = total_lots - probe;
+        let valley = if rem * step_1e4 >= 55_000 { rem } else { 0 };
+        (LotQty(probe), LotQty(valley))
     }
 
     #[inline]

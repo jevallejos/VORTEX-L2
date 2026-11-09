@@ -344,12 +344,12 @@ impl OnlineAdaptiveGovernor {
             self.price_sample_count[slot_idx] = 1;
             return;
         }
-        if snap.ts_local_ns.0.saturating_sub(self.last_price_sample_ts_ns[slot_idx]) < 1_000_000_000 {
+        if snap.ts_local_ns.0.saturating_sub(self.last_price_sample_ts_ns[slot_idx]) < 200_000_000 {
             return;
         }
         self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
-        self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 19 + px_1e4) / 20;
-        self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 299 + px_1e4) / 300;
+        self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 79 + px_1e4) / 80;
+        self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 1_199 + px_1e4) / 1_200;
         self.price_sample_count[slot_idx] = self.price_sample_count[slot_idx].saturating_add(1);
     }
 
@@ -486,7 +486,7 @@ impl OnlineAdaptiveGovernor {
         let d_sign = if matches!(side, Side::Bid) { 1_i64 } else { -1_i64 };
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
-        if s_drift < -15 || s_ext > 1_200 || (s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115) {
+        if s_drift < -15 || s_ext > 1_200 || (s_drift - s_ext >= 220) || (s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115) {
             return Err("VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
         }
         let d = Self::dir_idx(side);
@@ -622,6 +622,11 @@ impl OnlineAdaptiveGovernor {
         btc_leader_snap: &SymbolLobSnapshot,
     ) -> bool {
         if slot_idx >= MAX_ACTIVE_PAIRS {
+            return false;
+        }
+        if candidate_snap.ts_local_ns.0 > 1_700_000_000_000_000_000
+            && self.price_sample_count[slot_idx] < 15
+        {
             return false;
         }
         let entry_ticks = if candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0 {
@@ -1212,41 +1217,186 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Ley 2 y Ley 3 (Campeon V4.0): Escalera Convexa Monotonica de 2 Peldaños (+9.80 -> +6.40 @ 20s -> +4.42 @ 48s) sin Ping-Pong.
+    /// Arquitectura V9.2: Curva Elastica Autoaprendida con Piso 100% Victoria (>= 510 pb escalados = >= +1.10 pb netos, cero empates).
     #[inline]
     #[must_use]
-    pub const fn compute_monotonic_glide_floor_bps(
+    #[allow(clippy::manual_clamp)]
+    pub const fn compute_elastic_win_glide_floor_bps(
         hold_secs: i64,
         cur_gross_bps: i64,
         peak_gross_bps: i64,
         worst_mae_bps: i64,
+        learned_mfe_bps: i64,
+        vol5m_scaled: i64,
     ) -> ScaledBps {
-        // Si ya cayo bajo -85 ScaledBps (-0.85 bps) y lleva >= 24s, o supero los 48s, cerrojo irreversible en Scratch +4.42 bps
-        if hold_secs >= 48 || (hold_secs >= 24 && worst_mae_bps <= -850) {
-            return ScaledBps(442);
+        let vol_c = if vol5m_scaled < 3_650 {
+            3_650
+        } else if vol5m_scaled > 12_000 {
+            12_000
+        } else {
+            vol5m_scaled
+        };
+        let mfe_c = if learned_mfe_bps < 560 {
+            560
+        } else if learned_mfe_bps > 1_300 {
+            1_300
+        } else {
+            learned_mfe_bps
+        };
+        let raw_tau = (38 * 5_500) / vol_c;
+        let tau_secs = if raw_tau > 18 { raw_tau } else { 18 };
+        if hold_secs >= tau_secs * 2 || (hold_secs >= tau_secs && worst_mae_bps <= -900) {
+            return ScaledBps(510);
         }
-        // Candado rapido de retroceso de mecha: si toco >= +5.40 bps y retrocede >= 0.45 bps, asegura ganancia en L1
-        if peak_gross_bps >= 540 && cur_gross_bps >= 450 && cur_gross_bps <= peak_gross_bps - 45 {
-            let locked = if cur_gross_bps > 640 { 640 } else { cur_gross_bps };
+        if peak_gross_bps >= 565 && cur_gross_bps >= 510 && cur_gross_bps <= peak_gross_bps - 40 {
+            let locked = if cur_gross_bps > 720 { 720 } else { cur_gross_bps };
             return ScaledBps(locked);
         }
-        // Peldaño 2 (20s..48s): +6.40 bps brutos (+2.40 bps netos)
-        if hold_secs >= 20 {
-            return ScaledBps(640);
+        let raw_ini = (mfe_c * 74) / 100 + (vol_c * 4) / 100;
+        let initial_target = if raw_ini < 560 {
+            560
+        } else if raw_ini > 1_140 {
+            1_140
+        } else {
+            raw_ini
+        };
+        if hold_secs >= tau_secs {
+            let mid_target = (initial_target + 510) / 2;
+            return ScaledBps(if mid_target < 540 { 540 } else { mid_target });
         }
-        // Peldaño 1 (0..20s): +9.80 bps brutos (+5.80 bps netos)
-        ScaledBps(980)
+        ScaledBps(initial_target)
     }
 
-    /// Ley 2 y Ley 4 (Campeon V4.0): Acota el Stop-Loss inicial de servidor a maximo -56.00 bps (-5600 ScaledBps) sobre la entrada.
+    /// Arquitectura V9.2: Banda Elastica Anti-Agotamiento escalada por volatilidad viva y ventaja aprendida.
     #[inline]
     #[must_use]
-    pub const fn clamp_initial_sl_to_56bps(
+    #[allow(clippy::manual_clamp)]
+    pub const fn passes_elastic_anti_exhaustion_gate(
+        side: Side,
+        drift_scaled_bps: i64,
+        ext_scaled_bps: i64,
+        vol5m_scaled: i64,
+        learned_edge_bps_x100: i64,
+    ) -> bool {
+        let sgn = match side {
+            Side::Bid => 1_i64,
+            Side::Ask => -1_i64,
+        };
+        let s_drift = drift_scaled_bps.saturating_mul(sgn);
+        let s_ext = ext_scaled_bps.saturating_mul(sgn);
+        if s_drift < -15 || (s_drift - s_ext) >= 215 {
+            return false;
+        }
+        let vol_c = if vol5m_scaled < 3_650 {
+            3_650
+        } else if vol5m_scaled > 11_000 {
+            11_000
+        } else {
+            vol5m_scaled
+        };
+        let edge_c = if learned_edge_bps_x100 < 0 {
+            0
+        } else if learned_edge_bps_x100 > 400 {
+            400
+        } else {
+            learned_edge_bps_x100
+        };
+        let raw_ext_cap = (vol_c * 70) / 1_000 + (edge_c * 18) / 100;
+        let ext_cap = if raw_ext_cap < 270 {
+            270
+        } else if raw_ext_cap > 590 {
+            590
+        } else {
+            raw_ext_cap
+        };
+        let drift_cap = ext_cap + 210;
+        s_ext <= ext_cap && s_drift <= drift_cap
+    }
+
+    /// Arquitectura V9.2: Valida alineacion del Doble Faro Lider (BTC + ETH) contra contagio simultaneo.
+    #[inline]
+    #[must_use]
+    pub fn passes_dual_leader_contagion_shield(
+        side: Side,
+        btc_snap: &SymbolLobSnapshot,
+        eth_snap: &SymbolLobSnapshot,
+    ) -> bool {
+        let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
+        let btc_snr = crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(btc_snap) * dir_s;
+        let eth_snr = crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(eth_snap) * dir_s;
+        let btc_tfi = btc_snap.factor_tfi.get() * dir_s;
+        let eth_tfi = eth_snap.factor_tfi.get() * dir_s;
+        if (btc_snr < -0.06 && eth_snr < -0.06) || btc_tfi < -0.45 || eth_tfi < -0.50 {
+            return false;
+        }
+        true
+    }
+
+    /// Arquitectura V9.2: Autoriza el disparo unico del 64% de Compresion en Valle Elastico cuando el flujo gira a favor.
+    #[inline]
+    #[must_use]
+    pub fn authorizes_asymmetric_valley_compression(
+        side: Side,
+        vol5m_scaled: i64,
+        cur_gross_bps: i64,
+        hold_secs: i64,
+        valley_already_used: bool,
+        valley_reserve_lots: LotQty,
+        snap: &SymbolLobSnapshot,
+        btc_snap: &SymbolLobSnapshot,
+        eth_snap: &SymbolLobSnapshot,
+    ) -> bool {
+        if valley_already_used || valley_reserve_lots.0 <= 0 || hold_secs < 6 {
+            return false;
+        }
+        let vol_c = vol5m_scaled.clamp(3_650, 11_000);
+        let valley_trigger_bps = -((vol_c * 42) / 100).clamp(1_650, 3_400);
+        if cur_gross_bps > valley_trigger_bps || cur_gross_bps <= -5_200 {
+            return false;
+        }
+        if !Self::passes_dual_leader_contagion_shield(side, btc_snap, eth_snap) {
+            return false;
+        }
+        let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
+        let s_ofi = snap.factor_ofi.get() * dir_s;
+        let s_tfi = snap.factor_tfi.get() * dir_s;
+        let s_geom = snap.factor_geom.get() * dir_s;
+        s_ofi >= 0.24 && s_tfi >= 0.28 && s_geom >= 0.05
+    }
+
+    /// Arquitectura V9.2: Aborta gratis en cola si el flujo gira a negativo o pierde traccion tras 650ms.
+    #[inline]
+    #[must_use]
+    pub fn triggers_early_entry_flow_abort(resting_elapsed_ns: i64, flow_imp: f64) -> bool {
+        flow_imp <= -0.04 || (resting_elapsed_ns >= 650_000_000 && flow_imp < 0.14)
+    }
+
+    /// Arquitectura V9.2: Limite Elastico Corto de Servidor (-38 a -72 pb segun vol5m) — erradica posiciones negativas extremas.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::manual_clamp)]
+    pub const fn clamp_elastic_short_sl_ticks(
         side: Side,
         entry_ticks: PriceTicks,
         raw_sl_ticks: PriceTicks,
+        vol5m_scaled: i64,
     ) -> PriceTicks {
-        let max_dist = ((entry_ticks.0 * 5_600) / 1_000_000) + 2;
+        let vol_c = if vol5m_scaled < 3_650 {
+            3_650
+        } else if vol5m_scaled > 9_000 {
+            9_000
+        } else {
+            vol5m_scaled
+        };
+        let raw_sl_bps = (vol_c * 86) / 100;
+        let sl_bps = if raw_sl_bps < 3_800 {
+            3_800
+        } else if raw_sl_bps > 7_200 {
+            7_200
+        } else {
+            raw_sl_bps
+        };
+        let max_dist = ((entry_ticks.0 * sl_bps) / 1_000_000) + 2;
         match side {
             Side::Bid => {
                 let cap_sl = entry_ticks.0 - max_dist;
@@ -1266,20 +1416,6 @@ impl SlotExecutionEngine {
                 }
             }
         }
-    }
-
-    /// Ley 4 (Campeon V4.0): Guillotina temporal anti-zombi a los 240s cuando la posicion sigue subacuatica sin traccion.
-    #[inline]
-    #[must_use]
-    pub const fn triggers_wald_240s_guillotine(
-        hold_secs: i64,
-        cur_gross_bps: i64,
-        signed_flow_x100: i64,
-    ) -> bool {
-        if hold_secs < 240 {
-            return false;
-        }
-        cur_gross_bps <= -650 || (hold_secs >= 300 && cur_gross_bps < 180 && signed_flow_x100 < 0)
     }
 
     pub fn sync_to_shm_telemetry(&self, arena: &crate::lob_shm::VortexShmArena) {
@@ -2139,33 +2275,27 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_champion_glide_kelly_cap_funding_and_crowding_veto() {
-        // 1. Escalera monotonica V4.0: 980 -> 640 @ 20s -> 442 @ 48s
-        assert_eq!(
-            SlotExecutionEngine::compute_monotonic_glide_floor_bps(5, 120, 120, 0),
-            ScaledBps(980)
-        );
-        assert_eq!(
-            SlotExecutionEngine::compute_monotonic_glide_floor_bps(25, 120, 120, -200),
-            ScaledBps(640)
-        );
-        assert_eq!(
-            SlotExecutionEngine::compute_monotonic_glide_floor_bps(50, -100, 120, -400),
-            ScaledBps(442)
-        );
-        // 2. Kelly Lot-Cap: a $66.3256 USDT, BTCUSDT ($74.74 min lot) es rechazado como orden y actua solo como Faro; ETHUSDT ($21.25) pasa!
-        let w_bigbang = 6_632_564_713_i64;
-        assert!(!APPROVED_SPECS[0].passes_strict_kelly_lot_cap(w_bigbang, PriceTicks(747_400)));
-        assert!(APPROVED_SPECS[1].passes_strict_kelly_lot_cap(w_bigbang, PriceTicks(212_500)));
-        assert!(APPROVED_SPECS[0].passes_strict_kelly_lot_cap(26_500_000_000, PriceTicks(747_400)));
-        // 3. Escudo Funding UTC y Guillotina 240s
-        let ts_0800_utc_ns = 1_794_211_200_000_000_000_i64; // 08:00:00 UTC exacto
-        assert!(crate::alpha_3factor::OrthogonalFactorState::is_in_toxic_utc_funding_window(ts_0800_utc_ns));
-        assert!(!crate::alpha_3factor::OrthogonalFactorState::is_in_toxic_utc_funding_window(
-            ts_0800_utc_ns + 35 * 60 * 1_000_000_000
+    fn test_v9_elastic_asymmetric_36_64_win_floor_and_dual_beacon() {
+        let f_ini = SlotExecutionEngine::compute_elastic_win_glide_floor_bps(4, 120, 120, 0, 820, 5_000);
+        let f_fin = SlotExecutionEngine::compute_elastic_win_glide_floor_bps(90, -150, 120, -950, 820, 5_000);
+        assert!(f_ini.raw() >= 750);
+        assert_eq!(f_fin, ScaledBps(510));
+
+        let w_now = 6_630_520_000_i64;
+        assert!(!APPROVED_SPECS[0].passes_strict_kelly_lot_cap(w_now, PriceTicks(750_000)));
+        assert!(!APPROVED_SPECS[1].passes_strict_kelly_lot_cap(w_now, PriceTicks(212_500)));
+        assert!(APPROVED_SPECS[1].passes_strict_kelly_lot_cap(15_000_000_000, PriceTicks(212_500)));
+        let (probe_avax, valley_avax) =
+            APPROVED_SPECS[3].compute_asymmetric_probe_and_valley_lots(w_now, PriceTicks(8_600), 200, false);
+        assert!(probe_avax.0 >= 7 && valley_avax.0 > probe_avax.0);
+
+        assert!(!SlotExecutionEngine::passes_elastic_anti_exhaustion_gate(
+            Side::Bid, 785, 499, 4_472, 200
         ));
-        assert!(SlotExecutionEngine::triggers_wald_240s_guillotine(245, -1_200, -30));
-        assert!(!SlotExecutionEngine::triggers_wald_240s_guillotine(120, -1_200, -30));
+        assert!(SlotExecutionEngine::passes_elastic_anti_exhaustion_gate(
+            Side::Bid, 266, 170, 4_500, 200
+        ));
+        assert!(SlotExecutionEngine::triggers_early_entry_flow_abort(800_000_000, 0.05));
     }
 
     #[test]
