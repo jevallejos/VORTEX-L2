@@ -623,11 +623,28 @@ fn render_trades_and_executive_dashboard() {
     let gross_usdt = cum_gross * bps_to_usdt;
     let fee_usdt = cum_fee * bps_to_usdt;
 
-    let prog_25 = total.min(25);
-    let pct_25 = ((prog_25 as f64) / 25.0) * 100.0;
+    let trade_goal: usize = if total < 25 {
+        25
+    } else if total < 50 {
+        50
+    } else if total < 100 {
+        100
+    } else if total < 250 {
+        250
+    } else if total < 500 {
+        500
+    } else if total < 1_000 {
+        1_000
+    } else {
+        ((total / 500) + 1) * 500
+    };
+    let prog_25 = total.min(trade_goal);
+    let pct_25 = ((prog_25 as f64) / (trade_goal as f64)) * 100.0;
     let bars_25 = ((pct_25 / 5.0).round() as usize).min(20);
     let bar_25_str = format!("{}{}", "\u{2588}".repeat(bars_25), "\u{2591}".repeat(20 - bars_25));
-    let rem_25 = 25_usize.saturating_sub(prog_25);
+    let rem_25 = trade_goal.saturating_sub(prog_25);
+    let goal_lbl = format!("Meta {} Tiros", trade_goal);
+    let faltan_lbl = format!("Faltan Meta {}", trade_goal);
     let mkr_pct = if total > 0 {
         (maker_closes as f64 * 100.0) / (total as f64)
     } else {
@@ -670,8 +687,8 @@ fn render_trades_and_executive_dashboard() {
     let sec_perf = vec![
         "\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESION]".to_string(),
         fmt_3col(
-            format!("Meta 25 Tiros  : [{}] {:>2}/25 ({:>5.1}%)", bar_25_str, prog_25, pct_25),
-            format!("Faltan Meta 25        : {:>10} tiros", rem_25),
+            format!("{:<15}: [{}] {:>3}/{} ({:>5.1}%)", goal_lbl, bar_25_str, prog_25, trade_goal, pct_25),
+            format!("{:<22}: {:>10} tiros", faltan_lbl, rem_25),
             format!("Salidas Maker  : {:>6.1}%", mkr_pct),
         ),
         fmt_3col(
