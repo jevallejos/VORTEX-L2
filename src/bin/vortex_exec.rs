@@ -338,6 +338,53 @@ fn save_open_positions_state(engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS]) 
     }
 }
 
+fn fmt_3col(c1: String, c2: String, c3: String) -> String {
+    format!("   \u{2022} {:<58} \u{2502} {:<41} \u{2502} {}", c1, c2, c3)
+}
+
+fn format_telegram_close_message(
+    spec: PairSpec,
+    summary: &ClosedTradeSummary,
+    sub_reason: ExitSubReason,
+    trade_num: u64,
+    ledger: &ParitySyncLedger,
+) -> String {
+    let sym_name = spec.symbol_id.name();
+    let net_bps_f = (summary.net_scaled_bps.raw() as f64) / 100.0;
+    let gross_f = (summary.gross_scaled_bps.raw() as f64) / 100.0;
+    let fee_f = (summary.fee_scaled_bps.raw() as f64) / 100.0;
+    let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
+    let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
+    let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
+    let is_partial = matches!(sub_reason, ExitSubReason::Tranche1Harvest50);
+    let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
+    format!(
+        "{} [VORTEX-L3 {} #{} \u{2014} {:?}]\n- Ganancia : {:+.2}% @10x | {:+.4} USDT\n- Par y Lado : {} ({:?}) | Maker: {}\n- Precios    : {}.{:04} -> {}.{:04} USDT ({}t -> {}t)\n- Balance    : Bruto: {:+.2} bps | Fee: -{:.2} bps | Neto: {:+.2} bps ({:+.2}% @10x | {:+.4} USDT)\n- Sifon 30/70: Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps",
+        icon,
+        lbl.trim(),
+        trade_num,
+        sub_reason,
+        net_bps_f / 10.0,
+        pnl_usdt,
+        sym_name,
+        summary.side,
+        summary.is_maker_exit,
+        en_w,
+        en_f,
+        ex_w,
+        ex_f,
+        summary.entry_price.0,
+        summary.exit_price.0,
+        gross_f,
+        fee_f,
+        net_bps_f,
+        net_bps_f / 10.0,
+        pnl_usdt,
+        (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
+        (ledger.vault_locked_profit_bps_x100 as f64) / 100.0
+    )
+}
+
 fn render_live_hud(arena: &VortexShmArena) {
     let now_ns = now_epoch_ns().0 as u64;
     let hb_ns = arena.heartbeat_ns.load(Ordering::Acquire);
@@ -352,11 +399,12 @@ fn render_live_hud(arena: &VortexShmArena) {
         arena.version, hb_age_ms
     )];
     let sec_hdr = vec![
-        "SLOT  \u{2502} SYMBOL     \u{2502}       SEQ_ID \u{2502}     BEST_BID \u{2502}     BEST_ASK \u{2502} SPR_T \u{2502}  X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT".to_string(),
+        "SLOT  \u{2502} SYMBOL     \u{2502}       SEQ_ID \u{2502}     BEST_BID \u{2502}     BEST_ASK \u{2502} SPR_T \u{2502}  X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT            ".to_string(),
     ];
     let mut sec_rows = Vec::with_capacity(MAX_ACTIVE_PAIRS);
-    let mut first_open_summary: Option<String> = None;
+    let mut active_cells: Vec<String> = Vec::new();
     let mut open_slots_count = 0_usize;
+    let mut queued_slots_count = 0_usize;
 
     let btc_snap = arena
         .slot(0)
@@ -383,22 +431,21 @@ fn render_live_hud(arena: &VortexShmArena) {
                 let tp_t = tel.tp_ticks.load(Ordering::Acquire);
                 let sl_t = tel.sl_ticks.load(Ordering::Acquire);
                 let op_l = tel.open_lots.load(Ordering::Acquire);
-                let item = format!("{}({})@{}t[TP:{} SL:{} L:{}]", spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l);
-                first_open_summary = Some(match first_open_summary {
-                    Some(prev) => format!("{} \u{2502} {}", prev, item),
-                    None => item,
-                });
+                active_cells.push(format!(
+                    "{:<10}({:<3}) @{:>7}t [TP:{:>7} SL:{:>7} L:{:>2}]",
+                    spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l
+                ));
             }
         } else if is_slot_queued {
+            queued_slots_count += 1;
             if let Ok(tel) = arena.telemetry(s_idx) {
                 let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
                 let en_t = tel.entry_ticks.load(Ordering::Acquire);
                 let q_l = tel.queue_ahead_lots.load(Ordering::Acquire);
-                let item = format!("Q:{}({})@{}t[Q:{}]", spec.symbol_id.name(), sd, en_t, q_l);
-                first_open_summary = Some(match first_open_summary {
-                    Some(prev) => format!("{} \u{2502} {}", prev, item),
-                    None => item,
-                });
+                active_cells.push(format!(
+                    "Q:{:<8}({:<3}) @{:>7}t [Queue Ahead: {:>8} lots]",
+                    spec.symbol_id.name(), sd, en_t, q_l
+                ));
             }
         }
         let slot_col = if is_slot_open {
@@ -417,16 +464,16 @@ fn render_live_hud(arena: &VortexShmArena) {
             &btc_snap,
         ) {
             SignalVerdict::SpoofingVeto => {
-                format!("{}\u{1f7e0} SPOOF_VETO        {}", ANSI_ORANGE, ANSI_RESET)
+                format!("{}\u{1f7e0} SPOOF_VETO     {}", ANSI_ORANGE, ANSI_RESET)
             }
             SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => {
-                format!("{}\u{1f7e1} AUTH_LONG_MKR     {}", ANSI_YELLOW, ANSI_RESET)
+                format!("{}\u{1f7e1} AUTH_LONG_MKR  {}", ANSI_YELLOW, ANSI_RESET)
             }
             SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => {
-                format!("{}\u{1f7e1} AUTH_SHORT_MKR    {}", ANSI_YELLOW, ANSI_RESET)
+                format!("{}\u{1f7e1} AUTH_SHORT_MKR {}", ANSI_YELLOW, ANSI_RESET)
             }
             SignalVerdict::NeutralNoAction => {
-                format!("{}\u{26aa} NEUTRAL_WAIT      {}", ANSI_GRAY, ANSI_RESET)
+                format!("{}\u{26aa} NEUTRAL_WAIT   {}", ANSI_GRAY, ANSI_RESET)
             }
         };
         sec_rows.push(format!(
@@ -446,23 +493,39 @@ fn render_live_hud(arena: &VortexShmArena) {
         ));
     }
     let state_banner = if drain_active {
-        format!("{}\u{1f7e2} DRAINING_OPEN_SESSIONS ({} active){}", ANSI_GREEN, open_slots_count, ANSI_RESET)
-    } else if open_slots_count > 0 {
-        format!("{}\u{1f7e1} ACTIVE_MULTI_SLOT ({} open){}", ANSI_YELLOW, open_slots_count, ANSI_RESET)
+        format!("{}\u{1f7e2} DRAINING_OPEN_SESSIONS ({} open){}", ANSI_GREEN, open_slots_count, ANSI_RESET)
+    } else if open_slots_count > 0 || queued_slots_count > 0 {
+        format!(
+            "{}\u{1f7e1} ACTIVE_MULTI_SLOT ({} open / {} queued){}",
+            ANSI_YELLOW, open_slots_count, queued_slots_count, ANSI_RESET
+        )
     } else {
         format!("{}\u{26aa} IDLE (SCANNING 12 SLOTS){}", ANSI_GRAY, ANSI_RESET)
     };
-    let detail = first_open_summary.unwrap_or_else(|| "Sym: - (-) @ 0t [No Open Positions]".to_string());
-    let sec_footer = vec![
-        format!("[EXEC FSM LIVE] State: {} \u{2502} {}", state_banner, detail),
-        format!(
-            "[SESSION FLOW ] \u{1f7e1} Armed: {:<4} \u{2502} \u{1f7e0} Aborts: {:<4} \u{2502} \u{1f7e1} Fills: {:<4} \u{2502} \u{1f7e2} Closed: {:<4}",
-            arena.exec_armed_count.load(Ordering::Acquire),
-            arena.exec_abort_count.load(Ordering::Acquire),
-            arena.exec_fill_count.load(Ordering::Acquire),
-            arena.exec_closed_count.load(Ordering::Acquire)
-        ),
-    ];
+    let mut sec_footer = Vec::new();
+    sec_footer.push(format!(
+        "[EXEC FSM LIVE] State: {:<48} \u{2502} [FLOW] \u{1f7e1}Arm:{:<3} \u{1f7e0}Abr:{:<3} \u{1f7e1}Fil:{:<3} \u{1f7e2}Cls:{:<3}",
+        state_banner,
+        arena.exec_armed_count.load(Ordering::Acquire),
+        arena.exec_abort_count.load(Ordering::Acquire),
+        arena.exec_fill_count.load(Ordering::Acquire),
+        arena.exec_closed_count.load(Ordering::Acquire)
+    ));
+    if active_cells.is_empty() {
+        sec_footer.push("  \u{2022} [CUSTODY SLOTS] No open positions in custody.".to_string());
+    } else {
+        let mut idx = 0_usize;
+        while idx < active_cells.len() {
+            let left = &active_cells[idx];
+            if idx + 1 < active_cells.len() {
+                let right = &active_cells[idx + 1];
+                sec_footer.push(format!("  \u{2022} {:<54} \u{2502} \u{2022} {:<54}", left, right));
+            } else {
+                sec_footer.push(format!("  \u{2022} {:<54} \u{2502}", left));
+            }
+            idx += 2;
+        }
+    }
     print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_footer]);
 }
 
@@ -525,7 +588,7 @@ fn render_trades_and_executive_dashboard() {
             sum_hold_s += (hold_ms as f64) / 1_000.0;
             let (col, icon, lbl) = classify_trade_badge(n_bps, is_partial);
             rows_out.push(format!(
-                "{}{} [TRADE #{:<3} {}] {:<10} {:<3} \u{2502} {:>7}t->{:<7}t \u{2502} G:{:>+6.2} F:{:>4.2} N:{:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{:>+6.2} MAE:{:>+6.2} \u{2502} {:>4}s \u{2502} {} (Mkr={}){}",
+                "{}{} [TRADE #{:<3} {}] {:<10} {:<3} \u{2502} {:>7}t->{:<7}t \u{2502} G:{:>+6.2} F:{:>4.2} N:{:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{:>+6.2} MAE:{:>+6.2} \u{2502} {:>4}s \u{2502} {:<21} (Mkr={}){}",
                 col, icon, total, lbl, sym, side, en_t, ex_t, g_bps, f_bps, n_bps, n_bps / 10.0, mfe, mae, hold_ms / 1_000, sub_r, mkr, ANSI_RESET
             ));
         }
@@ -575,6 +638,7 @@ fn render_trades_and_executive_dashboard() {
     let goal_pct = ((goal_anchor_usdt / 95.0) * 100.0).clamp(0.0, 100.0);
     let filled_bars = ((goal_pct / 5.0).round() as usize).min(20);
     let bar_95 = format!("{}{}", "\u{2588}".repeat(filled_bars), "\u{2591}".repeat(20 - filled_bars));
+    let rem_95 = (95.0 - goal_anchor_usdt).max(0.0);
 
     let sec_summary = vec![format!(
         "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} {}\u{1f332} Partials: {}{} \u{2502} {}\u{1fa75} Scratches: {}{} \u{2502} \u{1f534} Losses: {}) \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x){}",
@@ -586,49 +650,58 @@ fn render_trades_and_executive_dashboard() {
     )];
     let sec_wallet = vec![
         "\u{1f4b0} [1. DINERO REAL EN BILLETERA Y GESTION DE MARGEN (USDT)]".to_string(),
-        format!(
-            "   \u{2022} Saldo Billetera (Wallet) : {:>9.4} USDT \u{2502} Equity Total Vivo  : {:>9.4} USDT",
-            w_usdt, eq_usdt
+        fmt_3col(
+            format!("Saldo Billetera (Wallet) : {:>10.4} USDT", w_usdt),
+            format!("Equity Total Vivo     : {:>10.4} USDT", eq_usdt),
+            "Estado Cuenta  : ACTIVA (10x)".to_string(),
         ),
-        format!(
-            "   \u{2022} Margen Disponible Libre  : {:>9.4} USDT \u{2502} PnL Abierto (UPL)  : {:>+9.4} USDT",
-            av_usdt, upl_usdt
+        fmt_3col(
+            format!("Margen Disponible Libre  : {:>10.4} USDT", av_usdt),
+            format!("PnL Abierto (UPL)     : {:>+10.4} USDT", upl_usdt),
+            "Modo Operativo : Multi-Slot L3".to_string(),
         ),
-        format!(
-            "   \u{2022} Nocional Compuesto (10x) : {:>9.4} USDT \u{2502} Margen Base/Tiro   : {:>9.4} USDT",
-            eff_notional_usdt, eff_notional_usdt * 0.10
+        fmt_3col(
+            format!("Nocional Compuesto (10x) : {:>10.4} USDT", eff_notional_usdt),
+            format!("Margen Base / Tiro    : {:>10.4} USDT", eff_notional_usdt * 0.10),
+            "Fraccion Kelly : 29.0% Wallet".to_string(),
         ),
     ];
     let denom_t = (total.max(1)) as f64;
     let sec_perf = vec![
         "\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESION]".to_string(),
-        format!(
-            "   \u{2022} Meta 25 Tiros  : [{}] {:>2}/25 ({:>5.1}%) \u{2502} Faltan: {:>2} tiros \u{2502} Salidas Maker: {:.1}%",
-            bar_25_str, prog_25, pct_25, rem_25, mkr_pct
+        fmt_3col(
+            format!("Meta 25 Tiros  : [{}] {:>2}/25 ({:>5.1}%)", bar_25_str, prog_25, pct_25),
+            format!("Faltan Meta 25        : {:>10} tiros", rem_25),
+            format!("Salidas Maker  : {:>6.1}%", mkr_pct),
+        ),
+        fmt_3col(
+            format!("Meta 95 USDT   : [{}] {:>5.2}/95 ({:>4.1}%)", bar_95, goal_anchor_usdt, goal_pct),
+            format!("Faltan Meta 95        : {:>10.4} USDT", rem_95),
+            "Anclaje Meta   : Wallet Floor".to_string(),
+        ),
+        fmt_3col(
+            format!("Balance (bps)  : Bruto: {:>+10.2} bps", cum_gross),
+            format!("Comisiones (Fees)     : {:>+10.2} bps", -cum_fee),
+            format!("Neto Sesion    : {:>+7.2} bps ({:+.2}% @10x)", cum_net, cum_net / 10.0),
+        ),
+        fmt_3col(
+            format!("Balance (USDT) : Bruto: {:>+10.4} USDT", gross_usdt),
+            format!("Comisiones (USDT)     : {:>+10.4} USDT", -fee_usdt),
+            format!("Neto (USDT)    : {:>+7.4} USDT", net_usdt),
+        ),
+        fmt_3col(
+            format!("Fondo Saneam.  : Reserva(30%): {:>+6.2} bps (+{:.4}$)", reserve_bps, reserve_bps * bps_to_usdt),
+            format!("Blindado Boveda (70%) : {:>+10.2} bps", locked_bps),
+            format!("Blindado USDT  : +{:>.4} USDT", locked_bps * bps_to_usdt),
+        ),
+        fmt_3col(
+            format!("Excursiones    : MFE Medio: {:>+8.2} bps", sum_mfe / denom_t),
+            format!("MAE Medio             : {:>+10.2} bps", sum_mae / denom_t),
+            format!("Custodia Media : {:>6.1} s", sum_hold_s / denom_t),
         ),
         format!(
-            "   \u{2022} Meta 95 USDT   : [{}] {:.4}/95.00 ({:>5.1}%) \u{2502} Faltan: {:.4} USDT (Anclada a Wallet)",
-            bar_95, goal_anchor_usdt, goal_pct, (95.0 - goal_anchor_usdt).max(0.0)
-        ),
-        format!(
-            "   \u{2022} Conteo Tiros   : Total: {} \u{2502} \u{1f7e2} WIN: {} ({:>5.1}%) \u{2502} \u{1f332} PART: {} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {} ({:>5.1}%)",
+            "   \u{2022} Conteo Tiros   : Total: {:<3} \u{2502} \u{1f7e2} WIN: {:<3} ({:>5.1}%) \u{2502} \u{1f332} PART: {:<3} ({:>5.1}%) \u{2502} \u{1fa75} SCR: {:<3} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {:<3} ({:>5.1}%)",
             total, wins, (wins as f64 * 100.0) / denom_t, partials, (partials as f64 * 100.0) / denom_t, scratches, (scratches as f64 * 100.0) / denom_t, losses, (losses as f64 * 100.0) / denom_t
-        ),
-        format!(
-            "   \u{2022} Balance (bps)  : Bruto: {:>+8.2} bps  \u{2502} Fees: {:>-8.2} bps  \u{2502} Neto: {:>+8.2} bps ({:+.2}% @10x)",
-            cum_gross, -cum_fee, cum_net, cum_net / 10.0
-        ),
-        format!(
-            "   \u{2022} Balance (USDT) : Bruto: {:>+8.4} USDT \u{2502} Fees: {:>-8.4} USDT \u{2502} Neto: {:>+8.4} USDT",
-            gross_usdt, -fee_usdt, net_usdt
-        ),
-        format!(
-            "   \u{2022} Fondo Saneam.  : Reserva (30%): {:+.2} bps ({:+.4} USDT) \u{2502} Blindado (70%): {:+.2} bps ({:+.4} USDT)",
-            reserve_bps, reserve_bps * bps_to_usdt, locked_bps, locked_bps * bps_to_usdt
-        ),
-        format!(
-            "   \u{2022} Excursiones    : MFE Medio: {:+.2} bps \u{2502} MAE Medio: {:+.2} bps \u{2502} Custodia Media: {:.1} s",
-            sum_mfe / denom_t, sum_mae / denom_t, sum_hold_s / denom_t
         ),
     ];
     print_auto_aligned_box(&[rows_out, sec_summary, sec_dash_hdr, sec_wallet, sec_perf]);
@@ -719,11 +792,22 @@ fn rehydrate_shadow_ledger(
             }
         }
     }
-    arena.exec_closed_count.store(count, Ordering::Release);
+    let mut l3_vault_count = 0_u64;
+    if let Ok(vf) = fs::File::open(AI_FORENSIC_VAULT_PATH) {
+        let rdr = BufReader::new(vf);
+        for l in rdr.lines().map_while(Result::ok) {
+            if l.contains("\"TRADE_CLOSE\"") {
+                l3_vault_count += 1;
+            }
+        }
+    }
+    let _ = count;
+    ledger.closed_trades_count = l3_vault_count;
+    arena.exec_closed_count.store(l3_vault_count, Ordering::Release);
     println!(
-        "{}\u{1f7e2} [JSONL REHYDRATE] Restored {} trades (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps){}",
+        "{}\u{1f7e2} [JSONL REHYDRATE] Restored {} VORTEX-L3 trades (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps){}",
         ANSI_GREEN,
-        count,
+        l3_vault_count,
         (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
         (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
         ANSI_RESET
@@ -1507,53 +1591,20 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 engines[s_idx].sync_to_shm_telemetry(arena);
                                 save_open_positions_state(&engines);
                                 let net_f = (summary.net_scaled_bps.raw() as f64) / 100.0;
-                                let gross_f = (summary.gross_scaled_bps.raw() as f64) / 100.0;
-                                let fee_f = (summary.fee_scaled_bps.raw() as f64) / 100.0;
-                                let mfe_f = ((engines[s_idx].last_closed_mfe_bps as f64) / 100.0).max(gross_f);
-                                let mae_f = (engines[s_idx].last_closed_mae_bps as f64) / 100.0;
                                 let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
                                 let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
-                                let w_disp = (wallet_1e8 as f64) / 100_000_000.0;
                                 let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
                                 let (col, icon, lbl) = classify_pnl_badge(net_f);
                                 println!(
-                                    "{}{} [TRADE CLOSE — {}] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps ({:+.4} USDT) | Hold: {}s{}",
+                                    "{}{} [TRADE CLOSE \u{2014} {}] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps ({:+.4} USDT) | Hold: {}s{}",
                                     col, icon, lbl.trim(), sym_name, summary.side, en_w, en_f, ex_w, ex_f, net_f, pnl_usdt, hold_s, ANSI_RESET
                                 );
-                                let _ = tg_tx.send(format!(
-                                    "{} [VORTEX-L3 {} #{} — {:?}]\n\u{2022} Par y Lado : {} ({:?}) | Maker: {}\n\u{2022} Precios    : {}.{:04} -> {}.{:04} USDT ({}t -> {}t)\n\u{2022} Balance    : Bruto: {:+.2} bps | Fee: -{:.2} bps | Neto: {:+.2} bps ({:+.2}% @10x | {:+.4} USDT)\n\u{2022} Excursion  : MFE: {:+.2} bps | MAE: {:+.2} bps | Custodia: {}s\n\u{2022} Microestr. : In[OFI:{:+.2} TFI:{:+.2} GEOM:{:+.2}] -> Out[OFI:{:+.2} TFI:{:+.2}]\n\u{2022} Cuenta/Meta: Wallet: {:.4} USDT | Meta 95: {:.1}%\n\u{2022} Sifon 30/70: Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps (ZMPQR:{} | LVDBS:{})",
-                                    icon,
-                                    lbl.trim(),
-                                    ledger.closed_trades_count,
+                                let _ = tg_tx.send(format_telegram_close_message(
+                                    spec,
+                                    &summary,
                                     engines[s_idx].last_exit_sub_reason,
-                                    sym_name,
-                                    summary.side,
-                                    summary.is_maker_exit,
-                                    en_w,
-                                    en_f,
-                                    ex_w,
-                                    ex_f,
-                                    summary.entry_price.0,
-                                    summary.exit_price.0,
-                                    gross_f,
-                                    fee_f,
-                                    net_f,
-                                    net_f / 10.0,
-                                    pnl_usdt,
-                                    mfe_f,
-                                    mae_f,
-                                    hold_s,
-                                    entry_forensics[s_idx].ofi_in,
-                                    entry_forensics[s_idx].tfi_in,
-                                    entry_forensics[s_idx].geom_in,
-                                    snap.factor_ofi.get(),
-                                    snap.factor_tfi.get(),
-                                    w_disp,
-                                    ((w_disp / 95.0) * 100.0).clamp(0.0, 100.0),
-                                    (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
-                                    (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
-                                    engines[s_idx].peristaltic_cycles_count,
-                                    engines[s_idx].lvdbs_deep_surfs_count
+                                    ledger.closed_trades_count,
+                                    &ledger,
                                 ));
                             } else {
                                 let real_lots = spec.parse_lot_qty(&real_sz_s).max(LotQty(1));
@@ -1619,20 +1670,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         );
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         save_open_positions_state(&engines);
-                        let net_f = (summary.net_scaled_bps.raw() as f64) / 100.0;
-                        let (_, icon, lbl) = classify_pnl_badge(net_f);
-                        let _ = tg_tx.send(format!(
-                            "{} [VORTEX-L3 {} #{}] {} {:?} | Net: {:+.2} bps | Reserva 30%: {:+.2}bp | Blindado 70%: {:+.2}bp (ZMPQR:{} | LVDBS:{})",
-                            icon,
-                            lbl.trim(),
+                        let _ = tg_tx.send(format_telegram_close_message(
+                            spec,
+                            &summary,
+                            engines[s_idx].last_exit_sub_reason,
                             ledger.closed_trades_count,
-                            sym_name,
-                            summary.side,
-                            net_f,
-                            (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
-                            (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
-                            engines[s_idx].peristaltic_cycles_count,
-                            engines[s_idx].lvdbs_deep_surfs_count
+                            &ledger,
                         ));
                     } else {
                         let cur_tranche1 = matches!(
