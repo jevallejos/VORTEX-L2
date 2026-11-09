@@ -231,8 +231,8 @@ impl OrthogonalFactorState {
         if Self::is_in_toxic_utc_funding_window(ts_ref) {
             return SignalVerdict::NeutralNoAction;
         }
-        // Compuerta de Energia de Volatilidad (VOL_MIN >= 44.20 bps = 4420 ScaledBps)
-        if snap.realized_vol_5m.raw() < 4_420 {
+        // Compuerta de Libro Vivo 24h (36.50 bps; passes_3x_friction_barrier exige excursion >= 3x comisiones de forma continua)
+        if snap.realized_vol_5m.raw() < 3_650 {
             return SignalVerdict::NeutralNoAction;
         }
         let mid_ticks = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
@@ -249,20 +249,20 @@ impl OrthogonalFactorState {
             return SignalVerdict::SpoofingVeto;
         }
 
-        let vol_ratio = (snap.realized_vol_5m.raw().clamp(4_420, 14_000) as f64) / 6_500.0;
-        let nu_sigma = vol_ratio.sqrt().clamp(0.85, 1.25);
-        let elastic_snr_floor = (0.40 * nu_sigma).clamp(0.38, 0.48);
+        let vol_ratio = (snap.realized_vol_5m.raw().clamp(3_650, 14_000) as f64) / 6_500.0;
+        let nu_sigma = vol_ratio.sqrt().clamp(0.82, 1.25);
+        let elastic_snr_floor = (0.39 * nu_sigma).clamp(0.36, 0.48);
         let composite = Self::snr_composite_score(snap);
         if composite.abs() < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
 
-        // Wall-Crowding Veto (|signed_geom| <= 0.72): evita colocarse detras de muros 6x..13x que solo llenan por barrida institucional
+        // Wall-Crowding Veto Condicional: veta muros extremos (>0.85) solo cuando no hay confirmacion de cinta (|TFI| < 0.45)
         let side = if composite > 0.0 {
             if ofi <= 0.15 || tfi <= 0.12 || geom < -0.05 {
                 return SignalVerdict::NeutralNoAction;
             }
-            if geom > 0.72 {
+            if geom > 0.85 && tfi < 0.45 {
                 return SignalVerdict::SpoofingVeto;
             }
             Side::Bid
@@ -270,22 +270,19 @@ impl OrthogonalFactorState {
             if ofi >= -0.15 || tfi >= -0.12 || geom > 0.05 {
                 return SignalVerdict::NeutralNoAction;
             }
-            if geom < -0.72 {
+            if geom < -0.85 && tfi > -0.45 {
                 return SignalVerdict::SpoofingVeto;
             }
             Side::Ask
         };
 
-        // Tope adimensional Moallemi-Yuan de cola L1 (Q_L1 / Q_base_66usdt <= 225x)
-        let base_q = spec
-            .compute_compounding_kelly_lots(6_632_564_713, mid_ticks, 200, false)
-            .0
-            .max(1);
-        let l1_resting_q = match side {
-            Side::Bid => best_bid.qty.0,
-            Side::Ask => best_ask.qty.0,
+        // Tope intrinseco Moallemi-Yuan L1 vs Profundidad L2..L5 del propio par (invariante al tamano de billetera)
+        let (l1_resting_q, deep_l1_l5_q) = match side {
+            Side::Bid => (best_bid.qty.0, snap.deep_bid_lots_l1_l5.0),
+            Side::Ask => (best_ask.qty.0, snap.deep_ask_lots_l1_l5.0),
         };
-        if l1_resting_q > base_q.saturating_mul(225) {
+        let l2_to_l5_q = deep_l1_l5_q.saturating_sub(l1_resting_q);
+        if l2_to_l5_q > 0 && l1_resting_q > l2_to_l5_q.saturating_mul(6) {
             return SignalVerdict::NeutralNoAction;
         }
 
