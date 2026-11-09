@@ -426,14 +426,33 @@ fn render_live_hud(arena: &VortexShmArena) {
         if is_slot_open {
             open_slots_count += 1;
             if let Ok(tel) = arena.telemetry(s_idx) {
-                let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
-                let avg_t = tel.avg_price_ticks.load(Ordering::Acquire);
+                let is_ask = tel.side_code.load(Ordering::Acquire) == 1;
+                let sd = if is_ask { "Ask" } else { "Bid" };
+                let avg_t = tel.avg_price_ticks.load(Ordering::Acquire) as i64;
                 let tp_t = tel.tp_ticks.load(Ordering::Acquire);
                 let sl_t = tel.sl_ticks.load(Ordering::Acquire);
-                let op_l = tel.open_lots.load(Ordering::Acquire);
+                let op_l = tel.open_lots.load(Ordering::Acquire) as i64;
+                let cur_t = if snap.mark_price.0 > 0 {
+                    snap.mark_price.0
+                } else if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+                    (snap.bids[0].price.0 + snap.asks[0].price.0) / 2
+                } else {
+                    avg_t
+                };
+                let diff_t = if is_ask { avg_t - cur_t } else { cur_t - avg_t };
+                let unit_usdt = ((spec.tick_size_1e8 as f64) / 100_000_000.0)
+                    * ((spec.lot_step_1e8 as f64) / 100_000_000.0);
+                let upl_usdt = (diff_t as f64) * (op_l as f64) * unit_usdt;
+                let upl_pct = ((diff_t as f64) / (avg_t.max(1) as f64)) * 1_000.0;
+                let pyg_raw = format!("{:+.2}({:+.1}%)", upl_usdt, upl_pct);
+                let pyg_col = if upl_usdt >= 0.0 {
+                    ANSI_GREEN
+                } else {
+                    vortex_rs::types::ANSI_RED
+                };
                 active_cells.push(format!(
-                    "{:<10}({:<3}) @{:>7}t [TP:{:>7} SL:{:>7} L:{:>2}]",
-                    spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l
+                    "{:<10}({:<3}) @{:>6}t [TP:{:>6} SL:{:>6} L:{:>2}] PyG:{}{:>13}{}",
+                    spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l, pyg_col, pyg_raw, ANSI_RESET
                 ));
             }
         } else if is_slot_queued {
@@ -443,7 +462,7 @@ fn render_live_hud(arena: &VortexShmArena) {
                 let en_t = tel.entry_ticks.load(Ordering::Acquire);
                 let q_l = tel.queue_ahead_lots.load(Ordering::Acquire);
                 active_cells.push(format!(
-                    "Q:{:<8}({:<3}) @{:>7}t [Queue Ahead: {:>8} lots]",
+                    "Q:{:<8}({:<3}) @{:>6}t [Queue Ahead: {:>8} lots | Resting L1   ]",
                     spec.symbol_id.name(), sd, en_t, q_l
                 ));
             }
@@ -519,9 +538,9 @@ fn render_live_hud(arena: &VortexShmArena) {
             let left = &active_cells[idx];
             if idx + 1 < active_cells.len() {
                 let right = &active_cells[idx + 1];
-                sec_footer.push(format!("  \u{2022} {:<54} \u{2502} \u{2022} {:<54}", left, right));
+                sec_footer.push(format!("  \u{2022} {} \u{2502} \u{2022} {}", left, right));
             } else {
-                sec_footer.push(format!("  \u{2022} {:<54} \u{2502}", left));
+                sec_footer.push(format!("  \u{2022} {} \u{2502}   {}", left, " ".repeat(69)));
             }
             idx += 2;
         }
