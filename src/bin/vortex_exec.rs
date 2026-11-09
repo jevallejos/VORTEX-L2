@@ -396,6 +396,19 @@ fn format_telegram_close_message(
     )
 }
 
+fn format_position_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3_600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        let h = secs / 3_600;
+        let m = (secs % 3_600) / 60;
+        let s = secs % 60;
+        format!("{}h {:02}m {:02}s", h, m, s)
+    }
+}
+
 fn render_live_hud(arena: &VortexShmArena) {
     let now_ns = now_epoch_ns().0 as u64;
     let hb_ns = arena.heartbeat_ns.load(Ordering::Acquire);
@@ -410,10 +423,9 @@ fn render_live_hud(arena: &VortexShmArena) {
         arena.version, hb_age_ms
     )];
     let sec_hdr = vec![
-        "SLOT  \u{2502} SYMBOL     \u{2502}      PyG (UPL) \u{2502}       SEQ_ID \u{2502}     BEST_BID \u{2502}     BEST_ASK \u{2502} SPR_T \u{2502}  X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT           ".to_string(),
+        "SLOT  \u{2502} SYMBOL     \u{2502}      PyG (UPL) \u{2502} POSITION TIME \u{2502}       SEQ_ID \u{2502}     BEST_BID \u{2502}     BEST_ASK \u{2502} SPR_T \u{2502}  X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT           ".to_string(),
     ];
     let mut sec_rows = Vec::with_capacity(MAX_ACTIVE_PAIRS);
-    let mut active_cells: Vec<String> = Vec::new();
     let mut open_slots_count = 0_usize;
     let mut queued_slots_count = 0_usize;
 
@@ -435,14 +447,12 @@ fn render_live_hud(arena: &VortexShmArena) {
         let is_slot_open = tel_state >= 3 && tel_state <= 5;
         let is_slot_queued = tel_state == 1 || tel_state == 2;
         let mut pyg_col_cell = format!("{}{:>14}{}", ANSI_GRAY, "-", ANSI_RESET);
+        let mut pos_time_cell = format!("{}{:>13}{}", ANSI_GRAY, "-", ANSI_RESET);
         if is_slot_open {
             open_slots_count += 1;
             if let Ok(tel) = arena.telemetry(s_idx) {
                 let is_ask = tel.side_code.load(Ordering::Acquire) == 1;
-                let sd = if is_ask { "Ask" } else { "Bid" };
                 let avg_t = tel.avg_price_ticks.load(Ordering::Acquire) as i64;
-                let tp_t = tel.tp_ticks.load(Ordering::Acquire);
-                let sl_t = tel.sl_ticks.load(Ordering::Acquire);
                 let op_l = tel.open_lots.load(Ordering::Acquire) as i64;
                 let cur_t = if snap.mark_price.0 > 0 {
                     snap.mark_price.0
@@ -463,28 +473,32 @@ fn render_live_hud(arena: &VortexShmArena) {
                     vortex_rs::types::ANSI_RED
                 };
                 pyg_col_cell = format!("{}{:>14}{}", pyg_col, pyg_raw, ANSI_RESET);
-                active_cells.push(pad_visible_right(
-                    &format!(
-                        "{:<10}({:<3}) @{:>6}t [TP:{:>6} SL:{:>6} L:{:>2}] {}{}{}",
-                        spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l, pyg_col, pyg_raw, ANSI_RESET
-                    ),
-                    64,
-                ));
+
+                let saved_open_ns = load_saved_slot_state(s_idx)
+                    .and_then(|v| v.get("opened_ts_ns")?.as_u64())
+                    .unwrap_or(0);
+                let shm_open_ns = tel.resting_since_ns.load(Ordering::Acquire);
+                let open_ns = if saved_open_ns > 0 { saved_open_ns } else { shm_open_ns };
+                let hold_secs = if open_ns > 0 && now_ns >= open_ns {
+                    (now_ns - open_ns) / 1_000_000_000
+                } else {
+                    0
+                };
+                let dur_str = format_position_duration(hold_secs);
+                pos_time_cell = format!("{}{:>13}{}", ANSI_YELLOW, dur_str, ANSI_RESET);
             }
         } else if is_slot_queued {
             queued_slots_count += 1;
             pyg_col_cell = format!("{}{:>14}{}", ANSI_SKY_BLUE, "IN_QUEUE_L1", ANSI_RESET);
             if let Ok(tel) = arena.telemetry(s_idx) {
-                let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
-                let en_t = tel.entry_ticks.load(Ordering::Acquire);
-                let q_l = tel.queue_ahead_lots.load(Ordering::Acquire);
-                active_cells.push(pad_visible_right(
-                    &format!(
-                        "Q:{:<8}({:<3}) @{:>6}t [Queue Ahead: {:>8} lots]",
-                        spec.symbol_id.name(), sd, en_t, q_l
-                    ),
-                    64,
-                ));
+                let q_ns = tel.resting_since_ns.load(Ordering::Acquire);
+                let q_secs = if q_ns > 0 && now_ns >= q_ns {
+                    (now_ns - q_ns) / 1_000_000_000
+                } else {
+                    0
+                };
+                let q_str = format!("Q: {}s", q_secs);
+                pos_time_cell = format!("{}{:>13}{}", ANSI_SKY_BLUE, q_str, ANSI_RESET);
             }
         }
         let slot_col = if is_slot_open {
@@ -516,10 +530,11 @@ fn render_live_hud(arena: &VortexShmArena) {
             }
         };
         sec_rows.push(format!(
-            "{} \u{2502} {:<10} \u{2502} {} \u{2502} {:>12} \u{2502} {:>7}.{:04} \u{2502} {:>7}.{:04} \u{2502} {:>5} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {}",
+            "{} \u{2502} {:<10} \u{2502} {} \u{2502} {} \u{2502} {:>12} \u{2502} {:>7}.{:04} \u{2502} {:>7}.{:04} \u{2502} {:>5} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {}",
             slot_col,
             spec.symbol_id.name(),
             pyg_col_cell,
+            pos_time_cell,
             snap.sequence_id,
             bw,
             bf,
@@ -542,30 +557,14 @@ fn render_live_hud(arena: &VortexShmArena) {
     } else {
         format!("{}\u{26aa} IDLE (SCANNING 12 SLOTS){}", ANSI_GRAY, ANSI_RESET)
     };
-    let mut sec_footer = Vec::new();
-    sec_footer.push(format!(
+    let sec_footer = vec![format!(
         "[EXEC FSM LIVE] State: {} \u{2502} [FLOW] \u{1f7e1}Arm:{:<3} \u{1f7e0}Abr:{:<3} \u{1f7e1}Fil:{:<3} \u{1f7e2}Cls:{:<3}",
         pad_visible_right(&state_banner, 45),
         arena.exec_armed_count.load(Ordering::Acquire),
         arena.exec_abort_count.load(Ordering::Acquire),
         arena.exec_fill_count.load(Ordering::Acquire),
         arena.exec_closed_count.load(Ordering::Acquire)
-    ));
-    if active_cells.is_empty() {
-        sec_footer.push("  \u{2022} [CUSTODY SLOTS] No open positions in custody.".to_string());
-    } else {
-        let mut idx = 0_usize;
-        while idx < active_cells.len() {
-            let left = &active_cells[idx];
-            if idx + 1 < active_cells.len() {
-                let right = &active_cells[idx + 1];
-                sec_footer.push(format!("  \u{2022} {} \u{2502} \u{2022} {}", left, right));
-            } else {
-                sec_footer.push(format!("  \u{2022} {} \u{2502}   {}", left, " ".repeat(64)));
-            }
-            idx += 2;
-        }
-    }
+    )];
     print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_footer]);
 }
 

@@ -1052,6 +1052,7 @@ impl SlotExecutionEngine {
                 tranche1_harvested,
                 tp_maker_price,
                 sl_trigger_price,
+                opened_ts,
                 ..
             } => {
                 let code = if tranche1_harvested {
@@ -1073,6 +1074,7 @@ impl SlotExecutionEngine {
                 tel.initial_lots.store(initial_lots.0 as u64, Ordering::Release);
                 tel.peristaltic_cycles.store(u64::from(peristaltic_cycles), Ordering::Release);
                 tel.tranche1_harvested.store(u64::from(tranche1_harvested), Ordering::Release);
+                tel.resting_since_ns.store(opened_ts.0 as u64, Ordering::Release);
             }
         }
     }
