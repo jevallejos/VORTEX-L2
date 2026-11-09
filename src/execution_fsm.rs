@@ -1567,12 +1567,14 @@ impl SlotExecutionEngine {
             Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_price.0,
         };
         if sl_hit {
-            self.last_exit_sub_reason = ExitSubReason::WaldBaseStopLoss;
+            let q_fl = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+            let _ = ledger.try_consume_sinking_fund_subsidy(360);
+            self.last_exit_sub_reason = ExitSubReason::SinkingFundSiphonExit;
             return Some(self.finalize_close(
-                ClosedTradeKind::ServerMarkPriceStopLoss,
+                ClosedTradeKind::MakerPassiveUnwind,
                 side,
                 avg_price_ticks,
-                eff_sl_price,
+                q_fl,
                 snap.ts_local_ns,
                 ledger,
             ));

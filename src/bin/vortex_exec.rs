@@ -1195,12 +1195,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     let lots = spec.parse_lot_qty(&sz_s).max(LotQty(1));
                     let now_t = now_epoch_ns();
                     let saved = load_saved_slot_state(s_idx);
-                    let avg_t = saved
-                        .as_ref()
-                        .and_then(|v| v.get("avg_ticks"))
-                        .and_then(|n| n.as_i64())
-                        .map(PriceTicks)
-                        .unwrap_or(bybit_avg_t);
+                    let avg_t = bybit_avg_t;
                     let init_l = saved
                         .as_ref()
                         .and_then(|v| v.get("initial_lots"))
@@ -1219,11 +1214,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .and_then(|n| n.as_i64())
                         .map(PriceTicks)
                         .unwrap_or(PriceTicks(0));
-                    let p_cycles = saved
-                        .as_ref()
-                        .and_then(|v| v.get("peristaltic_cycles"))
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0) as u32;
+                    let p_cycles = 0_u32;
                     let t1_done = saved
                         .as_ref()
                         .and_then(|v| v.get("tranche1_harvested"))
@@ -1652,7 +1643,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 }
                 OrderLifecycleState::PositionOpenMakerExit {
                     side,
-                    mut avg_price_ticks,
+                    avg_price_ticks,
                     mut peak_favorable_price,
                     mut worst_adverse_price,
                     initial_lots,
@@ -1785,49 +1776,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 || (hold_s >= 30 && !strong_trend)
                         };
 
-                        let crest_bonus =
-                            if signed_flow >= 0.30 && cur_gross_bps <= -180 {
-                                2_u64
-                            } else {
-                                0_u64
-                            };
-                        let target_amort =
-                            if !tranche1_harvested && cur_gross_bps <= -90 {
-                                (((hold_s / 900) as u64) + crest_bonus).min(16)
-                            } else {
-                                0
-                            };
-                        while engines[s_idx].peristaltic_cycles_count < target_amort
-                            && ledger.sinking_fund_reserve_bps_x100 >= 200
-                        {
-                            if ledger.try_consume_sinking_fund_subsidy(100) > 0 {
-                                let step_t =
-                                    ((avg_price_ticks.0 * 100) / 1_000_000).max(1);
-                                avg_price_ticks = match side {
-                                    Side::Bid => {
-                                        PriceTicks((avg_price_ticks.0 - step_t).max(1))
-                                    }
-                                    Side::Ask => PriceTicks(avg_price_ticks.0 + step_t),
-                                };
-                                let next_c = engines[s_idx]
-                                    .peristaltic_cycles_count
-                                    .saturating_add(1);
-                                engines[s_idx].peristaltic_cycles_count = next_c;
-                                let cyc_u32 = next_c as u32;
-                                if let OrderLifecycleState::PositionOpenMakerExit {
-                                    avg_price_ticks: ref mut ap_mut,
-                                    peristaltic_cycles: ref mut pc_mut,
-                                    ..
-                                } = engines[s_idx].state
-                                {
-                                    *ap_mut = avg_price_ticks;
-                                    *pc_mut = cyc_u32;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
                         let early_phase_siphon = hold_s >= 35
                             && peak_gross_bps <= 120
                             && (cur_gross_bps <= -40 || worst_mae_bps <= -60);
@@ -1836,9 +1784,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let siphon_eligible = !tranche1_harvested
                             && (early_phase_siphon || deep_stagnant_siphon)
                             && ledger.sinking_fund_reserve_bps_x100 >= 100;
-                        let siphon_sub_cap =
-                            (ledger.sinking_fund_reserve_bps_x100 / 2).clamp(0, 360);
-                        let siphon_floor_bps = (440 - siphon_sub_cap).clamp(80, 440);
 
                         let use_tranche1_50 = !tranche1_harvested
                             && initial_lots.0 >= 2
@@ -1848,10 +1793,10 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let mfe_lrn = engines[s_idx].learned_mfe_bps.clamp(540, 880);
                         let base_win_target = (vol_fl * 60 + mfe_lrn * 40) / 100;
                         let step_15s = (hold_s / 15).clamp(0, 6);
-                        let time_relax = (step_15s * (base_win_target - 500).max(0)) / 6;
-                        let target_floor_bps = if siphon_eligible {
-                            ScaledBps(siphon_floor_bps)
-                        } else if allow_scratch_floor {
+                        let win_exc = (base_win_target - 500).max(0);
+                        let time_relax = (step_15s * win_exc) / 6;
+                        let use_min_fl = siphon_eligible || allow_scratch_floor;
+                        let target_floor_bps = if use_min_fl {
                             ScaledBps(if tranche1_harvested { 465 } else { 440 })
                         } else if use_tranche1_50 {
                             ScaledBps(465)
