@@ -213,6 +213,35 @@ impl BybitV5LiveClient {
         }
     }
 
+    pub fn get_resting_exit_order_ticks(&self, spec: PairSpec) -> PriceTicks {
+        let sym = spec.symbol_id.name();
+        let q = format!("category=linear&symbol={}", sym);
+        let Some(val) = self.get_v5("/v5/order/realtime", &q) else {
+            return PriceTicks(0);
+        };
+        let Some(list) = val
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+        else {
+            return PriceTicks(0);
+        };
+        for item in list {
+            let ro = item
+                .get("reduceOnly")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if ro {
+                if let Some(px_s) = item.get("price").and_then(|v| v.as_str()) {
+                    if let Ok(pt) = spec.parse_price_ticks(px_s) {
+                        return pt;
+                    }
+                }
+            }
+        }
+        PriceTicks(0)
+    }
+
     pub fn get_open_position_info(&self, symbol: &str) -> (bool, String, Side, String) {
         let q = format!("category=linear&symbol={}", symbol);
         let Some(val) = self.get_v5("/v5/position/list", &q) else {
@@ -1119,7 +1148,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .map(|sn| sn.mark_price.0)
                         .unwrap_or(0);
                     let q_fl = defensive_zero_loss_maker_exit_price(side_p, avg_t);
-                    let tp_t = dynamic_maker_floor_price(side_p, avg_t, ScaledBps(520));
+                    let _tp_t = dynamic_maker_floor_price(side_p, avg_t, ScaledBps(520));
                     let sl_d = ((avg_t.0 * 18_500) / 1_000_000).max(4);
                     let sl_t = match side_p {
                         Side::Bid => {
@@ -1152,7 +1181,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         },
                         active_exit_price: q_fl,
                         active_exit_lots: LotQty((lots.0 / 2).max(1)),
-                        tp_maker_price: tp_t,
+                        tp_maker_price: PriceTicks(0),
                         sl_trigger_price: sl_t,
                         opened_ts: opened_ns,
                     };
@@ -1385,7 +1414,19 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_500_000_000;
                             if let Some(ref client) = live_client {
                                 client.cancel_all_symbol_orders(sym_name);
-                                if !client.get_open_position_info(sym_name).0 {
+                                let (already_open, _, _, real_avg_s) = client.get_open_position_info(sym_name);
+                                if already_open {
+                                    if let Ok(real_en_t) = spec.parse_price_ticks(&real_avg_s) {
+                                        if let OrderLifecycleState::RestingEntryQueue {
+                                            entry_price: ref mut ep,
+                                            ..
+                                        } = engines[s_idx].state
+                                        {
+                                            *ep = real_en_t;
+                                        }
+                                    }
+                                    engines[s_idx].next_peg_allowed_ts_ns = 0;
+                                } else {
                                     let rc = client.place_post_only_order(
                                         spec,
                                         side,
@@ -1604,25 +1645,27 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let active_floor_px = dynamic_maker_floor_price(side, avg_price_ticks, target_floor_bps);
                         let (raw_vac_lvl, raw_surf_px, _) =
                             OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(side, &snap, active_floor_px);
+                        let min_valid_sell_px = snap.asks[0].price.0.max(snap.bids[0].price.0 + 1).max(1);
+                        let max_valid_buy_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 1 {
+                            snap.bids[0].price.0.min(snap.asks[0].price.0 - 1).max(1)
+                        } else {
+                            snap.bids[0].price.0.max(1)
+                        };
+                        let l1_non_crossing_floor = match side {
+                            Side::Bid => PriceTicks(active_floor_px.0.max(min_valid_sell_px)),
+                            Side::Ask => PriceTicks(active_floor_px.0.min(max_valid_buy_px).max(1)),
+                        };
                         let lock_l1_immediately = allow_scratch_floor || mfe_pullback_lock || cur_gross_bps >= 440;
                         let (vac_lvl, cand_surf_px) = if lock_l1_immediately {
-                            (1_usize, active_floor_px)
+                            (1_usize, l1_non_crossing_floor)
                         } else {
-                            (raw_vac_lvl, raw_surf_px)
+                            let clamped_raw = match side {
+                                Side::Bid => PriceTicks(raw_surf_px.0.max(l1_non_crossing_floor.0)),
+                                Side::Ask => PriceTicks(raw_surf_px.0.min(l1_non_crossing_floor.0).max(1)),
+                            };
+                            (raw_vac_lvl, clamped_raw)
                         };
-                        let prev_tp_cur = match engines[s_idx].state {
-                            OrderLifecycleState::PositionOpenMakerExit { tp_maker_price, .. } => tp_maker_price,
-                            _ => PriceTicks(0),
-                        };
-                        // Trinquete Unidireccional: cuando el precio ya se acerca a verde (>=320 bps), prohibido alejar el TP
-                        let surf_px = if prev_tp_cur.0 > 0 && cur_gross_bps >= 320 {
-                            match side {
-                                Side::Bid => PriceTicks(cand_surf_px.0.min(prev_tp_cur.0).max(active_floor_px.0)),
-                                Side::Ask => PriceTicks(cand_surf_px.0.max(prev_tp_cur.0).min(active_floor_px.0).max(1)),
-                            }
-                        } else {
-                            cand_surf_px
-                        };
+                        let surf_px = cand_surf_px;
 
                         if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_500_000_000;
@@ -1710,30 +1753,18 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 ));
                             } else {
                                 let real_lots = spec.parse_lot_qty(&real_sz_s).max(LotQty(1));
-                                let prev_tp = match engines[s_idx].state {
-                                    OrderLifecycleState::PositionOpenMakerExit { tp_maker_price, .. } => tp_maker_price,
-                                    _ => PriceTicks(0),
-                                };
-                                if let OrderLifecycleState::PositionOpenMakerExit {
-                                    open_lots: ref mut op_l,
-                                    tp_maker_price: ref mut tp_p,
-                                    ..
-                                } = engines[s_idx].state
-                                {
-                                    *op_l = real_lots;
-                                    *tp_p = surf_px;
-                                }
-                                let tp_diff_ticks = (surf_px.0 - prev_tp.0).abs();
+                                let resting_tp = client.get_resting_exit_order_ticks(spec);
+                                let tp_diff_ticks = (surf_px.0 - resting_tp.0).abs();
                                 let moving_closer = match side {
-                                    Side::Bid => prev_tp.0 == 0 || surf_px.0 < prev_tp.0,
-                                    Side::Ask => prev_tp.0 == 0 || surf_px.0 > prev_tp.0,
+                                    Side::Bid => resting_tp.0 == 0 || surf_px.0 < resting_tp.0,
+                                    Side::Ask => resting_tp.0 == 0 || surf_px.0 > resting_tp.0,
                                 };
-                                let should_repeg = prev_tp.0 == 0
+                                let should_repeg = resting_tp.0 == 0
                                     || (moving_closer && tp_diff_ticks >= 1 && (lock_l1_immediately || tp_diff_ticks >= 2))
-                                    || (!moving_closer && cur_gross_bps < 250 && tp_diff_ticks >= 3);
-                                if should_repeg {
+                                    || (!moving_closer && cur_gross_bps < 200 && tp_diff_ticks >= 4);
+                                let active_tp_now = if should_repeg {
                                     client.cancel_all_symbol_orders(sym_name);
-                                    let _ = client.place_post_only_order(
+                                    let rc = client.place_post_only_order(
                                         spec,
                                         side.opposite(),
                                         surf_px,
@@ -1742,12 +1773,18 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                         true,
                                     );
                                     engines[s_idx].exit_peg_attempts = engines[s_idx].exit_peg_attempts.saturating_add(1);
-                                } else if let OrderLifecycleState::PositionOpenMakerExit {
-                                    tp_maker_price: ref mut tp_keep,
+                                    if rc == 0 { surf_px } else { PriceTicks(0) }
+                                } else {
+                                    resting_tp
+                                };
+                                if let OrderLifecycleState::PositionOpenMakerExit {
+                                    open_lots: ref mut op_l,
+                                    tp_maker_price: ref mut tp_p,
                                     ..
                                 } = engines[s_idx].state
                                 {
-                                    *tp_keep = prev_tp;
+                                    *op_l = real_lots;
+                                    *tp_p = active_tp_now;
                                 }
                                 engines[s_idx].sync_to_shm_telemetry(arena);
                             }
