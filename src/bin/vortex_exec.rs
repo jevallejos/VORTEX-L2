@@ -1876,9 +1876,8 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let step_15s = (hold_s / 15).clamp(0, 6);
                         let win_exc = (base_win_target - 500).max(0);
                         let time_relax = (step_15s * win_exc) / 6;
-                        let target_floor_bps = if siphon_eligible {
-                            ScaledBps(siphon_subsidized_floor_bps)
-                        } else if allow_scratch_floor {
+                        let _ = siphon_subsidized_floor_bps;
+                        let target_floor_bps = if allow_scratch_floor || siphon_eligible {
                             ScaledBps(if tranche1_harvested { 465 } else { 440 })
                         } else if use_tranche1_50 {
                             ScaledBps(465)
@@ -2215,17 +2214,19 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                             Side::Bid => snap.bids[0].price.max(PriceTicks(1)),
                                             Side::Ask => snap.asks[0].price.max(PriceTicks(1)),
                                         };
-                                    } else if SlotExecutionEngine::authorizes_funded_peristaltic_exhale(
-                                        exhaled_lots,
-                                        tranche1_harvested,
-                                        eff_init_lots,
-                                        hold_s,
-                                        worst_mae_bps,
-                                        cur_gross_bps,
-                                        ledger.sinking_fund_reserve_bps_x100,
-                                        crest_exh,
-                                        already_exhaling,
-                                    ) {
+                                    } else if cur_gross_bps >= 440
+                                        && SlotExecutionEngine::authorizes_funded_peristaltic_exhale(
+                                            exhaled_lots,
+                                            tranche1_harvested,
+                                            eff_init_lots,
+                                            hold_s,
+                                            worst_mae_bps,
+                                            cur_gross_bps,
+                                            ledger.sinking_fund_reserve_bps_x100,
+                                            crest_exh,
+                                            already_exhaling,
+                                        )
+                                    {
                                         zmpqr_active_mode = 1;
                                         zmpqr_target_lots = LotQty((eff_init_lots.0 / 4).max(1));
                                         zmpqr_target_px = match side {
