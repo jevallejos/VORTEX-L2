@@ -196,18 +196,76 @@ impl BybitV5LiveClient {
     }
 
     pub fn fetch_wallet_and_equity_usdt(&self) -> Option<(f64, f64, f64, f64)> {
-        let val = self.get_v5("/v5/account/wallet-balance", "accountType=UNIFIED")?;
+        let q = "accountType=UNIFIED&coin=USDT";
+        let val = self.get_v5("/v5/account/wallet-balance", q)?;
         let acct = val.get("result")?.get("list")?.as_array()?.first()?;
-        let w_s = acct.get("totalWalletBalance").and_then(|v| v.as_str()).unwrap_or("0");
-        let eq_s = acct.get("totalEquity").and_then(|v| v.as_str()).unwrap_or("0");
-        let av_s = acct.get("totalAvailableBalance").and_then(|v| v.as_str()).unwrap_or("0");
-        let up_s = acct.get("totalPerpUPL").and_then(|v| v.as_str()).unwrap_or("0");
-        let w = w_s.parse::<f64>().unwrap_or(0.0);
-        let eq = eq_s.parse::<f64>().unwrap_or(w);
-        let av = av_s.parse::<f64>().unwrap_or(eq);
-        let up = up_s.parse::<f64>().unwrap_or(0.0);
-        if w > 0.0 {
-            Some((w, eq, av, up))
+        let w_usd = acct
+            .get("totalWalletBalance")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let eq_usd = acct
+            .get("totalEquity")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(w_usd);
+        let av_usd = acct
+            .get("totalAvailableBalance")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(eq_usd);
+        let up_usd = acct
+            .get("totalPerpUPL")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        if let Some(coins) = acct.get("coin").and_then(|c| c.as_array()) {
+            for c_obj in coins {
+                let c_name = c_obj.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                if c_name == "USDT" {
+                    let w_c = c_obj
+                        .get("walletBalance")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    if w_c > 0.0 {
+                        let up_c = c_obj
+                            .get("unrealisedPnl")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(up_usd);
+                        let eq_c = c_obj
+                            .get("equity")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(w_c + up_c);
+                        let pos_im = c_obj
+                            .get("totalPositionIM")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let ord_im = c_obj
+                            .get("totalOrderIM")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let lck = c_obj
+                            .get("locked")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let av_c = (eq_c - pos_im - ord_im - lck).max(0.0);
+                        let w_final = w_c.max(w_usd);
+                        let eq_final = eq_c.max(eq_usd);
+                        let av_final = if av_c > 0.0 { av_c } else { av_usd };
+                        return Some((w_final, eq_final, av_final, up_c));
+                    }
+                }
+            }
+        }
+        if w_usd > 0.0 {
+            Some((w_usd, eq_usd, av_usd, up_usd))
         } else {
             None
         }
