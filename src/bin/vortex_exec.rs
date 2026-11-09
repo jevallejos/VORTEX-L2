@@ -374,26 +374,37 @@ fn render_live_hud(arena: &VortexShmArena) {
             .map(|t| t.state_code.load(Ordering::Acquire))
             .unwrap_or(0);
         let is_slot_open = tel_state >= 3 && tel_state <= 5;
+        let is_slot_queued = tel_state == 1 || tel_state == 2;
         if is_slot_open {
             open_slots_count += 1;
-            if first_open_summary.is_none() {
-                if let Ok(tel) = arena.telemetry(s_idx) {
-                    let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
-                    let avg_t = tel.avg_price_ticks.load(Ordering::Acquire);
-                    let pk_t = tel.peak_ticks.load(Ordering::Acquire);
-                    let tp_t = tel.tp_ticks.load(Ordering::Acquire);
-                    let sl_t = tel.sl_ticks.load(Ordering::Acquire);
-                    let op_l = tel.open_lots.load(Ordering::Acquire);
-                    let pc = tel.peristaltic_cycles.load(Ordering::Acquire);
-                    first_open_summary = Some(format!(
-                        "Sym: {} ({}) @ {}t [Peak:{}t \u{2502} TP:{}t \u{2502} SL:{}t \u{2502} Lots:{} \u{2502} ZMPQR:{}]",
-                        spec.symbol_id.name(), sd, avg_t, pk_t, tp_t, sl_t, op_l, pc
-                    ));
-                }
+            if let Ok(tel) = arena.telemetry(s_idx) {
+                let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
+                let avg_t = tel.avg_price_ticks.load(Ordering::Acquire);
+                let tp_t = tel.tp_ticks.load(Ordering::Acquire);
+                let sl_t = tel.sl_ticks.load(Ordering::Acquire);
+                let op_l = tel.open_lots.load(Ordering::Acquire);
+                let item = format!("{}({})@{}t[TP:{} SL:{} L:{}]", spec.symbol_id.name(), sd, avg_t, tp_t, sl_t, op_l);
+                first_open_summary = Some(match first_open_summary {
+                    Some(prev) => format!("{} \u{2502} {}", prev, item),
+                    None => item,
+                });
+            }
+        } else if is_slot_queued {
+            if let Ok(tel) = arena.telemetry(s_idx) {
+                let sd = if tel.side_code.load(Ordering::Acquire) == 1 { "Ask" } else { "Bid" };
+                let en_t = tel.entry_ticks.load(Ordering::Acquire);
+                let q_l = tel.queue_ahead_lots.load(Ordering::Acquire);
+                let item = format!("Q:{}({})@{}t[Q:{}]", spec.symbol_id.name(), sd, en_t, q_l);
+                first_open_summary = Some(match first_open_summary {
+                    Some(prev) => format!("{} \u{2502} {}", prev, item),
+                    None => item,
+                });
             }
         }
         let slot_col = if is_slot_open {
             format!("{}\u{1f7e1} {:2}{}", ANSI_YELLOW, s_idx, ANSI_RESET)
+        } else if is_slot_queued {
+            format!("{}\u{1fa75} {:2}{}", ANSI_SKY_BLUE, s_idx, ANSI_RESET)
         } else {
             format!("   {:2}", s_idx)
         };
@@ -699,8 +710,10 @@ fn rehydrate_shadow_ledger(
                 let pnl_1e8 = (BASE_NOTIONAL_1E8 * net_sc.raw()) / 1_000_000;
                 let fee_1e8 = (BASE_NOTIONAL_1E8 * 400) / 1_000_000;
                 ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
-                gov.seed_historical_price(s_idx, side, en_t, ex_t);
-                gov.observe_closed_trade(s_idx, side, net_sc, mkr, TimestampNs(ts_ns));
+                let _ = (en_t, ex_t, ts_ns);
+                if !mkr || net_sc.raw() < 0 {
+                    gov.observe_closed_trade(s_idx, side, net_sc, mkr, TimestampNs(0));
+                }
                 engines[s_idx].observe_mfe_sample((net_sc.raw() + 400).max(500));
                 count += 1;
             }
@@ -1162,42 +1175,91 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     side,
                     entry_price,
                     qty,
+                    sl_trigger_price,
                     resting_since_ts,
                     ..
                 } => {
-                    let live_l1_q = match side {
-                        Side::Bid => {
-                            if snap.bids[0].price == entry_price {
-                                snap.bids[0].qty.0
-                            } else {
-                                0
-                            }
-                        }
-                        Side::Ask => {
-                            if snap.asks[0].price == entry_price {
-                                snap.asks[0].qty.0
-                            } else {
-                                0
-                            }
-                        }
+                    let at_l1 = match side {
+                        Side::Bid => snap.bids[0].price == entry_price,
+                        Side::Ask => snap.asks[0].price == entry_price,
                     };
-                    if live_l1_q < cur_q_ahead[s_idx].0 {
-                        cur_q_ahead[s_idx] = LotQty(live_l1_q.max(0));
+                    if at_l1 {
+                        let live_l1_q = match side {
+                            Side::Bid => snap.bids[0].qty.0,
+                            Side::Ask => snap.asks[0].qty.0,
+                        };
+                        if live_l1_q < cur_q_ahead[s_idx].0 {
+                            cur_q_ahead[s_idx] = LotQty(live_l1_q.max(1));
+                        }
                     }
                     if let Ok(tel) = arena.telemetry(s_idx) {
                         tel.queue_ahead_lots.store(cur_q_ahead[s_idx].0 as u64, Ordering::Release);
                     }
+                    let resting_elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
                     let vol_q = snap.realized_vol_5m.raw().clamp(4_000, 12_500);
                     let elastic_queue_timeout_ns =
-                        ((12_000_000_000_i64 * 6_500) / vol_q).clamp(8_000_000_000, 18_000_000_000);
-                    if drain_active
-                        || now_ns.0.saturating_sub(resting_since_ts.0) >= elastic_queue_timeout_ns
-                        || check_queue_depletion_velocity_abort(
+                        ((15_000_000_000_i64 * 6_500) / vol_q).clamp(10_000_000_000, 20_000_000_000);
+                    let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
+                    let flow_imp = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+                    let dq_abort = (resting_elapsed_ns >= 1_500_000_000
+                        && at_l1
+                        && check_queue_depletion_velocity_abort(
                             side,
                             init_q_ahead[s_idx],
                             cur_q_ahead[s_idx],
                             &snap,
-                        )
+                        ))
+                        || flow_imp <= -0.48;
+                    if !drain_active && !dq_abort && !at_l1 && resting_elapsed_ns >= 2_500_000_000 {
+                        let new_l1 = match side {
+                            Side::Bid => snap.bids[0].price,
+                            Side::Ask => snap.asks[0].price,
+                        };
+                        let moved_away = match side {
+                            Side::Bid => new_l1.0 > entry_price.0 && (new_l1.0 - entry_price.0) <= 15,
+                            Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= 15,
+                        };
+                        let sig_ok = matches!(
+                            OrthogonalFactorState::evaluate_entry_signal_with_leader(spec, &snap, &btc_snap),
+                            SignalVerdict::AuthorizeMakerEntry { side: s_now, .. } if s_now == side
+                        );
+                        if moved_away && sig_ok && now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
+                            engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_500_000_000;
+                            if let Some(ref client) = live_client {
+                                client.cancel_all_symbol_orders(sym_name);
+                                if !client.get_open_position_info(sym_name).0 {
+                                    let rc = client.place_post_only_order(
+                                        spec,
+                                        side,
+                                        new_l1,
+                                        qty,
+                                        Some(sl_trigger_price),
+                                        false,
+                                    );
+                                    if rc == 0 {
+                                        if let OrderLifecycleState::RestingEntryQueue {
+                                            entry_price: ref mut ep,
+                                            resting_since_ts: ref mut r_ts,
+                                            ..
+                                        } = engines[s_idx].state
+                                        {
+                                            *ep = new_l1;
+                                            *r_ts = now_ns;
+                                        }
+                                        let q_new = match side {
+                                            Side::Bid => snap.bids[0].qty,
+                                            Side::Ask => snap.asks[0].qty,
+                                        };
+                                        init_q_ahead[s_idx] = q_new;
+                                        cur_q_ahead[s_idx] = q_new;
+                                        engines[s_idx].sync_to_shm_telemetry(arena);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if drain_active || resting_elapsed_ns >= elastic_queue_timeout_ns || dq_abort
                     {
                         if let Some(ref client) = live_client {
                             client.cancel_all_symbol_orders(sym_name);
@@ -1692,9 +1754,18 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
             return ExitCode::SUCCESS;
         }
 
-        if !drain_active && open_count < MAX_CONCURRENT_OPEN_SLOTS {
-            let mut best_cand: Option<(usize, SignalVerdict, f64)> = None;
+        let active_or_queued = engines
+            .iter()
+            .filter(|e| !matches!(e.state, OrderLifecycleState::Idle))
+            .count();
+        if !drain_active && active_or_queued < MAX_CONCURRENT_OPEN_SLOTS {
+            let mut armed_this_tick = 0_usize;
             for s_idx in 0..MAX_ACTIVE_PAIRS {
+                if active_or_queued + armed_this_tick >= MAX_CONCURRENT_OPEN_SLOTS
+                    || armed_this_tick >= 3
+                {
+                    break;
+                }
                 if !matches!(engines[s_idx].state, OrderLifecycleState::Idle) {
                     continue;
                 }
@@ -1711,36 +1782,18 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
                     if gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap) {
                         let (edge_bps, _, _) = gov.slot_direction_diagnostics(s_idx, side);
-                        let snr_abs = OrthogonalFactorState::snr_composite_score(&snap).abs();
-                        let vel_score =
-                            snr_abs * (1.0 + (edge_bps.clamp(0, 500) as f64) / 1_000.0);
-                        let is_better = match best_cand {
-                            Some((_, _, best_sc)) => vel_score > best_sc,
-                            None => true,
-                        };
-                        if is_better {
-                            best_cand = Some((s_idx, verdict, vel_score));
-                        }
+                        let in_debt = gov.is_in_scar_debt(s_idx, side);
+                        let lots = spec.compute_compounding_kelly_lots(
+                            wallet_1e8,
+                            snap.bids[0].price,
+                            edge_bps,
+                            in_debt,
+                        );
+                        let _ = engines[s_idx].try_arm_maker_entry(&spec, &snap, verdict, lots);
+                        engines[s_idx].sync_to_shm_telemetry(arena);
+                        armed_this_tick += 1;
                     }
                 }
-            }
-            if let Some((best_s, verdict, _)) = best_cand {
-                let spec = APPROVED_SPECS[best_s];
-                let snap = cached_snaps[best_s];
-                let side = match verdict {
-                    SignalVerdict::AuthorizeMakerEntry { side: s, .. } => s,
-                    _ => Side::Bid,
-                };
-                let (edge_bps, _, _) = gov.slot_direction_diagnostics(best_s, side);
-                let in_debt = gov.is_in_scar_debt(best_s, side);
-                let lots = spec.compute_compounding_kelly_lots(
-                    wallet_1e8,
-                    snap.bids[0].price,
-                    edge_bps,
-                    in_debt,
-                );
-                let _ = engines[best_s].try_arm_maker_entry(&spec, &snap, verdict, lots);
-                engines[best_s].sync_to_shm_telemetry(arena);
             }
         }
     }

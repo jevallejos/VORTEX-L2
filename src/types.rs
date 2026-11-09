@@ -352,7 +352,7 @@ impl PairSpec {
         } else {
             0
         };
-        let max_q = (min_q.saturating_mul(65 + edge_bonus)).clamp(2_500, 25_000);
+        let max_q = (min_q.saturating_mul(180 + edge_bonus * 2)).clamp(25_000, 120_000);
         let tot_q = (own_l1_lots.max(0) + opp_l1_lots.max(0)).max(1);
         let tfi_exc = (tfi_abs - ofi_abs).max(0.0);
         let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);

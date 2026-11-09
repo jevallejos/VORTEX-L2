@@ -430,14 +430,12 @@ impl OnlineAdaptiveGovernor {
         }
         let anchor_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
         let cur_1e4 = entry_ticks.saturating_mul(10_000);
-        let cross_stair = self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
-        if (self.win_streak[slot_idx][d] >= 2 || cross_stair) && anchor_1e4 > 0 && cur_1e4 > 0 {
+        if self.win_streak[slot_idx][d] >= 3 && anchor_1e4 > 0 && cur_1e4 > 0 {
             let chased_bps = match side {
                 Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
                 Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
             };
-            let cap = if cross_stair { 2_300 } else { 2_500 };
-            if chased_bps > cap {
+            if chased_bps > 2_500 && chased_bps < 15_000 {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
         }
@@ -451,11 +449,6 @@ impl OnlineAdaptiveGovernor {
             return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
         }
         if slot_idx > 0 {
-            if self.global_dir_win_streak[1 - d] >= 2
-                && check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 300_000_000_000
-            {
-                return Some("VETO_ALTCOIN_COUNTER_CASCADE");
-            }
             if self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8) {
                 return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
             }
@@ -482,8 +475,8 @@ impl OnlineAdaptiveGovernor {
         signed_geom: f64,
         snr_abs: f64,
     ) -> Result<(i64, i64), &'static str> {
-        let min_geom_floor = if snr_abs >= 0.65 {
-            (0.15 - (snr_abs - 0.60) * 0.25).clamp(0.09, 0.15)
+        let min_geom_floor = if snr_abs >= 0.50 {
+            (0.15 - (snr_abs - 0.50) * 0.55).clamp(0.05, 0.15)
         } else {
             0.15
         };
@@ -503,10 +496,18 @@ impl OnlineAdaptiveGovernor {
             180
         };
         let accel_net = s_drift - s_ext;
-        let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 120.0).round() as i64;
-        let snr_contrib = ((snr_abs - 0.42).max(0.0) * 120.0).round() as i64;
+        let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 260.0).round() as i64;
+        let snr_contrib = if snr_abs >= 0.46 {
+            ((snr_abs - 0.45).max(0.0) * 560.0).round() as i64
+        } else {
+            ((snr_abs - 0.42).max(0.0) * 120.0).round() as i64
+        };
         let e_kin = if accel_net <= 0 {
-            accel_net
+            if s_drift >= 0 && s_ext.abs() < 115 && snr_abs >= 0.48 {
+                (s_drift / 2) + geom_contrib + snr_contrib
+            } else {
+                accel_net
+            }
         } else {
             accel_net + geom_contrib + snr_contrib
         };
@@ -570,15 +571,11 @@ impl OnlineAdaptiveGovernor {
             self.global_dir_win_streak[1 - d] = 0;
             self.last_global_win_dir = d as u8;
             self.last_global_win_ts_ns = ts_ns.0;
-            if gw >= 3 {
-                let breather = ts_ns.0.saturating_add(180_000_000_000);
-                if breather > self.global_dir_cooldown_until_ns[d] {
-                    self.global_dir_cooldown_until_ns[d] = breather;
-                }
+            if gw >= 6 {
                 self.global_dir_win_streak[d] = 0;
             }
-            let breather_secs = ((320 - edge_clamped / 3) * (w.min(3) as i64)) / 3;
-            let win_breather_ns = ts_ns.0.saturating_add(breather_secs.clamp(45, 320) * 1_000_000_000);
+            let breather_secs = (25 - edge_clamped / 40).clamp(12, 30) * (w.min(2) as i64);
+            let win_breather_ns = ts_ns.0.saturating_add(breather_secs * 1_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
             }
