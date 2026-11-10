@@ -1549,16 +1549,7 @@ impl SlotExecutionEngine {
             0
         };
         let wald_pct = ((time_c + flow_c + depth_c) / 10).clamp(0, 48);
-        let base_sl_dist = (avg_price_ticks.0 - sl_trigger_price.0).abs().max(4);
-        let contracted_dist = ((base_sl_dist * (100 - wald_pct)) / 100).max(3);
-        let eff_sl_price = if wald_pct >= 32 && signed_flow <= -0.55 {
-            match side {
-                Side::Bid => PriceTicks((avg_price_ticks.0 - contracted_dist).max(1)),
-                Side::Ask => PriceTicks(avg_price_ticks.0 + contracted_dist),
-            }
-        } else {
-            sl_trigger_price
-        };
+        let eff_sl_price = sl_trigger_price;
         self.last_eff_sl_ticks = eff_sl_price;
         self.last_closed_wald_pct = wald_pct;
 
@@ -1661,7 +1652,8 @@ impl SlotExecutionEngine {
             }
         }
 
-        if hold_ns >= elastic_siphon_window_ns && cur_gross_bps >= 40 {
+        let _ = elastic_siphon_window_ns;
+        if hold_ns >= 35_000_000_000 && cur_gross_bps >= 40 {
             let needed = (440 - cur_gross_bps).max(0);
             if ledger.sinking_fund_reserve_bps_x100 >= needed {
                 let _ = ledger.try_consume_sinking_fund_subsidy(needed);

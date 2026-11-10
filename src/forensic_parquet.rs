@@ -8,7 +8,7 @@ use crate::types::{LotQty, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, V
 
 pub const COLUMNAR_BATCH_CAP: usize = 256;
 pub const PARQUET_MAGIC_HEADER: [u8; 4] = *b"PAR1";
-pub const MAX_SINKING_FUND_SCALED_BPS: i64 = 3_500;
+pub const MAX_SINKING_FUND_SCALED_BPS: i64 = 25_000;
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

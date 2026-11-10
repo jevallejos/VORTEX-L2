@@ -37,7 +37,7 @@ use vortex_rs::types::{
 
 const DEFAULT_WALLET_EQUITY_1E8: i64 = 7_080_000_000;
 const BASE_NOTIONAL_1E8: i64 = 1_250_000_000;
-const MAX_CONCURRENT_OPEN_SLOTS: usize = 8;
+const MAX_CONCURRENT_OPEN_SLOTS: usize = 9;
 const SHADOW_LEDGER_PATH: &str = "data/vortex_shadow_trades.jsonl";
 const AI_FORENSIC_VAULT_PATH: &str = "data/vault/vortex_ai_forensic_vault.jsonl";
 const RED_LOSS_BOX_PATH: &str = "data/vault/vortex_red_loss_box.jsonl";
@@ -779,7 +779,7 @@ fn render_trades_and_executive_dashboard() {
     let eff_notional_usdt = (w_usdt * 0.29).max(18.0);
     let bps_to_usdt = eff_notional_usdt / 10_000.0;
     let total_pos_bps = inherited_pos_bps.max(cum_net.max(0.0));
-    let reserve_bps = (total_pos_bps * 0.30).min(35.0);
+    let reserve_bps = (total_pos_bps * 0.30).min(250.0);
     let locked_bps = total_pos_bps * 0.70;
     let net_usdt = cum_net * bps_to_usdt;
     let gross_usdt = cum_gross * bps_to_usdt;
@@ -1195,12 +1195,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     let lots = spec.parse_lot_qty(&sz_s).max(LotQty(1));
                     let now_t = now_epoch_ns();
                     let saved = load_saved_slot_state(s_idx);
-                    let avg_t = saved
-                        .as_ref()
-                        .and_then(|v| v.get("avg_ticks"))
-                        .and_then(|n| n.as_i64())
-                        .map(PriceTicks)
-                        .unwrap_or(bybit_avg_t);
+                    let avg_t = bybit_avg_t;
                     let init_l = saved
                         .as_ref()
                         .and_then(|v| v.get("initial_lots"))
@@ -1219,11 +1214,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .and_then(|n| n.as_i64())
                         .map(PriceTicks)
                         .unwrap_or(PriceTicks(0));
-                    let p_cycles = saved
-                        .as_ref()
-                        .and_then(|v| v.get("peristaltic_cycles"))
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0) as u32;
+                    let p_cycles = 0_u32;
                     let t1_done = saved
                         .as_ref()
                         .and_then(|v| v.get("tranche1_harvested"))
@@ -1652,7 +1643,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 }
                 OrderLifecycleState::PositionOpenMakerExit {
                     side,
-                    mut avg_price_ticks,
+                    avg_price_ticks,
                     mut peak_favorable_price,
                     mut worst_adverse_price,
                     initial_lots,
@@ -1785,50 +1776,14 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 || (hold_s >= 30 && !strong_trend)
                         };
 
-                        let target_amort =
-                            if !tranche1_harvested && cur_gross_bps <= -120 {
-                                ((hold_s / 1_800) as u64).min(8)
-                            } else {
-                                0
-                            };
-                        while engines[s_idx].peristaltic_cycles_count < target_amort
-                            && ledger.sinking_fund_reserve_bps_x100 >= 200
-                        {
-                            if ledger.try_consume_sinking_fund_subsidy(100) > 0 {
-                                let step_t =
-                                    ((avg_price_ticks.0 * 100) / 1_000_000).max(1);
-                                avg_price_ticks = match side {
-                                    Side::Bid => {
-                                        PriceTicks((avg_price_ticks.0 - step_t).max(1))
-                                    }
-                                    Side::Ask => PriceTicks(avg_price_ticks.0 + step_t),
-                                };
-                                let next_c = engines[s_idx]
-                                    .peristaltic_cycles_count
-                                    .saturating_add(1);
-                                engines[s_idx].peristaltic_cycles_count = next_c;
-                                let cyc_u32 = next_c as u32;
-                                if let OrderLifecycleState::PositionOpenMakerExit {
-                                    avg_price_ticks: ref mut ap_mut,
-                                    peristaltic_cycles: ref mut pc_mut,
-                                    ..
-                                } = engines[s_idx].state
-                                {
-                                    *ap_mut = avg_price_ticks;
-                                    *pc_mut = cyc_u32;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
+                        let early_phase_siphon = hold_s >= 35
+                            && peak_gross_bps <= 120
+                            && (cur_gross_bps <= -40 || worst_mae_bps <= -60);
+                        let deep_stagnant_siphon =
+                            hold_s >= 180 && worst_mae_bps <= -120;
                         let siphon_eligible = !tranche1_harvested
-                            && hold_s >= 600
-                            && worst_mae_bps <= -180
-                            && ledger.sinking_fund_reserve_bps_x100 >= 120;
-                        let siphon_sub_cap =
-                            (ledger.sinking_fund_reserve_bps_x100 / 2).clamp(0, 360);
-                        let siphon_floor_bps = (440 - siphon_sub_cap).clamp(80, 440);
+                            && (early_phase_siphon || deep_stagnant_siphon)
+                            && ledger.sinking_fund_reserve_bps_x100 >= 100;
 
                         let use_tranche1_50 = !tranche1_harvested
                             && initial_lots.0 >= 2
@@ -1838,10 +1793,10 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let mfe_lrn = engines[s_idx].learned_mfe_bps.clamp(540, 880);
                         let base_win_target = (vol_fl * 60 + mfe_lrn * 40) / 100;
                         let step_15s = (hold_s / 15).clamp(0, 6);
-                        let time_relax = (step_15s * (base_win_target - 500).max(0)) / 6;
-                        let target_floor_bps = if siphon_eligible {
-                            ScaledBps(siphon_floor_bps)
-                        } else if allow_scratch_floor {
+                        let win_exc = (base_win_target - 500).max(0);
+                        let time_relax = (step_15s * win_exc) / 6;
+                        let use_min_fl = siphon_eligible || allow_scratch_floor;
+                        let target_floor_bps = if use_min_fl {
                             ScaledBps(if tranche1_harvested { 465 } else { 440 })
                         } else if use_tranche1_50 {
                             ScaledBps(465)
@@ -2204,7 +2159,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     &btc_snap,
                 );
                 if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
-                    if gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap) {
+                    let harvester_ok = open_count < 6
+                        || (snap.factor_ofi.get().abs() >= 0.45
+                            && snap.factor_tfi.get().abs() >= 0.55);
+                    if harvester_ok
+                        && gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap)
+                    {
                         let (edge_bps, _, _) = gov.slot_direction_diagnostics(s_idx, side);
                         let in_debt = gov.is_in_scar_debt(s_idx, side);
                         let lots = spec.compute_compounding_kelly_lots(
