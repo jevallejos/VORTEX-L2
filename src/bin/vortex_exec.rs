@@ -1461,7 +1461,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             signed_gm,
                             snr_v.abs(),
                         )
-                        .unwrap_or(((dr_b - ex_b) * d_sign_i, 125));
+                        .unwrap_or(((ex_b - dr_b) * d_sign_i, 125));
                     entry_forensics[s_idx] = SlotForensicEntrySnapshot {
                         armed_ts_ns: now_ns.0,
                         init_q_lots: q_l1.0,
@@ -1477,7 +1477,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         sl_streak: sl_st,
                         drift_bps: (dr_b as f64) / 100.0,
                         ext_bps: (ex_b as f64) / 100.0,
-                        kin_accel_net_bps: (((dr_b - ex_b) * d_sign_i) as f64) / 100.0,
+                        kin_accel_net_bps: (((ex_b - dr_b) * d_sign_i) as f64) / 100.0,
                         kin_energy_in_bps: (e_kin as f64) / 100.0,
                         req_kin_energy_in_bps: (e_min as f64) / 100.0,
                     };

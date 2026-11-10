@@ -21,6 +21,8 @@ pub struct OrthogonalFactorState {
     initialized: bool,
     prev_bids: [BookLevel; OFI_DEPTH],
     prev_asks: [BookLevel; OFI_DEPTH],
+    last_l2_ts_ns: i64,
+    last_tfi_ts_ns: i64,
     ofi_pos_fast: f64,
     ofi_neg_fast: f64,
     ofi_pos_med: f64,
@@ -50,6 +52,8 @@ impl OrthogonalFactorState {
             initialized: false,
             prev_bids: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; OFI_DEPTH],
             prev_asks: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; OFI_DEPTH],
+            last_l2_ts_ns: 0,
+            last_tfi_ts_ns: 0,
             ofi_pos_fast: 1.0,
             ofi_neg_fast: 1.0,
             ofi_pos_med: 1.0,
@@ -69,55 +73,175 @@ impl OrthogonalFactorState {
         *self = Self::new();
     }
 
+    #[inline]
+    fn decay_tfi_to_clock(&mut self, ts_ns: i64) {
+        let dt_s = if ts_ns > 0 && self.last_tfi_ts_ns > 0 && ts_ns > self.last_tfi_ts_ns {
+            ((ts_ns - self.last_tfi_ts_ns) as f64 * 1e-9).clamp(0.0, 30.0)
+        } else if ts_ns > 0 && self.last_tfi_ts_ns <= 0 {
+            self.last_tfi_ts_ns = ts_ns;
+            return;
+        } else {
+            0.020
+        };
+        if ts_ns > self.last_tfi_ts_ns {
+            self.last_tfi_ts_ns = ts_ns;
+        }
+        let a_tfi = (-dt_s / 4.0).exp();
+        self.tfi_buy_accum = (self.tfi_buy_accum * a_tfi).max(1e-3);
+        self.tfi_sell_accum = (self.tfi_sell_accum * a_tfi).max(1e-3);
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn update_realized_vol_5m(
+        prev_vol: ScaledBps,
+        anchor_px: PriceTicks,
+        cur_px: PriceTicks,
+        dt_ns: i64,
+    ) -> ScaledBps {
+        let a_px = anchor_px.0.max(1);
+        let dp = (cur_px.0 - a_px).abs();
+        let ret_bps = (dp.saturating_mul(1_000_000)) / a_px;
+        let dt_s = ((dt_ns.max(1_000_000_000) as f64) * 1e-9).clamp(1.0, 300.0);
+        let scale = (300.0 / dt_s).sqrt();
+        let inst_v = (((ret_bps as f64) * scale).round() as i64).clamp(800, 18_000);
+        let next_v = ((prev_vol.raw() * 88 + inst_v * 12) / 100).clamp(800, 18_000);
+        ScaledBps(next_v)
+    }
+
     pub fn on_l2_book_update(&mut self, snap: &mut SymbolLobSnapshot) {
         snap.refresh_deep_l1_l5_totals();
         if !self.initialized {
-            let mut i = 0;
-            while i < OFI_DEPTH {
+            for i in 0..OFI_DEPTH {
                 self.prev_bids[i] = snap.bids[i];
                 self.prev_asks[i] = snap.asks[i];
-                i += 1;
             }
+            self.last_l2_ts_ns = snap.ts_local_ns.0;
+            self.last_tfi_ts_ns = snap.ts_local_ns.0;
             self.initialized = true;
             return;
         }
         let weights: [f64; OFI_DEPTH] = [1.0, 0.70, 0.45, 0.25, 0.12];
-        let mut raw_ofi = 0.0_f64;
-        for (i, &w) in weights.iter().enumerate() {
-            let cur_b = snap.bids[i];
-            let prv_b = self.prev_bids[i];
-            let b_flow = if cur_b.price.0 > prv_b.price.0 {
-                cur_b.qty.0 as f64
-            } else if cur_b.price.0 == prv_b.price.0 {
-                (cur_b.qty.0 - prv_b.qty.0) as f64
-            } else {
-                -(prv_b.qty.0 as f64)
-            };
-            let cur_a = snap.asks[i];
-            let prv_a = self.prev_asks[i];
-            let a_flow = if cur_a.price.0 > 0 && prv_a.price.0 > 0 {
-                if cur_a.price.0 < prv_a.price.0 {
-                    cur_a.qty.0 as f64
-                } else if cur_a.price.0 == prv_a.price.0 {
-                    (cur_a.qty.0 - prv_a.qty.0) as f64
-                } else {
-                    -(prv_a.qty.0 as f64)
-                }
-            } else {
-                0.0
-            };
-            raw_ofi += w * (b_flow - a_flow);
-            self.prev_bids[i] = cur_b;
-            self.prev_asks[i] = cur_a;
+        let mut prev_worst_bid = 0_i64;
+        let mut cur_worst_bid = 0_i64;
+        let mut prev_worst_ask = 0_i64;
+        let mut cur_worst_ask = 0_i64;
+        for i in 0..OFI_DEPTH {
+            let pb = self.prev_bids[i].price.0;
+            if pb > 0 && (prev_worst_bid == 0 || pb < prev_worst_bid) {
+                prev_worst_bid = pb;
+            }
+            let cb = snap.bids[i].price.0;
+            if cb > 0 && (cur_worst_bid == 0 || cb < cur_worst_bid) {
+                cur_worst_bid = cb;
+            }
+            let pa = self.prev_asks[i].price.0;
+            if pa > prev_worst_ask {
+                prev_worst_ask = pa;
+            }
+            let ca = snap.asks[i].price.0;
+            if ca > cur_worst_ask {
+                cur_worst_ask = ca;
+            }
         }
+
+        let mut b_flow = 0.0_f64;
+        for i in 0..OFI_DEPTH {
+            let cur_b = snap.bids[i];
+            if cur_b.price.0 <= 0 {
+                continue;
+            }
+            let mut matched_prev = None;
+            for j in 0..OFI_DEPTH {
+                if self.prev_bids[j].price.0 == cur_b.price.0 {
+                    matched_prev = Some(self.prev_bids[j].qty.0);
+                    break;
+                }
+            }
+            if let Some(pq) = matched_prev {
+                b_flow += weights[i] * ((cur_b.qty.0 - pq) as f64);
+            } else if prev_worst_bid == 0 || cur_b.price.0 > prev_worst_bid {
+                b_flow += weights[i] * (cur_b.qty.0 as f64);
+            }
+        }
+        for j in 0..OFI_DEPTH {
+            let prv_b = self.prev_bids[j];
+            if prv_b.price.0 <= 0 {
+                continue;
+            }
+            let mut still_present = false;
+            for i in 0..OFI_DEPTH {
+                if snap.bids[i].price.0 == prv_b.price.0 {
+                    still_present = true;
+                    break;
+                }
+            }
+            if !still_present && (cur_worst_bid == 0 || prv_b.price.0 >= cur_worst_bid) {
+                b_flow -= weights[j] * (prv_b.qty.0 as f64);
+            }
+        }
+
+        let mut a_flow = 0.0_f64;
+        for i in 0..OFI_DEPTH {
+            let cur_a = snap.asks[i];
+            if cur_a.price.0 <= 0 {
+                continue;
+            }
+            let mut matched_prev = None;
+            for j in 0..OFI_DEPTH {
+                if self.prev_asks[j].price.0 == cur_a.price.0 {
+                    matched_prev = Some(self.prev_asks[j].qty.0);
+                    break;
+                }
+            }
+            if let Some(pq) = matched_prev {
+                a_flow += weights[i] * ((cur_a.qty.0 - pq) as f64);
+            } else if prev_worst_ask == 0 || cur_a.price.0 < prev_worst_ask {
+                a_flow += weights[i] * (cur_a.qty.0 as f64);
+            }
+        }
+        for j in 0..OFI_DEPTH {
+            let prv_a = self.prev_asks[j];
+            if prv_a.price.0 <= 0 {
+                continue;
+            }
+            let mut still_present = false;
+            for i in 0..OFI_DEPTH {
+                if snap.asks[i].price.0 == prv_a.price.0 {
+                    still_present = true;
+                    break;
+                }
+            }
+            if !still_present && (cur_worst_ask == 0 || prv_a.price.0 <= cur_worst_ask) {
+                a_flow -= weights[j] * (prv_a.qty.0 as f64);
+            }
+        }
+        for i in 0..OFI_DEPTH {
+            self.prev_bids[i] = snap.bids[i];
+            self.prev_asks[i] = snap.asks[i];
+        }
+
+        let ts_now = snap.ts_local_ns.0;
+        let dt_s = if ts_now > 0 && self.last_l2_ts_ns > 0 && ts_now > self.last_l2_ts_ns {
+            ((ts_now - self.last_l2_ts_ns) as f64 * 1e-9).clamp(0.001, 30.0)
+        } else {
+            0.050
+        };
+        if ts_now > self.last_l2_ts_ns {
+            self.last_l2_ts_ns = ts_now;
+        }
+        let a_fast = (-dt_s / 0.50).exp();
+        let a_med = (-dt_s / 3.00).exp();
+        let a_slow = (-dt_s / 15.00).exp();
+        let raw_ofi = b_flow - a_flow;
         let pos = raw_ofi.max(0.0);
         let neg = (-raw_ofi).max(0.0);
-        self.ofi_pos_fast = self.ofi_pos_fast * 0.82 + pos;
-        self.ofi_neg_fast = self.ofi_neg_fast * 0.82 + neg;
-        self.ofi_pos_med = self.ofi_pos_med * 0.94 + pos;
-        self.ofi_neg_med = self.ofi_neg_med * 0.94 + neg;
-        self.ofi_pos_slow = self.ofi_pos_slow * 0.985 + pos;
-        self.ofi_neg_slow = self.ofi_neg_slow * 0.985 + neg;
+        self.ofi_pos_fast = (self.ofi_pos_fast * a_fast).max(1e-3) + pos;
+        self.ofi_neg_fast = (self.ofi_neg_fast * a_fast).max(1e-3) + neg;
+        self.ofi_pos_med = (self.ofi_pos_med * a_med).max(1e-3) + pos;
+        self.ofi_neg_med = (self.ofi_neg_med * a_med).max(1e-3) + neg;
+        self.ofi_pos_slow = (self.ofi_pos_slow * a_slow).max(1e-3) + pos;
+        self.ofi_neg_slow = (self.ofi_neg_slow * a_slow).max(1e-3) + neg;
 
         let f_score = (self.ofi_pos_fast - self.ofi_neg_fast)
             / (self.ofi_pos_fast + self.ofi_neg_fast + 1e-6);
@@ -128,8 +252,7 @@ impl OrthogonalFactorState {
         let blended_ofi = 0.50 * f_score + 0.32 * m_score + 0.18 * s_score;
         self.last_ofi = BoundedScore::new_clamped(blended_ofi);
 
-        self.tfi_buy_accum *= 0.992;
-        self.tfi_sell_accum *= 0.992;
+        self.decay_tfi_to_clock(ts_now);
         let tfi_val = (self.tfi_buy_accum - self.tfi_sell_accum)
             / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6);
         self.last_tfi = BoundedScore::new_clamped(tfi_val);
@@ -168,8 +291,7 @@ impl OrthogonalFactorState {
         snap: &mut SymbolLobSnapshot,
     ) {
         let q = (qty.0.max(0)) as f64;
-        self.tfi_buy_accum *= 0.96;
-        self.tfi_sell_accum *= 0.96;
+        self.decay_tfi_to_clock(snap.ts_local_ns.0);
         match side {
             Side::Bid => {
                 self.tfi_buy_accum += q;
@@ -202,10 +324,19 @@ impl OrthogonalFactorState {
         snap: &SymbolLobSnapshot,
         leader_btc_snap: &SymbolLobSnapshot,
     ) -> SignalVerdict {
-        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+        let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
         let mid_ticks = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
+        if spread_ticks > 1 {
+            let spread_scaled_bps =
+                (spread_ticks.saturating_mul(1_000_000)) / mid_ticks.0.max(1);
+            let max_elastic_spread_bps =
+                (snap.realized_vol_5m.raw() / 25).clamp(185, 310);
+            if spread_scaled_bps > max_elastic_spread_bps {
+                return SignalVerdict::NeutralNoAction;
+            }
+        }
         if spec.validate_pair_eligibility(mid_ticks, snap.realized_vol_5m).is_err() {
             return SignalVerdict::NeutralNoAction;
         }
@@ -399,5 +530,57 @@ mod tests {
         snap.factor_ofi = BoundedScore::new_clamped(-0.40);
         snap.factor_tfi = BoundedScore::new_clamped(-0.55);
         assert!(OrthogonalFactorState::detects_rebound_crest_exhaustion(Side::Bid, &snap));
+    }
+
+    #[test]
+    fn test_price_matched_ofi_clock_decay_and_spread_guard() {
+        use crate::types::TimestampNs;
+        let mut st = OrthogonalFactorState::new();
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[7].symbol_id;
+        snap.realized_vol_5m = ScaledBps(6_500);
+        snap.ts_local_ns = TimestampNs(1_000_000_000);
+        for i in 0..5 {
+            snap.bids[i] = BookLevel {
+                price: PriceTicks(15_700 - (i as i64)),
+                qty: LotQty(5_000),
+            };
+            snap.asks[i] = BookLevel {
+                price: PriceTicks(15_702 + (i as i64)),
+                qty: LotQty(5_000),
+            };
+        }
+        st.on_l2_book_update(&mut snap);
+
+        // 1-lot improvement at 15701t shifts 5000-lot walls down without fake wall OFI
+        snap.ts_local_ns = TimestampNs(1_100_000_000);
+        snap.apply_level_update(Side::Bid, PriceTicks(15_701), LotQty(1));
+        st.on_l2_book_update(&mut snap);
+        assert!(snap.factor_ofi.get() > 0.05 && snap.factor_ofi.get() < 0.45);
+
+        // Wide 6-tick spread on PENDLEUSDT (~3.82 bps) is vetoed by elastic spread guard
+        snap.bids[0] = BookLevel { price: PriceTicks(15_693), qty: LotQty(500) };
+        snap.asks[0] = BookLevel { price: PriceTicks(15_699), qty: LotQty(400) };
+        snap.factor_ofi = BoundedScore::new_clamped(0.80);
+        snap.factor_tfi = BoundedScore::new_clamped(0.85);
+        snap.factor_geom = BoundedScore::new_clamped(0.45);
+        let wide_v = OrthogonalFactorState::evaluate_entry_signal_with_leader(
+            APPROVED_SPECS[7],
+            &snap,
+            &snap,
+        );
+        assert_eq!(wide_v, SignalVerdict::NeutralNoAction);
+
+        // Flat market decays realized_vol_5m honestly below 35.00 bps floor
+        let mut v = ScaledBps(6_000);
+        for _ in 0..20 {
+            v = OrthogonalFactorState::update_realized_vol_5m(
+                v,
+                PriceTicks(15_700),
+                PriceTicks(15_700),
+                5_000_000_000,
+            );
+        }
+        assert!(v.raw() < ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw());
     }
 }

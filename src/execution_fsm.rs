@@ -454,8 +454,15 @@ impl OnlineAdaptiveGovernor {
         let d_sign = if matches!(side, Side::Bid) { 1_i64 } else { -1_i64 };
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
-        if s_drift < -15 || s_ext > 1_200 || (s_ext.abs() > s_drift.abs() && s_ext.abs() >= 115) {
-            return Err("VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
+        let lead_impulse = s_ext.saturating_sub(s_drift);
+        let elastic_lead_cap = 48 + ((snr_abs - 0.58).max(0.0) * 110.0).round() as i64;
+        if s_drift < -15
+            || s_ext < -15
+            || s_ext > 1_200
+            || (lead_impulse > 0 && lead_impulse > elastic_lead_cap && s_ext >= 115)
+            || lead_impulse < -420
+        {
+            return Err("VETO_KINEMATIC_PHASE_OR_EXHAUSTION");
         }
         let d = Self::dir_idx(side);
         let learned_edge = if slot_idx < MAX_ACTIVE_PAIRS {
@@ -463,25 +470,28 @@ impl OnlineAdaptiveGovernor {
         } else {
             180
         };
-        let accel_net = s_drift - s_ext;
+        let impulse_contrib = if lead_impulse >= 0 {
+            lead_impulse.min(75) + (s_drift.max(0) / 2).min(85)
+        } else if snr_abs >= 0.50 && s_drift > 0 && s_ext >= -10 {
+            ((s_drift / 4) + ((snr_abs - 0.50) * 220.0).round() as i64).min(115)
+        } else {
+            (lead_impulse / 2).max(-60)
+        };
         let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 240.0).round() as i64;
         let snr_contrib = ((snr_abs - 0.42).max(0.0) * 280.0).round() as i64;
         let fresh_init_bonus = if s_drift >= 0
-            && s_drift <= 105
+            && s_drift <= 140
             && s_ext >= -10
-            && s_ext < 110
-            && s_ext <= s_drift + 35
+            && s_ext <= 165
+            && lead_impulse >= -20
+            && lead_impulse <= elastic_lead_cap
             && snr_abs >= 0.45
         {
             95_i64
         } else {
             0_i64
         };
-        let e_kin = if accel_net < -35 {
-            accel_net
-        } else {
-            accel_net.max(0) + geom_contrib + snr_contrib + fresh_init_bonus
-        };
+        let e_kin = impulse_contrib + geom_contrib + snr_contrib + fresh_init_bonus;
         let req_e_min = (125 + ((200 - learned_edge).max(0) / 4)).clamp(110, 260);
         if e_kin < req_e_min {
             return Err("VETO_KINEMATIC_ENERGY_SURFACE (E_kin < E_min)");
@@ -1634,6 +1644,13 @@ mod tests {
             OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold();
         assert_eq!(mitigated_62, 62);
         assert_eq!(manifold_2160, 2_160);
+        let gov = OnlineAdaptiveGovernor::new();
+        assert!(gov
+            .evaluate_kinematic_energy_surface(1, Side::Bid, 105, 148, 0.24, 0.60)
+            .is_ok());
+        assert!(gov
+            .evaluate_kinematic_energy_surface(1, Side::Bid, 220, 150, 0.22, 0.47)
+            .is_err());
     }
 
     #[test]

@@ -239,6 +239,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
     let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let mut vol_anchor_px = [0_i64; MAX_ACTIVE_PAIRS];
     let mut vol_anchor_ts_ns = [0_i64; MAX_ACTIVE_PAIRS];
+    let mut has_live_mark_px = [false; MAX_ACTIVE_PAIRS];
     let mut batch = ColumnarParquetBatch::new();
     let mut parquet_seq = discover_latest_parquet_seq();
 
@@ -249,13 +250,15 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
             active_snaps[s].symbol_id = APPROVED_SPECS[s].symbol_id;
             active_snaps[s].is_eligible = true;
             active_snaps[s].realized_vol_5m = ScaledBps(SAMPLE_VOL_5M_BPS[s]);
+            has_live_mark_px[s] = false;
         }
         if let Ok((mut socket, _)) = tungstenite::connect(BYBIT_PUBLIC_LINEAR_WS) {
-            let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 2);
+            let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 3);
             for spec in &APPROVED_SPECS {
                 let sym = spec.symbol_id.name();
                 topics.push(format!("\"orderbook.50.{}\"", sym));
                 topics.push(format!("\"publicTrade.{}\"", sym));
+                topics.push(format!("\"tickers.{}\"", sym));
             }
             let sub_msg = format!(
                 "{{\"op\":\"subscribe\",\"args\":[{}]}}",
@@ -338,25 +341,27 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                         }
                     }
                     if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-                        snap.mark_price =
+                        let mid_l1 =
                             PriceTicks((snap.bids[0].price.0 + snap.asks[0].price.0) / 2);
+                        if !has_live_mark_px[slot_idx] || snap.mark_price.0 <= 0 {
+                            snap.mark_price = mid_l1;
+                        }
                         if snap.last_trade_price.0 <= 0 {
-                            snap.last_trade_price = snap.mark_price;
+                            snap.last_trade_price = mid_l1;
                         }
                         let dt_v = local_ns.0.saturating_sub(vol_anchor_ts_ns[slot_idx]);
                         if vol_anchor_px[slot_idx] <= 0 {
-                            vol_anchor_px[slot_idx] = snap.mark_price.0;
+                            vol_anchor_px[slot_idx] = mid_l1.0;
                             vol_anchor_ts_ns[slot_idx] = local_ns.0;
                         } else if dt_v >= 5_000_000_000 {
-                            let a_px = vol_anchor_px[slot_idx].max(1);
-                            let dp = (snap.mark_price.0 - a_px).abs();
-                            let ret_5s = (dp.saturating_mul(1_000_000)) / a_px;
-                            let inst_v = (ret_5s.saturating_mul(12)).clamp(4_200, 12_500);
-                            let prev_v = snap.realized_vol_5m.raw();
-                            let next_v = ((prev_v * 92 + inst_v * 8) / 100)
-                                .clamp(4_200, 12_500);
-                            snap.realized_vol_5m = ScaledBps(next_v);
-                            vol_anchor_px[slot_idx] = snap.mark_price.0;
+                            snap.realized_vol_5m =
+                                OrthogonalFactorState::update_realized_vol_5m(
+                                    snap.realized_vol_5m,
+                                    PriceTicks(vol_anchor_px[slot_idx]),
+                                    mid_l1,
+                                    dt_v,
+                                );
+                            vol_anchor_px[slot_idx] = mid_l1.0;
                             vol_anchor_ts_ns[slot_idx] = local_ns.0;
                         }
                     }
@@ -431,6 +436,33 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                                     flush_parquet_batch(&mut batch, &mut parquet_seq);
                                     let _ = batch.push_row(&row);
                                 }
+                            }
+                        }
+                    }
+                } else if let Some(sym_name) = topic.strip_prefix("tickers.") {
+                    let Some(slot_idx) = slot_from_symbol_name(sym_name) else {
+                        continue;
+                    };
+                    let spec = APPROVED_SPECS[slot_idx];
+                    let snap = &mut active_snaps[slot_idx];
+                    let mp_opt = val.get("data").and_then(|d| {
+                        d.get("markPrice")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                d.as_array()
+                                    .and_then(|a| a.first())
+                                    .and_then(|o| o.get("markPrice"))
+                                    .and_then(|v| v.as_str())
+                            })
+                    });
+                    if let Some(mp_s) = mp_opt {
+                        if let Ok(mp_t) = spec.parse_price_ticks(mp_s) {
+                            snap.mark_price = mp_t;
+                            snap.ts_exchange_ns = exch_ns;
+                            snap.ts_local_ns = local_ns;
+                            has_live_mark_px[slot_idx] = true;
+                            if let Ok(slot_ref) = arena.slot(slot_idx) {
+                                slot_ref.write_snapshot(snap);
                             }
                         }
                     }
