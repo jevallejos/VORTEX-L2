@@ -53,12 +53,15 @@ fn load_dotenv_map() -> HashMap<String, String> {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() || trimmed.starts_with("#") {
                 continue;
             }
-            if let Some((k, v)) = trimmed.split_once('=') {
+            if let Some((k, v)) = trimmed.split_once("=") {
                 let clean_k = k.trim().to_string();
-                let clean_v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                let clean_v = v
+                    .trim()
+                    .trim_matches(|c: char| c as u32 == 34 || c as u32 == 39)
+                    .to_string();
                 map.entry(clean_k).or_insert(clean_v);
             }
         }
@@ -196,8 +199,8 @@ impl BybitV5LiveClient {
 
     pub fn fetch_wallet_and_equity_usdt(&self) -> Option<(f64, f64, f64, f64)> {
         let q = "accountType=UNIFIED&coin=USDT";
-        let val = self.get_v5("/v5/account/wallet-balance", q)?;
-        let acct = val.get("result")?.get("list")?.as_array()?.first()?;
+        let val = self.get_v5("/v5/account/wallet-balance", q)?; 
+        let acct = val.get("result")?.get("list")?.as_array()?.first()?; 
         let w_usd = acct
             .get("totalWalletBalance")
             .and_then(|v| v.as_str())
@@ -218,7 +221,6 @@ impl BybitV5LiveClient {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
-
         if let Some(coins) = acct.get("coin").and_then(|c| c.as_array()) {
             for c_obj in coins {
                 let c_name = c_obj.get("coin").and_then(|v| v.as_str()).unwrap_or("");
@@ -276,14 +278,14 @@ impl BybitV5LiveClient {
     ) -> Option<(PriceTicks, LotQty)> {
         let sym = spec.symbol_id.name();
         let q = format!("category=linear&symbol={}", sym);
-        let val = self.get_v5("/v5/order/realtime", &q)?;
+        let val = self.get_v5("/v5/order/realtime", &q)?; 
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return None;
         }
         let list = val
             .get("result")
             .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())?;
+            .and_then(|l| l.as_array())?; 
         for item in list {
             let ro = item
                 .get("reduceOnly")
@@ -306,14 +308,14 @@ impl BybitV5LiveClient {
         symbol: &str,
     ) -> Option<(bool, String, Side, String)> {
         let q = format!("category=linear&symbol={}", symbol);
-        let val = self.get_v5("/v5/position/list", &q)?;
+        let val = self.get_v5("/v5/position/list", &q)?; 
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return None;
         }
         let list = val
             .get("result")
             .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())?;
+            .and_then(|l| l.as_array())?; 
         for pos in list {
             let sz_s = pos.get("size").and_then(|v| v.as_str()).unwrap_or("0");
             let side_s = pos.get("side").and_then(|v| v.as_str()).unwrap_or("Buy");
@@ -423,14 +425,11 @@ fn save_open_positions_state(engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS]) 
             worst_adverse_price,
             initial_lots,
             open_lots,
-            exhaled_lots,
-            last_crest_exhale_price,
-            peristaltic_cycles,
             tranche1_harvested,
             tp_maker_price,
             sl_trigger_price,
             opened_ts,
-            ..
+            .. 
         } = eng.state
         {
             arr.push(serde_json::json!({
@@ -442,9 +441,6 @@ fn save_open_positions_state(engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS]) 
                 "worst_ticks": worst_adverse_price.0,
                 "initial_lots": initial_lots.0,
                 "open_lots": open_lots.0,
-                "exhaled_lots": exhaled_lots.0,
-                "crest_ticks": last_crest_exhale_price.0,
-                "peristaltic_cycles": peristaltic_cycles,
                 "tranche1_harvested": tranche1_harvested,
                 "tp_ticks": tp_maker_price.0,
                 "sl_ticks": sl_trigger_price.0,
@@ -456,7 +452,6 @@ fn save_open_positions_state(engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS]) 
         let _ = fs::write(OPEN_POS_STATE_PATH, txt);
     }
 }
-
 fn pad_visible_right(s: &str, target_w: usize) -> String {
     let w = vortex_rs::types::visible_terminal_width(s);
     let pad = target_w.saturating_sub(w);
@@ -545,7 +540,6 @@ fn render_live_hud(arena: &VortexShmArena) {
         0
     };
     let drain_active = Path::new(DRAIN_LOCK_PATH).exists();
-
     let sec_title = vec![format!(
         concat!(
             "\u{1f4e1} [VORTEX-L3 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap ",
@@ -559,7 +553,6 @@ fn render_live_hud(arena: &VortexShmArena) {
         " X_OFI \u{2502}  X_TFI \u{2502} X_GEOM \u{2502} VERDICT           "
     )
     .to_string()];
-
     let mut sec_rows = Vec::with_capacity(MAX_ACTIVE_PAIRS);
     let mut open_slots_count = 0_usize;
     let mut queued_slots_count = 0_usize;
@@ -567,7 +560,6 @@ fn render_live_hud(arena: &VortexShmArena) {
         .slot(0)
         .and_then(|s| s.read_snapshot(4))
         .unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
-
     for s_idx in 0..MAX_ACTIVE_PAIRS {
         let spec = APPROVED_SPECS[s_idx];
         let snap = arena
@@ -582,7 +574,6 @@ fn render_live_hud(arena: &VortexShmArena) {
         let is_slot_queued = tel_state == 1 || tel_state == 2;
         let mut pyg_col_cell = format!("{}{:>14}{}", ANSI_GRAY, "-", ANSI_RESET);
         let mut pos_time_cell = format!("{}{:>13}{}", ANSI_GRAY, "-", ANSI_RESET);
-
         if is_slot_open {
             open_slots_count += 1;
             if let Ok(tel) = arena.telemetry(s_idx) {
@@ -611,7 +602,6 @@ fn render_live_hud(arena: &VortexShmArena) {
                     vortex_rs::types::ANSI_RED
                 };
                 pyg_col_cell = format!("{}{:>14}{}", pyg_col, pyg_raw, ANSI_RESET);
-
                 let saved_open_ns = load_saved_slot_state(s_idx)
                     .and_then(|v| v.get("opened_ts_ns")?.as_u64())
                     .unwrap_or(0);
@@ -639,7 +629,6 @@ fn render_live_hud(arena: &VortexShmArena) {
                 pos_time_cell = format!("{}{:>13}{}", ANSI_SKY_BLUE, q_str, ANSI_RESET);
             }
         }
-
         let slot_col = if is_slot_open {
             format!("{}\u{1f7e1} {:2}{}", ANSI_YELLOW, s_idx, ANSI_RESET)
         } else if is_slot_queued {
@@ -668,7 +657,6 @@ fn render_live_hud(arena: &VortexShmArena) {
                 format!("{}\u{26aa} NEUTRAL_WAIT   {}", ANSI_GRAY, ANSI_RESET)
             }
         };
-
         sec_rows.push(format!(
             concat!(
                 "{} \u{2502} {:<10} \u{2502} {} \u{2502} {} \u{2502} {:>12} \u{2502} ",
@@ -691,7 +679,6 @@ fn render_live_hud(arena: &VortexShmArena) {
             verdict_str
         ));
     }
-
     let state_banner = if drain_active {
         format!(
             "{}\u{1f7e2} DRAINING_OPEN_SESSIONS ({} open){}",
@@ -705,7 +692,6 @@ fn render_live_hud(arena: &VortexShmArena) {
     } else {
         format!("{}\u{26aa} IDLE (SCANNING 12 SLOTS){}", ANSI_GRAY, ANSI_RESET)
     };
-
     let sec_footer = vec![format!(
         concat!(
             "[EXEC FSM LIVE] State: {} \u{2502} [FLOW] ",
@@ -735,7 +721,6 @@ fn render_trades_and_executive_dashboard() {
     let mut sum_mae = 0.0_f64;
     let mut sum_hold_s = 0.0_f64;
     let mut dash_ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
-
     if let Ok(file) = fs::File::open(AI_FORENSIC_VAULT_PATH) {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
@@ -780,7 +765,6 @@ fn render_trades_and_executive_dashboard() {
             sum_mfe += mfe;
             sum_mae += mae;
             sum_hold_s += (hold_ms as f64) / 1_000.0;
-
             let net_sc = ScaledBps((n_bps * 100.0).round() as i64);
             let pnl_1e8 = (BASE_NOTIONAL_1E8 * net_sc.raw()) / 1_000_000;
             let f_sc = (f_bps * 100.0).round() as i64;
@@ -822,7 +806,6 @@ fn render_trades_and_executive_dashboard() {
             "  \u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-L3...".to_string(),
         );
     }
-
     let live_client = BybitV5LiveClient::from_env_if_enabled(true);
     let (w_usdt, eq_usdt, av_usdt, upl_usdt) = live_client
         .as_ref()
@@ -835,7 +818,6 @@ fn render_trades_and_executive_dashboard() {
     let net_usdt = cum_net * bps_to_usdt;
     let gross_usdt = cum_gross * bps_to_usdt;
     let fee_usdt = cum_fee * bps_to_usdt;
-
     let trade_goal: usize = if total < 25 {
         25
     } else if total < 50 {
@@ -867,7 +849,6 @@ fn render_trades_and_executive_dashboard() {
     } else {
         100.0
     };
-
     let goal_anchor_usdt = w_usdt.max(eq_usdt);
     let goal_pct = ((goal_anchor_usdt / 95.0) * 100.0).clamp(0.0, 100.0);
     let filled_bars = ((goal_pct / 5.0).round() as usize).min(20);
@@ -877,7 +858,6 @@ fn render_trades_and_executive_dashboard() {
         "\u{2591}".repeat(20 - filled_bars)
     );
     let rem_95 = (95.0 - goal_anchor_usdt).max(0.0);
-
     let sec_summary = vec![format!(
         concat!(
             "{}\u{1f7e2} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} ",
@@ -939,7 +919,6 @@ fn render_trades_and_executive_dashboard() {
             "Fraccion Kelly : 29.0% Wallet".to_string(),
         ),
     ];
-
     let denom_t = (total.max(1)) as f64;
     let sec_perf = vec![
         "\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESION]".to_string(),
@@ -1016,10 +995,10 @@ fn render_trades_and_executive_dashboard() {
     ];
     print_auto_aligned_box(&[rows_out, sec_summary, sec_dash_hdr, sec_wallet, sec_perf]);
 }
+
 pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
     use vortex_rs::lob_shm::BookLevel;
     use vortex_rs::types::BoundedScore;
-
     let mut engines = SlotExecutionEngine::new_12_slot_array(BASE_NOTIONAL_1E8);
     let mut gov = OnlineAdaptiveGovernor::new();
     let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
@@ -1034,14 +1013,12 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
     let mut loss_1e8 = 0_i64;
     let mut sum_trade_pnl_1e8 = 0_i64;
     let mut step = 0_usize;
-
     while closed_total < 520 && step < 4_000 {
         let s_idx = step % MAX_ACTIVE_PAIRS;
         step += 1;
         ts += 3_600_000_000_000;
         let spec = APPROVED_SPECS[s_idx];
         let base_px = sample_px[s_idx];
-
         let mut btc_snap = SymbolLobSnapshot::new_empty();
         btc_snap.symbol_id = APPROVED_SPECS[0].symbol_id;
         btc_snap.is_eligible = true;
@@ -1054,7 +1031,6 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
         btc_snap.factor_ofi = BoundedScore::new_clamped(0.86);
         btc_snap.factor_tfi = BoundedScore::new_clamped(0.88);
         btc_snap.factor_geom = BoundedScore::new_clamped(0.58);
-
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = spec.symbol_id;
         snap.is_eligible = true;
@@ -1067,7 +1043,6 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
         snap.factor_ofi = BoundedScore::new_clamped(0.86);
         snap.factor_tfi = BoundedScore::new_clamped(0.88);
         snap.factor_geom = BoundedScore::new_clamped(0.58);
-
         let verdict = OrthogonalFactorState::evaluate_entry_signal_with_leader(
             spec,
             &snap,
@@ -1090,7 +1065,6 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
         }
         let _ = engines[s_idx].on_maker_entry_filled(TimestampNs(ts + 25_000_000));
         snap.ts_local_ns = TimestampNs(ts + 12_000_000_000);
-
         if closed_total % 85 == 42 {
             snap.mark_price = PriceTicks(1);
             snap.last_trade_price = PriceTicks(1);
@@ -1115,7 +1089,6 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
             snap.last_trade_price = snap.asks[3].price;
             snap.mark_price = snap.asks[3].price;
         }
-
         if let Some(summary) =
             engines[s_idx].step_open_position(&snap, &btc_snap, &gov, &mut ledger)
         {
@@ -1138,7 +1111,6 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
             );
         }
     }
-
     let maker_ratio = (maker_total as f64 * 100.0) / (closed_total.max(1) as f64);
     let pf = (profit_1e8 as f64) / (loss_1e8.max(1) as f64);
     let cum_usdt = (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0;
@@ -1227,8 +1199,8 @@ struct SlotForensicEntrySnapshot {
 }
 
 fn load_saved_slot_state(slot_idx: usize) -> Option<serde_json::Value> {
-    let txt = fs::read_to_string(OPEN_POS_STATE_PATH).ok()?;
-    let arr = serde_json::from_str::<Vec<serde_json::Value>>(&txt).ok()?;
+    let txt = fs::read_to_string(OPEN_POS_STATE_PATH).ok()?; 
+    let arr = serde_json::from_str::<Vec<serde_json::Value>>(&txt).ok()?; 
     arr.into_iter()
         .find(|v| v.get("slot_idx").and_then(|s| s.as_u64()) == Some(slot_idx as u64))
 }
@@ -1272,7 +1244,6 @@ fn append_closed_trade_logs(
         0
     };
     let q_floor = defensive_zero_loss_maker_exit_price(summary.side, summary.entry_price);
-
     let vault_line = serde_json::json!({
         "event": "TRADE_CLOSE",
         "trade_id": ledger.closed_trades_count,
@@ -1324,11 +1295,9 @@ fn append_closed_trade_logs(
         "req_kin_energy_in_bps": entry_f.req_kin_energy_in_bps,
         "exit_peg_attempts": eng.exit_peg_attempts,
         "wald_contraction_pct": eng.last_closed_wald_pct,
-        "peristaltic_cycles": eng.peristaltic_cycles_count,
         "lvdbs_surfs": eng.lvdbs_deep_surfs_count,
     })
     .to_string();
-
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1347,7 +1316,6 @@ fn append_closed_trade_logs(
         let _ = fs::write(HALT_LOCK_PATH, &vault_line);
     }
 }
-
 fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> ExitCode {
     let tg_tx = spawn_async_telegram_notifier();
     let live_client = BybitV5LiveClient::from_env_if_enabled(live_capital);
@@ -1362,9 +1330,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
     let mut wallet_1e8 = DEFAULT_WALLET_EQUITY_1E8;
     let mut last_wallet_sync_ns = 0_i64;
     let mut last_rest_call_ns = 0_i64;
-
     rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
-
     if let Some(ref client) = live_client {
         if let Some((w_f, _, _, _)) = client.fetch_wallet_and_equity_usdt() {
             wallet_1e8 = (w_f * 100_000_000.0).round() as i64;
@@ -1384,19 +1350,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .and_then(|n| n.as_i64())
                         .map(LotQty)
                         .unwrap_or(lots);
-                    let exh_l = saved
-                        .as_ref()
-                        .and_then(|v| v.get("exhaled_lots"))
-                        .and_then(|n| n.as_i64())
-                        .map(LotQty)
-                        .unwrap_or(LotQty(0));
-                    let crest_t = saved
-                        .as_ref()
-                        .and_then(|v| v.get("crest_ticks"))
-                        .and_then(|n| n.as_i64())
-                        .map(PriceTicks)
-                        .unwrap_or(PriceTicks(0));
-                    let p_cycles = 0_u32;
                     let t1_done = saved
                         .as_ref()
                         .and_then(|v| v.get("tranche1_harvested"))
@@ -1441,11 +1394,9 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         .map(PriceTicks)
                         .unwrap_or(avg_t);
                     client.set_position_trading_stop(*spec, sl_t);
-
                     entry_forensics[s_idx].armed_ts_ns = opened_ns.0;
                     entry_forensics[s_idx].init_q_lots = init_l.0;
                     engines[s_idx].last_opened_ts = opened_ns;
-                    engines[s_idx].peristaltic_cycles_count = u64::from(p_cycles);
                     engines[s_idx].state = OrderLifecycleState::PositionOpenMakerExit {
                         side: side_p,
                         entry_price: bybit_avg_t,
@@ -1454,9 +1405,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         worst_adverse_price: worst_t,
                         initial_lots: init_l.max(lots),
                         open_lots: lots,
-                        exhaled_lots: exh_l,
-                        last_crest_exhale_price: crest_t,
-                        peristaltic_cycles: p_cycles,
                         tranche1_harvested: t1_done,
                         active_exit_role: if t1_done {
                             ExitOrderRole::LvdbsDeepSurf50
@@ -1473,7 +1421,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     println!(
                         concat!(
                             "{}\u{1f7e2} [VORTEX-L3 LIVE ADOPT] Slot {:2} {} {:?} ",
-                            "qty={} @ {}t (T1={} | ZMPQR={}){}"
+                            "qty={} @ {}t (T1={}){}"
                         ),
                         ANSI_GREEN,
                         s_idx,
@@ -1482,7 +1430,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         sz_s,
                         avg_t.0,
                         t1_done,
-                        p_cycles,
                         ANSI_RESET
                     );
                 }
@@ -1490,15 +1437,13 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
         }
         save_open_positions_state(&engines);
     }
-
     println!(
         concat!(
             "{}\u{1f7e2} [VORTEX-L3 200.0 Hz ARMED] 12 Autonomous Slot Engines + ",
-            "ZMPQR Peristaltic Pump + LVDBS L2/L3 Surf + 30% Siphon active.{}"
+            "Canonical SSOT Exit Quoter + LVDBS L2/L3 Surf + 30% Siphon active.{}"
         ),
         ANSI_GREEN, ANSI_RESET
     );
-
     loop {
         thread::sleep(Duration::from_millis(5));
         let now_ns = now_epoch_ns();
@@ -1507,7 +1452,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
             continue;
         }
         let drain_active = Path::new(DRAIN_LOCK_PATH).exists();
-
         if now_ns.0.saturating_sub(last_wallet_sync_ns) >= 30_000_000_000 {
             last_wallet_sync_ns = now_ns.0;
             if let Some(ref client) = live_client {
@@ -1521,7 +1465,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 }
             }
         }
-
         for s_idx in 0..MAX_ACTIVE_PAIRS {
             if let Ok(slot_ref) = arena.slot(s_idx) {
                 if let Ok(snap) = slot_ref.read_snapshot(4) {
@@ -1535,7 +1478,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
         }
         let btc_snap = cached_snaps[0];
         let mut open_count = 0_usize;
-
         for s_idx in 0..MAX_ACTIVE_PAIRS {
             let spec = APPROVED_SPECS[s_idx];
             let sym_name = spec.symbol_id.name();
@@ -1543,7 +1485,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
             if snap.sequence_id == 0 {
                 continue;
             }
-
             match engines[s_idx].state {
                 OrderLifecycleState::Idle => {}
                 OrderLifecycleState::PlacingEntryMaker {
@@ -1552,7 +1493,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     qty,
                     sl_trigger_price,
                     submitted_ts,
-                    ..
+                    .. 
                 } => {
                     if drain_active {
                         engines[s_idx].state = OrderLifecycleState::Idle;
@@ -1670,7 +1611,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     qty,
                     sl_trigger_price,
                     resting_since_ts,
-                    ..
+                    .. 
                 } => {
                     let at_l1 = match side {
                         Side::Bid => snap.bids[0].price == entry_price,
@@ -1705,7 +1646,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             &snap,
                         ))
                         || flow_imp <= -0.48;
-
                     if !drain_active && !dq_abort && !at_l1 && resting_elapsed_ns >= 2_500_000_000 {
                         let new_l1 = match side {
                             Side::Bid => snap.bids[0].price,
@@ -1736,7 +1676,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     if let Ok(real_en_t) = spec.parse_price_ticks(&real_avg_s) {
                                         if let OrderLifecycleState::RestingEntryQueue {
                                             entry_price: ref mut ep,
-                                            ..
+                                            .. 
                                         } = engines[s_idx].state
                                         {
                                             *ep = real_en_t;
@@ -1756,7 +1696,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                         if let OrderLifecycleState::RestingEntryQueue {
                                             entry_price: ref mut ep,
                                             resting_since_ts: ref mut r_ts,
-                                            ..
+                                            .. 
                                         } = engines[s_idx].state
                                         {
                                             *ep = new_l1;
@@ -1775,7 +1715,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             }
                         }
                     }
-
                     if drain_active
                         || resting_elapsed_ns >= elastic_queue_timeout_ns
                         || dq_abort
@@ -1805,7 +1744,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         continue;
                     }
-
                     let filled = if let Some(ref client) = live_client {
                         if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns {
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_200_000_000;
@@ -1823,7 +1761,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let _ = engines[s_idx].on_maker_entry_filled(now_ns);
                         if let OrderLifecycleState::PositionOpenMakerExit {
                             tp_maker_price: ref mut tp_init,
-                            ..
+                            .. 
                         } = engines[s_idx].state
                         {
                             *tp_init = PriceTicks(0);
@@ -1898,7 +1836,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     tp_maker_price: prev_tp_state,
                     sl_trigger_price,
                     opened_ts,
-                    ..
+                    .. 
                 } => {
                     open_count += 1;
                     let cur_bbo = match side {
@@ -1931,7 +1869,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     if let OrderLifecycleState::PositionOpenMakerExit {
                         peak_favorable_price: ref mut pk,
                         worst_adverse_price: ref mut wr,
-                        ..
+                        .. 
                     } = engines[s_idx].state
                     {
                         *pk = peak_favorable_price;
@@ -1952,143 +1890,19 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         (wr_d.saturating_mul(1_000_000)) / avg_denom;
                     engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
                     engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
-
                     if let Some(ref client) = live_client {
                         let hold_s =
                             (now_ns.0.saturating_sub(opened_ts.0)).max(0) / 1_000_000_000;
-                        let dir_s = if matches!(side, Side::Bid) { 1.0 } else { -1.0 };
-                        let s_ofi = snap.factor_ofi.get() * dir_s;
-                        let s_tfi = snap.factor_tfi.get() * dir_s;
-                        let s_geom = snap.factor_geom.get() * dir_s;
-                        let signed_flow = 0.55 * s_ofi + 0.45 * s_tfi;
-                        let joint_adverse = s_ofi < -0.18 && s_tfi < -0.18;
-                        let strong_trend = s_ofi > 0.20 || s_tfi > 0.25;
-
-                        let time_c = (hold_s / 60).min(18) * 12;
-                        let flow_c = if signed_flow < -0.35 {
-                            ((-signed_flow - 0.35) * 280.0).round() as i64
-                        } else {
-                            0
+                        let Some(init_quote) = engines[s_idx].compute_canonical_exit_quote(
+                            &snap,
+                            ledger.sinking_fund_reserve_bps_x100,
+                        ) else {
+                            engines[s_idx].sync_to_shm_telemetry(arena);
+                            continue;
                         };
-                        let depth_c = if s_geom < -0.25 {
-                            ((-s_geom - 0.25) * 180.0).round() as i64
-                        } else {
-                            0
-                        };
-                        let wald_pct = ((time_c + flow_c + depth_c) / 10).clamp(0, 48);
                         engines[s_idx].last_eff_sl_ticks = sl_trigger_price;
-                        engines[s_idx].last_closed_wald_pct = wald_pct;
-
-                        let cur_diff_bbo = match side {
-                            Side::Bid => cur_bbo.0 - avg_price_ticks.0,
-                            Side::Ask => avg_price_ticks.0 - cur_bbo.0,
-                        };
-                        let cur_gross_bps =
-                            (cur_diff_bbo.saturating_mul(1_000_000)) / avg_denom;
-                        let peak_gross_bps = engines[s_idx].last_closed_mfe_bps;
-                        let worst_mae_bps = engines[s_idx].last_closed_mae_bps;
-                        let recovered_from_red =
-                            worst_mae_bps <= -150 && cur_gross_bps >= 440;
-                        let mfe_pullback_lock = if tranche1_harvested {
-                            hold_s >= 45 && cur_gross_bps >= 485 && signed_flow < -0.10
-                        } else {
-                            (peak_gross_bps >= 520
-                                && (cur_gross_bps <= peak_gross_bps - 35
-                                    || signed_flow < 0.08))
-                                || (cur_gross_bps >= 455
-                                    && hold_s >= 6
-                                    && signed_flow < 0.05)
-                        };
-                        let allow_scratch_floor = if tranche1_harvested {
-                            hold_s >= 90 && joint_adverse
-                        } else {
-                            recovered_from_red
-                                || hold_s >= 45
-                                || worst_mae_bps <= -120
-                                || (hold_s >= 18 && joint_adverse)
-                                || (hold_s >= 30 && !strong_trend)
-                        };
-                        let early_phase_siphon = hold_s >= 35
-                            && peak_gross_bps <= 120
-                            && (cur_gross_bps <= -40 || worst_mae_bps <= -60);
-                        let deep_stagnant_siphon =
-                            hold_s >= 180 && worst_mae_bps <= -120;
-                        let siphon_eligible = !tranche1_harvested
-                            && (early_phase_siphon || deep_stagnant_siphon)
-                            && ledger.sinking_fund_reserve_bps_x100 >= 100;
-                        let use_tranche1_50 = !tranche1_harvested
-                            && initial_lots.0 >= 2
-                            && !allow_scratch_floor
-                            && !siphon_eligible;
-
-                        let vol_fl = (snap.realized_vol_5m.raw() / 10).clamp(520, 700);
-                        let mfe_lrn = engines[s_idx].learned_mfe_bps.clamp(540, 880);
-                        let base_win_target = (vol_fl * 60 + mfe_lrn * 40) / 100;
-                        let step_15s = (hold_s / 15).clamp(0, 6);
-                        let win_exc = (base_win_target - 500).max(0);
-                        let time_relax = (step_15s * win_exc) / 6;
-                        let use_min_fl = siphon_eligible || allow_scratch_floor;
-                        let target_floor_bps = if use_min_fl {
-                            ScaledBps(if tranche1_harvested { 465 } else { 440 })
-                        } else if use_tranche1_50 {
-                            ScaledBps(465)
-                        } else if mfe_pullback_lock {
-                            ScaledBps(cur_gross_bps.clamp(485, 525))
-                        } else {
-                            ScaledBps((base_win_target - time_relax).clamp(525, 740))
-                        };
-
-                        let req_delta_t = ((avg_price_ticks
-                            .0
-                            .saturating_mul(target_floor_bps.raw())
-                            + 999_999)
-                            / 1_000_000)
-                            .max(1);
-                        let active_floor_px = match side {
-                            Side::Bid => PriceTicks(avg_price_ticks.0 + req_delta_t),
-                            Side::Ask => {
-                                PriceTicks((avg_price_ticks.0 - req_delta_t).max(1))
-                            }
-                        };
-                        let (raw_vac_lvl, raw_surf_px, _) =
-                            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(
-                                side,
-                                &snap,
-                                active_floor_px,
-                            );
-                        let min_sell_px =
-                            snap.asks[0].price.0.max(snap.bids[0].price.0 + 1).max(1);
-                        let max_buy_px =
-                            if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 1 {
-                                snap.bids[0].price.0.min(snap.asks[0].price.0 - 1).max(1)
-                            } else {
-                                snap.bids[0].price.0.max(1)
-                            };
-                        let l1_non_crossing = match side {
-                            Side::Bid => PriceTicks(active_floor_px.0.max(min_sell_px)),
-                            Side::Ask => {
-                                PriceTicks(active_floor_px.0.min(max_buy_px).max(1))
-                            }
-                        };
-                        let lock_l1_now = siphon_eligible
-                            || allow_scratch_floor
-                            || use_tranche1_50
-                            || mfe_pullback_lock
-                            || (!tranche1_harvested && cur_gross_bps >= 440);
-                        let (vac_lvl, surf_px) = if lock_l1_now {
-                            (1_usize, l1_non_crossing)
-                        } else {
-                            let clamped_raw = match side {
-                                Side::Bid => {
-                                    PriceTicks(raw_surf_px.0.max(l1_non_crossing.0))
-                                }
-                                Side::Ask => PriceTicks(
-                                    raw_surf_px.0.min(l1_non_crossing.0).max(1),
-                                ),
-                            };
-                            (raw_vac_lvl, clamped_raw)
-                        };
-
+                        engines[s_idx].last_closed_wald_pct = init_quote.wald_pct;
+                        let cur_gross_bps = init_quote.cur_gross_bps;
                         let rest_ready = now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
                             && now_ns.0.saturating_sub(last_rest_call_ns) >= 55_000_000;
                         if rest_ready {
@@ -2113,7 +1927,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     }
                                 }
                             }
-
                             if !still_open {
                                 client.cancel_all_symbol_orders(sym_name);
                                 let q_fl = defensive_zero_loss_maker_exit_price(
@@ -2174,14 +1987,15 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     };
                                     let realized_g_bps =
                                         (raw_d.saturating_mul(1_000_000)) / avg_denom;
-                                    if siphon_eligible {
-                                        let sub_used =
-                                            (440 - cur_gross_bps).clamp(40, 360);
-                                        let _ = ledger
-                                            .try_consume_sinking_fund_subsidy(sub_used);
+                                    if init_quote.siphon_subsidy_bps > 0 {
+                                        let _ = ledger.try_consume_sinking_fund_subsidy(
+                                            init_quote.siphon_subsidy_bps,
+                                        );
                                         engines[s_idx].last_exit_sub_reason =
                                             ExitSubReason::SinkingFundSiphonExit;
-                                    } else if realized_g_bps >= 500 || vac_lvl >= 2 {
+                                    } else if realized_g_bps >= 500
+                                        || init_quote.vac_level >= 2
+                                    {
                                         engines[s_idx].lvdbs_deep_surfs_count =
                                             engines[s_idx]
                                                 .lvdbs_deep_surfs_count
@@ -2197,7 +2011,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     }
                                     (ClosedTradeKind::MakerPassiveUnwind, unified_px)
                                 };
-
                                 let summary = engines[s_idx].finalize_close(
                                     close_kind,
                                     side,
@@ -2286,16 +2099,29 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                             .tranche1_harvests_count
                                             .saturating_add(1);
                                 }
-                                let order_lots_target = if !tranche1_harvested
-                                    && real_lots.0 >= 2
-                                    && !allow_scratch_floor
-                                    && !siphon_eligible
+                                if let OrderLifecycleState::PositionOpenMakerExit {
+                                    initial_lots: ref mut in_l,
+                                    open_lots: ref mut op_l,
+                                    tranche1_harvested: ref mut t1_h,
+                                    .. 
+                                } = engines[s_idx].state
                                 {
-                                    LotQty((real_lots.0 / 2).max(1))
-                                } else {
-                                    real_lots
+                                    *in_l = eff_init_lots;
+                                    *op_l = real_lots;
+                                    *t1_h = tranche1_harvested;
+                                }
+                                let Some(live_quote) =
+                                    engines[s_idx].compute_canonical_exit_quote(
+                                        &snap,
+                                        ledger.sinking_fund_reserve_bps_x100,
+                                    )
+                                else {
+                                    engines[s_idx].sync_to_shm_telemetry(arena);
+                                    continue;
                                 };
-
+                                let surf_px = live_quote.target_price;
+                                let order_lots_target = live_quote.order_lots;
+                                let lock_l1_now = live_quote.lock_l1_now;
                                 let Some((resting_tp, resting_qty)) =
                                     client.get_resting_exit_order_info(spec)
                                 else {
@@ -2320,7 +2146,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     || (!moving_closer
                                         && cur_gross_bps < 200
                                         && tp_diff_ticks >= 4);
-
                                 let active_tp_now = if should_repeg {
                                     client.cancel_all_symbol_orders(sym_name);
                                     let rc = client.place_post_only_order(
@@ -2337,19 +2162,16 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 } else {
                                     resting_tp
                                 };
-
                                 if let OrderLifecycleState::PositionOpenMakerExit {
-                                    initial_lots: ref mut in_l,
-                                    open_lots: ref mut op_l,
-                                    tranche1_harvested: ref mut t1_h,
+                                    active_exit_role: ref mut ax_r,
+                                    active_exit_price: ref mut ax_p,
                                     active_exit_lots: ref mut ax_l,
                                     tp_maker_price: ref mut tp_p,
-                                    ..
+                                    .. 
                                 } = engines[s_idx].state
                                 {
-                                    *in_l = eff_init_lots;
-                                    *op_l = real_lots;
-                                    *t1_h = tranche1_harvested;
+                                    *ax_r = live_quote.role;
+                                    *ax_p = surf_px;
                                     *ax_l = order_lots_target;
                                     *tp_p = active_tp_now;
                                 }
@@ -2361,14 +2183,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         }
                         continue;
                     }
-
                     let _ = engines[s_idx]
                         .step_open_position(&snap, &btc_snap, &gov, &mut ledger);
                     engines[s_idx].sync_to_shm_telemetry(arena);
                 }
             }
         }
-
         if drain_active && open_count == 0 {
             let _ = tg_tx.send(
                 concat!(
@@ -2386,7 +2206,6 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
             );
             return ExitCode::SUCCESS;
         }
-
         let active_or_queued = engines
             .iter()
             .filter(|e| !matches!(e.state, OrderLifecycleState::Idle))
@@ -2443,7 +2262,6 @@ fn main() -> ExitCode {
     let is_trades = args.iter().any(|a| a == "--trades");
     let is_daemon = args.iter().any(|a| a == "--daemon");
     let is_live_cap = args.iter().any(|a| a == "--live-capital");
-
     let shm_path = MappedShmRegion::default_shm_path();
     if is_live_hud {
         if let Ok(reg) = MappedShmRegion::open_or_create(&shm_path, false) {
@@ -2455,7 +2273,6 @@ fn main() -> ExitCode {
         render_trades_and_executive_dashboard();
         return ExitCode::SUCCESS;
     }
-
     let (oos_trades, maker_ratio, pf, cum_usdt, drift) =
         run_oos_520_certification_suite();
     let sep = "================================================================================";
@@ -2485,7 +2302,6 @@ fn main() -> ExitCode {
     if oos_trades < 500 || maker_ratio < 80.0 || pf < 1.35 || drift != 0 {
         return ExitCode::FAILURE;
     }
-
     if is_daemon {
         let Ok(reg) = MappedShmRegion::open_or_create(&shm_path, false) else {
             return ExitCode::FAILURE;
@@ -2520,7 +2336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_forensic_persistence_and_peristaltic_siphon_amortization() {
+    fn test_forensic_persistence_and_siphon_amortization() {
         let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
         ledger.record_closed_trade_with_sinking_split(
             50_000_000,
