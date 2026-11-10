@@ -721,7 +721,7 @@ impl OnlineAdaptiveGovernor {
     #[must_use]
     pub fn audit_unified_62_losses_and_2160_manifold() -> (usize, usize) {
         let gov = Self::new();
-        let cases: [(usize, Side, i64, i64, f64, f64); 25] = [
+        let cases: [(usize, Side, i64, i64, f64, f64); 62] = [
             (0, Side::Ask, -331, -347, 0.11, 0.55),
             (3, Side::Bid, 113, 120, 0.11, 0.52),
             (0, Side::Bid, 182, 248, 0.38, 0.58),
@@ -747,8 +747,45 @@ impl OnlineAdaptiveGovernor {
             (1, Side::Ask, -240, -168, 0.15, 0.42),
             (0, Side::Ask, -232, -160, 0.15, 0.42),
             (0, Side::Bid, 250, 162, 0.15, 0.42),
+            (7, Side::Bid, -42, -68, -0.10, 0.39),
+            (4, Side::Bid, 135, 195, 0.14, 0.49),
+            (3, Side::Bid, 148, 212, 0.13, 0.50),
+            (4, Side::Bid, 128, 184, 0.12, 0.47),
+            (4, Side::Bid, 162, 229, 0.16, 0.51),
+            (1, Side::Bid, 175, 244, 0.18, 0.52),
+            (2, Side::Ask, -154, -218, 0.14, 0.48),
+            (3, Side::Bid, 139, 204, 0.15, 0.49),
+            (5, Side::Ask, -166, -231, 0.17, 0.50),
+            (1, Side::Bid, 188, 262, 0.19, 0.53),
+            (1, Side::Ask, -45, 18, 0.08, 0.41),
+            (4, Side::Ask, -38, 22, 0.09, 0.42),
+            (1, Side::Bid, 42, -19, 0.07, 0.41),
+            (4, Side::Ask, -32, 25, 0.06, 0.40),
+            (5, Side::Bid, 152, 219, 0.14, 0.48),
+            (0, Side::Ask, -51, 14, 0.09, 0.43),
+            (0, Side::Ask, -48, 16, 0.08, 0.42),
+            (4, Side::Ask, -172, -245, 0.16, 0.51),
+            (0, Side::Ask, -184, -258, 0.18, 0.52),
+            (1, Side::Bid, 168, 239, 0.15, 0.50),
+            (0, Side::Ask, -179, -251, 0.17, 0.51),
+            (0, Side::Bid, 36, -24, 0.07, 0.41),
+            (1, Side::Bid, -28, -55, 0.05, 0.43),
+            (5, Side::Bid, -34, -62, 0.06, 0.44),
+            (1, Side::Bid, -49, -84, 0.04, 0.45),
+            (0, Side::Bid, 144, 208, 0.14, 0.48),
+            (1, Side::Ask, -169, -238, 0.16, 0.50),
+            (0, Side::Bid, 158, 226, 0.15, 0.49),
+            (1, Side::Ask, -163, -232, 0.15, 0.49),
+            (0, Side::Ask, -174, -246, 0.17, 0.51),
+            (0, Side::Bid, 132, 194, 0.13, 0.47),
+            (0, Side::Ask, -136, -198, 0.13, 0.47),
+            (3, Side::Ask, -151, -216, 0.14, 0.48),
+            (0, Side::Ask, -165, -234, 0.16, 0.50),
+            (1, Side::Ask, -159, -225, 0.15, 0.49),
+            (0, Side::Ask, -161, -228, 0.15, 0.49),
+            (4, Side::Bid, 146, 211, 0.14, 0.48),
         ];
-        let mut mitigated_62 = 37_usize;
+        let mut mitigated_62 = 0_usize;
         for &(s_idx, side, dr, ex, gm, snr) in &cases {
             if gov.evaluate_kinematic_energy_surface(s_idx, side, dr, ex, gm, snr).is_err() {
                 mitigated_62 += 1;
@@ -1320,10 +1357,7 @@ impl SlotExecutionEngine {
             Side::Bid => exit_price.0 - entry_price.0,
             Side::Ask => entry_price.0 - exit_price.0,
         };
-        let mut gross_bps = (raw_diff.saturating_mul(1_000_000)) / entry_price.0.max(1);
-        if is_maker_exit && gross_bps < 440 {
-            gross_bps = 440;
-        }
+        let gross_bps = (raw_diff.saturating_mul(1_000_000)) / entry_price.0.max(1);
         let net_bps = gross_bps - fee_scaled_bps.raw();
         let fee_1e8 = (self.notional_per_trade_1e8.saturating_mul(fee_scaled_bps.raw())) / 1_000_000;
         let net_pnl_1e8 = (self.notional_per_trade_1e8.saturating_mul(net_bps)) / 1_000_000;
@@ -1545,21 +1579,20 @@ impl SlotExecutionEngine {
             }
         }
 
-        let _ = elastic_siphon_window_ns;
-        if hold_ns >= 35_000_000_000 && cur_gross_bps >= 40 {
-            let needed = (440 - cur_gross_bps).max(0);
-            if ledger.sinking_fund_reserve_bps_x100 >= needed {
-                let _ = ledger.try_consume_sinking_fund_subsidy(needed);
-                self.last_exit_sub_reason = ExitSubReason::SinkingFundSiphonExit;
-                return Some(self.finalize_close(
-                    ClosedTradeKind::MakerPassiveUnwind,
-                    side,
-                    avg_price_ticks,
-                    q_floor,
-                    snap.ts_local_ns,
-                    ledger,
-                ));
-            }
+        if hold_ns >= elastic_siphon_window_ns
+            && cur_gross_bps >= 440
+            && ledger.sinking_fund_reserve_bps_x100 >= 40
+        {
+            let _ = ledger.try_consume_sinking_fund_subsidy(40);
+            self.last_exit_sub_reason = ExitSubReason::SinkingFundSiphonExit;
+            return Some(self.finalize_close(
+                ClosedTradeKind::MakerPassiveUnwind,
+                side,
+                avg_price_ticks,
+                cur_bbo_ref,
+                snap.ts_local_ns,
+                ledger,
+            ));
         }
         None
     }
@@ -1761,15 +1794,24 @@ mod tests {
         assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(1)).is_ok());
         assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
 
-        // At t = 950s (> 15 min), price bounces +0.60 bps gross (759046t) -> Siphon rescues!
+        // At t = 955s (+0.60 bps < q_floor), engine refuses wallet-losing exit
         snap.ts_local_ns = TimestampNs(955_000_000_000);
         snap.bids[0] = BookLevel { price: PriceTicks(759_045), qty: LotQty(100) };
         snap.asks[0] = BookLevel { price: PriceTicks(759_046), qty: LotQty(100) };
         snap.mark_price = PriceTicks(759_046);
         snap.last_trade_price = PriceTicks(759_046);
+        assert!(eng.step_open_position(&snap, &snap, &gov, &mut ledger).is_none());
+
+        // At t = 960s, price reaches real quantum floor 759334t (+4.40 bps gross)
+        snap.ts_local_ns = TimestampNs(960_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(759_333), qty: LotQty(100) };
+        snap.asks[0] = BookLevel { price: PriceTicks(759_334), qty: LotQty(100) };
+        snap.mark_price = PriceTicks(759_334);
+        snap.last_trade_price = PriceTicks(759_334);
         let closed = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
         assert!(closed.is_some());
         if let Some(summary) = closed {
+            assert_eq!(summary.exit_price, PriceTicks(759_334));
             assert!(summary.net_scaled_bps.raw() >= 40);
             assert_eq!(eng.last_exit_sub_reason, ExitSubReason::SinkingFundSiphonExit);
             assert!(ledger.vault_locked_profit_bps_x100 >= 1_200);

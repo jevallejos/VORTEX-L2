@@ -355,29 +355,6 @@ impl ParitySyncLedger {
         granted
     }
 
-    #[inline]
-    #[must_use]
-    pub const fn expected_exchange_balance_1e8(&self) -> i64 {
-        self.initial_equity_1e8.saturating_add(self.cumulative_net_pnl_1e8)
-    }
-
-    #[inline]
-    pub const fn verify_parity_against_exchange(
-        &self,
-        exchange_balance_1e8: i64,
-        tolerance_units: i64,
-    ) -> Result<i64, VortexError> {
-        let expected = self.expected_exchange_balance_1e8();
-        let drift = (expected - exchange_balance_1e8).abs();
-        if drift > tolerance_units {
-            return Err(VortexError::AccountingParityDrift {
-                internal_balance_1e8: expected,
-                exchange_balance_1e8,
-                drift_1e8: drift,
-            });
-        }
-        Ok(drift)
-    }
 }
 
 #[cfg(test)]

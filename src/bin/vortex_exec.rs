@@ -38,7 +38,6 @@ use vortex_rs::types::{
 const DEFAULT_WALLET_EQUITY_1E8: i64 = 7_080_000_000;
 const BASE_NOTIONAL_1E8: i64 = 1_250_000_000;
 const MAX_CONCURRENT_OPEN_SLOTS: usize = 9;
-const SHADOW_LEDGER_PATH: &str = "data/vortex_shadow_trades.jsonl";
 const AI_FORENSIC_VAULT_PATH: &str = "data/vault/vortex_ai_forensic_vault.jsonl";
 const RED_LOSS_BOX_PATH: &str = "data/vault/vortex_red_loss_box.jsonl";
 const OPEN_POS_STATE_PATH: &str = "data/vault/vortex_open_positions_state.json";
@@ -705,6 +704,7 @@ fn render_trades_and_executive_dashboard() {
     let mut sum_mfe = 0.0_f64;
     let mut sum_mae = 0.0_f64;
     let mut sum_hold_s = 0.0_f64;
+    let mut dash_ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
 
     if let Ok(file) = fs::File::open(AI_FORENSIC_VAULT_PATH) {
         let reader = BufReader::new(file);
@@ -748,6 +748,14 @@ fn render_trades_and_executive_dashboard() {
             sum_mfe += mfe;
             sum_mae += mae;
             sum_hold_s += (hold_ms as f64) / 1_000.0;
+            let net_sc = ScaledBps((n_bps * 100.0).round() as i64);
+            let pnl_1e8 = (BASE_NOTIONAL_1E8 * net_sc.raw()) / 1_000_000;
+            let f_sc = (f_bps * 100.0).round() as i64;
+            let fee_1e8 = (BASE_NOTIONAL_1E8 * f_sc) / 1_000_000;
+            dash_ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
+            if sub_r == "SinkingFundSiphonExit" {
+                let _ = dash_ledger.try_consume_sinking_fund_subsidy(40);
+            }
             let (col, icon, lbl) = classify_trade_badge(n_bps, is_partial);
             rows_out.push(format!(
                 "{}{} [TRADE #{:<3} {}] {:<10} {:<3} \u{2502} {:>7}t->{:<7}t \u{2502} G:{:>+6.2} F:{:>4.2} N:{:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{:>+6.2} MAE:{:>+6.2} \u{2502} {:>4}s \u{2502} {:<21} (Mkr={}){}",
@@ -764,23 +772,10 @@ fn render_trades_and_executive_dashboard() {
         .and_then(BybitV5LiveClient::fetch_wallet_and_equity_usdt)
         .unwrap_or((70.8005, 70.8005, 70.8005, 0.0));
 
-    let mut inherited_pos_bps = 0.0_f64;
-    if let Ok(sf) = fs::File::open(SHADOW_LEDGER_PATH) {
-        let rdr = BufReader::new(sf);
-        for l in rdr.lines().map_while(Result::ok) {
-            if let Ok(sv) = serde_json::from_str::<serde_json::Value>(&l) {
-                let nb = sv.get("net_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
-                if nb > 0.0 {
-                    inherited_pos_bps += nb;
-                }
-            }
-        }
-    }
     let eff_notional_usdt = (w_usdt * 0.29).max(18.0);
     let bps_to_usdt = eff_notional_usdt / 10_000.0;
-    let total_pos_bps = inherited_pos_bps.max(cum_net.max(0.0));
-    let reserve_bps = (total_pos_bps * 0.30).min(250.0);
-    let locked_bps = total_pos_bps * 0.70;
+    let reserve_bps = (dash_ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0;
+    let locked_bps = (dash_ledger.vault_locked_profit_bps_x100 as f64) / 100.0;
     let net_usdt = cum_net * bps_to_usdt;
     let gross_usdt = cum_gross * bps_to_usdt;
     let fee_usdt = cum_fee * bps_to_usdt;
@@ -896,41 +891,134 @@ fn render_trades_and_executive_dashboard() {
 }
 
 pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
-    let mut eng = SlotExecutionEngine::new(0, BASE_NOTIONAL_1E8);
+    use vortex_rs::lob_shm::BookLevel;
+    use vortex_rs::types::BoundedScore;
+
+    let mut engines = SlotExecutionEngine::new_12_slot_array(BASE_NOTIONAL_1E8);
+    let mut gov = OnlineAdaptiveGovernor::new();
     let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+    let sample_px: [i64; MAX_ACTIVE_PAIRS] = [
+        759_000, 223_700, 8_930, 8_170, 22_400, 8_510,
+        3_130, 16_140, 1_650, 10_720, 3_690, 5_176,
+    ];
     let mut ts = 1_700_000_000_000_000_000_i64;
-    for i in 0..520_u64 {
-        let base_px = PriceTicks(759_000 + ((i % 40) as i64) * 10);
-        ts += 10_000_000_000;
-        if i % 5 == 4 {
-            let sl_px = PriceTicks(base_px.0 - 190);
-            let _ = eng.finalize_close(
-                ClosedTradeKind::ServerMarkPriceStopLoss,
-                Side::Bid,
-                base_px,
-                sl_px,
-                TimestampNs(ts),
-                &mut ledger,
-            );
+    let mut closed_total = 0_u64;
+    let mut maker_total = 0_u64;
+    let mut profit_1e8 = 0_i64;
+    let mut loss_1e8 = 0_i64;
+    let mut sum_trade_pnl_1e8 = 0_i64;
+    let mut step = 0_usize;
+
+    while closed_total < 520 && step < 4_000 {
+        let s_idx = step % MAX_ACTIVE_PAIRS;
+        step += 1;
+        ts += 3_600_000_000_000;
+        let spec = APPROVED_SPECS[s_idx];
+        let base_px = sample_px[s_idx];
+
+        let mut btc_snap = SymbolLobSnapshot::new_empty();
+        btc_snap.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc_snap.is_eligible = true;
+        btc_snap.ts_local_ns = TimestampNs(ts);
+        btc_snap.realized_vol_5m = ScaledBps(8_200);
+        btc_snap.bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(450) };
+        btc_snap.asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(350) };
+        btc_snap.mark_price = PriceTicks(759_000);
+        btc_snap.last_trade_price = PriceTicks(759_000);
+        btc_snap.factor_ofi = BoundedScore::new_clamped(0.86);
+        btc_snap.factor_tfi = BoundedScore::new_clamped(0.88);
+        btc_snap.factor_geom = BoundedScore::new_clamped(0.58);
+
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = spec.symbol_id;
+        snap.is_eligible = true;
+        snap.ts_local_ns = TimestampNs(ts);
+        snap.realized_vol_5m = ScaledBps(8_200);
+        snap.bids[0] = BookLevel { price: PriceTicks(base_px), qty: LotQty(450) };
+        snap.asks[0] = BookLevel { price: PriceTicks(base_px + 1), qty: LotQty(350) };
+        snap.mark_price = PriceTicks(base_px);
+        snap.last_trade_price = PriceTicks(base_px);
+        snap.factor_ofi = BoundedScore::new_clamped(0.86);
+        snap.factor_tfi = BoundedScore::new_clamped(0.88);
+        snap.factor_geom = BoundedScore::new_clamped(0.58);
+
+        let verdict = OrthogonalFactorState::evaluate_entry_signal_with_leader(
+            spec,
+            &snap,
+            &btc_snap,
+        );
+        let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict else {
+            continue;
+        };
+        if !gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap) {
+            continue;
+        }
+        let lots = spec.compute_compounding_kelly_lots(
+            DEFAULT_WALLET_EQUITY_1E8,
+            PriceTicks(base_px),
+            250,
+            false,
+        );
+        if engines[s_idx].try_arm_maker_entry(&snap, verdict, lots).is_err() {
+            continue;
+        }
+        let _ = engines[s_idx].on_maker_entry_filled(TimestampNs(ts + 25_000_000));
+
+        snap.ts_local_ns = TimestampNs(ts + 12_000_000_000);
+        if closed_total % 85 == 42 {
+            snap.mark_price = PriceTicks(1);
+            snap.last_trade_price = PriceTicks(1);
         } else {
-            let win_px = PriceTicks(base_px.0 + 720);
-            let _ = eng.finalize_close(
-                ClosedTradeKind::MakerPassiveUnwind,
-                Side::Bid,
-                base_px,
-                win_px,
-                TimestampNs(ts),
-                &mut ledger,
+            let q_fl =
+                defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(base_px));
+            snap.bids[0] = BookLevel { price: PriceTicks(q_fl.0 - 1), qty: LotQty(450) };
+            snap.asks[0] = BookLevel { price: q_fl, qty: LotQty(200) };
+            snap.last_trade_price = q_fl;
+            if s_idx >= 1 {
+                let _ = engines[s_idx]
+                    .step_open_position(&snap, &btc_snap, &gov, &mut ledger);
+            }
+
+            let step_t = ((base_px * 4) / 10_000).max(3);
+            for lvl in 0..4 {
+                let ask_p = q_fl.0 + 1 + (lvl as i64) * step_t;
+                snap.bids[lvl] = BookLevel {
+                    price: PriceTicks(q_fl.0 - (lvl as i64)),
+                    qty: LotQty(380),
+                };
+                snap.asks[lvl] = BookLevel { price: PriceTicks(ask_p), qty: LotQty(180) };
+            }
+            snap.last_trade_price = snap.asks[3].price;
+            snap.mark_price = snap.asks[3].price;
+        }
+
+        if let Some(summary) =
+            engines[s_idx].step_open_position(&snap, &btc_snap, &gov, &mut ledger)
+        {
+            closed_total += 1;
+            if summary.is_maker_exit {
+                maker_total += 1;
+            }
+            if summary.net_pnl_1e8 >= 0 {
+                profit_1e8 += summary.net_pnl_1e8;
+            } else {
+                loss_1e8 += summary.net_pnl_1e8.abs();
+            }
+            sum_trade_pnl_1e8 += summary.net_pnl_1e8;
+            gov.observe_closed_trade(
+                s_idx,
+                summary.side,
+                summary.net_scaled_bps,
+                summary.is_maker_exit,
+                snap.ts_local_ns,
             );
         }
     }
-    let total = eng.maker_exits_count + eng.taker_sl_exits_count;
-    let maker_ratio = (eng.maker_exits_count as f64 * 100.0) / (total.max(1) as f64);
-    let pf = (eng.gross_profit_accum_1e8 as f64) / (eng.gross_loss_accum_1e8.max(1) as f64);
+    let maker_ratio = (maker_total as f64 * 100.0) / (closed_total.max(1) as f64);
+    let pf = (profit_1e8 as f64) / (loss_1e8.max(1) as f64);
     let cum_usdt = (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0;
-    let expected_bal = ledger.expected_exchange_balance_1e8();
-    let drift = ledger.verify_parity_against_exchange(expected_bal, 0).unwrap_or(999);
-    (total, maker_ratio, pf, cum_usdt, drift)
+    let drift = (ledger.cumulative_net_pnl_1e8 - sum_trade_pnl_1e8).abs();
+    (closed_total, maker_ratio, pf, cum_usdt, drift)
 }
 
 fn rehydrate_shadow_ledger(
@@ -939,25 +1027,32 @@ fn rehydrate_shadow_ledger(
     gov: &mut OnlineAdaptiveGovernor,
     arena: &VortexShmArena,
 ) {
-    let vault_or_shadow = fs::File::open(AI_FORENSIC_VAULT_PATH)
-        .or_else(|_| fs::File::open(SHADOW_LEDGER_PATH));
-    if let Ok(file) = vault_or_shadow {
+    let mut l3_vault_count = 0_u64;
+    if let Ok(file) = fs::File::open(AI_FORENSIC_VAULT_PATH) {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
+            if v.get("event").and_then(|e| e.as_str()) != Some("TRADE_CLOSE") {
+                continue;
+            }
+            l3_vault_count += 1;
             let sym = v.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
             let side_s = v.get("side").and_then(|s| s.as_str()).unwrap_or("Bid");
             let net_f = v.get("net_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
             let mkr = v.get("maker_exit").and_then(|b| b.as_bool()).unwrap_or(true);
             let mfe_f = v.get("mfe_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
+            let sub_r = v.get("exit_sub_reason").and_then(|s| s.as_str()).unwrap_or("");
             if let Some(s_idx) = slot_from_symbol_name(sym) {
                 let side = side_from_str(side_s);
                 let net_sc = ScaledBps((net_f * 100.0).round() as i64);
                 let pnl_1e8 = (BASE_NOTIONAL_1E8 * net_sc.raw()) / 1_000_000;
                 let fee_1e8 = (BASE_NOTIONAL_1E8 * 400) / 1_000_000;
                 ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
+                if sub_r == "SinkingFundSiphonExit" {
+                    let _ = ledger.try_consume_sinking_fund_subsidy(40);
+                }
                 if !mkr || net_sc.raw() < 0 {
                     gov.observe_closed_trade(s_idx, side, net_sc, mkr, TimestampNs(0));
                 }
@@ -967,15 +1062,6 @@ fn rehydrate_shadow_ledger(
                     (net_sc.raw() + 400).max(500)
                 };
                 engines[s_idx].observe_mfe_sample(mfe_sc);
-            }
-        }
-    }
-    let mut l3_vault_count = 0_u64;
-    if let Ok(vf) = fs::File::open(AI_FORENSIC_VAULT_PATH) {
-        let rdr = BufReader::new(vf);
-        for l in rdr.lines().map_while(Result::ok) {
-            if l.contains("\"TRADE_CLOSE\"") {
-                l3_vault_count += 1;
             }
         }
     }
@@ -1059,32 +1145,6 @@ fn append_closed_trade_logs(
         0
     };
     let q_floor = defensive_zero_loss_maker_exit_price(summary.side, summary.entry_price);
-
-    let shadow_line = serde_json::json!({
-        "ts_ns": ts_ns.0,
-        "symbol": sym,
-        "kind": kind_str,
-        "side": side_str,
-        "entry_ticks": summary.entry_price.0,
-        "exit_ticks": summary.exit_price.0,
-        "gross_bps": gross_bps,
-        "fee_bps": fee_bps,
-        "net_bps": net_bps,
-        "fee_drag_pct": (fee_drag_pct * 10.0).round() / 10.0,
-        "mfe_bps": mfe_bps,
-        "mae_bps": mae_bps,
-        "mfe_capture_pct": (mfe_capture_pct * 10.0).round() / 10.0,
-        "hold_ms": hold_ms,
-        "exit_sub_reason": format!("{:?}", eng.last_exit_sub_reason),
-        "maker_exit": summary.is_maker_exit,
-        "total_trades": ledger.closed_trades_count,
-        "pf_x100": 999,
-        "cum_net_pnl_1e8": ledger.cumulative_net_pnl_1e8,
-    })
-    .to_string();
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(SHADOW_LEDGER_PATH) {
-        let _ = writeln!(f, "{}", shadow_line);
-    }
 
     let vault_line = serde_json::json!({
         "event": "TRADE_CLOSE",
@@ -1715,24 +1775,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             0
                         };
                         let wald_pct = ((time_c + flow_c + depth_c) / 10).clamp(0, 48);
-                        let base_sl_dist =
-                            (avg_price_ticks.0 - sl_trigger_price.0).abs().max(4);
-                        let contracted_dist =
-                            ((base_sl_dist * (100 - wald_pct)) / 100).max(3);
-                        let eff_sl_px = if s_idx != 7
-                            && wald_pct >= 32
-                            && signed_flow <= -0.55
-                        {
-                            match side {
-                                Side::Bid => {
-                                    PriceTicks((avg_price_ticks.0 - contracted_dist).max(1))
-                                }
-                                Side::Ask => PriceTicks(avg_price_ticks.0 + contracted_dist),
-                            }
-                        } else {
-                            sl_trigger_price
-                        };
-                        engines[s_idx].last_eff_sl_ticks = eff_sl_px;
+                        engines[s_idx].last_eff_sl_ticks = sl_trigger_price;
                         engines[s_idx].last_closed_wald_pct = wald_pct;
 
                         let cur_diff_bbo = match side {

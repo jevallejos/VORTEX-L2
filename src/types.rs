@@ -151,11 +151,6 @@ pub enum VortexError {
     BatchCapacityExceeded,
     ColumnarIoFailure,
     ColumnarFormatCorrupted,
-    AccountingParityDrift {
-        internal_balance_1e8: i64,
-        exchange_balance_1e8: i64,
-        drift_1e8: i64,
-    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
