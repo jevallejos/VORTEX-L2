@@ -161,7 +161,11 @@ pub struct PairSpec {
     pub empirical_taker_exit_prob_pct: i64,
 }
 
-#[allow(clippy::manual_range_contains, clippy::manual_clamp, clippy::too_many_arguments)]
+#[allow(
+    clippy::manual_range_contains,
+    clippy::manual_clamp,
+    clippy::too_many_arguments
+)]
 impl PairSpec {
     #[inline]
     pub const fn tick_to_price_scaled_bps(
@@ -171,7 +175,8 @@ impl PairSpec {
         if reference_price_ticks.0 <= 0 || self.tick_size_1e8 <= 0 {
             return Err(VortexError::InvalidPriceOrTickSpec);
         }
-        let bps_scaled = (1_000_000 + (reference_price_ticks.0 / 2)) / reference_price_ticks.0;
+        let bps_scaled =
+            (1_000_000 + (reference_price_ticks.0 / 2)) / reference_price_ticks.0;
         Ok(ScaledBps(bps_scaled))
     }
 
@@ -243,6 +248,7 @@ impl PairSpec {
         Ok(required_3x)
     }
 
+    /// Enforces >= 2 ticks cushion against LastPrice and MarkPrice (prevents retCode 10001).
     #[inline]
     pub const fn validate_stop_loss_geometry(
         side: Side,
@@ -260,7 +266,8 @@ impl PairSpec {
                 } else {
                     mark_price.0
                 };
-                if proposed_sl.0 >= strict_bound {
+                let min_cushion = if strict_bound > 2 { 2 } else { 1 };
+                if proposed_sl.0 > strict_bound - min_cushion {
                     return Err(VortexError::StopLossGeometryViolation {
                         side,
                         proposed_sl_ticks: proposed_sl,
@@ -274,7 +281,7 @@ impl PairSpec {
                 } else {
                     mark_price.0
                 };
-                if proposed_sl.0 <= strict_bound {
+                if proposed_sl.0 < strict_bound.saturating_add(2) {
                     return Err(VortexError::StopLossGeometryViolation {
                         side,
                         proposed_sl_ticks: proposed_sl,
@@ -284,6 +291,64 @@ impl PairSpec {
             }
         }
         Ok(proposed_sl)
+    }
+
+    /// Exact executed position notional in USDT scaled by 1e8.
+    #[inline]
+    #[must_use]
+    pub const fn lot_notional_1e8(self, lots: LotQty, price: PriceTicks) -> i64 {
+        if lots.0 <= 0 || price.0 <= 0 || self.tick_size_1e8 <= 0 || self.lot_step_1e8 <= 0 {
+            return 0;
+        }
+        let qty_1e8 = (lots.0 as i128) * (self.lot_step_1e8 as i128);
+        let px_1e8 = (price.0 as i128) * (self.tick_size_1e8 as i128);
+        let usdt_1e8 = (qty_1e8 * px_1e8) / 100_000_000;
+        if usdt_1e8 > (i64::MAX as i128) {
+            i64::MAX
+        } else {
+            usdt_1e8 as i64
+        }
+    }
+
+    /// Canonical 29% base Kelly notional in USDT scaled by 1e8.
+    #[inline]
+    #[must_use]
+    pub const fn base_kelly_notional_1e8(wallet_usdt_1e8: i64) -> i64 {
+        let w_clamped = if wallet_usdt_1e8 < 5_000_000_000 {
+            5_000_000_000
+        } else if wallet_usdt_1e8 > 1_000_000_000_000 {
+            1_000_000_000_000
+        } else {
+            wallet_usdt_1e8
+        };
+        let raw_n = ((w_clamped as i128 * 29) / 100) as i64;
+        if raw_n < 1_800_000_000 {
+            1_800_000_000
+        } else if raw_n > 25_000_000_000 {
+            25_000_000_000
+        } else {
+            raw_n
+        }
+    }
+
+    /// True when the exchange minimum executable lot exceeds 2.2x base Kelly budget.
+    #[inline]
+    #[must_use]
+    pub const fn requires_oversized_lot_conviction(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+    ) -> bool {
+        let min_lots = if self.symbol_id.0 == 1 || self.symbol_id.0 == 2 {
+            1
+        } else if self.symbol_id.0 == 5 {
+            2
+        } else {
+            4
+        };
+        let min_notional = self.lot_notional_1e8(LotQty(min_lots), entry_price) as i128;
+        let kelly_base = Self::base_kelly_notional_1e8(wallet_usdt_1e8) as i128;
+        min_notional * 10 > kelly_base * 22
     }
 
     #[inline]
@@ -363,22 +428,7 @@ impl PairSpec {
             }
             return LotQty(1);
         }
-        let w_1e4 = wallet_usdt_1e8 / 10_000;
-        let w_clamped = if w_1e4 < 500_000 {
-            500_000
-        } else if w_1e4 > 100_000_000 {
-            100_000_000
-        } else {
-            w_1e4
-        };
-        let base_notional_1e4 = (w_clamped * 29) / 100;
-        let notional_clamped = if base_notional_1e4 < 180_000 {
-            180_000
-        } else if base_notional_1e4 > 2_500_000 {
-            2_500_000
-        } else {
-            base_notional_1e4
-        };
+        let notional_clamped = Self::base_kelly_notional_1e8(wallet_usdt_1e8) / 10_000;
         let kappa_permille = if in_scar_debt {
             650
         } else {
@@ -398,11 +448,14 @@ impl PairSpec {
             / 1_000_000_000_000;
         let denom = if lot_usdt_1e4 > 1 { lot_usdt_1e4 as i64 } else { 1 };
         let raw_lots = (eff_notional_1e4 + (denom / 2)) / denom;
-        let min_lots = if self.symbol_id.0 == 2 || self.symbol_id.0 == 5 {
-            2
-        } else {
-            4
-        };
+        if self.symbol_id.0 == 2 {
+            if raw_lots <= 1 {
+                return LotQty(1);
+            }
+            let even_eth = if (raw_lots & 1) != 0 { raw_lots + 1 } else { raw_lots };
+            return LotQty(even_eth);
+        }
+        let min_lots = if self.symbol_id.0 == 5 { 2 } else { 4 };
         let bounded = if raw_lots < min_lots { min_lots } else { raw_lots };
         let even_lots = if (bounded & 1) != 0 { bounded + 1 } else { bounded };
         LotQty(even_lots)
@@ -587,7 +640,6 @@ pub const APPROVED_SPECS: [PairSpec; 12] = [
     },
 ];
 
-
 #[inline]
 #[must_use]
 pub fn slot_from_symbol_name(name: &str) -> Option<usize> {
@@ -709,7 +761,7 @@ mod tests {
     #[test]
     fn test_all_12_approved_specs_and_kelly_compounding_divisibility() {
         assert_eq!(APPROVED_SPECS.len(), 12);
-        let wallet_70_usdt = 7_088_000_000_i64;
+        let wallet_66_usdt = 6_628_080_000_i64;
         let wallet_200_usdt = 20_000_000_000_i64;
         let sample_ticks: [i64; 12] = [
             759_000, 223_700, 8_930, 8_170, 22_400, 8_510,
@@ -719,14 +771,61 @@ mod tests {
             let px = PriceTicks(sample_ticks[idx]);
             let elig = spec.validate_pair_eligibility(px, ScaledBps(6_500));
             assert!(elig.is_ok());
-            let lots_70 = spec.compute_compounding_kelly_lots(wallet_70_usdt, px, 250, false);
+            let lots_66 = spec.compute_compounding_kelly_lots(wallet_66_usdt, px, 250, false);
             let lots_200 = spec.compute_compounding_kelly_lots(wallet_200_usdt, px, 350, false);
-            assert!(lots_70.0 >= 1);
-            assert!(lots_200.0 >= lots_70.0);
-            if idx >= 1 {
-                assert_eq!(lots_70.0 % 2, 0);
+            assert!(lots_66.0 >= 1);
+            assert!(lots_200.0 >= lots_66.0);
+            if idx == 1 {
+                assert_eq!(lots_66, LotQty(1));
+                assert_eq!(lots_200.0 % 2, 0);
+            } else if idx >= 2 {
+                assert_eq!(lots_66.0 % 2, 0);
                 assert_eq!(lots_200.0 % 2, 0);
             }
         }
+    }
+
+    #[test]
+    fn test_lot_notional_oversized_guard_and_strict_2tick_sl_geometry() {
+        let btc = APPROVED_SPECS[0];
+        let eth = APPROVED_SPECS[1];
+        let sui = APPROVED_SPECS[5];
+        assert_eq!(btc.lot_notional_1e8(LotQty(1), PriceTicks(759_000)), 7_590_000_000);
+        assert_eq!(eth.lot_notional_1e8(LotQty(1), PriceTicks(223_700)), 2_237_000_000);
+        assert_eq!(sui.lot_notional_1e8(LotQty(24), PriceTicks(8_510)), 2_042_400_000);
+
+        let w_live = 6_628_080_000_i64;
+        assert!(btc.requires_oversized_lot_conviction(w_live, PriceTicks(759_000)));
+        assert!(!btc.requires_oversized_lot_conviction(15_000_000_000, PriceTicks(759_000)));
+        assert!(!eth.requires_oversized_lot_conviction(w_live, PriceTicks(223_700)));
+
+        assert!(PairSpec::validate_stop_loss_geometry(
+            Side::Bid,
+            PriceTicks(8_197),
+            PriceTicks(8_198),
+            PriceTicks(8_199),
+        )
+        .is_err());
+        assert!(PairSpec::validate_stop_loss_geometry(
+            Side::Bid,
+            PriceTicks(8_196),
+            PriceTicks(8_198),
+            PriceTicks(8_199),
+        )
+        .is_ok());
+        assert!(PairSpec::validate_stop_loss_geometry(
+            Side::Ask,
+            PriceTicks(8_199),
+            PriceTicks(8_198),
+            PriceTicks(8_197),
+        )
+        .is_err());
+        assert!(PairSpec::validate_stop_loss_geometry(
+            Side::Ask,
+            PriceTicks(8_200),
+            PriceTicks(8_198),
+            PriceTicks(8_197),
+        )
+        .is_ok());
     }
 }

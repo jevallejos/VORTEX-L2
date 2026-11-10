@@ -1,5 +1,6 @@
 //! Lock-Free Seqlock Shared Memory Arena (SHM v12) with 12-Slot Native Telemetry.
 
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -126,6 +127,7 @@ impl SymbolLobSnapshot {
                 break;
             }
         }
+
         if qty.0 <= 0 {
             if let Some(idx) = existing_idx {
                 let mut j = idx;
@@ -138,12 +140,14 @@ impl SymbolLobSnapshot {
             self.refresh_deep_l1_l5_totals();
             return;
         }
+
         if let Some(idx) = existing_idx {
             levels[idx].qty = qty;
             self.purge_crossed_levels(side, price);
             self.refresh_deep_l1_l5_totals();
             return;
         }
+
         let mut insert_at = LOB_DEPTH;
         for (i, lvl) in levels.iter().enumerate() {
             if lvl.price.0 == 0 {
@@ -159,6 +163,7 @@ impl SymbolLobSnapshot {
                 break;
             }
         }
+
         if insert_at < LOB_DEPTH {
             let mut j = LOB_DEPTH - 1;
             while j > insert_at {
@@ -185,7 +190,7 @@ impl SymbolLobSnapshot {
                 }
             }
             Side::Ask => {
-                while self.bids[0].price.0 >= price.0 {
+                while self.bids[0].price.0 > 0 && self.bids[0].price.0 >= price.0 {
                     let mut k = 0_usize;
                     while k + 1 < LOB_DEPTH {
                         self.bids[k] = self.bids[k + 1];
@@ -249,7 +254,7 @@ impl SlotExecTelemetry {
 #[derive(Debug)]
 pub struct SeqlockSymbolSlot {
     seq: AtomicU64,
-    payload: core::cell::UnsafeCell<SymbolLobSnapshot>,
+    payload: core::cell::UnsafeCell<MaybeUninit<SymbolLobSnapshot>>,
 }
 
 unsafe impl Sync for SeqlockSymbolSlot {}
@@ -267,19 +272,22 @@ impl SeqlockSymbolSlot {
     pub const fn new() -> Self {
         Self {
             seq: AtomicU64::new(0),
-            payload: core::cell::UnsafeCell::new(SymbolLobSnapshot::new_empty()),
+            payload: core::cell::UnsafeCell::new(MaybeUninit::new(
+                SymbolLobSnapshot::new_empty(),
+            )),
         }
     }
 
     #[inline]
     pub fn write_snapshot(&self, snap: &SymbolLobSnapshot) {
         let s0 = self.seq.load(Ordering::Relaxed);
-        let s_odd = s0.wrapping_add(1);
+        let s_odd = s0.wrapping_add(1) | 1;
         self.seq.store(s_odd, Ordering::Release);
-        core::sync::atomic::fence(Ordering::Release);
+        core::sync::atomic::fence(Ordering::SeqCst);
         unsafe {
-            core::ptr::write_volatile(self.payload.get(), *snap);
+            core::ptr::write_volatile(self.payload.get(), MaybeUninit::new(*snap));
         }
+        core::sync::atomic::fence(Ordering::Release);
         self.seq.store(s_odd.wrapping_add(1), Ordering::Release);
     }
 
@@ -291,11 +299,11 @@ impl SeqlockSymbolSlot {
                 core::hint::spin_loop();
                 continue;
             }
-            let copy = unsafe { core::ptr::read_volatile(self.payload.get()) };
+            let raw_copy = unsafe { core::ptr::read_volatile(self.payload.get()) };
             core::sync::atomic::fence(Ordering::Acquire);
             let s2 = self.seq.load(Ordering::Acquire);
             if s1 == s2 {
-                return Ok(copy);
+                return Ok(unsafe { raw_copy.assume_init() });
             }
             core::hint::spin_loop();
         }
@@ -339,16 +347,32 @@ impl VortexShmArena {
             exec_fill_count: AtomicU64::new(0),
             exec_closed_count: AtomicU64::new(0),
             slot_telemetry: [
-                SlotExecTelemetry::new(), SlotExecTelemetry::new(), SlotExecTelemetry::new(),
-                SlotExecTelemetry::new(), SlotExecTelemetry::new(), SlotExecTelemetry::new(),
-                SlotExecTelemetry::new(), SlotExecTelemetry::new(), SlotExecTelemetry::new(),
-                SlotExecTelemetry::new(), SlotExecTelemetry::new(), SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
+                SlotExecTelemetry::new(),
             ],
             slots: [
-                SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(),
-                SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(),
-                SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(),
-                SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(), SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
+                SeqlockSymbolSlot::new(),
             ],
         }
     }
@@ -407,7 +431,10 @@ impl MappedShmRegion {
             .truncate(false)
             .open(path)
             .map_err(|_| VortexError::ColumnarIoFailure)?;
-        file.set_len(size as u64).map_err(|_| VortexError::ColumnarIoFailure)?;
+        let cur_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if initialize_writer || cur_len < (size as u64) {
+            file.set_len(size as u64).map_err(|_| VortexError::ColumnarIoFailure)?;
+        }
 
         #[cfg(unix)]
         {
@@ -415,6 +442,7 @@ impl MappedShmRegion {
             const PROT_READ: i32 = 0x1;
             const PROT_WRITE: i32 = 0x2;
             const MAP_SHARED: i32 = 0x01;
+
             let raw_ptr = unsafe {
                 mmap(
                     core::ptr::null_mut(),
@@ -441,6 +469,7 @@ impl MappedShmRegion {
             }
             Ok(Self { ptr: arena_ptr, len: size })
         }
+
         #[cfg(not(unix))]
         {
             let mut arena = Box::new(VortexShmArena::new());
@@ -489,6 +518,7 @@ mod tests {
             let arena = reg.arena();
             assert_eq!(arena.version, 12);
             assert_eq!(arena.active_pairs, 12);
+
             let mut snap = SymbolLobSnapshot::new_empty();
             snap.symbol_id = SymbolId(4);
             snap.apply_level_update(Side::Bid, PriceTicks(8_170), LotQty(200));
@@ -496,11 +526,32 @@ mod tests {
             snap.apply_level_update(Side::Ask, PriceTicks(8_171), LotQty(150));
             assert_eq!(snap.deep_bid_lots_l1_l5, LotQty(500));
             assert_eq!(snap.deep_ask_lots_l1_l5, LotQty(150));
+
             if let Ok(slot) = arena.slot(11) {
                 slot.write_snapshot(&snap);
                 assert_eq!(slot.read_snapshot(4), Ok(snap));
             }
         }
         let _ = std::fs::remove_file(&shm_path);
+    }
+
+    #[test]
+    fn test_seqlock_odd_recovery_and_ask_cross_purge_zero_guard() {
+        let slot = SeqlockSymbolSlot::new();
+        slot.seq.store(7, Ordering::Release);
+        assert_eq!(slot.read_snapshot(2), Err(VortexError::SharedMemorySeqConflict));
+
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = SymbolId(6);
+        snap.is_eligible = true;
+        snap.apply_level_update(Side::Ask, PriceTicks(8_510), LotQty(120));
+        snap.apply_level_update(Side::Bid, PriceTicks(8_512), LotQty(90));
+        snap.apply_level_update(Side::Ask, PriceTicks(8_509), LotQty(80));
+        assert_eq!(snap.bids[0].price, PriceTicks(0));
+        assert_eq!(snap.asks[0].price, PriceTicks(8_509));
+
+        slot.write_snapshot(&snap);
+        assert_eq!(slot.seq.load(Ordering::Acquire) & 1, 0);
+        assert_eq!(slot.read_snapshot(4), Ok(snap));
     }
 }

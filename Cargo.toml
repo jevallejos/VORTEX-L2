@@ -2,7 +2,7 @@
 name = "vortex-rs"
 version = "1.0.0"
 edition = "2021"
-description = "VORTEX-L3 — Autonomous 12-Slot Peristaltic & Deep-Book HFT Engine"
+description = "VORTEX-L3 - Autonomous 12-Slot Peristaltic & Deep-Book HFT Engine"
 license = "Proprietary"
 
 [lib]
@@ -23,6 +23,8 @@ path = "src/bin/vortex_exec.rs"
 
 [dependencies]
 serde_json = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 tungstenite = { version = "0.21", features = ["native-tls"] }
 
 [profile.release]
