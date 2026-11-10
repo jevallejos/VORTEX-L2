@@ -2,8 +2,10 @@
 name = "vortex-rs"
 version = "1.0.0"
 edition = "2021"
-description = "VORTEX-L3 - Autonomous 12-Slot Peristaltic & Deep-Book HFT Engine"
+rust-version = "1.88"
+description = "VORTEX-L3 - Institutional 12-Slot Seqlock LOB & Deep-Book HFT Core"
 license = "Proprietary"
+publish = false
 
 [lib]
 name = "vortex_rs"
@@ -32,11 +34,14 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+overflow-checks = false
 strip = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "deny"
+unused_must_use = "deny"
+dead_code = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -45,3 +50,4 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 float_cmp = "deny"
+dbg_macro = "deny"

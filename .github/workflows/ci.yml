@@ -1,56 +1,106 @@
-name: VORTEX-L3 Institutional CI/CD & Linux Binary Publisher
+name: VORTEX-L3 Institutional CI/CD & SHA-Locked Release
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: vortex-l3-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  verify-and-build-linux-x86_64:
-    runs-on: ubuntu-latest
+  certify-and-package:
+    name: 4-Gate LTO Build & COMMIT_SHA Seal (Linux x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
-      - name: Checkout repository
+      - name: Checkout repository with full history
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Ensure OpenSSL dev headers
-        run: pkg-config --exists openssl || (sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev)
+      - name: Install OpenSSL & pkg-config headers for native-tls
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates
 
-      - name: Install stable Rust toolchain
+      - name: Install stable Rust toolchain with clippy
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
-      - name: Gate 1 - Static Linter (Zero Warnings)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Cache Cargo registry and build dependencies
+        uses: Swatinem/rust-cache@v2
 
-      - name: Gate 2 - Unit & Integration Test Suite
-        run: cargo test --all-targets -- --test-threads=1
+      - name: "Gate 1: Strict Static Linter (Zero Warnings / Zero Panics)"
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Gate 3 - Build LTO Release Binaries
-        run: cargo build --release --bins
+      - name: "Gate 2: Deterministic Unit & LOSS-LAB Test Suite"
+        run: cargo test --locked --all-targets -- --nocapture
 
-      - name: Gate 4 - Execute Pre-Production Binary Gates
+      - name: "Gate 3: Fat-LTO Institutional Release Build"
+        run: cargo build --locked --release --bins
+
+      - name: "Gate 4: Binary Certification Gates (Tap + Replay + OOS 520)"
         run: |
           ./target/release/vortex_tap
           ./target/release/vortex_replay
           ./target/release/vortex_exec
 
-      - name: Package Certified Linux x86_64 Binaries & COMMIT_SHA
+      - name: Package SHA-locked Linux x86_64 tarball
         run: |
-          echo "${GITHUB_SHA}" > COMMIT_SHA
-          tar -czf vortex-linux-x86_64.tar.gz -C target/release vortex_tap vortex_replay vortex_exec
-          sha256sum vortex-linux-x86_64.tar.gz > vortex-linux-x86_64.tar.gz.sha256
+          rm -rf dist
+          mkdir -p dist
+          cp target/release/vortex_tap dist/vortex_tap
+          cp target/release/vortex_replay dist/vortex_replay
+          cp target/release/vortex_exec dist/vortex_exec
+          chmod +x dist/vortex_tap dist/vortex_replay dist/vortex_exec
+          git rev-parse HEAD | tr -d '[:space:]' > dist/COMMIT_SHA
+          printf '\n' >> dist/COMMIT_SHA
+          tar -C dist -czf /tmp/vortex.tgz vortex_tap vortex_replay vortex_exec COMMIT_SHA
+          mv /tmp/vortex.tgz dist/vortex-linux-x86_64.tar.gz
+          (cd dist && sha256sum vortex-linux-x86_64.tar.gz > vortex-linux-x86_64.tar.gz.sha256)
+          ls -lh dist/
+          cat dist/COMMIT_SHA
 
-      - name: Publish Latest Certified Linux Release Binary
-        uses: softprops/action-gh-release@v2
+      - name: Upload immutable CI workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: latest-linux-x86_64
-          name: "VORTEX-L3 Certified Linux x86_64 Binaries (Latest Main)"
-          prerelease: false
-          files: |
-            COMMIT_SHA
-            vortex-linux-x86_64.tar.gz
-            vortex-linux-x86_64.tar.gz.sha256
+          name: vortex-rs-linux-x86_64
+          path: |
+            dist/vortex-linux-x86_64.tar.gz
+            dist/vortex-linux-x86_64.tar.gz.sha256
+            dist/COMMIT_SHA
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish atomic SHA-locked release (latest-linux-x86_64)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REL_TAG="latest-linux-x86_64"
+          SHA_NOW="$(tr -d '[:space:]' < dist/COMMIT_SHA)"
+          SHORT_SHA="$(cut -c1-7 dist/COMMIT_SHA)"
+          TITLE="VORTEX-L3 Certified Linux x86_64 (${SHORT_SHA})"
+          NOTES="4-Gate certified Fat-LTO build for commit ${SHA_NOW}."
+          git tag -f "${REL_TAG}" "${SHA_NOW}"
+          git push origin "refs/tags/${REL_TAG}" --force
+          if ! gh release view "${REL_TAG}" >/dev/null 2>&1; then
+            gh release create "${REL_TAG}" --title "${TITLE}" --notes "${NOTES}"
+          fi
+          gh release upload "${REL_TAG}" dist/vortex-linux-x86_64.tar.gz --clobber
+          gh release upload "${REL_TAG}" dist/vortex-linux-x86_64.tar.gz.sha256 --clobber
+          gh release edit "${REL_TAG}" --title "${TITLE}" --notes "${NOTES}"
+          gh release upload "${REL_TAG}" dist/COMMIT_SHA --clobber
