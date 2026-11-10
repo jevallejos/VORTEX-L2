@@ -3,9 +3,7 @@
     clippy::manual_clamp,
     clippy::manual_range_contains,
     clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    dead_code,
-    unused_imports
+    clippy::too_many_arguments
 )]
 
 use core::sync::atomic::Ordering;
@@ -15,6 +13,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use vortex_rs::alpha_3factor::OrthogonalFactorState;
 use vortex_rs::forensic_parquet::{
     ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind,
@@ -24,11 +23,14 @@ use vortex_rs::lob_shm::{
     VORTEX_SHM_VERSION,
 };
 use vortex_rs::types::{
-    now_epoch_ns, slot_from_symbol_name, BoundedScore, LotQty, PairSpec, PriceTicks,
-    ScaledBps, Side, SymbolId, TimestampNs, ANSI_GREEN, ANSI_RED, ANSI_RESET, APPROVED_SPECS,
+    now_epoch_ns, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId,
+    ANSI_GREEN, ANSI_RED, ANSI_RESET, APPROVED_SPECS,
 };
+#[cfg(target_os = "linux")]
+use vortex_rs::types::{slot_from_symbol_name, TimestampNs};
 
 const MAX_PARQUET_RING_FILES: u64 = 4_096;
+#[cfg(target_os = "linux")]
 const BYBIT_PUBLIC_LINEAR_WS: &str = "wss://stream.bybit.com/v5/public/linear";
 
 #[derive(Copy, Clone, Debug)]
@@ -166,6 +168,20 @@ pub fn verify_and_seed_12_institutional_slots(
     Ok(approved_count)
 }
 
+pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
+    if parquet_seq > MAX_PARQUET_RING_FILES {
+        let expired_seq = parquet_seq - MAX_PARQUET_RING_FILES;
+        let expired_path =
+            data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
+        let _ = fs::remove_file(&expired_path);
+    }
+    let legacy_lake = data_dir.join("lakehouse_par1");
+    if legacy_lake.exists() {
+        let _ = fs::remove_dir_all(&legacy_lake);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) {
     if batch.is_empty() {
         return;
@@ -173,7 +189,8 @@ fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) 
     let data_dir = Path::new("data");
     let _ = fs::create_dir_all(data_dir);
     *parquet_seq = parquet_seq.wrapping_add(1);
-    let file_path = data_dir.join(format!("vortex_l2_segment_{:06}.parquet", *parquet_seq));
+    let seg_name = format!("vortex_l2_segment_{:06}.parquet", *parquet_seq);
+    let file_path = data_dir.join(seg_name);
     if let Ok(checksum) = batch.write_to_file(&file_path) {
         println!(
             "[PAR1 FLUSH] Wrote {} live events to {} (FNV1a64: 0x{:016X})",
@@ -182,20 +199,11 @@ fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) 
             checksum
         );
     }
-    if *parquet_seq > MAX_PARQUET_RING_FILES {
-        let expired_seq = *parquet_seq - MAX_PARQUET_RING_FILES;
-        let expired_path =
-            data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
-        let lake_dir = data_dir.join("lakehouse_par1");
-        let _ = fs::create_dir_all(&lake_dir);
-        let lake_path = lake_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
-        if fs::rename(&expired_path, &lake_path).is_err() {
-            let _ = fs::remove_file(&expired_path);
-        }
-    }
+    prune_expired_parquet_segment(data_dir, *parquet_seq);
     batch.clear();
 }
 
+#[cfg(target_os = "linux")]
 fn discover_latest_parquet_seq() -> u64 {
     let mut max_seq = 0_u64;
     if let Ok(entries) = fs::read_dir("data") {
@@ -459,6 +467,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let _ = fs::remove_file(&tmp_par);
+    prune_expired_parquet_segment(Path::new("data"), 0);
     println!("--------------------------------------------------------------------------------");
     println!(
         "[SEQLOCK & PAR1 OK] Active Institutional Slots: {} | Rows Verified: {} | FNV1a64: 0x{:016X}",
@@ -500,5 +509,19 @@ mod tests {
             }
         }
         let _ = fs::remove_file(&shm_path);
+    }
+
+    #[test]
+    fn test_parquet_ring_prunes_expired_without_lakehouse_accumulation() {
+        let tmp_dir = std::env::temp_dir().join("vortex_l3_ring_prune_test");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let lake_dir = tmp_dir.join("lakehouse_par1");
+        assert!(fs::create_dir_all(&lake_dir).is_ok());
+        let seg1 = tmp_dir.join("vortex_l2_segment_000001.parquet");
+        assert!(fs::write(&seg1, b"PAR1").is_ok());
+        prune_expired_parquet_segment(&tmp_dir, MAX_PARQUET_RING_FILES + 1);
+        assert!(!seg1.exists());
+        assert!(!lake_dir.exists());
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

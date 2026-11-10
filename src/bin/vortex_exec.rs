@@ -939,19 +939,6 @@ fn rehydrate_shadow_ledger(
     gov: &mut OnlineAdaptiveGovernor,
     arena: &VortexShmArena,
 ) {
-    if let Ok(seed_f) = fs::File::open("deploy/forensic_vault_171.seed") {
-        let reader = BufReader::new(seed_f);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                let sym = v.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                let mfe_f = v.get("mfe_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
-                if let Some(s_idx) = slot_from_symbol_name(sym) {
-                    engines[s_idx].observe_mfe_sample((mfe_f * 100.0).round() as i64);
-                }
-            }
-        }
-    }
-    let mut count = 0_u64;
     let vault_or_shadow = fs::File::open(AI_FORENSIC_VAULT_PATH)
         .or_else(|_| fs::File::open(SHADOW_LEDGER_PATH));
     if let Ok(file) = vault_or_shadow {
@@ -962,23 +949,24 @@ fn rehydrate_shadow_ledger(
             };
             let sym = v.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
             let side_s = v.get("side").and_then(|s| s.as_str()).unwrap_or("Bid");
-            let en_t = v.get("entry_ticks").and_then(|n| n.as_i64()).unwrap_or(0);
-            let ex_t = v.get("exit_ticks").and_then(|n| n.as_i64()).unwrap_or(0);
             let net_f = v.get("net_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
             let mkr = v.get("maker_exit").and_then(|b| b.as_bool()).unwrap_or(true);
-            let ts_ns = v.get("ts_ns").and_then(|n| n.as_i64()).unwrap_or(0);
+            let mfe_f = v.get("mfe_bps").and_then(|n| n.as_f64()).unwrap_or(0.0);
             if let Some(s_idx) = slot_from_symbol_name(sym) {
                 let side = side_from_str(side_s);
                 let net_sc = ScaledBps((net_f * 100.0).round() as i64);
                 let pnl_1e8 = (BASE_NOTIONAL_1E8 * net_sc.raw()) / 1_000_000;
                 let fee_1e8 = (BASE_NOTIONAL_1E8 * 400) / 1_000_000;
                 ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
-                let _ = (en_t, ex_t, ts_ns);
                 if !mkr || net_sc.raw() < 0 {
                     gov.observe_closed_trade(s_idx, side, net_sc, mkr, TimestampNs(0));
                 }
-                engines[s_idx].observe_mfe_sample((net_sc.raw() + 400).max(500));
-                count += 1;
+                let mfe_sc = if mfe_f > 0.0 {
+                    (mfe_f * 100.0).round() as i64
+                } else {
+                    (net_sc.raw() + 400).max(500)
+                };
+                engines[s_idx].observe_mfe_sample(mfe_sc);
             }
         }
     }
@@ -991,7 +979,6 @@ fn rehydrate_shadow_ledger(
             }
         }
     }
-    let _ = count;
     ledger.closed_trades_count = l3_vault_count;
     arena.exec_closed_count.store(l3_vault_count, Ordering::Release);
     println!(

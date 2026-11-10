@@ -45,7 +45,6 @@ fi
 
 curl -fsSL --retry 3 --retry-delay 2 "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"
 sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
-rm -f "${VAULT_DIR}/DRAIN_MODE.lock" "${VAULT_DIR}/HALTED_ON_LOSS.lock"
 tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
 rm -f "/tmp/vortex-linux-x86_64.tar.gz"
 chmod +x "${BIN_DIR}/vortex_tap" "${BIN_DIR}/vortex_replay" "${BIN_DIR}/vortex_exec"
@@ -158,6 +157,8 @@ for vf in "vortex_ai_forensic_vault.jsonl" "vortex_red_loss_box.jsonl" "vortex_o
         cp -f "${VAULT_DIR}/${vf}" "${BACKUP_DIR}/${vf}.bak" || true
     fi
 done
+rm -rf "${DATA_DIR}/lakehouse_par1" || true
+find "${BACKUP_DIR}" -type f -name "*.parquet" -delete 2>/dev/null || true
 find "${DATA_DIR}" -maxdepth 1 -name "vortex_l2_segment_*.parquet" | sort | head -n -4096 | xargs -r rm -f || true
 sudo journalctl --vacuum-time=3d --vacuum-size=100M >/dev/null 2>&1 || true
 MAINT_EOF
@@ -333,10 +334,14 @@ VORTEX_CLI_EOF
 sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 sudo systemctl enable --now vortex-doctor.timer vortex-maint.timer >/dev/null 2>&1 || true
-sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true
 /usr/local/bin/vortex-doctor || true
-sudo systemctl restart vortex-tap.service
-sleep 2
-sudo systemctl restart vortex-exec.service
-sleep 1
-echo "[OK] VORTEX-L3 Daemons + Doctor + Maint active (Commit SHA Verified)."
+if [ "${1:-}" = "--start-daemons" ] && [ ! -f "${VAULT_DIR}/DRAIN_MODE.lock" ] && [ ! -f "${VAULT_DIR}/HALTED_ON_LOSS.lock" ]; then
+    sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true
+    sudo systemctl restart vortex-tap.service
+    sleep 2
+    sudo systemctl restart vortex-exec.service
+    sleep 1
+    echo "[OK] VORTEX-L3 Daemons + Doctor + Maint active (Commit SHA Verified)."
+else
+    echo "[OK] VORTEX-L3 Binaries + Doctor + Maint installed (Daemons STOPPED / LOCKED)."
+fi
