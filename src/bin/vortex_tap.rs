@@ -144,7 +144,7 @@ pub fn verify_and_seed_12_institutional_slots(
         approved_count += 1;
         if verbose {
             println!(
-                "  {}\u{1f7e2} [APPROVED -> SLOT {:2}] {:<10} | Tick_bps: {:>5.2} bps (<= 1.50) | Vol5m: {} bps{}",
+                "  {}\u{1f7e2} [APPROVED -> SLOT {:2}] {:<10} | Tick_bps: {:>5.2} bps (Elastic) | Vol5m: {} bps{}",
                 ANSI_GREEN,
                 slot_idx,
                 spec.symbol_id.name(),

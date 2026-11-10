@@ -896,7 +896,7 @@ fn render_trades_and_executive_dashboard() {
 }
 
 pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
-    let mut eng = SlotExecutionEngine::new(0, BASE_NOTIONAL_1E8, 10_000_000_000);
+    let mut eng = SlotExecutionEngine::new(0, BASE_NOTIONAL_1E8);
     let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
     let mut ts = 1_700_000_000_000_000_000_i64;
     for i in 0..520_u64 {
@@ -1034,7 +1034,6 @@ fn append_closed_trade_logs(
     let sym = spec.symbol_id.name();
     let side_str = if matches!(summary.side, Side::Ask) { "Ask" } else { "Bid" };
     let kind_str = match summary.kind {
-        ClosedTradeKind::MakerStructuralTp => "MakerStructuralTp",
         ClosedTradeKind::MakerPassiveUnwind => "MakerPassiveUnwind",
         ClosedTradeKind::ServerMarkPriceStopLoss => "ServerMarkPriceStopLoss",
     };
@@ -1156,7 +1155,7 @@ fn append_closed_trade_logs(
 fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> ExitCode {
     let tg_tx = spawn_async_telegram_notifier();
     let live_client = BybitV5LiveClient::from_env_if_enabled(live_capital);
-    let mut engines = SlotExecutionEngine::new_12_slot_array(BASE_NOTIONAL_1E8, 10_000_000_000);
+    let mut engines = SlotExecutionEngine::new_12_slot_array(BASE_NOTIONAL_1E8);
     let mut gov = OnlineAdaptiveGovernor::new();
     let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
     let mut cached_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
@@ -2160,7 +2159,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             edge_bps,
                             in_debt,
                         );
-                        let _ = engines[s_idx].try_arm_maker_entry(&spec, &snap, verdict, lots);
+                        let _ = engines[s_idx].try_arm_maker_entry(&snap, verdict, lots);
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         armed_this_tick += 1;
                     }
@@ -2239,7 +2238,7 @@ mod tests {
 
     #[test]
     fn test_12_slot_autonomous_array_initialization_and_persistence() {
-        let engines = SlotExecutionEngine::new_12_slot_array(BASE_NOTIONAL_1E8, 10_000_000_000);
+        let engines = SlotExecutionEngine::new_12_slot_array(BASE_NOTIONAL_1E8);
         assert_eq!(engines.len(), 12);
         for (idx, eng) in engines.iter().enumerate() {
             assert_eq!(eng.slot_idx, idx);

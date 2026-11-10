@@ -29,7 +29,6 @@ pub struct TimestampNs(pub i64);
 pub struct ScaledBps(pub i64);
 
 impl ScaledBps {
-    pub const MAX_ALLOWED_TICK_BPS: Self = Self(150);
     pub const MIN_REQUIRED_VOL_5M_BPS: Self = Self(3_500);
     pub const BYBIT_VIP0_MAKER_FEE_BPS: Self = Self(200);
     pub const BYBIT_VIP0_TAKER_FEE_BPS: Self = Self(550);
@@ -191,24 +190,29 @@ impl PairSpec {
             Ok(v) => v,
             Err(e) => return Err(e),
         };
-        let tick_bps = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 12 && raw_tick_bps.0 > 150 {
-            ScaledBps(150)
-        } else {
-            raw_tick_bps
-        };
-        if tick_bps.0 > ScaledBps::MAX_ALLOWED_TICK_BPS.0 {
-            return Err(VortexError::TickBpsExceedsInstitutionalCap {
-                observed_scaled_bps: tick_bps,
-                max_allowed_scaled_bps: ScaledBps::MAX_ALLOWED_TICK_BPS,
-            });
-        }
         if realized_vol_5m.0 < ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 {
             return Err(VortexError::RealizedVolBelowStructuralFloor {
                 observed_vol_5m_scaled_bps: realized_vol_5m,
                 min_required_scaled_bps: ScaledBps::MIN_REQUIRED_VOL_5M_BPS,
             });
         }
-        Ok(tick_bps)
+        let p_taker = if self.empirical_taker_exit_prob_pct < 0 {
+            0
+        } else if self.empirical_taker_exit_prob_pct > 100 {
+            100
+        } else {
+            self.empirical_taker_exit_prob_pct
+        };
+        let tox_excess = if p_taker > 5 { p_taker - 5 } else { 0 };
+        let tox_div = 10 + tox_excess * 4;
+        let elastic_max_tick = ScaledBps(realized_vol_5m.0 / tox_div);
+        if raw_tick_bps.0 > elastic_max_tick.0 {
+            return Err(VortexError::TickBpsExceedsInstitutionalCap {
+                observed_scaled_bps: raw_tick_bps,
+                max_allowed_scaled_bps: elastic_max_tick,
+            });
+        }
+        Ok(raw_tick_bps)
     }
 
     #[inline]
@@ -221,11 +225,6 @@ impl PairSpec {
             Ok(v) => v,
             Err(e) => return Err(e),
         };
-        let tick_bps = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 12 && raw_tick_bps.0 > 150 {
-            ScaledBps(150)
-        } else {
-            raw_tick_bps
-        };
         let p_taker = if self.empirical_taker_exit_prob_pct < 0 {
             0
         } else if self.empirical_taker_exit_prob_pct > 100 {
@@ -237,13 +236,8 @@ impl PairSpec {
         let exit_fee_expected = (p_maker * ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0
             + p_taker * ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.0)
             / 100;
-        let eff_t = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 12 && tick_bps.0 > 150 {
-            150
-        } else {
-            tick_bps.0
-        };
         let round_trip_cost =
-            ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 + exit_fee_expected + eff_t;
+            ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 + exit_fee_expected + raw_tick_bps.0;
         let required_3x = ScaledBps(round_trip_cost.saturating_mul(3));
         if expected_excursion.0 < required_3x.0 {
             return Err(VortexError::FrictionBarrierRejected {

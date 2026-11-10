@@ -140,6 +140,7 @@ impl SymbolLobSnapshot {
         }
         if let Some(idx) = existing_idx {
             levels[idx].qty = qty;
+            self.purge_crossed_levels(side, price);
             self.refresh_deep_l1_l5_totals();
             return;
         }
@@ -166,7 +167,34 @@ impl SymbolLobSnapshot {
             }
             levels[insert_at] = BookLevel { price, qty };
         }
+        self.purge_crossed_levels(side, price);
         self.refresh_deep_l1_l5_totals();
+    }
+
+    #[inline]
+    fn purge_crossed_levels(&mut self, updated_side: Side, price: PriceTicks) {
+        match updated_side {
+            Side::Bid => {
+                while self.asks[0].price.0 > 0 && self.asks[0].price.0 <= price.0 {
+                    let mut k = 0_usize;
+                    while k + 1 < LOB_DEPTH {
+                        self.asks[k] = self.asks[k + 1];
+                        k += 1;
+                    }
+                    self.asks[LOB_DEPTH - 1] = BookLevel::default();
+                }
+            }
+            Side::Ask => {
+                while self.bids[0].price.0 >= price.0 {
+                    let mut k = 0_usize;
+                    while k + 1 < LOB_DEPTH {
+                        self.bids[k] = self.bids[k + 1];
+                        k += 1;
+                    }
+                    self.bids[LOB_DEPTH - 1] = BookLevel::default();
+                }
+            }
+        }
     }
 }
 
@@ -415,8 +443,11 @@ impl MappedShmRegion {
         }
         #[cfg(not(unix))]
         {
-            let _ = initialize_writer;
-            Ok(Self { arena: Box::new(VortexShmArena::new()) })
+            let mut arena = Box::new(VortexShmArena::new());
+            if initialize_writer {
+                arena.version = VORTEX_SHM_VERSION;
+            }
+            Ok(Self { arena })
         }
     }
 

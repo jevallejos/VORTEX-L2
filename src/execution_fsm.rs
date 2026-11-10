@@ -6,7 +6,6 @@ use crate::types::{LotQty, PriceTicks, ScaledBps, Side, TimestampNs, APPROVED_SP
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
-    MakerStructuralTp,
     MakerPassiveUnwind,
     ServerMarkPriceStopLoss,
 }
@@ -159,9 +158,8 @@ pub const fn defensive_zero_loss_maker_exit_price(
     side: Side,
     entry_price: PriceTicks,
 ) -> PriceTicks {
-    let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
-    let fee_ticks = (entry_price.0.saturating_mul(fee_rt_bps) + 999_999) / 1_000_000;
-    let quantum_ticks = fee_ticks + 1;
+    let min_gross_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2 + 40;
+    let quantum_ticks = (entry_price.0.saturating_mul(min_gross_bps) + 999_999) / 1_000_000;
     let min_delta = if quantum_ticks > 2 { quantum_ticks } else { 2 };
     match side {
         Side::Bid => PriceTicks(entry_price.0 + min_delta),
@@ -239,7 +237,6 @@ pub struct OnlineAdaptiveGovernor {
     global_dir_win_streak: [u32; 2],
     global_dir_cooldown_until_ns: [i64; 2],
     last_global_win_dir: u8,
-    last_global_win_ts_ns: i64,
     ewma_fast_px_1e4: [i64; MAX_ACTIVE_PAIRS],
     ewma_slow_px_1e4: [i64; MAX_ACTIVE_PAIRS],
     last_price_sample_ts_ns: [i64; MAX_ACTIVE_PAIRS],
@@ -249,7 +246,6 @@ pub struct OnlineAdaptiveGovernor {
     abort_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     abort_anchor_px_1e4: [[i64; 2]; MAX_ACTIVE_PAIRS],
     abort_last_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
-    price_sample_count: [u32; MAX_ACTIVE_PAIRS],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -275,7 +271,6 @@ impl OnlineAdaptiveGovernor {
             global_dir_win_streak: [0; 2],
             global_dir_cooldown_until_ns: [0; 2],
             last_global_win_dir: 255,
-            last_global_win_ts_ns: 0,
             ewma_fast_px_1e4: [0; MAX_ACTIVE_PAIRS],
             ewma_slow_px_1e4: [0; MAX_ACTIVE_PAIRS],
             last_price_sample_ts_ns: [0; MAX_ACTIVE_PAIRS],
@@ -285,7 +280,6 @@ impl OnlineAdaptiveGovernor {
             abort_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             abort_anchor_px_1e4: [[0; 2]; MAX_ACTIVE_PAIRS],
             abort_last_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
-            price_sample_count: [0; MAX_ACTIVE_PAIRS],
         }
     }
 
@@ -295,30 +289,6 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => 0,
             Side::Ask => 1,
         }
-    }
-
-    #[inline]
-    pub fn seed_historical_price(
-        &mut self,
-        slot_idx: usize,
-        side: Side,
-        entry_ticks: i64,
-        exit_ticks: i64,
-    ) {
-        if slot_idx >= MAX_ACTIVE_PAIRS || entry_ticks <= 0 || exit_ticks <= 0 {
-            return;
-        }
-        let d = Self::dir_idx(side);
-        let en_1e4 = entry_ticks.saturating_mul(10_000);
-        let ex_1e4 = exit_ticks.saturating_mul(10_000);
-        if self.wave_anchor_px_1e4[slot_idx][d] <= 0 {
-            self.wave_anchor_px_1e4[slot_idx][d] = en_1e4;
-        }
-        self.last_exit_px_1e4[slot_idx][d] = ex_1e4;
-        self.wave_step_count[slot_idx][d] = self.wave_step_count[slot_idx][d].saturating_add(1);
-        self.abort_streak[slot_idx][d] = 0;
-        self.abort_anchor_px_1e4[slot_idx][d] = en_1e4;
-        self.abort_last_ts_ns[slot_idx][d] = 0;
     }
 
     #[inline]
@@ -341,7 +311,6 @@ impl OnlineAdaptiveGovernor {
             self.ewma_fast_px_1e4[slot_idx] = px_1e4;
             self.ewma_slow_px_1e4[slot_idx] = px_1e4;
             self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
-            self.price_sample_count[slot_idx] = 1;
             return;
         }
         if snap.ts_local_ns.0.saturating_sub(self.last_price_sample_ts_ns[slot_idx]) < 1_000_000_000 {
@@ -350,7 +319,6 @@ impl OnlineAdaptiveGovernor {
         self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
         self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 19 + px_1e4) / 20;
         self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 299 + px_1e4) / 300;
-        self.price_sample_count[slot_idx] = self.price_sample_count[slot_idx].saturating_add(1);
     }
 
     #[inline]
@@ -573,7 +541,6 @@ impl OnlineAdaptiveGovernor {
             self.global_dir_win_streak[d] = gw;
             self.global_dir_win_streak[1 - d] = 0;
             self.last_global_win_dir = d as u8;
-            self.last_global_win_ts_ns = ts_ns.0;
             if gw >= 6 {
                 self.global_dir_win_streak[d] = 0;
             }
@@ -815,42 +782,7 @@ pub enum ExitOrderRole {
     Tranche1Harvest50 = 1,
     LvdbsDeepSurf50 = 2,
     PeristalticExhale25 = 3,
-    PeristalticInhale25 = 4,
-    SiphonFullUnwind100 = 5,
-    StandardMakerExit100 = 6,
-}
-
-/// Non-blocking directive emitted by a slot engine on a 5ms step.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum OpenPositionStepDirective {
-    #[default]
-    HoldPassive,
-    PlaceOrPegMakerOrder {
-        role: ExitOrderRole,
-        order_side: Side,
-        price: PriceTicks,
-        qty: LotQty,
-        reduce_only: bool,
-        vacuum_level: usize,
-    },
-    Tranche1Filled {
-        filled_price: PriceTicks,
-        filled_lots: LotQty,
-        remaining_lots: LotQty,
-        net_scaled_bps: ScaledBps,
-    },
-    PeristalticExhaleFilled {
-        crest_price: PriceTicks,
-        exhaled_lots: LotQty,
-        remaining_lots: LotQty,
-        subsidy_used_bps: i64,
-    },
-    PeristalticInhaleFilled {
-        valley_price: PriceTicks,
-        inhaled_lots: LotQty,
-        new_open_lots: LotQty,
-        new_avg_price: PriceTicks,
-    },
+    StandardMakerExit100 = 4,
 }
 
 /// Per-Slot Autonomous Lifecycle State Machine (Tranche & Peristaltic Native).
@@ -920,19 +852,13 @@ pub struct SlotExecutionEngine {
     pub last_opened_ts: TimestampNs,
     pub next_peg_allowed_ts_ns: i64,
     pub exit_peg_attempts: u32,
-    pub last_step_directive: OpenPositionStepDirective,
 }
 
 #[allow(clippy::manual_clamp, clippy::too_many_arguments)]
 impl SlotExecutionEngine {
     #[inline]
     #[must_use]
-    pub const fn new(
-        slot_idx: usize,
-        notional_per_trade_1e8: i64,
-        max_daily_drawdown_1e8: i64,
-    ) -> Self {
-        let _ = max_daily_drawdown_1e8;
+    pub const fn new(slot_idx: usize, notional_per_trade_1e8: i64) -> Self {
         Self {
             slot_idx,
             state: OrderLifecycleState::Idle,
@@ -956,7 +882,6 @@ impl SlotExecutionEngine {
             last_opened_ts: TimestampNs(0),
             next_peg_allowed_ts_ns: 0,
             exit_peg_attempts: 0,
-            last_step_directive: OpenPositionStepDirective::HoldPassive,
         }
     }
 
@@ -964,21 +889,20 @@ impl SlotExecutionEngine {
     #[must_use]
     pub const fn new_12_slot_array(
         notional_per_trade_1e8: i64,
-        max_daily_drawdown_1e8: i64,
     ) -> [Self; MAX_ACTIVE_PAIRS] {
         [
-            Self::new(0, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(1, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(2, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(3, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(4, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(5, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(6, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(7, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(8, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(9, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(10, notional_per_trade_1e8, max_daily_drawdown_1e8),
-            Self::new(11, notional_per_trade_1e8, max_daily_drawdown_1e8),
+            Self::new(0, notional_per_trade_1e8),
+            Self::new(1, notional_per_trade_1e8),
+            Self::new(2, notional_per_trade_1e8),
+            Self::new(3, notional_per_trade_1e8),
+            Self::new(4, notional_per_trade_1e8),
+            Self::new(5, notional_per_trade_1e8),
+            Self::new(6, notional_per_trade_1e8),
+            Self::new(7, notional_per_trade_1e8),
+            Self::new(8, notional_per_trade_1e8),
+            Self::new(9, notional_per_trade_1e8),
+            Self::new(10, notional_per_trade_1e8),
+            Self::new(11, notional_per_trade_1e8),
         ]
     }
 
@@ -1084,7 +1008,6 @@ impl SlotExecutionEngine {
 impl SlotExecutionEngine {
     pub fn try_arm_maker_entry(
         &mut self,
-        spec: &crate::types::PairSpec,
         snap: &SymbolLobSnapshot,
         verdict: crate::alpha_3factor::SignalVerdict,
         qty: LotQty,
@@ -1135,7 +1058,6 @@ impl SlotExecutionEngine {
             ref_last,
             ref_mark,
         )?;
-        let _ = spec;
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side,
             entry_price,
@@ -1206,16 +1128,14 @@ impl SlotExecutionEngine {
         };
         self.last_opened_ts = fill_ts;
         self.last_eff_sl_ticks = sl_trigger_price;
+        self.tranche1_harvests_count = 0;
+        self.peristaltic_cycles_count = 0;
+        self.lvdbs_deep_surfs_count = 0;
+        self.last_closed_mfe_bps = 0;
+        self.last_closed_mae_bps = 0;
+        self.last_closed_wald_pct = 0;
         self.exit_peg_attempts = 0;
         self.next_peg_allowed_ts_ns = fill_ts.0;
-        self.last_step_directive = OpenPositionStepDirective::PlaceOrPegMakerOrder {
-            role: init_role,
-            order_side: side.opposite(),
-            price: init_exit_px,
-            qty: init_exit_lots,
-            reduce_only: true,
-            vacuum_level: 1,
-        };
         self.state = OrderLifecycleState::PositionOpenMakerExit {
             side,
             entry_price,
@@ -1243,7 +1163,7 @@ impl SlotExecutionEngine {
         &mut self,
         fill_price: PriceTicks,
         ledger: &mut crate::forensic_parquet::ParitySyncLedger,
-    ) -> Option<OpenPositionStepDirective> {
+    ) -> bool {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
@@ -1254,10 +1174,10 @@ impl SlotExecutionEngine {
             ..
         } = self.state
         else {
-            return None;
+            return false;
         };
         if *tranche1_harvested || open_lots.0 < 2 {
-            return None;
+            return false;
         }
         let harvested = LotQty(open_lots.0 / 2);
         *open_lots = LotQty(open_lots.0 - harvested.0);
@@ -1282,14 +1202,7 @@ impl SlotExecutionEngine {
             .saturating_add(reserve_30)
             .min(crate::forensic_parquet::MAX_SINKING_FUND_SCALED_BPS);
 
-        let dir = OpenPositionStepDirective::Tranche1Filled {
-            filled_price: fill_price,
-            filled_lots: harvested,
-            remaining_lots: *open_lots,
-            net_scaled_bps: ScaledBps(net_leg_bps),
-        };
-        self.last_step_directive = dir;
-        Some(dir)
+        true
     }
 
     /// Innovation #1 (ZMPQR Step 1): Executes 25% Peristaltic Exhale on intermediate rebound crest.
@@ -1297,7 +1210,7 @@ impl SlotExecutionEngine {
         &mut self,
         crest_price: PriceTicks,
         ledger: &mut crate::forensic_parquet::ParitySyncLedger,
-    ) -> Option<OpenPositionStepDirective> {
+    ) -> bool {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
@@ -1310,10 +1223,10 @@ impl SlotExecutionEngine {
             ..
         } = self.state
         else {
-            return None;
+            return false;
         };
         if tranche1_harvested || exhaled_lots.0 > 0 || initial_lots.0 < 4 || open_lots.0 < 4 {
-            return None;
+            return false;
         }
         let q_exhale = LotQty((initial_lots.0 / 4).max(1));
         let raw_diff = match side {
@@ -1323,28 +1236,23 @@ impl SlotExecutionEngine {
         let cur_g_bps = (raw_diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
         let needed_sub = (((440 - cur_g_bps).max(0) + 3) / 4).min(250);
         if ledger.sinking_fund_reserve_bps_x100 < needed_sub {
-            return None;
+            return false;
         }
-        let used_sub = ledger.try_consume_sinking_fund_subsidy(needed_sub);
+        if ledger.try_consume_sinking_fund_subsidy(needed_sub) < needed_sub {
+            return false;
+        }
         *open_lots = LotQty(open_lots.0 - q_exhale.0);
         *exhaled_lots = q_exhale;
         *last_crest_exhale_price = crest_price;
         *active_exit_role = ExitOrderRole::PeristalticExhale25;
-        let dir = OpenPositionStepDirective::PeristalticExhaleFilled {
-            crest_price,
-            exhaled_lots: q_exhale,
-            remaining_lots: *open_lots,
-            subsidy_used_bps: used_sub,
-        };
-        self.last_step_directive = dir;
-        Some(dir)
+        true
     }
 
     /// Innovation #1 (ZMPQR Step 2): Executes 25% Peristaltic Inhale in valley, compressing avg_price.
     pub fn apply_peristaltic_inhale_25pct(
         &mut self,
         valley_price: PriceTicks,
-    ) -> Option<OpenPositionStepDirective> {
+    ) -> bool {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             ref mut avg_price_ticks,
@@ -1358,20 +1266,20 @@ impl SlotExecutionEngine {
             ..
         } = self.state
         else {
-            return None;
+            return false;
         };
         if exhaled_lots.0 <= 0
             || last_crest_exhale_price.0 <= 0
             || open_lots.0 + exhaled_lots.0 > initial_lots.0
         {
-            return None;
+            return false;
         }
         let gained_ticks = match side {
             Side::Bid => last_crest_exhale_price.0 - valley_price.0,
             Side::Ask => valley_price.0 - last_crest_exhale_price.0,
         };
         if gained_ticks <= 0 {
-            return None;
+            return false;
         }
         let fee_t = ((last_crest_exhale_price.0 * 400) + 999_999) / 1_000_000;
         let net_gain_t = (gained_ticks - fee_t).max(1);
@@ -1387,14 +1295,7 @@ impl SlotExecutionEngine {
         self.peristaltic_cycles_count = self.peristaltic_cycles_count.saturating_add(1);
         *tp_maker_price = dynamic_maker_floor_price(side, *avg_price_ticks, ScaledBps(500));
         *active_exit_role = ExitOrderRole::Tranche1Harvest50;
-        let dir = OpenPositionStepDirective::PeristalticInhaleFilled {
-            valley_price,
-            inhaled_lots: reloaded,
-            new_open_lots: *open_lots,
-            new_avg_price: *avg_price_ticks,
-        };
-        self.last_step_directive = dir;
-        Some(dir)
+        true
     }
 
     pub fn finalize_close(
@@ -1587,14 +1488,6 @@ impl SlotExecutionEngine {
             let (vac_lvl, surf_px, _) =
                 OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(side, snap, q_floor);
             self.exit_peg_attempts = self.exit_peg_attempts.saturating_add(1);
-            self.last_step_directive = OpenPositionStepDirective::PlaceOrPegMakerOrder {
-                role: ExitOrderRole::LvdbsDeepSurf50,
-                order_side: side.opposite(),
-                price: surf_px,
-                qty: open_lots,
-                reduce_only: true,
-                vacuum_level: vac_lvl,
-            };
             let reached_surf = match side {
                 Side::Bid => ref_trade.0 >= surf_px.0,
                 Side::Ask => ref_trade.0 > 0 && ref_trade.0 <= surf_px.0,
@@ -1737,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_slot_engine_tranche1_and_lvdbs_deep_surf_close() {
-        let mut eng = SlotExecutionEngine::new(3, 1_250_000_000, 10_000_000_000);
+        let mut eng = SlotExecutionEngine::new(3, 1_250_000_000);
         let gov = OnlineAdaptiveGovernor::new();
         let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
         let spec = APPROVED_SPECS[3];
@@ -1753,7 +1646,7 @@ mod tests {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
         };
-        assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(26)).is_ok());
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(26)).is_ok());
         assert!(eng.on_entry_order_resting(TimestampNs(1_025_000_000)).is_ok());
         assert!(eng.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
 
@@ -1785,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_slot_engine_peristaltic_pump_exhale_and_inhale_ratchet() {
-        let mut eng = SlotExecutionEngine::new(5, 1_250_000_000, 10_000_000_000);
+        let mut eng = SlotExecutionEngine::new(5, 1_250_000_000);
         let gov = OnlineAdaptiveGovernor::new();
         let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
         ledger.sinking_fund_reserve_bps_x100 = 500;
@@ -1802,7 +1695,7 @@ mod tests {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
         };
-        assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(24)).is_ok());
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(24)).is_ok());
         assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
 
         // Price drops to 8470t (-93 bps MAE)
@@ -1847,7 +1740,7 @@ mod tests {
 
     #[test]
     fn test_slot_engine_sinking_fund_siphon_rescue_at_15min() {
-        let mut eng = SlotExecutionEngine::new(0, 1_250_000_000, 10_000_000_000);
+        let mut eng = SlotExecutionEngine::new(0, 1_250_000_000);
         let gov = OnlineAdaptiveGovernor::new();
         let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
         ledger.sinking_fund_reserve_bps_x100 = 500;
@@ -1865,7 +1758,7 @@ mod tests {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(600),
         };
-        assert!(eng.try_arm_maker_entry(&spec, &snap, verdict, LotQty(1)).is_ok());
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(1)).is_ok());
         assert!(eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
 
         // At t = 950s (> 15 min), price bounces +0.60 bps gross (759046t) -> Siphon rescues!

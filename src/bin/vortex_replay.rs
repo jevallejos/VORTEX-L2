@@ -262,7 +262,7 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             6 => 3_180_i64,
             _ => 22_300_i64,
         };
-        let mut eng = SlotExecutionEngine::new(slot_idx, 1_250_000_000, 10_000_000_000);
+        let mut eng = SlotExecutionEngine::new(slot_idx, 1_250_000_000);
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = spec.symbol_id;
         snap.realized_vol_5m = ScaledBps(7_200);
@@ -278,7 +278,7 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             target_excursion_scaled_bps: ScaledBps(680),
         };
         let lots = spec.compute_compounding_kelly_lots(7_088_000_000, PriceTicks(base_px), 280, false);
-        let _ = eng.try_arm_maker_entry(&spec, &snap, verdict, lots);
+        let _ = eng.try_arm_maker_entry(&snap, verdict, lots);
         let _ = eng.on_maker_entry_filled(TimestampNs(t0_ns + 50_000_000));
 
         if episode % 2 == 0 {
@@ -454,7 +454,7 @@ fn replay_live_parquet_ring() {
     if files.is_empty() {
         return;
     }
-    let mut engines = SlotExecutionEngine::new_12_slot_array(1_250_000_000, 10_000_000_000);
+    let mut engines = SlotExecutionEngine::new_12_slot_array(1_250_000_000);
     let mut gov = OnlineAdaptiveGovernor::new();
     let mut ledger = ParitySyncLedger::new(7_088_000_000);
     let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
@@ -487,7 +487,7 @@ fn replay_live_parquet_ring() {
             if last_event_ts_ns > 0
                 && row.ts_local_ns.0.saturating_sub(last_event_ts_ns) > 60_000_000_000
             {
-                engines = SlotExecutionEngine::new_12_slot_array(1_250_000_000, 10_000_000_000);
+                engines = SlotExecutionEngine::new_12_slot_array(1_250_000_000);
                 gov = OnlineAdaptiveGovernor::new();
             }
             last_event_ts_ns = row.ts_local_ns.0;
@@ -521,12 +521,7 @@ fn replay_live_parquet_ring() {
                     SignalVerdict::SpoofingVeto => spoof_vetoes += 1,
                     SignalVerdict::AuthorizeMakerEntry { side, .. } => {
                         if gov.authorizes_adaptive_entry(s_idx, side, &cur_snap_copy, &btc_snap) {
-                            let _ = engines[s_idx].try_arm_maker_entry(
-                                &APPROVED_SPECS[s_idx],
-                                &cur_snap_copy,
-                                verdict,
-                                LotQty(4),
-                            );
+                            let _ = engines[s_idx].try_arm_maker_entry(&cur_snap_copy, verdict, LotQty(4));
                             let _ = engines[s_idx].on_maker_entry_filled(cur_snap_copy.ts_local_ns);
                             armed += 1;
                             fills += 1;
