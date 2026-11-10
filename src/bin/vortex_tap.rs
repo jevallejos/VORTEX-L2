@@ -1,4 +1,5 @@
-//! VORTEX-L3 Immortal 12-Pair WebSocket Ingestor, Eligibility Guard & PAR1 Ring Writer.
+//! VORTEX-L3 Immortal 12-Pair WebSocket Ingestor, Isolated Audit Gate & PAR1 Ring Writer.
+
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -18,13 +19,15 @@ use vortex_rs::alpha_3factor::OrthogonalFactorState;
 use vortex_rs::forensic_parquet::{
     ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind,
 };
+#[cfg(target_os = "linux")]
+use vortex_rs::lob_shm::{classify_l2_sequence_transition, L2SeqDecision};
 use vortex_rs::lob_shm::{
     BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS,
     VORTEX_SHM_VERSION,
 };
 use vortex_rs::types::{
     now_epoch_ns, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId,
-    ANSI_GREEN, ANSI_RED, ANSI_RESET, APPROVED_SPECS,
+    VortexError, ANSI_GREEN, ANSI_RED, ANSI_RESET, APPROVED_SPECS,
 };
 #[cfg(target_os = "linux")]
 use vortex_rs::types::{slot_from_symbol_name, TimestampNs};
@@ -91,7 +94,7 @@ pub fn verify_and_seed_12_institutional_slots(
     arena: &VortexShmArena,
     batch: &mut ColumnarParquetBatch,
     verbose: bool,
-) -> Result<usize, vortex_rs::types::VortexError> {
+) -> Result<usize, VortexError> {
     let now_ns = now_epoch_ns();
     let mut approved_count = 0_usize;
     for (slot_idx, spec) in APPROVED_SPECS.iter().enumerate() {
@@ -121,7 +124,12 @@ pub fn verify_and_seed_12_institutional_slots(
             };
         }
         snap.refresh_deep_l1_l5_totals();
-        arena.slot(slot_idx)?.write_snapshot(&snap);
+        let slot_ref = arena.slot(slot_idx)?;
+        slot_ref.write_snapshot(&snap);
+        let verified_snap = slot_ref.read_snapshot(4)?;
+        if verified_snap.symbol_id != spec.symbol_id {
+            return Err(VortexError::InvalidSymbolSlot);
+        }
         let row = ColumnarMarketRow {
             symbol_id: spec.symbol_id,
             event_kind: MarketEventKind::L2BookSnapshot,
@@ -144,7 +152,10 @@ pub fn verify_and_seed_12_institutional_slots(
         approved_count += 1;
         if verbose {
             println!(
-                "  {}\u{1f7e2} [APPROVED -> SLOT {:2}] {:<10} | Tick_bps: {:>5.2} bps (Elastic) | Vol5m: {} bps{}",
+                concat!(
+                    "  {}\u{1f7e2} [APPROVED -> SLOT {:2}] {:<10} | ",
+                    "Tick_bps: {:>5.2} bps (Elastic) | Vol5m: {} bps{}"
+                ),
                 ANSI_GREEN,
                 slot_idx,
                 spec.symbol_id.name(),
@@ -168,6 +179,62 @@ pub fn verify_and_seed_12_institutional_slots(
     Ok(approved_count)
 }
 
+/// Runs the 12-pair + Seqlock + PAR1 gate inside an isolated ephemeral arena (0 live SHM writes).
+pub fn run_isolated_tap_self_test(verbose: bool) -> Result<(usize, usize, u64), VortexError> {
+    let eph_shm = MappedShmRegion::ephemeral_self_test_path("tap_gate");
+    let ts_u = now_epoch_ns().0.unsigned_abs();
+    let eph_par = std::env::temp_dir().join(format!(
+        "vortex_l3_tap_gate_{}_{}.parquet",
+        std::process::id(),
+        ts_u
+    ));
+    let mut batch = ColumnarParquetBatch::new();
+    let res = (|| -> Result<(usize, usize, u64), VortexError> {
+        let region = MappedShmRegion::open_or_create(&eph_shm, true)?;
+        let approved = verify_and_seed_12_institutional_slots(region.arena(), &mut batch, verbose)?;
+        let checksum = batch.write_to_file(&eph_par)?;
+        let (reloaded, verified_crc) = ColumnarParquetBatch::read_from_file(&eph_par)?;
+        if verified_crc != checksum || reloaded.len() != approved {
+            return Err(VortexError::ColumnarFormatCorrupted);
+        }
+        Ok((approved, reloaded.len(), checksum))
+    })();
+    let _ = fs::remove_file(&eph_shm);
+    let _ = fs::remove_file(&eph_par);
+    res
+}
+
+fn inspect_live_shm_readonly(shm_path: &Path) {
+    if !shm_path.exists() {
+        return;
+    }
+    if let Ok(ro_reg) = MappedShmRegion::open_existing_read_only(shm_path) {
+        let arena = ro_reg.arena();
+        let now_ns = now_epoch_ns();
+        let hb_age_ms = arena
+            .heartbeat_age_ns(now_ns)
+            .map(|ns| ns / 1_000_000)
+            .unwrap_or(0);
+        let mut live_slots = 0_usize;
+        for idx in 0..MAX_ACTIVE_PAIRS {
+            if let Ok(slot) = arena.slot(idx) {
+                if let Ok(sn) = slot.read_snapshot(2) {
+                    if sn.sequence_id > 0 {
+                        live_slots += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "[LIVE SHM READ-ONLY] {} | Active Live Slots: {}/{} | Heartbeat Age: {} ms",
+            shm_path.display(),
+            live_slots,
+            MAX_ACTIVE_PAIRS,
+            hb_age_ms
+        );
+    }
+}
+
 pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
     if parquet_seq > MAX_PARQUET_RING_FILES {
         let expired_seq = parquet_seq - MAX_PARQUET_RING_FILES;
@@ -178,6 +245,24 @@ pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
     let legacy_lake = data_dir.join("lakehouse_par1");
     if legacy_lake.exists() {
         let _ = fs::remove_dir_all(&legacy_lake);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_ws_tcp_stream(
+    socket: &mut tungstenite::WebSocket<
+        tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    >,
+) {
+    let tcp_opt = match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(s) => Some(s),
+        tungstenite::stream::MaybeTlsStream::NativeTls(tls) => Some(tls.get_mut()),
+        _ => None,
+    };
+    if let Some(tcp) = tcp_opt {
+        let _ = tcp.set_nodelay(true);
+        let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
     }
 }
 
@@ -240,6 +325,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
     let mut vol_anchor_px = [0_i64; MAX_ACTIVE_PAIRS];
     let mut vol_anchor_ts_ns = [0_i64; MAX_ACTIVE_PAIRS];
     let mut has_live_mark_px = [false; MAX_ACTIVE_PAIRS];
+    let mut has_book_snapshot = [false; MAX_ACTIVE_PAIRS];
     let mut batch = ColumnarParquetBatch::new();
     let mut parquet_seq = discover_latest_parquet_seq();
 
@@ -251,8 +337,10 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
             active_snaps[s].is_eligible = true;
             active_snaps[s].realized_vol_5m = ScaledBps(SAMPLE_VOL_5M_BPS[s]);
             has_live_mark_px[s] = false;
+            has_book_snapshot[s] = false;
         }
         if let Ok((mut socket, _)) = tungstenite::connect(BYBIT_PUBLIC_LINEAR_WS) {
+            configure_ws_tcp_stream(&mut socket);
             let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 3);
             for spec in &APPROVED_SPECS {
                 let sym = spec.symbol_id.name();
@@ -264,20 +352,31 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                 "{{\"op\":\"subscribe\",\"args\":[{}]}}",
                 topics.join(",")
             );
-            let _ = socket.send(tungstenite::Message::Text(sub_msg));
+            if socket.send(tungstenite::Message::Text(sub_msg)).is_err() {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             let mut last_ping_ns = now_epoch_ns().0;
-
             while let Ok(msg) = socket.read() {
                 let local_ns = now_epoch_ns();
                 arena.heartbeat_ns.store(local_ns.0 as u64, Ordering::Release);
                 if local_ns.0.saturating_sub(last_ping_ns) >= 15_000_000_000 {
-                    let _ = socket.send(tungstenite::Message::Text(
-                        "{\"op\":\"ping\"}".to_string(),
-                    ));
+                    if socket
+                        .send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string()))
+                        .is_err()
+                    {
+                        break;
+                    }
                     last_ping_ns = local_ns.0;
                 }
-                let tungstenite::Message::Text(txt) = msg else {
-                    continue;
+                let txt = match msg {
+                    tungstenite::Message::Text(t) => t,
+                    tungstenite::Message::Ping(payload) => {
+                        let _ = socket.send(tungstenite::Message::Pong(payload));
+                        continue;
+                    }
+                    tungstenite::Message::Close(_) => break,
+                    _ => continue,
                 };
                 let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) else {
                     continue;
@@ -303,67 +402,79 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                         .and_then(|t| t.as_str())
                         .map(|t| t == "snapshot")
                         .unwrap_or(false);
-                    if is_snapshot {
-                        snap.bids = [BookLevel::default(); 50];
-                        snap.asks = [BookLevel::default(); 50];
-                    }
-                    if let Some(data) = val.get("data") {
-                        if let Some(u_seq) = data.get("u").and_then(|u| u.as_u64()) {
-                            snap.sequence_id = u_seq;
+                    let Some(data) = val.get("data") else {
+                        continue;
+                    };
+                    let incoming_u = data.get("u").and_then(|u| u.as_u64()).unwrap_or(0);
+                    match classify_l2_sequence_transition(
+                        has_book_snapshot[slot_idx],
+                        snap.sequence_id,
+                        is_snapshot,
+                        incoming_u,
+                    ) {
+                        L2SeqDecision::ResetAndApplySnapshot => {
+                            snap.bids = [BookLevel::default(); 50];
+                            snap.asks = [BookLevel::default(); 50];
+                            factor_states[slot_idx].reset();
+                            has_book_snapshot[slot_idx] = true;
                         }
-                        if let Some(bids) = data.get("b").and_then(|b| b.as_array()) {
-                            for b_entry in bids {
-                                if let Some(arr) = b_entry.as_array() {
-                                    if arr.len() >= 2 {
-                                        let p_s = arr[0].as_str().unwrap_or("");
-                                        let q_s = arr[1].as_str().unwrap_or("");
-                                        if let Ok(px) = spec.parse_price_ticks(p_s) {
-                                            let qty = spec.parse_lot_qty(q_s);
-                                            snap.apply_level_update(Side::Bid, px, qty);
-                                        }
+                        L2SeqDecision::ApplyMonotonicDelta => {}
+                        L2SeqDecision::IgnorePreSnapshotOrStaleDelta => continue,
+                    }
+                    if incoming_u > 0 {
+                        snap.sequence_id = incoming_u;
+                    }
+                    if let Some(bids) = data.get("b").and_then(|b| b.as_array()) {
+                        for b_entry in bids {
+                            if let Some(arr) = b_entry.as_array() {
+                                if arr.len() >= 2 {
+                                    let p_s = arr[0].as_str().unwrap_or("");
+                                    let q_s = arr[1].as_str().unwrap_or("");
+                                    if let Ok(px) = spec.parse_price_ticks(p_s) {
+                                        let qty = spec.parse_lot_qty(q_s);
+                                        snap.apply_level_update(Side::Bid, px, qty);
                                     }
                                 }
                             }
                         }
-                        if let Some(asks) = data.get("a").and_then(|a| a.as_array()) {
-                            for a_entry in asks {
-                                if let Some(arr) = a_entry.as_array() {
-                                    if arr.len() >= 2 {
-                                        let p_s = arr[0].as_str().unwrap_or("");
-                                        let q_s = arr[1].as_str().unwrap_or("");
-                                        if let Ok(px) = spec.parse_price_ticks(p_s) {
-                                            let qty = spec.parse_lot_qty(q_s);
-                                            snap.apply_level_update(Side::Ask, px, qty);
-                                        }
+                    }
+                    if let Some(asks) = data.get("a").and_then(|a| a.as_array()) {
+                        for a_entry in asks {
+                            if let Some(arr) = a_entry.as_array() {
+                                if arr.len() >= 2 {
+                                    let p_s = arr[0].as_str().unwrap_or("");
+                                    let q_s = arr[1].as_str().unwrap_or("");
+                                    if let Ok(px) = spec.parse_price_ticks(p_s) {
+                                        let qty = spec.parse_lot_qty(q_s);
+                                        snap.apply_level_update(Side::Ask, px, qty);
                                     }
                                 }
                             }
                         }
                     }
-                    if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-                        let mid_l1 =
-                            PriceTicks((snap.bids[0].price.0 + snap.asks[0].price.0) / 2);
-                        if !has_live_mark_px[slot_idx] || snap.mark_price.0 <= 0 {
-                            snap.mark_price = mid_l1;
-                        }
-                        if snap.last_trade_price.0 <= 0 {
-                            snap.last_trade_price = mid_l1;
-                        }
-                        let dt_v = local_ns.0.saturating_sub(vol_anchor_ts_ns[slot_idx]);
-                        if vol_anchor_px[slot_idx] <= 0 {
-                            vol_anchor_px[slot_idx] = mid_l1.0;
-                            vol_anchor_ts_ns[slot_idx] = local_ns.0;
-                        } else if dt_v >= 5_000_000_000 {
-                            snap.realized_vol_5m =
-                                OrthogonalFactorState::update_realized_vol_5m(
-                                    snap.realized_vol_5m,
-                                    PriceTicks(vol_anchor_px[slot_idx]),
-                                    mid_l1,
-                                    dt_v,
-                                );
-                            vol_anchor_px[slot_idx] = mid_l1.0;
-                            vol_anchor_ts_ns[slot_idx] = local_ns.0;
-                        }
+                    if snap.bbo_and_spread_ticks().is_none() {
+                        continue;
+                    }
+                    let mid_l1 = PriceTicks((snap.bids[0].price.0 + snap.asks[0].price.0) / 2);
+                    if !has_live_mark_px[slot_idx] || snap.mark_price.0 <= 0 {
+                        snap.mark_price = mid_l1;
+                    }
+                    if snap.last_trade_price.0 <= 0 {
+                        snap.last_trade_price = mid_l1;
+                    }
+                    let dt_v = local_ns.0.saturating_sub(vol_anchor_ts_ns[slot_idx]);
+                    if vol_anchor_px[slot_idx] <= 0 {
+                        vol_anchor_px[slot_idx] = mid_l1.0;
+                        vol_anchor_ts_ns[slot_idx] = local_ns.0;
+                    } else if dt_v >= 5_000_000_000 {
+                        snap.realized_vol_5m = OrthogonalFactorState::update_realized_vol_5m(
+                            snap.realized_vol_5m,
+                            PriceTicks(vol_anchor_px[slot_idx]),
+                            mid_l1,
+                            dt_v,
+                        );
+                        vol_anchor_px[slot_idx] = mid_l1.0;
+                        vol_anchor_ts_ns[slot_idx] = local_ns.0;
                     }
                     snap.ts_exchange_ns = exch_ns;
                     snap.ts_local_ns = local_ns;
@@ -411,6 +522,11 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                                 snap.ts_exchange_ns = exch_ns;
                                 snap.ts_local_ns = local_ns;
                                 factor_states[slot_idx].on_trade_print(side, qty, snap);
+                                if !has_book_snapshot[slot_idx]
+                                    || snap.bbo_and_spread_ticks().is_none()
+                                {
+                                    continue;
+                                }
                                 if let Ok(slot_ref) = arena.slot(slot_idx) {
                                     slot_ref.write_snapshot(snap);
                                 }
@@ -461,14 +577,19 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena) -> ! {
                             snap.ts_exchange_ns = exch_ns;
                             snap.ts_local_ns = local_ns;
                             has_live_mark_px[slot_idx] = true;
-                            if let Ok(slot_ref) = arena.slot(slot_idx) {
-                                slot_ref.write_snapshot(snap);
+                            if has_book_snapshot[slot_idx]
+                                && snap.bbo_and_spread_ticks().is_some()
+                            {
+                                if let Ok(slot_ref) = arena.slot(slot_idx) {
+                                    slot_ref.write_snapshot(snap);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        flush_parquet_batch(&mut batch, &mut parquet_seq);
         thread::sleep(Duration::from_millis(500));
     }
 }
@@ -478,41 +599,40 @@ fn main() -> ExitCode {
     let is_daemon = args.iter().any(|a| a == "--daemon");
     let shm_path = MappedShmRegion::default_shm_path();
 
-    println!("================================================================================");
+    let sep = "================================================================================";
+    println!("{}", sep);
     println!(
         "[VORTEX-TAP V3.0] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
         VORTEX_SHM_VERSION,
         shm_path.display()
     );
-    println!("================================================================================");
+    println!("{}", sep);
 
+    let Ok((approved, rows, checksum)) = run_isolated_tap_self_test(true) else {
+        return ExitCode::FAILURE;
+    };
+
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        concat!(
+            "[SEQLOCK & PAR1 OK] Isolated Gate Slots: {} | Rows Verified: {} | ",
+            "FNV1a64: 0x{:016X}"
+        ),
+        approved, rows, checksum
+    );
+
+    if !is_daemon {
+        inspect_live_shm_readonly(&shm_path);
+        println!("{}", sep);
+        return ExitCode::SUCCESS;
+    }
+
+    println!("{}", sep);
+    prune_expired_parquet_segment(Path::new("data"), 0);
     let Ok(region) = MappedShmRegion::open_or_create(&shm_path, true) else {
         return ExitCode::FAILURE;
     };
-    let arena = region.arena();
-    let mut batch = ColumnarParquetBatch::new();
-    let Ok(approved) = verify_and_seed_12_institutional_slots(arena, &mut batch, true) else {
-        return ExitCode::FAILURE;
-    };
-    let tmp_par = std::env::temp_dir().join("vortex_l3_tap_gate.parquet");
-    let Ok(checksum) = batch.write_to_file(&tmp_par) else {
-        return ExitCode::FAILURE;
-    };
-    let _ = fs::remove_file(&tmp_par);
-    prune_expired_parquet_segment(Path::new("data"), 0);
-    println!("--------------------------------------------------------------------------------");
-    println!(
-        "[SEQLOCK & PAR1 OK] Active Institutional Slots: {} | Rows Verified: {} | FNV1a64: 0x{:016X}",
-        approved,
-        batch.len(),
-        checksum
-    );
-    println!("================================================================================");
-
-    if is_daemon {
-        run_live_bybit_ws_daemon(arena);
-    }
-    ExitCode::SUCCESS
+    run_live_bybit_ws_daemon(region.arena());
 }
 
 #[cfg(test)]
@@ -520,27 +640,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vortex_tap_12_slot_eligibility_and_shm_v12_sync() {
-        let shm_path = std::env::temp_dir().join("vortex_l3_tap_unit_test.mmap");
-        let reg = MappedShmRegion::open_or_create(&shm_path, true);
-        assert!(reg.is_ok());
-        if let Ok(region) = reg {
-            let mut batch = ColumnarParquetBatch::new();
-            let res = verify_and_seed_12_institutional_slots(region.arena(), &mut batch, false);
-            assert_eq!(res, Ok(12));
-            assert_eq!(batch.len(), 12);
-            for s in 0..12 {
-                if let Ok(slot) = region.arena().slot(s) {
-                    let snap = slot.read_snapshot(4);
-                    assert!(snap.is_ok());
-                    if let Ok(sn) = snap {
-                        assert_eq!(sn.symbol_id, APPROVED_SPECS[s].symbol_id);
-                        assert!(sn.deep_bid_lots_l1_l5.0 > 0);
-                    }
+    fn test_vortex_tap_isolated_self_test_never_clobbers_live_shm() {
+        let live_shm = MappedShmRegion::ephemeral_self_test_path("simulated_live_shm");
+        {
+            let reg = MappedShmRegion::open_or_create(&live_shm, true);
+            assert!(reg.is_ok());
+            if let Ok(r) = reg {
+                let mut live_snap = SymbolLobSnapshot::new_empty();
+                live_snap.symbol_id = APPROVED_SPECS[0].symbol_id;
+                live_snap.sequence_id = 888_777;
+                live_snap.bids[0] = BookLevel { price: PriceTicks(912_345), qty: LotQty(500) };
+                live_snap.asks[0] = BookLevel { price: PriceTicks(912_346), qty: LotQty(450) };
+                if let Ok(slot0) = r.arena().slot(0) {
+                    slot0.write_snapshot(&live_snap);
                 }
             }
         }
-        let _ = fs::remove_file(&shm_path);
+        let gate_res = run_isolated_tap_self_test(false);
+        assert!(gate_res.is_ok());
+        if let Ok((approved, rows, crc)) = gate_res {
+            assert_eq!(approved, 12);
+            assert_eq!(rows, 12);
+            assert_ne!(crc, 0);
+        }
+        inspect_live_shm_readonly(&live_shm);
+        let ro = MappedShmRegion::open_existing_read_only(&live_shm);
+        assert!(ro.is_ok());
+        if let Ok(r_check) = ro {
+            if let Ok(s0) = r_check.arena().slot(0) {
+                let snap_after = s0.read_snapshot(4);
+                assert!(snap_after.is_ok());
+                if let Ok(sn) = snap_after {
+                    assert_eq!(sn.sequence_id, 888_777);
+                    assert_eq!(sn.bids[0].price, PriceTicks(912_345));
+                }
+            }
+        }
+        let _ = fs::remove_file(&live_shm);
     }
 
     #[test]
