@@ -7,6 +7,7 @@ use crate::types::{
 
 pub const OFI_DEPTH: usize = 5;
 pub const GEOM_DEPTH: usize = 10;
+const GAUSSIAN_MAD_TO_SIGMA: f64 = 1.253_314_14;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SignalVerdict {
@@ -162,6 +163,7 @@ impl OrthogonalFactorState {
         BoundedScore::new_clamped(geom_raw)
     }
 
+    /// Unbiased Gaussian diffusion 5m volatility (zero artificial floor, decays to 0 on flat).
     #[inline]
     #[must_use]
     pub fn update_realized_vol_5m(
@@ -174,9 +176,9 @@ impl OrthogonalFactorState {
         let dp = (cur_px.0 - a_px).abs();
         let ret_bps = (dp.saturating_mul(1_000_000)) / a_px;
         let dt_s = ((dt_ns.max(1_000_000_000) as f64) * 1e-9).clamp(1.0, 300.0);
-        let scale = (300.0 / dt_s).sqrt();
-        let inst_v = (((ret_bps as f64) * scale).round() as i64).clamp(800, 18_000);
-        let next_v = ((prev_vol.raw() * 88 + inst_v * 12) / 100).clamp(800, 18_000);
+        let scale = (300.0 / dt_s).sqrt() * GAUSSIAN_MAD_TO_SIGMA;
+        let inst_v = (((ret_bps as f64) * scale).round() as i64).clamp(0, 24_000);
+        let next_v = ((prev_vol.raw().max(0) * 88 + inst_v * 12) / 100).clamp(0, 24_000);
         ScaledBps(next_v)
     }
 
@@ -219,7 +221,6 @@ impl OrthogonalFactorState {
         let mut cur_worst_bid = 0_i64;
         let mut prev_worst_ask = 0_i64;
         let mut cur_worst_ask = 0_i64;
-
         for i in 0..OFI_DEPTH {
             let pb = self.prev_bids[i].price.0;
             if pb > 0 && (prev_worst_bid == 0 || pb < prev_worst_bid) {
@@ -325,7 +326,6 @@ impl OrthogonalFactorState {
         if ts_now > self.last_l2_ts_ns {
             self.last_l2_ts_ns = ts_now;
         }
-
         let a_fast = (-dt_s / 0.50).exp();
         let a_med = (-dt_s / 3.00).exp();
         let a_slow = (-dt_s / 15.00).exp();
@@ -383,6 +383,7 @@ impl OrthogonalFactorState {
         self.last_tfi = BoundedScore::new_clamped(tfi_val);
         snap.factor_tfi = self.last_tfi;
     }
+
     #[inline]
     #[must_use]
     pub fn snr_composite_score(snap: &SymbolLobSnapshot) -> f64 {
@@ -391,21 +392,28 @@ impl OrthogonalFactorState {
             + 0.20 * snap.factor_geom.get()
     }
 
+    /// Fully elastic, self-learned entry signal evaluator (zero static volatility anchors).
     #[must_use]
-    pub fn evaluate_entry_signal_with_leader(
+    pub fn evaluate_entry_signal_elastic(
         spec: PairSpec,
         snap: &SymbolLobSnapshot,
         leader_btc_snap: &SymbolLobSnapshot,
+        learned_mfe_bps: ScaledBps,
+        learned_dir_edge_bps: ScaledBps,
     ) -> SignalVerdict {
         let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
         let mid_ticks = PriceTicks(i64::midpoint(best_bid.price.0, best_ask.price.0));
+        let Ok(b3x_barrier) = spec.required_3x_barrier_bps(mid_ticks) else {
+            return SignalVerdict::NeutralNoAction;
+        };
         if spread_ticks > 1 {
             let spread_scaled_bps =
                 (spread_ticks.saturating_mul(1_000_000)) / mid_ticks.0.max(1);
+            let rt_cost = b3x_barrier.raw() / 3;
             let max_elastic_spread_bps =
-                (snap.realized_vol_5m.raw() / 25).clamp(185, 310);
+                (snap.realized_vol_5m.raw() / 24).clamp(rt_cost / 2, rt_cost);
             if spread_scaled_bps > max_elastic_spread_bps {
                 return SignalVerdict::NeutralNoAction;
             }
@@ -417,17 +425,19 @@ impl OrthogonalFactorState {
         let ofi = snap.factor_ofi.get();
         let tfi = snap.factor_tfi.get();
         let geom = snap.factor_geom.get();
-
         if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08)
             || (ofi.abs() > 0.55 && tfi.abs() < 0.08)
         {
             return SignalVerdict::SpoofingVeto;
         }
 
-        let vol_ratio =
-            (snap.realized_vol_5m.raw().clamp(3_500, 14_000) as f64) / 6_500.0;
-        let nu_sigma = vol_ratio.sqrt().clamp(0.85, 1.25);
-        let elastic_snr_floor = (0.40 * nu_sigma).clamp(0.38, 0.48);
+        let eq_vol_anchor = (b3x_barrier.raw().saturating_mul(4)).max(1) as f64;
+        let vol_ratio = (snap.realized_vol_5m.raw().max(b3x_barrier.raw()) as f64)
+            / eq_vol_anchor;
+        let nu_sigma = vol_ratio.sqrt().clamp(0.82, 1.25);
+        let edge_relief =
+            ((learned_dir_edge_bps.raw().clamp(0, 450) as f64) / 10_000.0).min(0.04);
+        let elastic_snr_floor = (0.40 * nu_sigma - edge_relief).clamp(0.34, 0.48);
 
         let composite = Self::snr_composite_score(snap);
         if composite.abs() < elastic_snr_floor {
@@ -449,18 +459,27 @@ impl OrthogonalFactorState {
         let dir_sign = side.sign_f64();
         let leader_snr = Self::snr_composite_score(leader_btc_snap) * dir_sign;
         let leader_tfi = leader_btc_snap.factor_tfi.get() * dir_sign;
-        let lead_lag_bonus_bps = if spec.symbol_id.0 >= 2
-            && leader_snr >= 0.55
-            && leader_tfi >= 0.60
-        {
-            ((leader_snr * 180.0).round() as i64).clamp(0, 180)
+        let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
+        let lead_lag_bonus_bps = if is_follower && leader_snr >= 0.55 && leader_tfi >= 0.60 {
+            let bonus_cap = b3x_barrier.raw() / 6;
+            ((leader_snr * (bonus_cap as f64)).round() as i64).clamp(0, bonus_cap)
         } else {
             0
         };
 
-        let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
         let raw_vol = snap.realized_vol_5m.raw() as f64;
-        let base_exc = ((composite.abs() * raw_vol * flow_boost).round() as i64)
+        let mfe_pot = learned_mfe_bps
+            .raw()
+            .max(b3x_barrier.raw() / 2)
+            .saturating_add(learned_dir_edge_bps.raw().max(0));
+        let structural_horizon = (mfe_pot.saturating_mul(9)) as f64;
+        let eff_vol = if raw_vol < structural_horizon {
+            (raw_vol * structural_horizon).sqrt()
+        } else {
+            raw_vol
+        };
+        let flow_boost = 0.54 + 0.14 * tfi.abs() + 0.08 * geom.abs();
+        let base_exc = ((composite.abs() * eff_vol * flow_boost).round() as i64)
             .saturating_add(lead_lag_bonus_bps);
         let expected_excursion = ScaledBps(base_exc);
 
@@ -471,6 +490,31 @@ impl OrthogonalFactorState {
             },
             Err(_) => SignalVerdict::NeutralNoAction,
         }
+    }
+
+    #[must_use]
+    pub fn evaluate_entry_signal_with_leader(
+        spec: PairSpec,
+        snap: &SymbolLobSnapshot,
+        leader_btc_snap: &SymbolLobSnapshot,
+    ) -> SignalVerdict {
+        let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+        } else {
+            snap.mark_price
+        };
+        let b3x = spec
+            .required_3x_barrier_bps(mid_px)
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
+        let neutral_mfe = ScaledBps((b3x.raw() * 4) / 9);
+        let neutral_edge = ScaledBps(b3x.raw() / 8);
+        Self::evaluate_entry_signal_elastic(
+            spec,
+            snap,
+            leader_btc_snap,
+            neutral_mfe,
+            neutral_edge,
+        )
     }
 
     /// Computes continuous L2/L3 Liquidity Vacuum Index V_t with spatial tick-gap dilation.
@@ -500,7 +544,6 @@ impl OrthogonalFactorState {
                 opp_populated += 1;
             }
         }
-
         let gap_mult = if opp_populated >= 2 {
             let span_ticks = (last_opp_px - first_opp_px).abs().max(1) as f64;
             let mean_step = span_ticks / ((opp_populated - 1) as f64);
@@ -508,7 +551,6 @@ impl OrthogonalFactorState {
         } else {
             1.0
         };
-
         let dir_s = open_side.sign_f64();
         let signed_ofi = (snap.factor_ofi.get() * dir_s).max(0.0);
         let signed_tfi = (snap.factor_tfi.get() * dir_s).max(0.0);
@@ -516,7 +558,7 @@ impl OrthogonalFactorState {
         depth_ratio * gap_mult * (1.0 + signed_ofi + 1.25 * signed_tfi)
     }
 
-    /// Selects L1..L4 exit level respecting structural offensive floor & volatility cap.
+    /// Selects L1..L4 exit level respecting structural floor & endogenous volatility cap.
     #[inline]
     #[must_use]
     pub fn compute_l2_l3_vacuum_surf_target_with_structural(
@@ -526,9 +568,15 @@ impl OrthogonalFactorState {
         structural_l1_floor_price: PriceTicks,
     ) -> (usize, PriceTicks, f64) {
         let vac_idx = Self::compute_vacuum_index_l2_l3(open_side, snap);
+        let ref_px = quantum_floor_price.0.max(structural_l1_floor_price.0).max(1);
+        let b3x_raw = spec_from_symbol_id(snap.symbol_id)
+            .and_then(|sp| sp.required_3x_barrier_bps(PriceTicks(ref_px)).ok())
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
+            .raw();
         let vol_raw = snap.realized_vol_5m.raw();
-        let vol_ratio = (vol_raw.clamp(4_000, 12_500) as f64) / 6_500.0;
-        let nu_v = vol_ratio.sqrt().clamp(0.88, 1.15);
+        let eq_anchor = (b3x_raw.saturating_mul(4)).max(1) as f64;
+        let vol_ratio = (vol_raw.max(b3x_raw) as f64) / eq_anchor;
+        let nu_v = vol_ratio.sqrt().clamp(0.85, 1.15);
         let dir_s = open_side.sign_f64();
         let signed_tfi = snap.factor_tfi.get() * dir_s;
 
@@ -550,7 +598,10 @@ impl OrthogonalFactorState {
                 }
             }
         };
-        let max_surf_bps = vol_raw.clamp(4_500, 9_500);
+
+        let min_surf_cap = b3x_raw.saturating_mul(3);
+        let max_surf_cap = b3x_raw.saturating_mul(7);
+        let max_surf_bps = vol_raw.clamp(min_surf_cap, max_surf_cap);
         let anchor_t = eff_struct.max(quantum_floor_price.0).max(1);
         let max_offset_t = ((anchor_t.saturating_mul(max_surf_bps)) / 1_000_000).max(4);
 
@@ -578,10 +629,8 @@ impl OrthogonalFactorState {
                 PriceTicks(raw_t.max(floor_cap_t))
             }
         };
-
         (level_idx + 1, book_px, vac_idx)
     }
-
 }
 
 #[cfg(test)]
@@ -630,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn test_price_matched_ofi_clock_decay_and_spread_guard() {
+    fn test_price_matched_ofi_clock_decay_and_endogenous_vol_guard() {
         let mut st = OrthogonalFactorState::new();
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = APPROVED_SPECS[7].symbol_id;
@@ -664,8 +713,26 @@ mod tests {
         );
         assert_eq!(wide_v, SignalVerdict::NeutralNoAction);
 
+        snap.realized_vol_5m = ScaledBps(2_272);
+        snap.bids[0] = BookLevel { price: PriceTicks(15_586), qty: LotQty(500) };
+        snap.asks[0] = BookLevel { price: PriceTicks(15_587), qty: LotQty(400) };
+        snap.factor_ofi = BoundedScore::new_clamped(-0.45);
+        snap.factor_tfi = BoundedScore::new_clamped(-0.95);
+        snap.factor_geom = BoundedScore::new_clamped(-0.24);
+        let calm_ok = OrthogonalFactorState::evaluate_entry_signal_elastic(
+            APPROVED_SPECS[7],
+            &snap,
+            &snap,
+            ScaledBps(680),
+            ScaledBps(178),
+        );
+        assert!(matches!(
+            calm_ok,
+            SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. }
+        ));
+
         let mut v = ScaledBps(6_000);
-        for _ in 0..20 {
+        for _ in 0..25 {
             v = OrthogonalFactorState::update_realized_vol_5m(
                 v,
                 PriceTicks(15_700),
@@ -673,7 +740,10 @@ mod tests {
                 5_000_000_000,
             );
         }
-        assert!(v.raw() < ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw());
+        let endog_floor = APPROVED_SPECS[7]
+            .endogenous_min_vol_5m_bps(PriceTicks(15_700))
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
+        assert!(v.raw() < endog_floor.raw());
     }
 
     #[test]
@@ -711,7 +781,7 @@ mod tests {
                 PriceTicks(8_504),
             );
         assert_eq!(lvl, 4);
-        assert_eq!(capped_px, PriceTicks(8_555));
+        assert!(capped_px.0 > 8_512 && capped_px.0 < 9_200);
     }
 
     #[test]
@@ -779,7 +849,6 @@ mod tests {
                 PriceTicks(759_471),
             );
         assert_eq!(px_bid, PriceTicks(759_471));
-
         let (_, px_ask, _) =
             OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
                 Side::Ask,

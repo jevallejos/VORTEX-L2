@@ -1,4 +1,5 @@
-//! VORTEX-L3 Deterministic L1..L4 FIFO Simulator, Walk-Forward PAR1 & A/B/A+B Lab.
+//! VORTEX-L3 Deterministic L1..L4 FIFO Simulator, 1:1 Walk-Forward PAR1 & A/B/A+B Lab.
+
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -101,7 +102,9 @@ impl FifoQueueSimulator {
                 order_qty,
                 ..
             } => (limit_price, order_qty),
-            _ => (PriceTicks(0), LotQty(0)),
+            SimulatedOrderState::Inactive
+            | SimulatedOrderState::FilledMaker { .. }
+            | SimulatedOrderState::RejectedPostOnlyCross => (PriceTicks(0), LotQty(0)),
         }
     }
 
@@ -239,7 +242,9 @@ impl FifoQueueSimulator {
                     last_observed_lvl_qty: next_obs,
                 };
             }
-            _ => {}
+            SimulatedOrderState::Inactive
+            | SimulatedOrderState::FilledMaker { .. }
+            | SimulatedOrderState::RejectedPostOnlyCross => {}
         }
     }
 
@@ -344,7 +349,9 @@ impl FifoQueueSimulator {
                     last_observed_lvl_qty: next_obs,
                 };
             }
-            _ => {}
+            SimulatedOrderState::Inactive
+            | SimulatedOrderState::FilledMaker { .. }
+            | SimulatedOrderState::RejectedPostOnlyCross => {}
         }
     }
 
@@ -419,6 +426,7 @@ pub struct AblationMetrics {
     pub defensive_latches: u64,
     pub lvdbs_deep_surfs: u64,
 }
+
 pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
     let mut metrics = AblationMetrics::default();
     let gov = OnlineAdaptiveGovernor::new();
@@ -427,10 +435,10 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
 
     for episode in 0..24_usize {
         let slot_idx = match episode % 4 {
-            0 => 3_usize, // AVAXUSDT
-            1 => 5_usize, // SUIUSDT
-            2 => 6_usize, // ORDIUSDT
-            _ => 4_usize, // TAOUSDT
+            0 => 3_usize,
+            1 => 5_usize,
+            2 => 6_usize,
+            _ => 4_usize,
         };
         let spec = APPROVED_SPECS[slot_idx];
         let base_px = match slot_idx {
@@ -439,7 +447,6 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             6 => 3_180_i64,
             _ => 22_300_i64,
         };
-
         let mut eng = SlotExecutionEngine::new(slot_idx);
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = spec.symbol_id;
@@ -448,6 +455,7 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
         snap.ts_local_ns = TimestampNs(t0_ns);
         snap.bids[0] = BookLevel { price: PriceTicks(base_px), qty: LotQty(400) };
         snap.asks[0] = BookLevel { price: PriceTicks(base_px + 1), qty: LotQty(350) };
+        snap.refresh_deep_l1_l5_totals();
         snap.mark_price = PriceTicks(base_px);
         snap.last_trade_price = PriceTicks(base_px);
 
@@ -455,14 +463,16 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(680),
         };
-        let lots = spec.compute_compounding_kelly_lots(
+        let lots = spec.compute_bayesian_kelly_lots(
             INITIAL_REPLAY_EQUITY_1E8,
             PriceTicks(base_px),
             280,
+            55,
             false,
         );
         let _ = eng.try_arm_maker_entry(&snap, verdict, lots);
         let _ = eng.on_maker_entry_filled(TimestampNs(t0_ns + 50_000_000));
+
         let q_floor = defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(base_px));
 
         if episode % 2 == 0 {
@@ -651,7 +661,6 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             let latched = eng
                 .compute_canonical_exit_quote(&snap)
                 .is_some_and(|q| q.defensive_lock_active);
-
             if let Some(summary) =
                 eng.step_open_position(&snap, &snap, &gov, &mut ledger)
             {
@@ -674,7 +683,6 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             }
         }
     }
-
     metrics.mean_hold_secs = total_hold_secs / (metrics.closed_trades.max(1) as i64);
     metrics
 }
@@ -731,7 +739,7 @@ fn rehydrate_governor_scars_if_present(gov: &mut OnlineAdaptiveGovernor) {
     );
 }
 
-/// F-10 Fix: Continuous Walk-Forward PAR1 Replay with 25ms L1..L4 FIFO & Honest PF.
+/// Continuous 1:1 Walk-Forward PAR1 Replay (Preflight C1 + Re-Peg + 25ms L1..L4 FIFO).
 #[must_use]
 pub fn run_parquet_walk_forward_on_dir(
     data_dir: &Path,
@@ -768,10 +776,11 @@ pub fn run_parquet_walk_forward_on_dir(
     let mut init_q_ahead = [LotQty(0); MAX_ACTIVE_PAIRS];
     let mut armed_ts_latch = [0_i64; MAX_ACTIVE_PAIRS];
     let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    let init_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 4);
     for s in 0..MAX_ACTIVE_PAIRS {
         snaps[s].symbol_id = APPROVED_SPECS[s].symbol_id;
         snaps[s].is_eligible = true;
-        snaps[s].realized_vol_5m = ScaledBps(6_500);
+        snaps[s].realized_vol_5m = init_vol;
     }
 
     for f_path in &files {
@@ -824,8 +833,15 @@ pub fn run_parquet_walk_forward_on_dir(
                             beta_guard.observe_active_side(active_s);
                         }
                     }
-                    let verdict = OrthogonalFactorState::evaluate_entry_signal_with_leader(
-                        spec, &cur_snap, &btc_snap,
+                    let comp_raw = OrthogonalFactorState::snr_composite_score(&cur_snap);
+                    let probe_side = if comp_raw >= 0.0 { Side::Bid } else { Side::Ask };
+                    let (dir_edge, _, _) = gov.slot_direction_diagnostics(s_idx, probe_side);
+                    let verdict = OrthogonalFactorState::evaluate_entry_signal_elastic(
+                        spec,
+                        &cur_snap,
+                        &btc_snap,
+                        ScaledBps(engines[s_idx].learned_mfe_bps),
+                        ScaledBps(dir_edge),
                     );
                     match verdict {
                         SignalVerdict::SpoofingVeto => {
@@ -840,13 +856,14 @@ pub fn run_parquet_walk_forward_on_dir(
                             {
                                 let (edge_b, _, _) =
                                     gov.slot_direction_diagnostics(s_idx, side);
+                                let ir_x100 = gov.slot_information_ratio_x100(s_idx, side);
                                 let in_debt = gov.is_in_scar_debt(s_idx, side);
                                 let en_px = side.select_entry_bbo_price(
                                     cur_snap.bids[0].price,
                                     cur_snap.asks[0].price,
                                 );
-                                let lots = spec.compute_compounding_kelly_lots(
-                                    eq_1e8, en_px, edge_b, in_debt,
+                                let lots = spec.compute_bayesian_kelly_lots(
+                                    eq_1e8, en_px, edge_b, ir_x100, in_debt,
                                 );
                                 if engines[s_idx]
                                     .try_arm_maker_entry(&cur_snap, verdict, lots)
@@ -857,37 +874,74 @@ pub fn run_parquet_walk_forward_on_dir(
                                     )
                                 {
                                     armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
-                                    entry_fifo[s_idx].submit_post_only(
-                                        side,
-                                        en_px,
-                                        lots,
-                                        cur_snap.ts_local_ns,
-                                    );
-                                    rep.armed += 1;
+                                    entry_fifo[s_idx].reset();
                                 }
                             }
                         }
                         SignalVerdict::NeutralNoAction => {}
                     }
                 }
-                OrderLifecycleState::PlacingEntryMaker { .. }
-                | OrderLifecycleState::RestingEntryQueue { .. } => {
+                OrderLifecycleState::PlacingEntryMaker {
+                    side,
+                    qty,
+                    submitted_ts,
+                    ..
+                } => {
                     match entry_fifo[s_idx].state {
+                        SimulatedOrderState::Inactive => {
+                            let wait_ns = engines[s_idx]
+                                .elastic_preflight_window_ns(cur_snap.realized_vol_5m);
+                            if cur_snap.ts_local_ns.0.saturating_sub(submitted_ts.0) < wait_ns {
+                                continue;
+                            }
+                            let eq_1e8 = ledger.current_equity_1e8();
+                            if gov
+                                .confirm_preflight_kinematics_non_choking(
+                                    s_idx, side, eq_1e8, &cur_snap, &btc_snap,
+                                )
+                                .is_err()
+                            {
+                                engines[s_idx].state = OrderLifecycleState::Idle;
+                                continue;
+                            }
+                            let Ok((synced_px, _)) =
+                                engines[s_idx].sync_preflight_l1_entry(&cur_snap, 8)
+                            else {
+                                engines[s_idx].state = OrderLifecycleState::Idle;
+                                continue;
+                            };
+                            armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
+                            entry_fifo[s_idx].submit_post_only(
+                                side,
+                                synced_px,
+                                qty,
+                                cur_snap.ts_local_ns,
+                            );
+                            rep.armed += 1;
+                        }
+                        SimulatedOrderState::InFlightToExchange { .. } => {}
                         SimulatedOrderState::RejectedPostOnlyCross => {
                             rep.post_only_rejects += 1;
                             entry_fifo[s_idx].reset();
                             engines[s_idx].state = OrderLifecycleState::Idle;
                         }
+                        SimulatedOrderState::RestingInFifoQueue {
+                            queue_ahead_qty, ..
+                        } => {
+                            init_q_ahead[s_idx] = queue_ahead_qty;
+                            let _ = engines[s_idx]
+                                .on_entry_order_resting(cur_snap.ts_local_ns);
+                        }
                         SimulatedOrderState::FilledMaker {
-                            side,
+                            side: f_side,
                             fill_price,
                             filled_qty,
                             fill_ts_ns,
                         } => {
-                            gov.clear_abort_streak(s_idx, side);
+                            gov.clear_abort_streak(s_idx, f_side);
                             let _ = engines[s_idx].on_maker_entry_filled_verified(
                                 fill_ts_ns,
-                                Some(side),
+                                Some(f_side),
                                 Some(fill_price),
                                 Some(filled_qty),
                             );
@@ -896,75 +950,127 @@ pub fn run_parquet_walk_forward_on_dir(
                             exit_role_latch[s_idx] = ExitOrderRole::None;
                             rep.fills += 1;
                         }
-                        SimulatedOrderState::RestingInFifoQueue {
-                            queue_ahead_qty, ..
-                        } => {
-                            if matches!(
-                                engines[s_idx].state,
-                                OrderLifecycleState::PlacingEntryMaker { .. }
-                            ) {
-                                init_q_ahead[s_idx] = queue_ahead_qty;
-                                let _ = engines[s_idx]
-                                    .on_entry_order_resting(cur_snap.ts_local_ns);
-                            }
-                            if let OrderLifecycleState::RestingEntryQueue {
+                    }
+                }
+                OrderLifecycleState::RestingEntryQueue {
+                    side,
+                    entry_price,
+                    qty,
+                    resting_since_ts,
+                    ..
+                } => match entry_fifo[s_idx].state {
+                    SimulatedOrderState::RejectedPostOnlyCross => {
+                        rep.post_only_rejects += 1;
+                        entry_fifo[s_idx].reset();
+                        engines[s_idx].state = OrderLifecycleState::Idle;
+                    }
+                    SimulatedOrderState::FilledMaker {
+                        side: f_side,
+                        fill_price,
+                        filled_qty,
+                        fill_ts_ns,
+                    } => {
+                        gov.clear_abort_streak(s_idx, f_side);
+                        let _ = engines[s_idx].on_maker_entry_filled_verified(
+                            fill_ts_ns,
+                            Some(f_side),
+                            Some(fill_price),
+                            Some(filled_qty),
+                        );
+                        entry_fifo[s_idx].reset();
+                        exit_fifo[s_idx].reset();
+                        exit_role_latch[s_idx] = ExitOrderRole::None;
+                        rep.fills += 1;
+                    }
+                    SimulatedOrderState::RestingInFifoQueue {
+                        queue_ahead_qty, ..
+                    } => {
+                        let elapsed_ns =
+                            cur_snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
+                        let max_chase_ns =
+                            gov.max_total_entry_chase_ns(s_idx, cur_snap.realized_vol_5m);
+                        let timeout_ns = (max_chase_ns * 3) / 4;
+                        let total_chase_ns =
+                            cur_snap.ts_local_ns.0.saturating_sub(armed_ts_latch[s_idx]);
+                        let at_l1 = match side {
+                            Side::Bid => cur_snap.bids[0].price == entry_price,
+                            Side::Ask => cur_snap.asks[0].price == entry_price,
+                        };
+                        let flow_imp = (0.55 * cur_snap.factor_ofi.get()
+                            + 0.45 * cur_snap.factor_tfi.get())
+                            * side.sign_f64();
+                        let dq_abort = (elapsed_ns >= 1_500_000_000
+                            && at_l1
+                            && check_queue_depletion_velocity_abort(
+                                side,
+                                init_q_ahead[s_idx],
+                                queue_ahead_qty,
+                                &cur_snap,
+                            ))
+                            || flow_imp <= -0.48;
+                        if elapsed_ns >= timeout_ns
+                            || total_chase_ns >= max_chase_ns
+                            || dq_abort
+                        {
+                            gov.observe_entry_abort(
+                                s_idx,
                                 side,
                                 entry_price,
-                                resting_since_ts,
-                                ..
-                            } = engines[s_idx].state
+                                cur_snap.ts_local_ns,
+                            );
+                            entry_fifo[s_idx].reset();
+                            engines[s_idx].state = OrderLifecycleState::Idle;
+                            rep.queue_aborts += 1;
+                        } else if !at_l1
+                            && elapsed_ns >= 2_500_000_000
+                            && total_chase_ns + 2_500_000_000 < max_chase_ns
+                            && cur_snap.ts_local_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
+                        {
+                            let new_l1 = side.select_entry_bbo_price(
+                                cur_snap.bids[0].price,
+                                cur_snap.asks[0].price,
+                            );
+                            let moved_away = match side {
+                                Side::Bid => {
+                                    new_l1.0 > entry_price.0
+                                        && (new_l1.0 - entry_price.0) <= 15
+                                }
+                                Side::Ask => {
+                                    new_l1.0 < entry_price.0
+                                        && (entry_price.0 - new_l1.0) <= 15
+                                }
+                            };
+                            let eq_1e8 = ledger.current_equity_1e8();
+                            if moved_away
+                                && gov
+                                    .confirm_preflight_kinematics_non_choking(
+                                        s_idx, side, eq_1e8, &cur_snap, &btc_snap,
+                                    )
+                                    .is_ok()
                             {
-                                let elapsed_ns = cur_snap
-                                    .ts_local_ns
-                                    .0
-                                    .saturating_sub(resting_since_ts.0);
-                                let vol_q =
-                                    cur_snap.realized_vol_5m.raw().clamp(4_000, 12_500);
-                                let timeout_ns = ((15_000_000_000_i64 * 6_500) / vol_q)
-                                    .clamp(10_000_000_000, 20_000_000_000);
-                                let total_chase_ns = cur_snap
-                                    .ts_local_ns
-                                    .0
-                                    .saturating_sub(armed_ts_latch[s_idx]);
-                                let max_chase_ns =
-                                    OnlineAdaptiveGovernor::max_total_entry_chase_ns(
-                                        cur_snap.realized_vol_5m,
-                                    );
-                                let at_l1 = match side {
-                                    Side::Bid => cur_snap.bids[0].price == entry_price,
-                                    Side::Ask => cur_snap.asks[0].price == entry_price,
-                                };
-                                let flow_imp = (0.55 * cur_snap.factor_ofi.get()
-                                    + 0.45 * cur_snap.factor_tfi.get())
-                                    * side.sign_f64();
-                                let dq_abort = (elapsed_ns >= 1_500_000_000
-                                    && at_l1
-                                    && check_queue_depletion_velocity_abort(
-                                        side,
-                                        init_q_ahead[s_idx],
-                                        queue_ahead_qty,
-                                        &cur_snap,
-                                    ))
-                                    || flow_imp <= -0.48;
-                                if elapsed_ns >= timeout_ns
-                                    || total_chase_ns >= max_chase_ns
-                                    || dq_abort
+                                if let Ok(repeg_sl) =
+                                    engines[s_idx].compute_repeg_sl_trigger(&cur_snap, new_l1)
                                 {
-                                    gov.observe_entry_abort(
-                                        s_idx,
-                                        side,
-                                        entry_price,
+                                    engines[s_idx].next_peg_allowed_ts_ns =
+                                        cur_snap.ts_local_ns.0 + 1_500_000_000;
+                                    engines[s_idx].apply_resting_repeg(
+                                        new_l1,
+                                        repeg_sl,
                                         cur_snap.ts_local_ns,
                                     );
-                                    entry_fifo[s_idx].reset();
-                                    engines[s_idx].state = OrderLifecycleState::Idle;
-                                    rep.queue_aborts += 1;
+                                    entry_fifo[s_idx].submit_post_only(
+                                        side,
+                                        new_l1,
+                                        qty,
+                                        cur_snap.ts_local_ns,
+                                    );
                                 }
                             }
                         }
-                        _ => {}
                     }
-                }
+                    SimulatedOrderState::InFlightToExchange { .. }
+                    | SimulatedOrderState::Inactive => {}
+                },
                 OrderLifecycleState::PositionOpenMakerExit {
                     side,
                     avg_price_ticks,
@@ -1125,6 +1231,7 @@ pub fn run_parquet_walk_forward_on_dir(
                         rep.post_only_rejects += 1;
                         exit_fifo[s_idx].reset();
                     }
+
                     if let Some(quote) = engines[s_idx].compute_canonical_exit_quote(&cur_snap)
                     {
                         engines[s_idx]
@@ -1169,7 +1276,6 @@ pub fn run_parquet_walk_forward_on_dir(
             }
         }
     }
-
     rep.cum_net_pnl_1e8 = ledger.cumulative_net_pnl_1e8;
     if verbose {
         print_walk_forward_summary(&rep);
@@ -1191,7 +1297,6 @@ fn print_walk_forward_summary(rep: &WalkForwardReport) {
         format!("{:.2}", (rep.gross_profit_1e8 as f64) / (rep.gross_loss_1e8 as f64))
     };
     let pnl_usdt = (rep.cum_net_pnl_1e8 as f64) / 100_000_000.0;
-
     println!(
         concat!(
             "  -> Live PAR1 Archives Verified: {} files | ",
@@ -1333,6 +1438,7 @@ mod tests {
         let mod_a = run_ab_economic_ablation_model(AblationMode::BaselineFixedL1A);
         let mod_b = run_ab_economic_ablation_model(AblationMode::ElasticMultiTrancheB);
         let mod_ab = run_ab_economic_ablation_model(AblationMode::FullVortexL3AB);
+
         assert_eq!(mod_a.closed_trades, 24);
         assert_eq!(mod_b.closed_trades, 24);
         assert_eq!(mod_ab.closed_trades, 24);
@@ -1352,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_f10_walk_forward_par1_fifo_25ms_25pct_l2_and_zero_60s_wipe() {
+    fn test_f10_walk_forward_par1_1to1_preflight_fifo_25ms_and_zero_60s_wipe() {
         let tmp_dir = std::env::temp_dir().join(format!(
             "vortex_l3_chat11_wf_{}",
             std::process::id()
@@ -1413,23 +1519,9 @@ mod tests {
                 LotQty(360),
             ))
             .is_ok());
-
-        // Trade at +10ms (under 25ms flight latency) must NOT fill in-flight order.
+        // +35ms completes elastic preflight C1 check & dispatches 25ms PostOnly order.
         avax.sequence_id = 2;
-        avax.ts_local_ns = TimestampNs(2_010_000_000);
-        assert!(seg1
-            .push_row(&ColumnarMarketRow::from_lob_snapshot(
-                &avax,
-                MarketEventKind::PublicTradePrint,
-                Side::Ask,
-                PriceTicks(8_200),
-                LotQty(500),
-            ))
-            .is_ok());
-
-        // +30ms lands in L1 queue (360 ahead); +40ms L2 cancel drops 160 -> 320 ahead.
-        avax.sequence_id = 3;
-        avax.ts_local_ns = TimestampNs(2_030_000_000);
+        avax.ts_local_ns = TimestampNs(2_035_000_000);
         assert!(seg1
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
                 &avax,
@@ -1439,8 +1531,32 @@ mod tests {
                 LotQty(360),
             ))
             .is_ok());
+        // Trade at +45ms (10ms in-flight < 25ms) must NOT fill in-flight order.
+        avax.sequence_id = 3;
+        avax.ts_local_ns = TimestampNs(2_045_000_000);
+        assert!(seg1
+            .push_row(&ColumnarMarketRow::from_lob_snapshot(
+                &avax,
+                MarketEventKind::PublicTradePrint,
+                Side::Ask,
+                PriceTicks(8_200),
+                LotQty(500),
+            ))
+            .is_ok());
+        // +65ms lands in L1 queue (360 ahead); +75ms L2 cancel drops 160 -> 320 ahead.
         avax.sequence_id = 4;
-        avax.ts_local_ns = TimestampNs(2_040_000_000);
+        avax.ts_local_ns = TimestampNs(2_065_000_000);
+        assert!(seg1
+            .push_row(&ColumnarMarketRow::from_lob_snapshot(
+                &avax,
+                MarketEventKind::L2BookSnapshot,
+                Side::Bid,
+                PriceTicks(8_200),
+                LotQty(360),
+            ))
+            .is_ok());
+        avax.sequence_id = 5;
+        avax.ts_local_ns = TimestampNs(2_075_000_000);
         avax.bids[0].qty = LotQty(200);
         assert!(seg1
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
@@ -1451,10 +1567,9 @@ mod tests {
                 LotQty(200),
             ))
             .is_ok());
-
-        // +60ms 350-lot sell print clears remaining 320 queue ahead & fills entry.
-        avax.sequence_id = 5;
-        avax.ts_local_ns = TimestampNs(2_060_000_000);
+        // +95ms 350-lot sell print clears remaining 320 queue ahead & fills entry.
+        avax.sequence_id = 6;
+        avax.ts_local_ns = TimestampNs(2_095_000_000);
         assert!(seg1
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
                 &avax,
@@ -1464,9 +1579,8 @@ mod tests {
                 LotQty(350),
             ))
             .is_ok());
-
         // At t = 25s (hold = 22s, offensive mode), Tranche 1 (50%) harvests @ 8_204.
-        avax.sequence_id = 6;
+        avax.sequence_id = 7;
         avax.ts_local_ns = TimestampNs(25_000_000_000);
         avax.mark_price = PriceTicks(8_204);
         avax.bids[0] = BookLevel { price: PriceTicks(8_203), qty: LotQty(420) };
@@ -1480,7 +1594,7 @@ mod tests {
                 LotQty(420),
             ))
             .is_ok());
-        avax.sequence_id = 7;
+        avax.sequence_id = 8;
         avax.ts_local_ns = TimestampNs(25_030_000_000);
         assert!(seg1
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
@@ -1491,7 +1605,7 @@ mod tests {
                 LotQty(420),
             ))
             .is_ok());
-        avax.sequence_id = 8;
+        avax.sequence_id = 9;
         avax.ts_local_ns = TimestampNs(25_050_000_000);
         assert!(seg1
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
@@ -1508,7 +1622,7 @@ mod tests {
 
         // Segment 2 after a 65.45s gap: open Tranche 2 survives & surfs L4 @ 8_224.
         let mut seg2 = ColumnarParquetBatch::new();
-        avax.sequence_id = 9;
+        avax.sequence_id = 10;
         avax.ts_local_ns = TimestampNs(90_500_000_000);
         avax.mark_price = PriceTicks(8_201);
         let ask_vac = [8_201, 8_208, 8_216, 8_224];
@@ -1530,7 +1644,7 @@ mod tests {
                 LotQty(420),
             ))
             .is_ok());
-        avax.sequence_id = 10;
+        avax.sequence_id = 11;
         avax.ts_local_ns = TimestampNs(90_530_000_000);
         assert!(seg2
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
@@ -1541,7 +1655,7 @@ mod tests {
                 LotQty(420),
             ))
             .is_ok());
-        avax.sequence_id = 11;
+        avax.sequence_id = 12;
         avax.ts_local_ns = TimestampNs(90_550_000_000);
         assert!(seg2
             .push_row(&ColumnarMarketRow::from_lob_snapshot(

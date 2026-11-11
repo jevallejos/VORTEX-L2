@@ -1,4 +1,4 @@
-//! Execution FSM Primitives, Quantum Floors, Moallemi dQ/dt Shield & 12x2 Adaptive Governor.
+//! Execution FSM, Quantum Floors, Moallemi dQ/dt Shield & Bayesian 12x2 Governor.
 
 use crate::alpha_3factor::OrthogonalFactorState;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -10,6 +10,35 @@ use crate::types::{
 };
 
 pub const MAX_CLOSE_RECONCILE_RETRIES: u8 = 3;
+const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
+const INIT_RETURN_VAR_BPS2: i64 = 40_000;
+
+#[inline]
+const fn c_min_i64(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+#[inline]
+const fn c_max_i64(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+#[inline]
+#[allow(clippy::manual_clamp)]
+const fn c_clamp_i64(val: i64, lo: i64, hi: i64) -> i64 {
+    if val < lo {
+        lo
+    } else if val > hi {
+        hi
+    } else {
+        val
+    }
+}
+
+#[inline]
+const fn c_min_u32(a: u32, b: u32) -> u32 {
+    if a < b { a } else { b }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
@@ -167,7 +196,6 @@ fn sha256_digest_2parts(part1: &[u8], part2: &[u8]) -> [u8; 32] {
             fill = 0;
         }
     }
-
     block[fill] = 0x80;
     fill += 1;
     if fill > 56 {
@@ -235,7 +263,6 @@ pub fn parse_verified_avg_price_ticks(
     let mut frac_digits: u32 = 0;
     let mut in_frac = false;
     let mut has_extra_nonzero_frac = false;
-
     for b in s.bytes() {
         if b == b'.' {
             if in_frac {
@@ -261,7 +288,6 @@ pub fn parse_verified_avg_price_ticks(
         frac = frac.saturating_mul(10);
         frac_digits += 1;
     }
-
     let total_1e8 = whole.saturating_mul(100_000_000).saturating_add(frac);
     if total_1e8 <= 0 && !has_extra_nonzero_frac {
         return Err(VortexError::InvalidPriceOrTickSpec);
@@ -307,13 +333,11 @@ pub fn parse_signed_decimal_1e8(decimal_str: &str) -> Result<i64, VortexError> {
     if start_idx >= bytes.len() {
         return Err(VortexError::AsciiDecimalParseError);
     }
-
     let mut whole: i128 = 0;
     let mut frac: i128 = 0;
     let mut frac_digits: u32 = 0;
     let mut in_frac = false;
     let mut saw_digit = false;
-
     for &b in &bytes[start_idx..] {
         if b == b'.' {
             if in_frac {
@@ -341,7 +365,6 @@ pub fn parse_signed_decimal_1e8(decimal_str: &str) -> Result<i64, VortexError> {
         frac = frac.saturating_mul(10);
         frac_digits += 1;
     }
-
     let mag = whole.saturating_mul(100_000_000).saturating_add(frac);
     let clamped = mag.min(i64::MAX as i128) as i64;
     Ok(if neg { -clamped } else { clamped })
@@ -394,7 +417,7 @@ pub const fn dynamic_maker_floor_price(
     }
 }
 
-/// Moallemi-Yuan L1 Queue Depletion Velocity Shield (dQ/dt).
+/// Moallemi-Yuan L1 Queue Depletion Velocity Shield (dQ/dt) coupled to endogenous barrier.
 #[inline]
 #[must_use]
 pub fn check_queue_depletion_velocity_abort(
@@ -413,12 +436,19 @@ pub fn check_queue_depletion_velocity_abort(
     if init_queue_ahead.0 <= 0 {
         return false;
     }
-    let vol_ratio = (snap.realized_vol_5m.raw().clamp(4_000, 12_000) as f64) / 6_000.0;
+    let ref_px = snap.bids[0].price.0.max(snap.asks[0].price.0).max(1);
+    let b3x_raw = crate::types::spec_from_symbol_id(snap.symbol_id)
+        .and_then(|sp| sp.required_3x_barrier_bps(PriceTicks(ref_px)).ok())
+        .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
+        .raw();
+    let eq_anchor = (b3x_raw.saturating_mul(4)).max(1) as f64;
+    let vol_ratio = (snap.realized_vol_5m.raw().max(b3x_raw) as f64) / eq_anchor;
     let nu_sigma = vol_ratio.sqrt().clamp(0.80, 1.35);
     let depleted_lots = (init_queue_ahead.0 - current_queue_ahead.0).max(0) as f64;
     let depleted_frac = depleted_lots / (init_queue_ahead.0 as f64);
     depleted_frac >= (0.55 * nu_sigma) && flow_impulse <= (-0.05 * nu_sigma)
 }
+
 #[inline]
 fn extract_matrix_i64_12x2(
     val: &serde_json::Value,
@@ -457,10 +487,12 @@ fn extract_matrix_u32_12x2(
     }
 }
 
-/// 12x2 Native Online Adaptive Governor with 6 Shields, E_kin Surface & Scar Memory.
+/// 12x2 Online Bayesian Governor with Welford-EWMA Variance, Intrinsic Clock & E_kin Surface.
 #[derive(Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    ewma_var_bps2: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    eq_vol_5m_bps: [i64; MAX_ACTIVE_PAIRS],
     cum_net_bps_x100: [[i64; 2]; MAX_ACTIVE_PAIRS],
     sl_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     win_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
@@ -474,6 +506,7 @@ pub struct OnlineAdaptiveGovernor {
     ewma_slow_px_1e4: [i64; MAX_ACTIVE_PAIRS],
     last_price_sample_ts_ns: [i64; MAX_ACTIVE_PAIRS],
     wave_anchor_px_1e4: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    wave_anchor_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
     abort_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     abort_anchor_px_1e4: [[i64; 2]; MAX_ACTIVE_PAIRS],
     abort_last_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
@@ -491,8 +524,11 @@ impl OnlineAdaptiveGovernor {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
+        let init_eq_vol = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 4;
         Self {
-            ewma_net_bps_x100: [[200; 2]; MAX_ACTIVE_PAIRS],
+            ewma_net_bps_x100: [[ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw(); 2]; MAX_ACTIVE_PAIRS],
+            ewma_var_bps2: [[INIT_RETURN_VAR_BPS2; 2]; MAX_ACTIVE_PAIRS],
+            eq_vol_5m_bps: [init_eq_vol; MAX_ACTIVE_PAIRS],
             cum_net_bps_x100: [[0; 2]; MAX_ACTIVE_PAIRS],
             sl_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             win_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
@@ -506,6 +542,7 @@ impl OnlineAdaptiveGovernor {
             ewma_slow_px_1e4: [0; MAX_ACTIVE_PAIRS],
             last_price_sample_ts_ns: [0; MAX_ACTIVE_PAIRS],
             wave_anchor_px_1e4: [[0; 2]; MAX_ACTIVE_PAIRS],
+            wave_anchor_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
             abort_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             abort_anchor_px_1e4: [[i64::MIN; 2]; MAX_ACTIVE_PAIRS],
             abort_last_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
@@ -519,6 +556,61 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => 0,
             Side::Ask => 1,
         }
+    }
+
+    /// Bayesian Information Ratio x100: IR_{s,d} = mu / (sqrt(var) + fee_rt).
+    #[inline]
+    #[must_use]
+    pub const fn slot_information_ratio_x100(&self, slot_idx: usize, side: Side) -> i64 {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return 0;
+        }
+        let d = Self::dir_idx(side);
+        let mu = self.ewma_net_bps_x100[slot_idx][d];
+        let var_u = if self.ewma_var_bps2[slot_idx][d] > 1 {
+            self.ewma_var_bps2[slot_idx][d] as u64
+        } else {
+            1_u64
+        };
+        let sigma = var_u.isqrt() as i64;
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        (mu.saturating_mul(100)) / c_max_i64(sigma.saturating_add(fee_rt), 1)
+    }
+
+    /// Intrinsic diffusion clock tau_mkt(s) derived from 5m vol horizon & learned eq_vol.
+    #[inline]
+    #[must_use]
+    const fn intrinsic_diffusion_clock_ns(&self, slot_idx: usize) -> i64 {
+        let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
+        let ref_v = min_v * 4;
+        let eq_v = if slot_idx < MAX_ACTIVE_PAIRS && self.eq_vol_5m_bps[slot_idx] > min_v {
+            self.eq_vol_5m_bps[slot_idx]
+        } else {
+            ref_v
+        };
+        let raw_ns = ((VOL_5M_HORIZON_NS as i128) * (ref_v as i128)) / (eq_v as i128);
+        let lo = VOL_5M_HORIZON_NS / 3;
+        let hi = VOL_5M_HORIZON_NS * 3;
+        if raw_ns < (lo as i128) {
+            lo
+        } else if raw_ns > (hi as i128) {
+            hi
+        } else {
+            raw_ns as i64
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    const fn elastic_wave_anchor_ttl_ns(&self, slot_idx: usize, d: usize) -> i64 {
+        let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let edge_pos = if self.ewma_net_bps_x100[slot_idx][d] > 0 {
+            c_min_i64(self.ewma_net_bps_x100[slot_idx][d], fee_rt * 2)
+        } else {
+            0
+        };
+        (tau_ns.saturating_mul(2 * fee_rt + edge_pos)) / fee_rt
     }
 
     #[inline]
@@ -535,21 +627,30 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         let px_1e4 = mid_ticks.saturating_mul(10_000);
+        let obs_vol = snap.realized_vol_5m.raw();
         let fast_prev = self.ewma_fast_px_1e4[slot_idx];
         let slow_prev = self.ewma_slow_px_1e4[slot_idx];
         if fast_prev <= 0 || slow_prev <= 0 {
             self.ewma_fast_px_1e4[slot_idx] = px_1e4;
             self.ewma_slow_px_1e4[slot_idx] = px_1e4;
+            if obs_vol > 0 {
+                self.eq_vol_5m_bps[slot_idx] = obs_vol;
+            }
             self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
             return;
         }
-        let sample_dt = snap.ts_local_ns.0.saturating_sub(self.last_price_sample_ts_ns[slot_idx]);
+        let sample_dt =
+            snap.ts_local_ns.0.saturating_sub(self.last_price_sample_ts_ns[slot_idx]);
         if sample_dt < 1_000_000_000 {
             return;
         }
         self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
         self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 19 + px_1e4) / 20;
         self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 299 + px_1e4) / 300;
+        if obs_vol > 0 {
+            let prev_eq = self.eq_vol_5m_bps[slot_idx];
+            self.eq_vol_5m_bps[slot_idx] = (prev_eq * 599 + obs_vol) / 600;
+        }
     }
 
     #[inline]
@@ -596,6 +697,19 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
+    /// Evaluates strictly local slot scar debt (prevents cross-asset Bid deadlock on Slot 0).
+    #[inline]
+    #[must_use]
+    pub const fn is_in_local_slot_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return false;
+        }
+        let d = Self::dir_idx(side);
+        let local_floor = -(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 8);
+        self.cum_net_bps_x100[slot_idx][d] <= local_floor || self.sl_streak[slot_idx][d] > 0
+    }
+
+    /// Evaluates portfolio-wide directional or local scar debt for conservative sizing.
     #[inline]
     #[must_use]
     pub const fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
@@ -603,9 +717,9 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let d = Self::dir_idx(side);
-        self.cum_net_bps_x100[slot_idx][d] < -1_500
-            || self.sl_streak[slot_idx][d] > 0
-            || self.global_dir_debt_bps_x100[d] < -6_000
+        let global_floor = -(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 30);
+        self.is_in_local_slot_scar_debt(slot_idx, side)
+            || self.global_dir_debt_bps_x100[d] < global_floor
     }
 
     #[inline]
@@ -627,46 +741,92 @@ impl OnlineAdaptiveGovernor {
         if check_ts_ns > 0 && check_ts_ns < self.global_dir_cooldown_until_ns[d] {
             return Some("VETO_GLOBAL_WAVE_OR_SL_BREATHER");
         }
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
         let anchor_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
+        let anchor_ts = self.wave_anchor_ts_ns[slot_idx][d];
+        let wave_fresh = check_ts_ns <= 0
+            || anchor_ts <= 0
+            || check_ts_ns.saturating_sub(anchor_ts)
+                <= self.elastic_wave_anchor_ttl_ns(slot_idx, d);
         let cur_1e4 = entry_ticks.saturating_mul(10_000);
         let wave_active = self.win_streak[slot_idx][d] >= 3
             || (self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 3);
-        if wave_active && anchor_1e4 > 0 && cur_1e4 > 0 {
+        if wave_active && wave_fresh && anchor_1e4 > 0 && cur_1e4 > 0 {
             let chased_bps = match side {
                 Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
                 Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
             };
-            if chased_bps > 2_500 && chased_bps < 15_000 {
+            let edge_adj = c_clamp_i64(
+                self.ewma_net_bps_x100[slot_idx][d],
+                -fee_rt,
+                fee_rt,
+            ) / 4;
+            let stair_min = fee_rt * 6 + edge_adj;
+            let stair_max = self.eq_vol_5m_bps[slot_idx].saturating_mul(2) + fee_rt * 8;
+            if chased_bps > stair_min && chased_bps < stair_max {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
         }
+        let abort_breather_ns = tau_ns / 20;
         if self.abort_streak[slot_idx][d] >= 4
             && self.abort_anchor_px_1e4[slot_idx][d] > 0
             && check_ts_ns > 0
-            && check_ts_ns.saturating_sub(self.abort_last_ts_ns[slot_idx][d]) < 15_000_000_000
+            && check_ts_ns.saturating_sub(self.abort_last_ts_ns[slot_idx][d]) < abort_breather_ns
         {
             return Some("VETO_ABORT_STREAK_BREATHER");
         }
-        if self.sl_streak[slot_idx][d] >= 1 && self.cum_net_bps_x100[slot_idx][d] <= -4_500 {
-            return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
+        let deep_debt_floor = -(fee_rt * 11);
+        if self.sl_streak[slot_idx][d] >= 1
+            && self.cum_net_bps_x100[slot_idx][d] <= deep_debt_floor
+        {
+            let slot_cd = self.directional_cooldown_until_ns[slot_idx][d];
+            let debt_mult = c_clamp_i64(
+                (-self.cum_net_bps_x100[slot_idx][d]) / fee_rt,
+                2,
+                16,
+            );
+            let sl_m = c_min_u32(self.sl_streak[slot_idx][d], 4) as i64;
+            let deep_q_ns = (tau_ns.saturating_mul(debt_mult).saturating_mul(sl_m)) / 2;
+            if check_ts_ns <= 0 || slot_cd <= 0 || check_ts_ns < slot_cd.saturating_add(deep_q_ns)
+            {
+                return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
+            }
         }
         if slot_idx > 0 {
+            let glob_cd = self.global_dir_cooldown_until_ns[d];
             if self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8) {
-                return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
+                let g_sl_m = c_min_u32(self.global_dir_sl_streak[d], 4) as i64;
+                let dom_ns = tau_ns.saturating_mul(g_sl_m) * 2;
+                if check_ts_ns <= 0 || glob_cd <= 0 || check_ts_ns < glob_cd.saturating_add(dom_ns)
+                {
+                    return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
+                }
             }
             let symbol_total_net =
                 self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
-            if symbol_total_net <= -2_500
-                && self.global_dir_debt_bps_x100[d] <= -10_000
+            if symbol_total_net <= -(fee_rt * 6)
+                && self.global_dir_debt_bps_x100[d] <= -(fee_rt * 25)
                 && self.cum_net_bps_x100[slot_idx][d] <= 0
             {
-                return Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION");
+                let glob_mult = c_clamp_i64(
+                    (-self.global_dir_debt_bps_x100[d]) / (fee_rt * 4),
+                    4,
+                    16,
+                );
+                let contagion_ns = tau_ns.saturating_mul(glob_mult);
+                if check_ts_ns <= 0
+                    || glob_cd <= 0
+                    || check_ts_ns < glob_cd.saturating_add(contagion_ns)
+                {
+                    return Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION");
+                }
             }
         }
         None
     }
 
-    /// Evaluates continuous Kinematic Free-Energy Surface (E_kin >= E_min).
+    /// Evaluates C1 Kinematic Free-Energy Surface coupled to Bayesian IR & learned eq_vol.
     #[inline]
     pub fn evaluate_kinematic_energy_surface(
         &self,
@@ -677,7 +837,9 @@ impl OnlineAdaptiveGovernor {
         signed_geom: f64,
         snr_abs: f64,
     ) -> Result<(i64, i64), &'static str> {
-        let min_geom_floor = if snr_abs >= 0.50 {
+        let min_geom_floor = if snr_abs > 0.58 {
+            (0.106 - (snr_abs - 0.58) * 1.15).clamp(-0.05, 0.15)
+        } else if snr_abs >= 0.50 {
             (0.15 - (snr_abs - 0.50) * 0.55).clamp(0.05, 0.15)
         } else {
             0.15
@@ -685,55 +847,78 @@ impl OnlineAdaptiveGovernor {
         if signed_geom < min_geom_floor {
             return Err("VETO_LOW_L2_GEOM_VACUUM (<min_geom)");
         }
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let eq_vol = if slot_idx < MAX_ACTIVE_PAIRS {
+            self.eq_vol_5m_bps[slot_idx].max(fee_rt * 3)
+        } else {
+            fee_rt * 12
+        };
         let d_sign = side.sign_i64();
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
         let lead_impulse = s_ext.saturating_sub(s_drift);
-        let elastic_lead_cap = 48 + ((snr_abs - 0.58).max(0.0) * 110.0).round() as i64;
-        if s_drift < -15
-            || s_ext < -15
-            || s_ext > 1_200
-            || (lead_impulse > 0 && lead_impulse > elastic_lead_cap && s_ext >= 115)
-            || lead_impulse < -420
+        let absorp_span = (eq_vol / 64).clamp(fee_rt / 10, fee_rt / 3);
+        let snr_exc = ((snr_abs - 0.55).max(0.0) / 0.35).clamp(0.0, 1.0);
+        let pullback_floor =
+            -(fee_rt / 26) - ((absorp_span as f64 * snr_exc).round() as i64);
+        let max_ext_cap = (eq_vol / 2).max(fee_rt * 3);
+        let base_lead = (fee_rt * 12) / 100;
+        let lead_ext_gate = (fee_rt * 29) / 100;
+        let elastic_lead_cap = base_lead
+            + (((snr_abs - 0.58).max(0.0) * (eq_vol as f64 / 20.0)).round() as i64);
+        if s_drift < pullback_floor
+            || s_ext < pullback_floor
+            || s_ext > max_ext_cap
+            || (lead_impulse > 0 && lead_impulse > elastic_lead_cap && s_ext >= lead_ext_gate)
+            || lead_impulse < -fee_rt - 20
         {
             return Err("VETO_KINEMATIC_PHASE_OR_EXHAUSTION");
         }
         let d = Self::dir_idx(side);
-        let learned_edge = if slot_idx < MAX_ACTIVE_PAIRS {
-            self.ewma_net_bps_x100[slot_idx][d]
+        let (learned_edge, ir_x100) = if slot_idx < MAX_ACTIVE_PAIRS {
+            (
+                self.ewma_net_bps_x100[slot_idx][d],
+                self.slot_information_ratio_x100(slot_idx, side),
+            )
         } else {
-            180
+            (fee_rt / 2, 33)
         };
         let impulse_contrib = if lead_impulse >= 0 {
             lead_impulse.min(75) + (s_drift.max(0) / 2).min(85)
-        } else if snr_abs >= 0.50 && s_drift > 0 && s_ext >= -10 {
-            ((s_drift / 4) + ((snr_abs - 0.50) * 220.0).round() as i64).min(115)
+        } else if snr_abs >= 0.50 && s_drift >= pullback_floor && s_ext >= pullback_floor {
+            ((s_drift.max(0) / 4) + ((snr_abs - 0.50) * 220.0).round() as i64).min(115)
         } else {
             (lead_impulse / 2).max(-60)
         };
         let geom_contrib = ((signed_geom - min_geom_floor).max(0.0) * 240.0).round() as i64;
         let snr_contrib = ((snr_abs - 0.42).max(0.0) * 280.0).round() as i64;
-        let fresh_init_bonus = if s_drift >= 0
-            && s_drift <= 140
-            && s_ext >= -10
-            && s_ext <= 165
-            && lead_impulse >= -20
+        let fresh_drift_cap = (eq_vol / 32).max((fee_rt * 7) / 20);
+        let fresh_ext_cap = (eq_vol / 26).max((fee_rt * 9) / 20);
+        let fresh_init_bonus = if s_drift >= pullback_floor
+            && s_drift <= fresh_drift_cap
+            && s_ext >= pullback_floor
+            && s_ext <= fresh_ext_cap
+            && lead_impulse >= -(fee_rt / 16)
             && lead_impulse <= elastic_lead_cap
             && snr_abs >= 0.45
         {
-            95_i64
+            (fee_rt * 19) / 80
         } else {
             0_i64
         };
         let e_kin = impulse_contrib + geom_contrib + snr_contrib + fresh_init_bonus;
-        let req_e_min = (125 + ((200 - learned_edge).max(0) / 4)).clamp(110, 260);
+        let base_e = (fee_rt * 5) / 16;
+        let edge_deficit = (fee_rt / 2 - learned_edge).max(0) / 4;
+        let ir_relief = (ir_x100 - 33).clamp(-60, 80) / 5;
+        let req_e_min =
+            (base_e + edge_deficit - ir_relief).clamp(fee_rt / 4, (fee_rt * 13) / 20);
         if e_kin < req_e_min {
             return Err("VETO_KINEMATIC_ENERGY_SURFACE (E_kin < E_min)");
         }
         Ok((e_kin, req_e_min))
     }
 
-    /// F-07 Fix: Records closed trade with real entry_price to arm wave_anchor_px_1e4.
+    /// Updates online mean, Welford-EWMA variance, wave anchor & intrinsic cooldowns.
     pub fn observe_closed_trade_at_entry(
         &mut self,
         slot_idx: usize,
@@ -747,50 +932,74 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         let d = Self::dir_idx(side);
-        let prev = self.ewma_net_bps_x100[slot_idx][d];
-        let edge_clamped = prev.clamp(80, 450);
-        self.ewma_net_bps_x100[slot_idx][d] = (prev * 75 + net_scaled_bps.raw() * 25) / 100;
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let prev_mean = self.ewma_net_bps_x100[slot_idx][d];
+        let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
+        let sq_clamped = diff.saturating_mul(diff).min(25_000_000);
+        self.ewma_var_bps2[slot_idx][d] =
+            ((self.ewma_var_bps2[slot_idx][d] * 80 + sq_clamped * 20) / 100).max(2_500);
+        self.ewma_net_bps_x100[slot_idx][d] = (prev_mean * 75 + net_scaled_bps.raw() * 25) / 100;
         self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d]
             .saturating_add(net_scaled_bps.raw())
-            .clamp(-24_000, 24_000);
+            .clamp(-(fee_rt * 60), fee_rt * 60);
         self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d]
             .saturating_add(net_scaled_bps.raw())
-            .clamp(-30_000, 12_000);
+            .clamp(-(fee_rt * 75), fee_rt * 30);
 
-        if !is_maker_exit || net_scaled_bps.raw() < -50 {
+        let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
+        let ir_x100 = self.slot_information_ratio_x100(slot_idx, side).clamp(-50, 100);
+
+        if !is_maker_exit || net_scaled_bps.raw() < -(fee_rt / 8) {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
             self.global_dir_win_streak[d] = 0;
             self.wave_anchor_px_1e4[slot_idx][d] = 0;
+            self.wave_anchor_ts_ns[slot_idx][d] = 0;
             if ts_ns.0 > 0 {
-                let backoff_ns = 150_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
+                let backoff_ns = (tau_ns / 2).saturating_mul(1_i64 << s.min(4));
                 self.directional_cooldown_until_ns[slot_idx][d] =
                     ts_ns.0.saturating_add(backoff_ns);
             }
             let gs = self.global_dir_sl_streak[d].saturating_add(1).min(4);
             self.global_dir_sl_streak[d] = gs;
             if ts_ns.0 > 0 {
-                let global_pause_ns = 180_000_000_000_i64.saturating_mul(i64::from(gs));
+                let global_pause_ns = ((tau_ns * 3) / 5).saturating_mul(i64::from(gs));
                 self.global_dir_cooldown_until_ns[d] = ts_ns.0.saturating_add(global_pause_ns);
             }
-        } else if net_scaled_bps.raw() < 100 {
+        } else if net_scaled_bps.raw() < fee_rt / 4 {
             if ts_ns.0 > 0 {
-                let scratch_secs = (115 - (edge_clamped / 20)).clamp(60, 130);
-                let scratch_cooldown_ns = ts_ns.0.saturating_add(scratch_secs * 1_000_000_000);
-                if scratch_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
-                    self.directional_cooldown_until_ns[slot_idx][d] = scratch_cooldown_ns;
+                let scratch_ns = (tau_ns * (120 - ir_x100 / 2)) / 360;
+                let scratch_cd = ts_ns.0.saturating_add(scratch_ns);
+                if scratch_cd > self.directional_cooldown_until_ns[slot_idx][d] {
+                    self.directional_cooldown_until_ns[slot_idx][d] = scratch_cd;
                 }
             }
         } else {
             self.clear_abort_streak(slot_idx, side);
-            if entry_price.0 > 0 && self.wave_anchor_px_1e4[slot_idx][d] <= 0 {
+            let prev_anchor_ts = self.wave_anchor_ts_ns[slot_idx][d];
+            let anchor_expired = ts_ns.0 > 0
+                && prev_anchor_ts > 0
+                && ts_ns.0.saturating_sub(prev_anchor_ts)
+                    > self.elastic_wave_anchor_ttl_ns(slot_idx, d);
+            if entry_price.0 > 0
+                && (self.wave_anchor_px_1e4[slot_idx][d] <= 0 || anchor_expired)
+            {
                 self.wave_anchor_px_1e4[slot_idx][d] = entry_price.0.saturating_mul(10_000);
             }
-            let w = self.win_streak[slot_idx][d].saturating_add(1);
+            if ts_ns.0 > 0 {
+                self.wave_anchor_ts_ns[slot_idx][d] = ts_ns.0;
+            }
+            let w = if anchor_expired {
+                1_u32
+            } else {
+                self.win_streak[slot_idx][d].saturating_add(1)
+            };
             self.win_streak[slot_idx][d] = w;
             self.win_streak[slot_idx][1 - d] = 0;
             self.wave_anchor_px_1e4[slot_idx][1 - d] = 0;
+            self.wave_anchor_ts_ns[slot_idx][1 - d] = 0;
+
             let gw = self.global_dir_win_streak[d].saturating_add(1);
             self.global_dir_win_streak[d] = gw;
             self.global_dir_win_streak[1 - d] = 0;
@@ -799,27 +1008,28 @@ impl OnlineAdaptiveGovernor {
                 self.global_dir_win_streak[d] = 0;
             }
             if ts_ns.0 > 0 {
-                let breather_secs =
-                    (25 - edge_clamped / 40).clamp(12, 30) * (w.min(2) as i64);
-                let win_breather_ns = ts_ns.0.saturating_add(breather_secs * 1_000_000_000);
-                if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
-                    self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
+                let win_ns =
+                    ((tau_ns * (100 - ir_x100 / 3)) / 1_500) * (w.min(2) as i64);
+                let win_cd = ts_ns.0.saturating_add(win_ns);
+                if win_cd > self.directional_cooldown_until_ns[slot_idx][d] {
+                    self.directional_cooldown_until_ns[slot_idx][d] = win_cd;
                 }
             }
             if self.sl_streak[slot_idx][d] > 0
-                && w >= 5
-                && self.cum_net_bps_x100[slot_idx][d] >= -1_500
+                && w >= 3
+                && self.cum_net_bps_x100[slot_idx][d] >= -(fee_rt * 8)
             {
                 self.sl_streak[slot_idx][d] -= 1;
                 self.win_streak[slot_idx][d] = 0;
             }
-            if self.global_dir_sl_streak[d] > 0 && self.global_dir_debt_bps_x100[d] >= -3_000 {
+            if self.global_dir_sl_streak[d] > 0
+                && self.global_dir_debt_bps_x100[d] >= -(fee_rt * 15)
+            {
                 self.global_dir_sl_streak[d] -= 1;
             }
         }
     }
 
-    /// F-07 Fix: Resets pre-fill abort streak on fill or after a 60s calm window.
     #[inline]
     pub fn clear_abort_streak(&mut self, slot_idx: usize, side: Side) {
         if slot_idx >= MAX_ACTIVE_PAIRS {
@@ -831,7 +1041,6 @@ impl OnlineAdaptiveGovernor {
         self.abort_last_ts_ns[slot_idx][d] = 0;
     }
 
-    /// Records a pre-fill queue abort with 60s window decay so old aborts do not lock forever.
     #[inline]
     pub fn observe_entry_abort(
         &mut self,
@@ -844,8 +1053,9 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         let d = Self::dir_idx(side);
+        let decay_win_ns = self.intrinsic_diffusion_clock_ns(slot_idx) / 5;
         let prev_ts = self.abort_last_ts_ns[slot_idx][d];
-        if prev_ts > 0 && ts_ns.0 > prev_ts && ts_ns.0.saturating_sub(prev_ts) >= 60_000_000_000 {
+        if prev_ts > 0 && ts_ns.0 > prev_ts && ts_ns.0.saturating_sub(prev_ts) >= decay_win_ns {
             self.abort_streak[slot_idx][d] = 0;
         }
         self.abort_streak[slot_idx][d] = self.abort_streak[slot_idx][d].saturating_add(1).min(8);
@@ -853,18 +1063,20 @@ impl OnlineAdaptiveGovernor {
         self.abort_last_ts_ns[slot_idx][d] = ts_ns.0;
     }
 
-    /// Exports immutable 12x2 scar snapshot JSON for vortex_governor_scar_memory.jsonl.
     #[must_use]
     pub fn to_scar_snapshot_json(&self, ts_ns: TimestampNs) -> serde_json::Value {
         serde_json::json!({
             "event": "GOV_SCAR_SNAPSHOT",
             "ts_ns": ts_ns.0,
             "ewma_net_bps_x100": self.ewma_net_bps_x100,
+            "ewma_var_bps2": self.ewma_var_bps2,
+            "eq_vol_5m_bps": self.eq_vol_5m_bps,
             "cum_net_bps_x100": self.cum_net_bps_x100,
             "sl_streak": self.sl_streak,
             "win_streak": self.win_streak,
             "directional_cooldown_until_ns": self.directional_cooldown_until_ns,
             "wave_anchor_px_1e4": self.wave_anchor_px_1e4,
+            "wave_anchor_ts_ns": self.wave_anchor_ts_ns,
             "global_dir_debt_bps_x100": self.global_dir_debt_bps_x100,
             "global_dir_sl_streak": self.global_dir_sl_streak,
             "global_dir_win_streak": self.global_dir_win_streak,
@@ -873,13 +1085,23 @@ impl OnlineAdaptiveGovernor {
         })
     }
 
-    /// Restores 12x2 scar tissue from JSON and returns snapshot_ts_ns for deduped replay.
     pub fn apply_scar_snapshot_json(&mut self, val: &serde_json::Value) -> Option<TimestampNs> {
         if val.get("event").and_then(|v| v.as_str()) != Some("GOV_SCAR_SNAPSHOT") {
             return None;
         }
         let snap_ts = val.get("ts_ns").and_then(|v| v.as_i64()).unwrap_or(0);
         extract_matrix_i64_12x2(val, "ewma_net_bps_x100", &mut self.ewma_net_bps_x100);
+        self.ewma_var_bps2 = [[INIT_RETURN_VAR_BPS2; 2]; MAX_ACTIVE_PAIRS];
+        extract_matrix_i64_12x2(val, "ewma_var_bps2", &mut self.ewma_var_bps2);
+        if let Some(eq_arr) = val.get("eq_vol_5m_bps").and_then(|v| v.as_array()) {
+            for (s, cell) in eq_arr.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
+                if let Some(n) = cell.as_i64() {
+                    if n > 0 {
+                        self.eq_vol_5m_bps[s] = n;
+                    }
+                }
+            }
+        }
         extract_matrix_i64_12x2(val, "cum_net_bps_x100", &mut self.cum_net_bps_x100);
         extract_matrix_u32_12x2(val, "sl_streak", &mut self.sl_streak);
         extract_matrix_u32_12x2(val, "win_streak", &mut self.win_streak);
@@ -889,6 +1111,20 @@ impl OnlineAdaptiveGovernor {
             &mut self.directional_cooldown_until_ns,
         );
         extract_matrix_i64_12x2(val, "wave_anchor_px_1e4", &mut self.wave_anchor_px_1e4);
+        self.wave_anchor_ts_ns = [[0; 2]; MAX_ACTIVE_PAIRS];
+        extract_matrix_i64_12x2(val, "wave_anchor_ts_ns", &mut self.wave_anchor_ts_ns);
+        for s in 0..MAX_ACTIVE_PAIRS {
+            for d in 0..2 {
+                if self.wave_anchor_px_1e4[s][d] > 0 && self.wave_anchor_ts_ns[s][d] <= 0 {
+                    let fallback_ts = if self.directional_cooldown_until_ns[s][d] > 0 {
+                        self.directional_cooldown_until_ns[s][d]
+                    } else {
+                        snap_ts
+                    };
+                    self.wave_anchor_ts_ns[s][d] = fallback_ts;
+                }
+            }
+        }
         if let Some(arr) = val.get("global_dir_debt_bps_x100").and_then(|v| v.as_array()) {
             for (d, cell) in arr.iter().take(2).enumerate() {
                 if let Some(n) = cell.as_i64() {
@@ -961,9 +1197,17 @@ impl OnlineAdaptiveGovernor {
         }
         let d = Self::dir_idx(side);
         let spec = APPROVED_SPECS[slot_idx];
-        let (own_q, opp_q) = match side {
-            Side::Bid => (candidate_snap.bids[0].qty.0, candidate_snap.asks[0].qty.0),
-            Side::Ask => (candidate_snap.asks[0].qty.0, candidate_snap.bids[0].qty.0),
+        let (own_q, opp_q, own_deep) = match side {
+            Side::Bid => (
+                candidate_snap.bids[0].qty,
+                candidate_snap.asks[0].qty,
+                candidate_snap.deep_bid_lots_l1_l5,
+            ),
+            Side::Ask => (
+                candidate_snap.asks[0].qty,
+                candidate_snap.bids[0].qty,
+                candidate_snap.deep_ask_lots_l1_l5,
+            ),
         };
         if !spec.passes_l1_queue_depth_and_wall_guard(
             entry_px,
@@ -971,22 +1215,26 @@ impl OnlineAdaptiveGovernor {
             self.ewma_net_bps_x100[slot_idx][d],
             own_q,
             opp_q,
+            own_deep,
             candidate_snap.factor_ofi.get().abs(),
             candidate_snap.factor_tfi.get().abs(),
         ) {
             return false;
         }
+
         let (self_drift_bps, self_ext_bps) =
             self.price_drift_and_extension_scaled_bps(slot_idx, candidate_snap);
         let dir_s = side.sign_f64();
         let signed_geom = candidate_snap.factor_geom.get() * dir_s;
         let cand_comp = OrthogonalFactorState::snr_composite_score(candidate_snap).abs();
+        let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         let in_scar = self.is_in_scar_debt(slot_idx, side);
+
         if !spec.passes_oversized_lot_conviction_guard(
             wallet_usdt_1e8,
             entry_px,
             cand_comp,
-            in_scar,
+            in_local_scar,
         ) {
             return false;
         }
@@ -1003,6 +1251,7 @@ impl OnlineAdaptiveGovernor {
         {
             return false;
         }
+
         let sl_s = self.sl_streak[slot_idx][d] as f64;
         let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
@@ -1018,22 +1267,25 @@ impl OnlineAdaptiveGovernor {
             0.0
         };
         let staircase_penalty = if win_s >= 2.0 { 0.03 * (win_s - 1.0) } else { 0.0 };
-        let learned_edge = (self.ewma_net_bps_x100[slot_idx][d].clamp(0, 450) as f64) / 10_000.0;
-        if in_scar && candidate_snap.factor_tfi.get().abs() < 0.40 {
+        let ir_adj =
+            (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
+
+        let req_scar_tfi = if in_local_scar { 0.45 } else { 0.38 };
+        if in_scar && candidate_snap.factor_tfi.get().abs() < req_scar_tfi {
             return false;
         }
         if slot_idx > 0 {
             let btc_comp = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
             let btc_ofi = btc_leader_snap.factor_ofi.get() * dir_s;
             let btc_tfi = btc_leader_snap.factor_tfi.get() * dir_s;
-            let strong_independent = cand_comp >= 0.50 && sl_s == 0.0 && debt_penalty == 0.0;
+            let strong_independent = cand_comp >= 0.50 && !in_local_scar;
             if strong_independent {
                 if btc_comp < -0.08 || (btc_ofi < -0.18 && btc_tfi < -0.18) {
                     return false;
                 }
             } else {
-                let min_req_btc = 0.10 + 0.10 * sl_s + 0.55 * (debt_penalty + global_penalty);
-                if btc_ofi < 0.0 || btc_tfi < 0.0 || btc_comp < min_req_btc {
+                let min_req_btc = 0.08 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty);
+                if btc_ofi < -0.05 || btc_tfi < -0.05 || btc_comp < min_req_btc {
                     return false;
                 }
             }
@@ -1043,20 +1295,27 @@ impl OnlineAdaptiveGovernor {
             + debt_penalty
             + global_penalty
             + staircase_penalty
-            - learned_edge)
-            .clamp(0.38, 0.80);
+            - ir_adj)
+            .clamp(0.36, 0.80);
         cand_comp >= adaptive_threshold
     }
 
-    /// V3-03: Elastic total chase horizon from initial arming (14s..25s).
     #[inline]
     #[must_use]
-    pub fn max_total_entry_chase_ns(realized_vol_5m: ScaledBps) -> i64 {
-        let vol_c = realized_vol_5m.raw().clamp(4_000, 12_500);
-        ((22_000_000_000_i64 * 6_500) / vol_c).clamp(14_000_000_000, 25_000_000_000)
+    pub fn max_total_entry_chase_ns(&self, slot_idx: usize, realized_vol_5m: ScaledBps) -> i64 {
+        let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
+        let eq_v = if slot_idx < MAX_ACTIVE_PAIRS {
+            self.eq_vol_5m_bps[slot_idx].max(min_v * 2)
+        } else {
+            min_v * 4
+        };
+        let vol_c = realized_vol_5m.raw().max(min_v);
+        let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
+        let base_chase = tau_ns / 14;
+        ((base_chase.saturating_mul(eq_v)) / vol_c).clamp(tau_ns / 24, tau_ns / 10)
     }
 
-    /// V3-03 & Law 10 (Zero Self-Choke): Continuous C1 hysteresis preflight validator.
+    /// Continuous C1 hysteresis preflight validator (Law 10: Zero Self-Choke).
     pub fn confirm_preflight_kinematics_non_choking(
         &self,
         slot_idx: usize,
@@ -1071,6 +1330,13 @@ impl OnlineAdaptiveGovernor {
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
             return Err("VETO_PREFLIGHT_INVALID_BBO");
         };
+        let ofi = snap.factor_ofi.get();
+        let tfi = snap.factor_tfi.get();
+        if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08)
+            || (ofi.abs() > 0.55 && tfi.abs() < 0.08)
+        {
+            return Err("VETO_PREFLIGHT_SPOOFING");
+        }
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         if let Some(veto) = self.audit_historical_entry_veto(
             slot_idx,
@@ -1086,12 +1352,12 @@ impl OnlineAdaptiveGovernor {
             return Err("VETO_PREFLIGHT_SNR_COLLAPSE");
         }
         let spec = APPROVED_SPECS[slot_idx];
-        let in_scar = self.is_in_scar_debt(slot_idx, side);
+        let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         if !spec.passes_oversized_lot_conviction_guard(
             wallet_usdt_1e8,
             entry_px,
             signed_snr,
-            in_scar,
+            in_local_scar,
         ) {
             return Err("VETO_PREFLIGHT_OVERSIZED_LOT");
         }
@@ -1119,24 +1385,34 @@ impl OnlineAdaptiveGovernor {
         ) {
             return Ok(ok_pair);
         }
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let eq_vol = self.eq_vol_5m_bps[slot_idx].max(fee_rt * 3);
         let d_sign = side.sign_i64();
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
         let lead_impulse = s_ext.saturating_sub(s_drift);
-        let elastic_lead_cap =
-            60 + ((signed_snr - 0.55).max(0.0) * 110.0).round() as i64;
-        if s_drift < -20
-            || s_ext < -20
-            || s_ext > 1_200
-            || (lead_impulse > elastic_lead_cap && s_ext >= 120)
-            || lead_impulse < -420
+        let pre_pullback =
+            -(fee_rt / 16) - ((eq_vol / 64) * i64::from(signed_snr > 0.55));
+        let max_pre_ext = (eq_vol / 2).max(fee_rt * 3) + (fee_rt / 8);
+        let elastic_lead_cap = (fee_rt * 15) / 100
+            + (((signed_snr - 0.55).max(0.0) * (eq_vol as f64 / 18.0)).round() as i64);
+        if s_drift < pre_pullback
+            || s_ext < pre_pullback
+            || s_ext > max_pre_ext
+            || (lead_impulse > elastic_lead_cap && s_ext >= (fee_rt * 3) / 10)
+            || lead_impulse < -fee_rt - 20
         {
             return Err("VETO_PREFLIGHT_KINEMATIC_EXHAUSTION");
         }
         let d = Self::dir_idx(side);
         let learned_edge = self.ewma_net_bps_x100[slot_idx][d];
-        let req_e_min = (125 + ((200 - learned_edge).max(0) / 4)).clamp(110, 260);
-        let hyst_e_min = ((req_e_min * 80) / 100).clamp(85, 220);
+        let ir_x100 = self.slot_information_ratio_x100(slot_idx, side);
+        let base_e = (fee_rt * 5) / 16;
+        let edge_deficit = (fee_rt / 2 - learned_edge).max(0) / 4;
+        let ir_relief = (ir_x100 - 33).clamp(-60, 80) / 5;
+        let req_e_min =
+            (base_e + edge_deficit - ir_relief).clamp(fee_rt / 4, (fee_rt * 13) / 20);
+        let hyst_e_min = ((req_e_min * 80) / 100).clamp(fee_rt / 5, (fee_rt * 11) / 20);
         let geom_c = ((signed_geom - min_pre_geom).max(0.0) * 240.0).round() as i64;
         let snr_c = ((signed_snr - 0.34).max(0.0) * 300.0).round() as i64;
         let imp_c = if lead_impulse >= 0 {
@@ -1145,12 +1421,15 @@ impl OnlineAdaptiveGovernor {
             (lead_impulse / 2).max(-60)
         };
         let snr_ramp = ((signed_snr - 0.26) / 0.10).clamp(0.0, 1.0);
-        let bonus =
-            if s_drift >= -10 && s_drift <= 155 && s_ext >= -12 && s_ext <= 185 {
-                (95.0 * snr_ramp).round() as i64
-            } else {
-                0_i64
-            };
+        let bonus = if s_drift >= pre_pullback
+            && s_drift <= (eq_vol / 28).max(fee_rt / 2)
+            && s_ext >= pre_pullback
+            && s_ext <= (eq_vol / 22).max((fee_rt * 3) / 5)
+        {
+            (((fee_rt * 19) / 80) as f64 * snr_ramp).round() as i64
+        } else {
+            0_i64
+        };
         let e_kin_hyst = imp_c + geom_c + snr_c + bonus;
         if e_kin_hyst < hyst_e_min {
             return Err("VETO_PREFLIGHT_ENERGY_COLLAPSE");
@@ -1158,7 +1437,6 @@ impl OnlineAdaptiveGovernor {
         Ok((e_kin_hyst, hyst_e_min))
     }
 
-    /// V3-02: Parses legacy scar rows, Red-Box rows & TRADE_CLOSE rows uniformly.
     #[must_use]
     pub fn parse_historical_trade_scar_tuple(
         val: &serde_json::Value,
@@ -1189,7 +1467,6 @@ impl OnlineAdaptiveGovernor {
         Some(((ts_ns, slot_idx, d_u8), (en_t, net_sc, mkr)))
     }
 
-    /// V3-02: Deduplicated chronological scar rehydration across Scar, RedBox & Vault.
     pub fn rehydrate_from_scar_and_loss_files(
         &mut self,
         scar_path: &std::path::Path,
@@ -1216,7 +1493,6 @@ impl OnlineAdaptiveGovernor {
                 }
             }
         }
-
         let mut dedup_events: std::collections::BTreeMap<
             ScarEventKey,
             ScarEventPayload,
@@ -1244,7 +1520,6 @@ impl OnlineAdaptiveGovernor {
                 }
             }
         }
-
         let mut max_ts = snap_ts_ns;
         let ingested = dedup_events.len();
         for (&(ts_ns, slot_idx, d_u8), &(en_t, net_sc, mkr)) in &dedup_events {
@@ -1311,7 +1586,8 @@ impl OnlineAdaptiveGovernor {
         for s_idx in 0..MAX_ACTIVE_PAIRS {
             for &side in &[Side::Bid, Side::Ask] {
                 for step in 0..90_i64 {
-                    let dr = if matches!(side, Side::Bid) { 120 + step } else { -(120 + step) };
+                    let dr =
+                        if matches!(side, Side::Bid) { 120 + step } else { -(120 + step) };
                     let ex = if matches!(side, Side::Bid) {
                         190 + step * 2
                     } else {
@@ -1329,6 +1605,7 @@ impl OnlineAdaptiveGovernor {
         (mitigated_62, manifold_blocked)
     }
 }
+
 #[inline]
 fn extract_json_epoch_ms(item: &serde_json::Value, key: &str) -> i64 {
     item.get(key)
@@ -1338,7 +1615,6 @@ fn extract_json_epoch_ms(item: &serde_json::Value, key: &str) -> i64 {
         })
         .unwrap_or(0)
 }
-
 /// Per-Slot Autonomous Lifecycle State Machine (Monotonic Tranche & LVDBS Native).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum OrderLifecycleState {
@@ -1409,13 +1685,14 @@ impl SlotExecutionEngine {
     #[inline]
     #[must_use]
     pub const fn new(slot_idx: usize) -> Self {
+        let init_mfe = (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 17) / 5;
         Self {
             slot_idx,
             state: OrderLifecycleState::Idle,
             cooldown_until_ns: TimestampNs(0),
             tranche1_harvests_count: 0,
             lvdbs_deep_surfs_count: 0,
-            learned_mfe_bps: 680,
+            learned_mfe_bps: init_mfe,
             last_eff_sl_ticks: PriceTicks(0),
             last_closed_mfe_bps: 0,
             last_closed_mae_bps: 0,
@@ -1460,24 +1737,33 @@ impl SlotExecutionEngine {
         }
     }
 
+    /// Elastic preflight window scaled by contract diffusion & learned MFE (zero static anchor).
     #[inline]
     #[must_use]
     pub fn elastic_preflight_window_ns(&self, realized_vol_5m: ScaledBps) -> i64 {
-        let vol_c = realized_vol_5m.raw().clamp(4_000, 12_500);
-        let mfe_c = self.learned_mfe_bps.clamp(560, 1_200);
-        let raw_ns = ((25_000_000_i64 * 6_000) / vol_c * mfe_c) / 720;
-        raw_ns.clamp(15_000_000, 35_000_000)
+        let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
+        let eq_v = min_v * 4;
+        let vol_c = realized_vol_5m.raw().clamp(min_v, eq_v * 3);
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let init_mfe = (fee_rt * 17) / 10;
+        let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 7) / 5, fee_rt * 3);
+        let base_flight_ns = VOL_5M_HORIZON_NS / 12_000;
+        let raw_ns = ((base_flight_ns * eq_v) / vol_c * mfe_c) / init_mfe;
+        raw_ns.clamp((base_flight_ns * 3) / 5, (base_flight_ns * 7) / 5)
     }
 
+    /// Law 2 & Law 4: Defensive scratches (< fee_rt + 100) never shrink learned_mfe_bps.
     #[inline]
     pub fn observe_mfe_sample(&mut self, gross_mfe_scaled_bps: i64) {
-        if gross_mfe_scaled_bps >= 500 {
-            let clamped = gross_mfe_scaled_bps.clamp(560, 1_600);
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let win_mfe_gate = fee_rt + 100;
+        if gross_mfe_scaled_bps >= win_mfe_gate {
+            let clamped = gross_mfe_scaled_bps.clamp((fee_rt * 7) / 5, fee_rt * 4);
             self.learned_mfe_bps = (self.learned_mfe_bps * 80 + clamped * 20) / 100;
         }
     }
 
-    /// F-06 Fix: Enforces 110..145 bps server SL distance & >= 2-tick Mark/Last cushion.
+    /// Enforces 110..145 bps server SL distance & >= 2-tick Mark/Last cushion.
     #[inline]
     pub fn compute_fill_or_adopt_sl_ticks(
         side: Side,
@@ -1514,7 +1800,7 @@ impl SlotExecutionEngine {
         PairSpec::validate_stop_loss_geometry(side, raw_sl, ref_last, ref_mark)
     }
 
-    /// F-09 Fix: Publishes tear-free Seqlock telemetry via SlotExecTelemetry::write_consistent.
+    /// Publishes tear-free Seqlock telemetry via SlotExecTelemetry::write_consistent.
     pub fn sync_to_shm_telemetry(&self, arena: &VortexShmArena) {
         let Ok(tel) = arena.telemetry(self.slot_idx) else {
             return;
@@ -1650,7 +1936,7 @@ impl SlotExecutionEngine {
         Ok(self.state)
     }
 
-    /// F-02 Fix: Mutates PlacingEntryMaker in-place with post-preflight L1 price & SL.
+    /// Mutates PlacingEntryMaker in-place with post-preflight L1 price & SL.
     pub fn sync_preflight_l1_entry(
         &mut self,
         snap: &SymbolLobSnapshot,
@@ -1684,7 +1970,6 @@ impl SlotExecutionEngine {
         Ok((cur_l1_px, new_sl))
     }
 
-    /// Validates Stop-Loss geometry at a new L1 price prior to re-pegging a resting order.
     pub fn compute_repeg_sl_trigger(
         &self,
         snap: &SymbolLobSnapshot,
@@ -1741,7 +2026,7 @@ impl SlotExecutionEngine {
         Ok(self.state)
     }
 
-    /// F-02 & F-06 Fix: Promotes entry to PositionOpenMakerExit with 110..145 bps SL.
+    /// Promotes entry to PositionOpenMakerExit exhaustively (zero silent wildcard, zero ID branch).
     pub fn on_maker_entry_filled_verified(
         &mut self,
         fill_ts: TimestampNs,
@@ -1767,9 +2052,9 @@ impl SlotExecutionEngine {
                     sl_trigger_price,
                     ..
                 } => (side, entry_price, qty, target_excursion, sl_trigger_price),
-                _ => return Ok(self.state),
+                OrderLifecycleState::Idle
+                | OrderLifecycleState::PositionOpenMakerExit { .. } => return Ok(self.state),
             };
-
         let side = verified_side.unwrap_or(state_side);
         let eff_entry_px = match verified_avg_price {
             Some(px) if px.0 > 0 => px,
@@ -1790,12 +2075,13 @@ impl SlotExecutionEngine {
         } else {
             state_sl_px
         };
-
-        let tp_bps = target_excursion.raw().max(520);
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let min_win_gross = (fee_rt * 13) / 10;
+        let tp_bps = target_excursion.raw().max(min_win_gross);
         let structural_tp_price =
             dynamic_maker_floor_price(side, eff_entry_px, ScaledBps(tp_bps));
         let q_floor = defensive_zero_loss_maker_exit_price(side, eff_entry_px);
-        let can_split = self.slot_idx >= 1 && eff_lots.0 >= 2;
+        let can_split = eff_lots.0 >= 2;
         let (init_role, init_exit_px, init_exit_lots) = if can_split {
             (ExitOrderRole::Tranche1Harvest50, q_floor, LotQty(eff_lots.0 / 2))
         } else {
@@ -1844,7 +2130,7 @@ impl SlotExecutionEngine {
         self.on_maker_entry_filled_verified(fill_ts, None, None, None)
     }
 
-    /// F-06 Fix: Adopts live Bybit position on startup with validated 2-tick SL geometry.
+    /// Adopts live Bybit position on startup with validated 2-tick SL geometry (zero ID branch).
     pub fn adopt_live_open_position(
         &mut self,
         side: Side,
@@ -1861,12 +2147,14 @@ impl SlotExecutionEngine {
         let eff_open = LotQty(open_lots.0.max(1));
         let eff_init = LotQty(initial_lots.0.max(eff_open.0));
         let q_fl = defensive_zero_loss_maker_exit_price(side, verified_avg_price);
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let struct_bps = self.learned_mfe_bps.max((fee_rt * 27) / 20);
         let struct_tp =
-            dynamic_maker_floor_price(side, verified_avg_price, ScaledBps(540));
+            dynamic_maker_floor_price(side, verified_avg_price, ScaledBps(struct_bps));
         let harvested_lots = LotQty((eff_init.0 - eff_open.0).max(0));
         let t1_done = tranche1_harvested || harvested_lots.0 > 0;
         let t1_px = if t1_done { q_fl } else { PriceTicks(0) };
-        let can_split = self.slot_idx >= 1 && !t1_done && eff_open.0 >= 2;
+        let can_split = !t1_done && eff_open.0 >= 2;
         let (role, init_px, init_lots) = if can_split {
             (ExitOrderRole::Tranche1Harvest50, q_fl, LotQty(eff_open.0 / 2))
         } else if t1_done {
@@ -1913,12 +2201,13 @@ impl SlotExecutionEngine {
         Ok(sl_t)
     }
 
-    /// Keeps open position entry_price, avg_price_ticks & structural_tp locked to Bybit avgPrice.
     #[inline]
     pub fn sync_open_avg_price_ticks(&mut self, verified_avg_price: PriceTicks) {
         if verified_avg_price.0 <= 0 {
             return;
         }
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let min_win_gross = (fee_rt * 13) / 10;
         if let OrderLifecycleState::PositionOpenMakerExit {
             side,
             ref mut entry_price,
@@ -1932,7 +2221,8 @@ impl SlotExecutionEngine {
             if *avg_price_ticks != verified_avg_price {
                 let prev_avg = avg_price_ticks.0.max(1);
                 let prev_diff = (structural_tp_price.0 - prev_avg).abs();
-                let prev_bps = ((prev_diff.saturating_mul(1_000_000)) / prev_avg).max(520);
+                let prev_bps =
+                    ((prev_diff.saturating_mul(1_000_000)) / prev_avg).max(min_win_gross);
                 *entry_price = verified_avg_price;
                 *avg_price_ticks = verified_avg_price;
                 *structural_tp_price = dynamic_maker_floor_price(
@@ -1962,7 +2252,6 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Monotonic 1-way latch: once defensive mode activates, 50%<->100% oscillation is banned.
     #[inline]
     pub fn latch_defensive_floor_if_needed(&mut self, lock_active: bool) {
         if !lock_active {
@@ -1977,7 +2266,6 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// F-05 Fix: Records Tranche 1 (50%) harvest without premature ledger double-crediting.
     pub fn record_tranche1_harvest(&mut self, fill_price: PriceTicks) -> bool {
         let OrderLifecycleState::PositionOpenMakerExit {
             ref mut open_lots,
@@ -2004,6 +2292,7 @@ impl SlotExecutionEngine {
         self.tranche1_harvests_count = self.tranche1_harvests_count.saturating_add(1);
         true
     }
+
     #[inline]
     fn fold_price_into_excursions(
         &mut self,
@@ -2066,7 +2355,8 @@ impl SlotExecutionEngine {
         };
         let raw_d = (exit_px.0 - entry_px.0).saturating_mul(side.sign_i64());
         let gross_bps = (raw_d.saturating_mul(1_000_000)) / entry_px.0.max(1);
-        if strictly_above_q_floor && (gross_bps >= 520 || vac_level_hint >= 2) {
+        let win_gross = (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 26) / 10;
+        if strictly_above_q_floor && (gross_bps >= win_gross || vac_level_hint >= 2) {
             ExitSubReason::LvdbsDeepVacuumSurf
         } else if tranche1_harvested || legs_count >= 2 {
             ExitSubReason::Tranche1Harvest50
@@ -2075,7 +2365,7 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// F-03 Fix: Reconciles position closure deterministically against /v5/position/closed-pnl.
+    /// Reconciles position closure deterministically against /v5/position/closed-pnl.
     #[must_use]
     pub fn reconcile_closed_pnl_payload(
         &self,
@@ -2111,7 +2401,6 @@ impl SlotExecutionEngine {
         if list.is_empty() {
             return ClosedPnlQueryOutcome::PendingIndexerRetry;
         }
-
         let spec = APPROVED_SPECS[self.slot_idx];
         let sym_expected = spec.symbol_id.name();
         let expected_close_side = match side {
@@ -2170,7 +2459,6 @@ impl SlotExecutionEngine {
             if rec_ms > 0 && min_bound_ms > 0 && rec_ms < min_bound_ms {
                 continue;
             }
-
             let Some(avg_en_s) = item.get("avgEntryPrice").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -2186,7 +2474,6 @@ impl SlotExecutionEngine {
             if (leg_en_t.0 - avg_price_ticks.0).abs() > max_entry_tol_ticks {
                 continue;
             }
-
             let raw_sz_s = item
                 .get("closedSize")
                 .and_then(|v| v.as_str())
@@ -2215,7 +2502,6 @@ impl SlotExecutionEngine {
             if order_type_s != "Limit" || is_forced_exec {
                 any_market_or_forced = true;
             }
-
             if let Some(Ok(leg_pnl)) = item
                 .get("closedPnl")
                 .and_then(|v| v.as_str())
@@ -2229,7 +2515,6 @@ impl SlotExecutionEngine {
                 total_closed_pnl_1e8 = total_closed_pnl_1e8.saturating_add(scaled_pnl);
                 has_pnl_field = true;
             }
-
             accum_lots = accum_lots.saturating_add(take_lots);
             weighted_entry_sum += (take_lots as i128) * (leg_en_t.0 as i128);
             weighted_exit_sum += (take_lots as i128) * (leg_ex_t.0 as i128);
@@ -2239,7 +2524,6 @@ impl SlotExecutionEngine {
         if legs_count == 0 || accum_lots < min_req_lots {
             return ClosedPnlQueryOutcome::PendingIndexerRetry;
         }
-
         let denom = accum_lots as i128;
         let verified_entry_ticks = match side {
             Side::Bid => ((weighted_entry_sum + denom - 1) / denom) as i64,
@@ -2249,9 +2533,9 @@ impl SlotExecutionEngine {
             Side::Bid => (weighted_exit_sum / denom).max(1) as i64,
             Side::Ask => ((weighted_exit_sum + denom - 1) / denom) as i64,
         };
-
         let verified_entry_price = PriceTicks(verified_entry_ticks.max(1));
         let verified_exit_price = PriceTicks(verified_exit_ticks.max(1));
+
         let (kind, sub_reason) = if any_market_or_forced {
             (
                 ClosedTradeKind::ServerMarkPriceStopLoss,
@@ -2284,7 +2568,7 @@ impl SlotExecutionEngine {
         })
     }
 
-    /// F-03 Safe Fallback: Used only if /v5/position/closed-pnl fails after bounded retries.
+    /// Safe Fallback: Used only if /v5/position/closed-pnl fails after bounded retries.
     #[must_use]
     pub fn resolve_fallback_unverified_close(
         &self,
@@ -2307,7 +2591,6 @@ impl SlotExecutionEngine {
         else {
             return None;
         };
-
         let eff_sl = if self.last_eff_sl_ticks.0 > 0 {
             self.last_eff_sl_ticks
         } else {
@@ -2324,7 +2607,6 @@ impl SlotExecutionEngine {
         } else {
             cur_bbo
         };
-
         let sl_breached = match side {
             Side::Bid => {
                 (mkt_ref.0 > 0 && mkt_ref.0 <= eff_sl.0.saturating_add(2))
@@ -2340,7 +2622,6 @@ impl SlotExecutionEngine {
                 Side::Bid => mkt_ref.0 > 0 && mkt_ref.0 < avg_price_ticks.0,
                 Side::Ask => mkt_ref.0 > avg_price_ticks.0,
             };
-
         let tot_lots = initial_lots.max(open_lots).max(LotQty(1));
         if sl_breached || no_resting_tp_underwater {
             let sl_exit_px = if sl_breached {
@@ -2391,7 +2672,6 @@ impl SlotExecutionEngine {
             if tranche1_harvested { 2 } else { 1 },
             vac_level_hint,
         );
-
         Some(VerifiedCloseResolution {
             kind: ClosedTradeKind::MakerPassiveUnwind,
             sub_reason,
@@ -2403,7 +2683,6 @@ impl SlotExecutionEngine {
         })
     }
 
-    /// Applies a VerifiedCloseResolution atomically and records the canonical close summary.
     pub fn apply_verified_close_resolution(
         &mut self,
         resolution: VerifiedCloseResolution,
@@ -2432,7 +2711,7 @@ impl SlotExecutionEngine {
         ))
     }
 
-    /// F-04 Fix: Unified Canonical Exit Quoter (1:1 SSOT for live daemon & offline simulator).
+    /// Unified Canonical Exit Quoter (1:1 SSOT, zero ID branches, endogenous scaling).
     #[must_use]
     pub fn compute_canonical_exit_quote(
         &self,
@@ -2455,8 +2734,8 @@ impl SlotExecutionEngine {
         if self.slot_idx >= MAX_ACTIVE_PAIRS {
             return None;
         }
-
         let spec = APPROVED_SPECS[self.slot_idx];
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let avg_denom = avg_price_ticks.0.max(1);
         let cur_bbo = match side {
             Side::Bid => snap.asks[0].price,
@@ -2467,9 +2746,9 @@ impl SlotExecutionEngine {
             Side::Ask => avg_price_ticks.0 - cur_bbo.0,
         };
         let cur_gross_bps = (cur_diff.saturating_mul(1_000_000)) / avg_denom;
+
         let hold_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0);
         let hold_s = hold_ns / 1_000_000_000;
-
         let dir_s = side.sign_f64();
         let s_ofi = snap.factor_ofi.get() * dir_s;
         let s_tfi = snap.factor_tfi.get() * dir_s;
@@ -2492,49 +2771,63 @@ impl SlotExecutionEngine {
 
         let peak_gross_bps = self.last_closed_mfe_bps;
         let worst_mae_bps = self.last_closed_mae_bps;
-        let vol_c = snap.realized_vol_5m.raw().clamp(4_000, 12_500);
-        let mfe_c = self.learned_mfe_bps.clamp(540, 1_250);
+        let b3x_raw = spec
+            .required_3x_barrier_bps(avg_price_ticks)
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
+            .raw();
+        let eq_v = (b3x_raw * 4).max(fee_rt * 8);
+        let vol_c = snap.realized_vol_5m.raw().clamp(b3x_raw, eq_v * 3);
+        let init_mfe = (fee_rt * 17) / 10;
+        let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 27) / 20, fee_rt * 3);
         let tau_bps = spec
             .tick_to_price_scaled_bps(avg_price_ticks)
-            .unwrap_or(ScaledBps(50))
+            .unwrap_or(ScaledBps(fee_rt / 8))
             .raw();
         let mae_trig_bps = -((3 * tau_bps).max(vol_c / 18));
-        let t_def_s = (((75_i64 * 6_500) / vol_c) * mfe_c / 680).clamp(50, 110);
+        let base_hold_s = (VOL_5M_HORIZON_NS / 4_000_000_000).max(45);
+        let t_def_s =
+            (((base_hold_s * eq_v) / vol_c) * mfe_c / init_mfe).clamp(45, 110);
 
         let defensive_now = if tranche1_harvested {
-            let t_def_t2 = (t_def_s + 30).clamp(80, 140);
+            let t_def_t2 = (t_def_s + base_hold_s / 2).clamp(80, 145);
             defensive_floor_locked
-                || worst_mae_bps <= (mae_trig_bps - 120)
+                || worst_mae_bps <= (mae_trig_bps - (fee_rt * 3) / 10)
                 || hold_s >= t_def_t2
-                || (hold_s >= 45 && joint_adverse)
+                || (hold_s >= (t_def_s * 3) / 5 && joint_adverse)
         } else {
             defensive_floor_locked
                 || worst_mae_bps <= mae_trig_bps
                 || hold_s >= t_def_s
-                || (hold_s >= 25 && joint_adverse)
+                || (hold_s >= t_def_s / 3 && joint_adverse)
         };
 
+        let win_gross = (fee_rt * 13) / 10;
+        let ratchet_arm = (fee_rt * 7) / 5;
+        let ratchet_floor_min = fee_rt + (fee_rt * 16) / 100;
         let mfe_ratchet_lock = if tranche1_harvested {
-            (hold_s >= 45 && cur_gross_bps >= 485 && signed_flow < -0.10)
-                || (peak_gross_bps >= 900
-                    && cur_gross_bps >= 520
-                    && cur_gross_bps <= peak_gross_bps - 250
+            (hold_s >= (t_def_s * 3) / 5
+                && cur_gross_bps >= fee_rt + (fee_rt * 21) / 100
+                && signed_flow < -0.10)
+                || (peak_gross_bps >= fee_rt * 2 + 100
+                    && cur_gross_bps >= win_gross
+                    && cur_gross_bps <= peak_gross_bps - (fee_rt * 5) / 8
                     && signed_flow < 0.05)
         } else {
-            peak_gross_bps >= 560
-                && cur_gross_bps >= 465
+            peak_gross_bps >= ratchet_arm
+                && cur_gross_bps >= ratchet_floor_min
                 && signed_flow < 0.12
-                && (cur_gross_bps <= peak_gross_bps - 60 || signed_flow < -0.05)
-        };
-        let ratchet_bps = if peak_gross_bps > 800 {
-            let r70 = 400 + ((peak_gross_bps - 400) * 70) / 100;
-            r70.min(cur_gross_bps.max(465))
-        } else {
-            cur_gross_bps.clamp(465, 540)
+                && (cur_gross_bps <= peak_gross_bps - (fee_rt * 3) / 20
+                    || signed_flow < -0.05)
         };
 
-        let can_split_tranche1 = self.slot_idx >= 1
-            && !tranche1_harvested
+        let ratchet_bps = if peak_gross_bps > fee_rt * 2 {
+            let r70 = fee_rt + ((peak_gross_bps - fee_rt) * 70) / 100;
+            r70.min(cur_gross_bps.max(ratchet_floor_min))
+        } else {
+            cur_gross_bps.clamp(ratchet_floor_min, (fee_rt * 27) / 20)
+        };
+
+        let can_split_tranche1 = !tranche1_harvested
             && initial_lots.0 >= 2
             && open_lots.0 >= 2
             && !defensive_now
@@ -2544,7 +2837,7 @@ impl SlotExecutionEngine {
         let struct_floor = if structural_tp_price.0 > 0 {
             structural_tp_price
         } else {
-            dynamic_maker_floor_price(side, avg_price_ticks, ScaledBps(520))
+            dynamic_maker_floor_price(side, avg_price_ticks, ScaledBps(win_gross))
         };
 
         let (role, sub_reason, raw_target_px, order_lots, vac_level, def_lock) =
@@ -2561,14 +2854,18 @@ impl SlotExecutionEngine {
                 let fl_bps = if mfe_ratchet_lock {
                     ScaledBps(ratchet_bps)
                 } else {
-                    ScaledBps(if tranche1_harvested { 465 } else { 440 })
+                    ScaledBps(if tranche1_harvested {
+                        ratchet_floor_min
+                    } else {
+                        fee_rt + 40
+                    })
                 };
                 let fl_px = dynamic_maker_floor_price(side, avg_price_ticks, fl_bps);
                 let above_qf = match side {
                     Side::Bid => fl_px.0 > q_floor.0,
                     Side::Ask => fl_px.0 < q_floor.0,
                 };
-                let sub = if above_qf && fl_bps.raw() >= 520 {
+                let sub = if above_qf && fl_bps.raw() >= win_gross {
                     ExitSubReason::LvdbsDeepVacuumSurf
                 } else {
                     ExitSubReason::AdverseScratchEscape
@@ -2616,21 +2913,12 @@ impl SlotExecutionEngine {
             Side::Bid => PriceTicks(raw_target_px.0.max(min_sell_px).max(q_floor.0)),
             Side::Ask => PriceTicks(raw_target_px.0.min(max_buy_px).min(q_floor.0).max(1)),
         };
-
         let eff_order_lots = if matches!(role, ExitOrderRole::Tranche1Harvest50) {
-            if let OrderLifecycleState::PositionOpenMakerExit {
-                initial_lots, ..
-            } = self.state
-            {
-                let target_rem = (initial_lots.0 + 1) / 2;
-                LotQty((open_lots.0 - target_rem).clamp(1, open_lots.0.max(1)))
-            } else {
-                order_lots
-            }
+            let target_rem = (initial_lots.0 + 1) / 2;
+            LotQty((open_lots.0 - target_rem).clamp(1, open_lots.0.max(1)))
         } else {
             order_lots
         };
-
         Some(CanonicalExitQuote {
             role,
             sub_reason,
@@ -2644,7 +2932,6 @@ impl SlotExecutionEngine {
         })
     }
 
-    /// F-05 Fix: Exact lot-notional close accounting (1 Entry = 1 Consolidated Ledger Record).
     pub fn finalize_close_with_lots(
         &mut self,
         kind: ClosedTradeKind,
@@ -2685,7 +2972,8 @@ impl SlotExecutionEngine {
             net_scaled_bps,
         );
         self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_scaled_bps.raw()));
-        self.cooldown_until_ns = TimestampNs(closed_ts.0 + 3_000_000_000);
+        let post_close_breather_ns = VOL_5M_HORIZON_NS / 100;
+        self.cooldown_until_ns = TimestampNs(closed_ts.0 + post_close_breather_ns);
         self.close_reconcile_retries = 0;
         self.state = OrderLifecycleState::Idle;
 
@@ -2705,7 +2993,6 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Consolidates Leg 1 (if harvested) + Leg 2 using exact PairSpec lot notional (F-05).
     pub fn finalize_open_position_close(
         &mut self,
         leg2_kind: ClosedTradeKind,
@@ -2725,7 +3012,6 @@ impl SlotExecutionEngine {
         else {
             return None;
         };
-
         let q2 = LotQty(open_lots.0.max(1));
         if !tranche1_harvested || tranche1_lots.0 <= 0 || tranche1_exit_price.0 <= 0 {
             return Some(self.finalize_close_with_lots(
@@ -2753,7 +3039,6 @@ impl SlotExecutionEngine {
                     + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
             )
         };
-
         let (pnl1, fee1, g1, _) = spec.compute_leg_pnl_and_fee_1e8(
             side,
             q1,
@@ -2791,7 +3076,8 @@ impl SlotExecutionEngine {
             ScaledBps(net_bps),
         );
         self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_bps));
-        self.cooldown_until_ns = TimestampNs(closed_ts.0 + 3_000_000_000);
+        let post_close_breather_ns = VOL_5M_HORIZON_NS / 100;
+        self.cooldown_until_ns = TimestampNs(closed_ts.0 + post_close_breather_ns);
         self.close_reconcile_retries = 0;
         self.state = OrderLifecycleState::Idle;
 
@@ -2829,6 +3115,7 @@ impl SlotExecutionEngine {
         else {
             return None;
         };
+
         let cur_bbo_ref = match side {
             Side::Bid => snap.asks[0].price,
             Side::Ask => snap.bids[0].price,
@@ -2838,6 +3125,7 @@ impl SlotExecutionEngine {
         } else {
             cur_bbo_ref
         };
+
         match side {
             Side::Bid => {
                 if ref_trade.0 > peak_favorable_price.0 {
@@ -2865,6 +3153,7 @@ impl SlotExecutionEngine {
             *pk = peak_favorable_price;
             *wr = worst_adverse_price;
         }
+
         let peak_diff = match side {
             Side::Bid => peak_favorable_price.0 - avg_price_ticks.0,
             Side::Ask => avg_price_ticks.0 - peak_favorable_price.0,
@@ -2905,7 +3194,6 @@ impl SlotExecutionEngine {
         if !reached_target {
             return None;
         }
-
         if matches!(quote.role, ExitOrderRole::Tranche1Harvest50) {
             let _ = self.record_tranche1_harvest(quote.target_price);
             return None;
@@ -2954,6 +3242,9 @@ mod tests {
     #[test]
     fn test_moallemi_queue_depletion_velocity_shield() {
         let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+        snap.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(300) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(250) };
         snap.realized_vol_5m = ScaledBps(6_000);
         snap.factor_ofi = BoundedScore::new_clamped(-0.60);
         snap.factor_tfi = BoundedScore::new_clamped(-0.55);
@@ -2971,6 +3262,7 @@ mod tests {
             OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold();
         assert_eq!(mitigated_62, 62);
         assert_eq!(manifold_2160, 2_160);
+
         let gov = OnlineAdaptiveGovernor::new();
         assert!(gov
             .evaluate_kinematic_energy_surface(1, Side::Bid, 105, 148, 0.24, 0.60)
@@ -2978,6 +3270,99 @@ mod tests {
         assert!(gov
             .evaluate_kinematic_energy_surface(1, Side::Bid, 220, 150, 0.22, 0.47)
             .is_err());
+    }
+
+    #[test]
+    fn test_live_singapur_bid_deadlock_eradicated_and_zombie_anchor_expires() {
+        let live_snap_json = serde_json::json!({
+            "event": "GOV_SCAR_SNAPSHOT",
+            "ts_ns": 1_794_379_228_780_565_050_i64,
+            "cum_net_bps_x100": [
+                [1038, -133], [-5389, 3556], [1580, 8780], [9646, 10982],
+                [4198, 7192], [5866, 7503], [6478, 0], [-24000, 301],
+                [5560, 0], [4426, 2801], [1280, 425], [4087, 764]
+            ],
+            "directional_cooldown_until_ns": [
+                [1_794_239_964_703_437_143_i64, 1_794_242_544_152_966_210_i64],
+                [1_794_239_969_540_647_262_i64, 1_794_379_339_780_565_050_i64],
+                [1_794_191_589_360_755_839_i64, 1_794_189_735_509_464_253_i64],
+                [1_794_211_446_079_196_625_i64, 1_794_223_784_956_420_890_i64],
+                [1_794_235_041_996_258_884_i64, 1_794_241_637_703_685_870_i64],
+                [1_794_239_784_220_319_099_i64, 1_794_241_195_997_668_400_i64],
+                [1_794_214_953_878_548_667_i64, 0],
+                [1_794_242_814_128_285_563_i64, 1_794_092_589_432_475_272_i64],
+                [1_794_239_440_385_316_436_i64, 0],
+                [1_794_215_220_723_034_949_i64, 1_794_217_856_259_737_923_i64],
+                [1_794_194_445_603_752_116_i64, 1_794_192_799_823_027_285_i64],
+                [1_794_223_730_791_615_378_i64, 1_794_241_560_790_167_716_i64]
+            ],
+            "ewma_net_bps_x100": [
+                [65, 58], [111, 78], [178, 211], [309, 247],
+                [157, 107], [198, 282], [992, 200], [-8046, 178],
+                [1207, 200], [261, 231], [330, 256], [402, 278]
+            ],
+            "global_dir_cooldown_until_ns": [
+                1_794_242_694_128_285_563_i64,
+                1_794_102_421_290_056_964_i64
+            ],
+            "global_dir_debt_bps_x100": [-20740, 12000],
+            "global_dir_sl_streak": [1, 0],
+            "global_dir_win_streak": [0, 3],
+            "last_global_win_dir": 1,
+            "sl_streak": [
+                [0, 1], [2, 0], [0, 0], [0, 0],
+                [0, 0], [0, 0], [0, 0], [1, 0],
+                [0, 0], [0, 0], [0, 0], [0, 0]
+            ],
+            "wave_anchor_px_1e4": [
+                [7_473_640_000_i64, 0], [2_106_670_000_i64, 0], [88_020_000, 0],
+                [0, 80_170_000], [215_980_000, 0], [0, 85_730_000],
+                [32_270_000, 0], [0, 0], [15_630_000, 0],
+                [0, 104_500_000], [36_050_000, 0], [0, 51_820_000]
+            ],
+            "win_streak": [
+                [6, 0], [6, 0], [3, 0], [0, 3],
+                [3, 0], [0, 2], [10, 0], [0, 0],
+                [2, 0], [0, 3], [1, 0], [0, 1]
+            ]
+        });
+
+        let mut gov = OnlineAdaptiveGovernor::new();
+        assert!(gov.apply_scar_snapshot_json(&live_snap_json).is_some());
+        let now_live_ns = 1_794_411_268_000_000_000_i64;
+
+        assert!(!gov.is_in_local_slot_scar_debt(0, Side::Bid));
+        assert!(gov.is_in_scar_debt(0, Side::Bid));
+        assert_eq!(
+            gov.audit_historical_entry_veto(3, Side::Bid, 8_550, now_live_ns),
+            None
+        );
+        assert_eq!(
+            gov.audit_historical_entry_veto(9, Side::Ask, 10_400, now_live_ns),
+            None
+        );
+        assert_eq!(
+            gov.audit_historical_entry_veto(11, Side::Ask, 5_121, now_live_ns),
+            None
+        );
+
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.ts_local_ns = TimestampNs(now_live_ns);
+        btc.realized_vol_5m = ScaledBps(2_800);
+        btc.bids[0] = BookLevel { price: PriceTicks(738_779), qty: LotQty(200) };
+        btc.asks[0] = BookLevel { price: PriceTicks(738_780), qty: LotQty(180) };
+        btc.refresh_deep_l1_l5_totals();
+        btc.factor_ofi = BoundedScore::new_clamped(0.82);
+        btc.factor_tfi = BoundedScore::new_clamped(0.92);
+        btc.factor_geom = BoundedScore::new_clamped(0.45);
+        assert!(gov.authorizes_adaptive_entry_with_wallet(
+            0,
+            Side::Bid,
+            6_628_080_000,
+            &btc,
+            &btc,
+        ));
     }
 
     #[test]
@@ -2995,6 +3380,7 @@ mod tests {
             );
         }
         assert_eq!(gov.wave_anchor_px_1e4[3][0], 82_000_000);
+        assert!(gov.slot_information_ratio_x100(3, Side::Bid) > 35);
         gov.observe_closed_trade_at_entry(
             3,
             Side::Ask,
@@ -3007,6 +3393,10 @@ mod tests {
         assert_eq!(
             gov.audit_historical_entry_veto(3, Side::Bid, 8_225, t0 + 600_000_000_000),
             Some("VETO_WAVE_STAIRCASE_25BPS")
+        );
+        assert_eq!(
+            gov.audit_historical_entry_veto(3, Side::Bid, 8_225, t0 + 1_600_000_000_000),
+            None
         );
 
         for a in 0..4_i64 {
@@ -3129,7 +3519,6 @@ mod tests {
         snap.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(250) };
         snap.mark_price = PriceTicks(8_200);
         snap.last_trade_price = PriceTicks(8_200);
-
         let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
@@ -3145,7 +3534,6 @@ mod tests {
         {
             *resting_exit_price = PriceTicks(8_205);
         }
-
         snap.mark_price = PriceTicks(8_195);
         let fb = eng.resolve_fallback_unverified_close(&snap, 2);
         assert!(fb.is_some());
@@ -3230,7 +3618,6 @@ mod tests {
         let shm_path = MappedShmRegion::ephemeral_self_test_path("chat6_fsm_f09");
         let reg = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(reg.is_ok());
-
         let mut eng = SlotExecutionEngine::new(3);
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = APPROVED_SPECS[3].symbol_id;
@@ -3240,6 +3627,7 @@ mod tests {
         snap.asks[0] = BookLevel { price: PriceTicks(8_199), qty: LotQty(250) };
         snap.mark_price = PriceTicks(8_198);
         snap.last_trade_price = PriceTicks(8_198);
+
         let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
@@ -3345,6 +3733,7 @@ mod tests {
         link.factor_ofi = BoundedScore::new_clamped(0.42);
         link.factor_tfi = BoundedScore::new_clamped(0.44);
         link.factor_geom = BoundedScore::new_clamped(0.08);
+
         assert!(gov
             .confirm_preflight_kinematics_non_choking(
                 9,
@@ -3355,7 +3744,6 @@ mod tests {
             )
             .is_ok());
 
-        // Trade #29 LTCUSDT +5.86 bps archetype (high SNR=0.71 with geom=-0.04) passes!
         let mut ltc = link;
         ltc.symbol_id = APPROVED_SPECS[11].symbol_id;
         ltc.factor_ofi = BoundedScore::new_clamped(0.84);
@@ -3371,7 +3759,6 @@ mod tests {
             )
             .is_ok());
 
-        // Genuine book reversal on mild SNR must abort at $0.00 cost.
         link.factor_geom = BoundedScore::new_clamped(-0.04);
         assert!(gov
             .confirm_preflight_kinematics_non_choking(
@@ -3393,6 +3780,7 @@ mod tests {
         sui.asks[0] = BookLevel { price: PriceTicks(8_266), qty: LotQty(400) };
         sui.mark_price = PriceTicks(8_265);
         sui.last_trade_price = PriceTicks(8_265);
+
         let v_sui = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(650),
@@ -3428,6 +3816,7 @@ mod tests {
         );
         assert_eq!(summary.exit_price, PriceTicks(8_270));
         assert_eq!(eng.last_closed_peak_ticks, PriceTicks(8_270));
+
         let qf_sui =
             defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(8_265));
         assert_eq!(qf_sui, PriceTicks(8_269));
