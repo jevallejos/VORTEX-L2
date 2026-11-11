@@ -2617,11 +2617,25 @@ impl SlotExecutionEngine {
             Side::Ask => PriceTicks(raw_target_px.0.min(max_buy_px).min(q_floor.0).max(1)),
         };
 
+        let eff_order_lots = if matches!(role, ExitOrderRole::Tranche1Harvest50) {
+            if let OrderLifecycleState::PositionOpenMakerExit {
+                initial_lots, ..
+            } = self.state
+            {
+                let target_rem = (initial_lots.0 + 1) / 2;
+                LotQty((open_lots.0 - target_rem).clamp(1, open_lots.0.max(1)))
+            } else {
+                order_lots
+            }
+        } else {
+            order_lots
+        };
+
         Some(CanonicalExitQuote {
             role,
             sub_reason,
             target_price,
-            order_lots,
+            order_lots: eff_order_lots,
             vac_level,
             cur_gross_bps,
             wald_pct,

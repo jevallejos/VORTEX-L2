@@ -648,7 +648,13 @@ impl BybitV5LiveClient {
                 .unwrap_or(false);
             if ro {
                 let px_s = item.get("price").and_then(|v| v.as_str()).unwrap_or("0");
-                let qt_s = item.get("qty").and_then(|v| v.as_str()).unwrap_or("0");
+                let qt_s = item.get("leavesQty")
+                .filter(|v| {
+                    v.as_str().is_some_and(|s| {
+                        s.bytes().any(|b| b.is_ascii_digit() && b != b'0')
+                    })
+                })
+                .or_else(|| item.get("qty")).and_then(|v| v.as_str()).unwrap_or("0");
                 if let Ok(pt) = spec.parse_price_ticks(px_s) {
                     let lq = spec.parse_lot_qty(qt_s);
                     return Some((pt, lq));
@@ -1100,7 +1106,7 @@ fn process_gateway_command(
         }
         GatewayCommand::SyncOpenSlot {
             slot_idx,
-            side,
+            side: _,
             target_px,
             target_lots,
             defensive_lock,
@@ -1157,7 +1163,7 @@ fn process_gateway_command(
             };
             let eff_lots = LotQty(target_lots.0.min(real_lots.0).max(1));
             let tp_diff = (target_px.0 - resting_tp.0).abs();
-            let moving_closer = match side {
+            let moving_closer = match r_side {
                 Side::Bid => resting_tp.0 == 0 || target_px.0 < resting_tp.0,
                 Side::Ask => resting_tp.0 == 0 || target_px.0 > resting_tp.0,
             };
@@ -1166,10 +1172,12 @@ fn process_gateway_command(
                 || (moving_closer && tp_diff >= 1 && (defensive_lock || tp_diff >= 2))
                 || (!moving_closer && cur_gross_bps < 200 && tp_diff >= 4);
             let active_resting_tp = if should_repeg {
-                let _ = client.cancel_all_symbol_orders(sym);
+                if resting_tp.0 > 0 || resting_qty.0 > 0 {
+                    let _ = client.cancel_all_symbol_orders(sym);
+                }
                 let rc = client.place_post_only_order(
                     spec,
-                    side.opposite(),
+                    r_side.opposite(),
                     target_px,
                     eff_lots,
                     None,
@@ -2924,14 +2932,15 @@ fn handle_gateway_event(
                     engines[slot_idx].sync_open_avg_price_ticks(v_avg);
                 }
             }
-            let hold_s = (now_ns.0.saturating_sub(opened_ts.0)).max(0) / 1_000_000_000;
+            let hold_ms = (now_ns.0.saturating_sub(opened_ts.0)).max(0) / 1_000_000;
             let eff_init = initial_lots.max(real_lots);
+            let target_t2_rem = (eff_init.0 + 1) / 2;
             let mut t1_done = tranche1_harvested;
             if !t1_done
                 && prev_rest_tp.0 > 0
                 && eff_init.0 >= 2
-                && real_lots.0 < eff_init.0
-                && hold_s >= 1
+                && real_lots.0 <= target_t2_rem
+                && hold_ms >= 50
             {
                 t1_done = true;
                 engines[slot_idx].tranche1_harvests_count =
