@@ -392,7 +392,7 @@ impl OrthogonalFactorState {
             + 0.20 * snap.factor_geom.get()
     }
 
-    /// Fully elastic, self-learned entry signal evaluator (zero static volatility anchors).
+    /// Fully elastic, self-learned entry signal evaluator preserving LVDBS L2..L4 reach.
     #[must_use]
     pub fn evaluate_entry_signal_elastic(
         spec: PairSpec,
@@ -461,24 +461,27 @@ impl OrthogonalFactorState {
         let leader_tfi = leader_btc_snap.factor_tfi.get() * dir_sign;
         let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
         let lead_lag_bonus_bps = if is_follower && leader_snr >= 0.55 && leader_tfi >= 0.60 {
-            let bonus_cap = b3x_barrier.raw() / 6;
+            let bonus_cap = b3x_barrier.raw() / 9;
             ((leader_snr * (bonus_cap as f64)).round() as i64).clamp(0, bonus_cap)
         } else {
             0
         };
 
         let raw_vol = snap.realized_vol_5m.raw() as f64;
-        let mfe_pot = learned_mfe_bps
+        let learned_span = learned_mfe_bps
             .raw()
-            .max(b3x_barrier.raw() / 2)
+            .max(0)
             .saturating_add(learned_dir_edge_bps.raw().max(0));
-        let structural_horizon = (mfe_pot.saturating_mul(9)) as f64;
-        let eff_vol = if raw_vol < structural_horizon {
-            (raw_vol * structural_horizon).sqrt()
+        let eq_horizon = b3x_barrier
+            .raw()
+            .saturating_mul(3)
+            .saturating_add(learned_span.saturating_mul(2)) as f64;
+        let eff_vol = if raw_vol < eq_horizon {
+            (raw_vol * eq_horizon).sqrt()
         } else {
             raw_vol
         };
-        let flow_boost = 0.54 + 0.14 * tfi.abs() + 0.08 * geom.abs();
+        let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
         let base_exc = ((composite.abs() * eff_vol * flow_boost).round() as i64)
             .saturating_add(lead_lag_bonus_bps);
         let expected_excursion = ScaledBps(base_exc);
