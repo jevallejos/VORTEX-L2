@@ -607,7 +607,7 @@ impl MappedShmRegion {
     pub fn ephemeral_self_test_path(tag: &str) -> PathBuf {
         let ts = now_epoch_ns().0.unsigned_abs();
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("vortex_l3_{}_{}_{}.mmap", tag, pid, ts))
+        std::env::temp_dir().join(format!("vortex_l3_{tag}_{pid}_{ts}.mmap"))
     }
 
     #[cfg(not(unix))]
@@ -627,7 +627,7 @@ impl MappedShmRegion {
             .read(true)
             .open(path)
             .map_err(|_| VortexError::ColumnarIoFailure)?;
-        let cur_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let cur_len = file.metadata().map_or(0, |m| m.len());
         if cur_len != (size as u64) {
             return Err(VortexError::ColumnarFormatCorrupted);
         }
@@ -697,7 +697,7 @@ impl MappedShmRegion {
             .truncate(false)
             .open(path)
             .map_err(|_| VortexError::ColumnarIoFailure)?;
-        let cur_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let cur_len = file.metadata().map_or(0, |m| m.len());
         if cur_len != (size as u64) {
             file.set_len(size as u64)
                 .map_err(|_| VortexError::ColumnarIoFailure)?;
@@ -784,7 +784,7 @@ impl MappedShmRegion {
                     let fresh = Self::alloc_zero_padded_arena();
                     let bytes = unsafe {
                         core::slice::from_raw_parts(
-                            (&*fresh as *const VortexShmArena).cast::<u8>(),
+                            core::ptr::from_ref::<VortexShmArena>(&fresh).cast::<u8>(),
                             size,
                         )
                     };
@@ -834,7 +834,7 @@ impl Drop for MappedShmRegion {
                     let size = core::mem::size_of::<VortexShmArena>();
                     let bytes = unsafe {
                         core::slice::from_raw_parts(
-                            (&*self.arena as *const VortexShmArena).cast::<u8>(),
+                            core::ptr::from_ref::<VortexShmArena>(&self.arena).cast::<u8>(),
                             size,
                         )
                     };

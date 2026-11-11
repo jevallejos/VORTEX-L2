@@ -137,9 +137,10 @@ impl ColumnarMarketRow {
             MarketEventKind::L2BookSnapshot => {
                 if snap.last_trade_price.0 <= 0 {
                     if self.best_bid_ticks.0 > 0 && self.best_ask_ticks.0 > 0 {
-                        snap.last_trade_price = PriceTicks(
-                            (self.best_bid_ticks.0 + self.best_ask_ticks.0) / 2,
-                        );
+                        snap.last_trade_price = PriceTicks(i64::midpoint(
+                            self.best_bid_ticks.0,
+                            self.best_ask_ticks.0,
+                        ));
                     } else if self.price_ticks.0 > 0 {
                         snap.last_trade_price = self.price_ticks;
                     }

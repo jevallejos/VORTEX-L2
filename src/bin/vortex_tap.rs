@@ -150,10 +150,11 @@ fn flush_parquet_batch_to_dir(
     prune_expired_parquet_segment(data_dir, *parquet_seq);
 }
 
-/// F-11 Fix: Bounded asynchronous PAR1 writer off the critical WebSocket read loop.
+/// F-11 & Cat-3 Fix: Zero-reallocation ring writer with recycled batch pool.
 #[derive(Debug)]
 pub struct AsyncParquetRingWriter {
     tx: Option<SyncSender<Box<ColumnarParquetBatch>>>,
+    recycle_rx: std::sync::mpsc::Receiver<Box<ColumnarParquetBatch>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -162,15 +163,23 @@ impl AsyncParquetRingWriter {
     pub fn spawn(data_dir: PathBuf, verbose_log: bool) -> Self {
         let (tx, rx) =
             mpsc::sync_channel::<Box<ColumnarParquetBatch>>(ASYNC_PARQUET_QUEUE_DEPTH);
+        let (recycle_tx, recycle_rx) =
+            mpsc::sync_channel::<Box<ColumnarParquetBatch>>(ASYNC_PARQUET_QUEUE_DEPTH);
+        for _ in 0..ASYNC_PARQUET_QUEUE_DEPTH {
+            let _ = recycle_tx.try_send(Box::<ColumnarParquetBatch>::default());
+        }
         let init_seq = discover_latest_parquet_seq(&data_dir);
         let worker = thread::spawn(move || {
             let mut seq = init_seq;
-            while let Ok(batch_box) = rx.recv() {
+            while let Ok(mut batch_box) = rx.recv() {
                 flush_parquet_batch_to_dir(&data_dir, &batch_box, &mut seq, verbose_log);
+                batch_box.clear();
+                let _ = recycle_tx.try_send(batch_box);
             }
         });
         Self {
             tx: Some(tx),
+            recycle_rx,
             worker: Some(worker),
         }
     }
@@ -180,11 +189,23 @@ impl AsyncParquetRingWriter {
         if batch.is_empty() {
             return true;
         }
-        let full_batch = core::mem::take(batch);
-        if let Some(ref sender) = self.tx {
-            sender.try_send(full_batch).is_ok()
-        } else {
-            false
+        let Some(ref sender) = self.tx else {
+            batch.clear();
+            return false;
+        };
+        let replacement = self
+            .recycle_rx
+            .try_recv()
+            .unwrap_or_else(|_| Box::<ColumnarParquetBatch>::default());
+        let outgoing = core::mem::replace(batch, replacement);
+        match sender.try_send(outgoing) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(mut returned)
+            | mpsc::TrySendError::Disconnected(mut returned)) => {
+                returned.clear();
+                *batch = returned;
+                false
+            }
         }
     }
 }
@@ -520,8 +541,10 @@ fn run_live_bybit_ws_daemon(
                     if snap.bbo_and_spread_ticks().is_none() {
                         continue;
                     }
-                    let mid_l1 =
-                        PriceTicks((snap.bids[0].price.0 + snap.asks[0].price.0) / 2);
+                    let mid_l1 = PriceTicks(i64::midpoint(
+                        snap.bids[0].price.0,
+                        snap.asks[0].price.0,
+                    ));
                     if !has_live_mark_px[slot_idx] || snap.mark_price.0 <= 0 {
                         snap.mark_price = mid_l1;
                     }

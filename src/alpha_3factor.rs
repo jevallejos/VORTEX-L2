@@ -97,7 +97,7 @@ impl OrthogonalFactorState {
     #[must_use]
     pub fn flow_prior_bounds(snap: &SymbolLobSnapshot) -> (f64, f64) {
         let ref_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-            PriceTicks((snap.bids[0].price.0 + snap.asks[0].price.0) / 2)
+            PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
         } else if snap.mark_price.0 > 0 {
             snap.mark_price
         } else if snap.last_trade_price.0 > 0 {
@@ -400,7 +400,7 @@ impl OrthogonalFactorState {
         let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
-        let mid_ticks = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
+        let mid_ticks = PriceTicks(i64::midpoint(best_bid.price.0, best_ask.price.0));
         if spread_ticks > 1 {
             let spread_scaled_bps =
                 (spread_ticks.saturating_mul(1_000_000)) / mid_ticks.0.max(1);
@@ -536,10 +536,8 @@ impl OrthogonalFactorState {
             3_usize
         } else if vac_idx >= (1.42 * nu_v) && signed_tfi >= 0.18 {
             2_usize
-        } else if vac_idx >= (1.04 * nu_v) {
-            1_usize
         } else {
-            0_usize
+            usize::from(vac_idx >= (1.04 * nu_v))
         };
 
         let eff_struct = match open_side {

@@ -99,6 +99,7 @@ fn load_dotenv_map() -> HashMap<String, String> {
 pub struct ParsedEndpointUrl {
     pub use_tls: bool,
     pub host: String,
+    pub host_header: String,
     pub port: u16,
     pub base_path: String,
 }
@@ -130,9 +131,16 @@ pub fn parse_endpoint_url(raw_url: &str) -> Option<ParsedEndpointUrl> {
     if host_s.is_empty() {
         return None;
     }
+    let host = host_s.to_string();
+    let host_header = if port == default_port {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
     Some(ParsedEndpointUrl {
         use_tls,
-        host: host_s.to_string(),
+        host,
+        host_header,
         port,
         base_path,
     })
@@ -207,6 +215,9 @@ impl Write for HttpTransportStream {
 struct KeepAliveHttpConn {
     endpoint: ParsedEndpointUrl,
     reader: Option<BufReader<HttpTransportStream>>,
+    req_buf: Vec<u8>,
+    line_buf: String,
+    body_buf: Vec<u8>,
 }
 
 impl std::fmt::Debug for KeepAliveHttpConn {
@@ -214,7 +225,7 @@ impl std::fmt::Debug for KeepAliveHttpConn {
         f.debug_struct("KeepAliveHttpConn")
             .field("endpoint", &self.endpoint)
             .field("connected", &self.reader.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -224,6 +235,9 @@ impl KeepAliveHttpConn {
         Self {
             endpoint,
             reader: None,
+            req_buf: Vec::with_capacity(1_024),
+            line_buf: String::with_capacity(256),
+            body_buf: Vec::with_capacity(4_096),
         }
     }
 
@@ -233,42 +247,33 @@ impl KeepAliveHttpConn {
         target_path_and_query: &str,
         extra_headers: &[(&str, &str)],
         body: &str,
-    ) -> Option<Vec<u8>> {
-        let full_target = if self.endpoint.base_path.is_empty() {
-            target_path_and_query.to_string()
-        } else {
-            format!("{}{}", self.endpoint.base_path, target_path_and_query)
-        };
-        let default_port = if self.endpoint.use_tls { 443 } else { 80 };
-        let host_hdr = if self.endpoint.port == default_port {
-            self.endpoint.host.clone()
-        } else {
-            format!("{}:{}", self.endpoint.host, self.endpoint.port)
-        };
-
-        let mut req = Vec::with_capacity(256 + body.len());
+    ) -> Option<&[u8]> {
+        self.req_buf.clear();
         let _ = write!(
-            req,
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n",
-            method, full_target, host_hdr
+            self.req_buf,
+            "{} {}{} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n",
+            method,
+            self.endpoint.base_path,
+            target_path_and_query,
+            self.endpoint.host_header
         );
         let _ = write!(
-            req,
+            self.req_buf,
             "User-Agent: vortex-l3/1.0\r\nAccept: application/json\r\n"
         );
         if !body.is_empty() || method == "POST" {
             let _ = write!(
-                req,
+                self.req_buf,
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",
                 body.len()
             );
         }
         for &(hk, hv) in extra_headers {
-            let _ = write!(req, "{}: {}\r\n", hk, hv);
+            let _ = write!(self.req_buf, "{hk}: {hv}\r\n");
         }
-        req.extend_from_slice(b"\r\n");
+        self.req_buf.extend_from_slice(b"\r\n");
         if !body.is_empty() {
-            req.extend_from_slice(body.as_bytes());
+            self.req_buf.extend_from_slice(body.as_bytes());
         }
 
         for attempt in 0..2_u8 {
@@ -278,15 +283,17 @@ impl KeepAliveHttpConn {
                 self.reader = Some(BufReader::new(stream));
             }
             let rdr = self.reader.as_mut()?;
-            if rdr.get_mut().write_all(&req).is_err() || rdr.get_mut().flush().is_err() {
+            if rdr.get_mut().write_all(&self.req_buf).is_err()
+                || rdr.get_mut().flush().is_err()
+            {
                 self.reader = None;
                 if attempt == 0 && (was_reused || method == "GET") {
                     continue;
                 }
                 return None;
             }
-            let mut status_line = String::new();
-            match rdr.read_line(&mut status_line) {
+            self.line_buf.clear();
+            match rdr.read_line(&mut self.line_buf) {
                 Ok(n) if n > 0 => {}
                 _ => {
                     self.reader = None;
@@ -296,7 +303,8 @@ impl KeepAliveHttpConn {
                     return None;
                 }
             }
-            let status_ok = status_line
+            let status_ok = self
+                .line_buf
                 .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse::<u16>().ok())
@@ -306,95 +314,114 @@ impl KeepAliveHttpConn {
             let mut is_chunked = false;
             let mut conn_close = false;
             loop {
-                let mut hdr = String::new();
-                let Ok(n) = rdr.read_line(&mut hdr) else {
+                self.line_buf.clear();
+                let Ok(n) = rdr.read_line(&mut self.line_buf) else {
                     self.reader = None;
                     return None;
                 };
-                if n == 0 || hdr == "\r\n" || hdr == "\n" {
+                if n == 0 || self.line_buf == "\r\n" || self.line_buf == "\n" {
                     break;
                 }
-                if let Some((k, v)) = hdr.split_once(':') {
-                    let kl = k.trim().to_ascii_lowercase();
-                    let vl = v.trim().to_ascii_lowercase();
-                    if kl == "content-length" {
+                if let Some((k, v)) = self.line_buf.split_once(':') {
+                    let kl = k.trim();
+                    let vl = v.trim();
+                    if kl.eq_ignore_ascii_case("content-length") {
                         content_len = vl.parse::<usize>().ok();
-                    } else if kl == "transfer-encoding" && vl.contains("chunked") {
+                    } else if kl.eq_ignore_ascii_case("transfer-encoding")
+                        && vl.to_ascii_lowercase().contains("chunked")
+                    {
                         is_chunked = true;
-                    } else if kl == "connection" && vl.contains("close") {
+                    } else if kl.eq_ignore_ascii_case("connection")
+                        && vl.to_ascii_lowercase().contains("close")
+                    {
                         conn_close = true;
                     }
                 }
             }
 
-            let body_bytes = if is_chunked {
-                let Some(b) = Self::read_chunked_body(rdr) else {
+            self.body_buf.clear();
+            if is_chunked {
+                if !Self::read_chunked_into(rdr, &mut self.line_buf, &mut self.body_buf)
+                {
                     self.reader = None;
                     return None;
-                };
-                b
+                }
             } else if let Some(clen) = content_len {
                 if clen > MAX_HTTP_BODY_BYTES {
                     self.reader = None;
                     return None;
                 }
-                let mut buf = vec![0_u8; clen];
-                if clen > 0 && rdr.read_exact(&mut buf).is_err() {
+                self.body_buf.resize(clen, 0_u8);
+                if clen > 0 && rdr.read_exact(&mut self.body_buf).is_err() {
                     self.reader = None;
                     return None;
                 }
-                buf
             } else {
-                let mut buf = Vec::new();
                 if rdr
                     .by_ref()
                     .take(MAX_HTTP_BODY_BYTES as u64)
-                    .read_to_end(&mut buf)
+                    .read_to_end(&mut self.body_buf)
                     .is_err()
                 {
                     self.reader = None;
                     return None;
                 }
                 conn_close = true;
-                buf
-            };
+            }
 
             if conn_close || !status_ok {
                 self.reader = None;
             }
-            return if status_ok { Some(body_bytes) } else { None };
+            return if status_ok {
+                Some(self.body_buf.as_slice())
+            } else {
+                None
+            };
         }
         None
     }
 
-    fn read_chunked_body(rdr: &mut BufReader<HttpTransportStream>) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
+    fn read_chunked_into(
+        rdr: &mut BufReader<HttpTransportStream>,
+        line_buf: &mut String,
+        out: &mut Vec<u8>,
+    ) -> bool {
         loop {
-            let mut sz_line = String::new();
-            let n = rdr.read_line(&mut sz_line).ok()?;
+            line_buf.clear();
+            let Ok(n) = rdr.read_line(line_buf) else {
+                return false;
+            };
             if n == 0 {
-                return None;
+                return false;
             }
-            let hex_part = sz_line.trim().split(';').next().unwrap_or("").trim();
-            let chunk_len = usize::from_str_radix(hex_part, 16).ok()?;
+            let hex_part = line_buf.trim().split(';').next().unwrap_or("").trim();
+            let Ok(chunk_len) = usize::from_str_radix(hex_part, 16) else {
+                return false;
+            };
             if chunk_len == 0 {
                 loop {
-                    let mut trl = String::new();
-                    let tn = rdr.read_line(&mut trl).ok()?;
-                    if tn == 0 || trl == "\r\n" || trl == "\n" {
+                    line_buf.clear();
+                    let Ok(tn) = rdr.read_line(line_buf) else {
+                        return false;
+                    };
+                    if tn == 0 || line_buf == "\r\n" || line_buf == "\n" {
                         break;
                     }
                 }
-                return Some(out);
+                return true;
             }
             if out.len().saturating_add(chunk_len) > MAX_HTTP_BODY_BYTES {
-                return None;
+                return false;
             }
             let start = out.len();
             out.resize(start + chunk_len, 0_u8);
-            rdr.read_exact(&mut out[start..]).ok()?;
+            if rdr.read_exact(&mut out[start..]).is_err() {
+                return false;
+            }
             let mut crlf = [0_u8; 2];
-            rdr.read_exact(&mut crlf).ok()?;
+            if rdr.read_exact(&mut crlf).is_err() {
+                return false;
+            }
         }
     }
 }
@@ -440,7 +467,7 @@ impl std::fmt::Debug for BybitV5LiveClient {
             .field("api_key_set", &(!self.api_key.is_empty()))
             .field("api_secret", &"[REDACTED]")
             .field("conn", &self.conn)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -499,7 +526,7 @@ impl BybitV5LiveClient {
             ("X-BAPI-SIGN", sign.as_str()),
         ];
         let raw = self.conn.send_json_request("GET", &target, &hdrs, "")?;
-        serde_json::from_slice(&raw).ok()
+        serde_json::from_slice(raw).ok()
     }
 
     pub fn post_v5(
@@ -518,7 +545,7 @@ impl BybitV5LiveClient {
             ("X-BAPI-SIGN", sign.as_str()),
         ];
         let raw = self.conn.send_json_request("POST", endpoint, &hdrs, body_json)?;
-        serde_json::from_slice(&raw).ok()
+        serde_json::from_slice(raw).ok()
     }
 
     pub fn fetch_wallet_and_equity_usdt(&mut self) -> Option<(f64, f64, f64, f64)> {
@@ -1221,7 +1248,9 @@ fn spawn_private_ws_listener(evt_tx: SyncSender<GatewayEvent>) {
                     last_ping_ns = now_ns;
                 }
                 match msg {
-                    tungstenite::Message::Text(t) => parse_ws_private_frame(&t, &evt_tx),
+                    tungstenite::Message::Text(t) => {
+                        parse_ws_private_frame(&t, &evt_tx);
+                    }
                     tungstenite::Message::Ping(p) => {
                         let _ = socket.send(tungstenite::Message::Pong(p));
                     }
@@ -1508,7 +1537,7 @@ fn render_live_hud(arena: &VortexShmArena) {
             let cur_t = if snap.mark_price.0 > 0 {
                 snap.mark_price.0
             } else if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-                (snap.bids[0].price.0 + snap.asks[0].price.0) / 2
+                i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)
             } else {
                 avg_t
             };

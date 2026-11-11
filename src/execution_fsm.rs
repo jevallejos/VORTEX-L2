@@ -96,68 +96,94 @@ const SHA256_K: [u32; 64] = [
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+#[inline]
 #[allow(clippy::needless_range_loop)]
-fn sha256_digest(data: &[u8]) -> [u8; 32] {
+fn sha256_compress_block(h: &mut [u32; 8], chunk: &[u8; 64]) {
+    let mut w = [0_u32; 64];
+    for i in 0..16 {
+        let j = i * 4;
+        w[i] = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+        (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
+#[allow(clippy::needless_range_loop)]
+fn sha256_digest_2parts(part1: &[u8], part2: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     ];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = Vec::with_capacity(data.len() + 72);
-    msg.extend_from_slice(data);
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0x00);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let total_len = part1.len().saturating_add(part2.len());
+    let bit_len = (total_len as u64).wrapping_mul(8);
+    let mut block = [0_u8; 64];
+    let mut fill = 0_usize;
 
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut w = [0_u32; 64];
-        for i in 0..16 {
-            let j = i * 4;
-            w[i] = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+    for &b in part1.iter().chain(part2.iter()) {
+        block[fill] = b;
+        fill += 1;
+        if fill == 64 {
+            sha256_compress_block(&mut h, &block);
+            fill = 0;
         }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(SHA256_K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
     }
+
+    block[fill] = 0x80;
+    fill += 1;
+    if fill > 56 {
+        while fill < 64 {
+            block[fill] = 0;
+            fill += 1;
+        }
+        sha256_compress_block(&mut h, &block);
+        fill = 0;
+    }
+    while fill < 56 {
+        block[fill] = 0;
+        fill += 1;
+    }
+    block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    sha256_compress_block(&mut h, &block);
 
     let mut out = [0_u8; 32];
     for (i, word) in h.iter().enumerate() {
-        let bytes = word.to_be_bytes();
-        out[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
 }
@@ -167,7 +193,7 @@ pub fn sign_bybit_v5_hmac_sha256(secret: &str, payload: &str) -> String {
     let mut key_block = [0_u8; 64];
     let sec_bytes = secret.as_bytes();
     if sec_bytes.len() > 64 {
-        let hashed = sha256_digest(sec_bytes);
+        let hashed = sha256_digest_2parts(sec_bytes, &[]);
         key_block[..32].copy_from_slice(&hashed);
     } else {
         key_block[..sec_bytes.len()].copy_from_slice(sec_bytes);
@@ -178,15 +204,8 @@ pub fn sign_bybit_v5_hmac_sha256(secret: &str, payload: &str) -> String {
         ipad[i] ^= key_block[i];
         opad[i] ^= key_block[i];
     }
-    let mut inner_data = Vec::with_capacity(64 + payload.len());
-    inner_data.extend_from_slice(&ipad);
-    inner_data.extend_from_slice(payload.as_bytes());
-    let inner_hash = sha256_digest(&inner_data);
-
-    let mut outer_data = Vec::with_capacity(96);
-    outer_data.extend_from_slice(&opad);
-    outer_data.extend_from_slice(&inner_hash);
-    let digest = sha256_digest(&outer_data);
+    let inner_hash = sha256_digest_2parts(&ipad, payload.as_bytes());
+    let digest = sha256_digest_2parts(&opad, &inner_hash);
 
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hex_str = String::with_capacity(64);
@@ -504,7 +523,7 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         let mid_ticks = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-            (snap.bids[0].price.0 + snap.asks[0].price.0) / 2
+            i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)
         } else {
             snap.mark_price.0
         };
@@ -546,7 +565,7 @@ impl OnlineAdaptiveGovernor {
         }
         let drift_bps = ((fast - slow).saturating_mul(1_000_000)) / slow;
         let cur_ticks = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-            (snap.bids[0].price.0 + snap.asks[0].price.0) / 2
+            i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)
         } else {
             snap.mark_price.0
         };

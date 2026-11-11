@@ -753,7 +753,11 @@ pub fn run_parquet_walk_forward_on_dir(
     };
     let mut files: Vec<_> = entries
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+        })
         .map(|e| e.path())
         .collect();
     files.sort();
@@ -833,7 +837,9 @@ pub fn run_parquet_walk_forward_on_dir(
                         spec, &cur_snap, &btc_snap,
                     );
                     match verdict {
-                        SignalVerdict::SpoofingVeto => rep.spoof_vetoes += 1,
+                        SignalVerdict::SpoofingVeto => {
+                            rep.spoof_vetoes += 1;
+                        }
                         SignalVerdict::AuthorizeMakerEntry { side, .. } => {
                             let eq_1e8 = ledger.current_equity_1e8();
                             if beta_guard.can_admit_side(side)
