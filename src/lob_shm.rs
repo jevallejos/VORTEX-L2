@@ -17,7 +17,6 @@ pub const MAX_ACTIVE_PAIRS: usize = 12;
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C33;
 pub const VORTEX_SHM_VERSION: u32 = 12;
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
-pub const MAX_FEED_STALE_NS: u64 = 2_500_000_000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum L2SeqDecision {
@@ -102,20 +101,6 @@ impl SymbolLobSnapshot {
             bids: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; LOB_DEPTH],
             asks: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; LOB_DEPTH],
         }
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn is_fresh_at(&self, now_ns: TimestampNs, max_stale_ns: u64) -> bool {
-        if self.sequence_id == 0 || self.ts_local_ns.0 <= 0 || now_ns.0 <= 0 {
-            return false;
-        }
-        let age = if now_ns.0 >= self.ts_local_ns.0 {
-            (now_ns.0 - self.ts_local_ns.0) as u64
-        } else {
-            0
-        };
-        age <= max_stale_ns
     }
 
     #[inline]
@@ -303,12 +288,6 @@ impl SlotExecTelemetry {
             resting_since_ns: AtomicU64::new(0),
             queue_ahead_lots: AtomicU64::new(0),
         }
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn peek_state_code(&self) -> u8 {
-        (self.state_code.load(Ordering::Acquire) & 0xFF) as u8
     }
 
     #[inline]
@@ -575,15 +554,6 @@ impl VortexShmArena {
             return None;
         }
         Some((now_ns.0 as u64).saturating_sub(hb))
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn is_feed_fresh(&self, now_ns: TimestampNs, max_stale_ns: u64) -> bool {
-        match self.heartbeat_age_ns(now_ns) {
-            Some(age) => age <= max_stale_ns,
-            None => false,
-        }
     }
 
     #[inline]
@@ -962,7 +932,6 @@ mod tests {
                             queue_ahead_lots: 0,
                         });
                     }
-                    assert_eq!(t0.peek_state_code(), 4);
                 }
                 if let Ok(t1) = a1.telemetry(1) {
                     t1.state_code.store((5_u64 << 8) | 3, Ordering::Release);
@@ -973,10 +942,6 @@ mod tests {
             let ro = MappedShmRegion::open_existing_read_only(&shm_path);
             assert!(ro.is_ok());
             if let Ok(ro_reg) = ro {
-                assert!(ro_reg.arena().is_feed_fresh(
-                    TimestampNs(1_700_000_001_000_000_000),
-                    MAX_FEED_STALE_NS,
-                ));
                 if let Ok(t0) = ro_reg.arena().telemetry(0) {
                     let snap = t0.read_consistent_or_default(4);
                     assert_eq!(snap.state_code, 4);
@@ -997,7 +962,6 @@ mod tests {
                 }
                 if let Ok(t1) = a2.telemetry(1) {
                     assert_eq!((t1.state_code.load(Ordering::Acquire) >> 8) & 1, 0);
-                    assert_eq!(t1.peek_state_code(), 0);
                     assert!(t1.read_consistent(4).is_ok());
                 }
                 if let Ok(t0) = a2.telemetry(0) {
@@ -1040,7 +1004,6 @@ mod tests {
         );
         let tel = SlotExecTelemetry::new();
         tel.state_code.store((1_u64 << 8) | 2, Ordering::Release);
-        assert_eq!(tel.peek_state_code(), 2);
         assert_eq!(tel.read_consistent(2), Err(VortexError::SharedMemorySeqConflict));
     }
 }

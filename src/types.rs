@@ -409,39 +409,6 @@ impl PairSpec {
         Ok(proposed_sl)
     }
 
-    /// Computes server MarkPrice SL ticks (110..145 bps) and validates >= 2-tick cushion.
-    #[inline]
-    pub const fn compute_validated_sl_ticks(
-        side: Side,
-        entry_price: PriceTicks,
-        last_price: PriceTicks,
-        mark_price: PriceTicks,
-        realized_vol_5m: ScaledBps,
-    ) -> Result<PriceTicks, VortexError> {
-        if entry_price.0 <= 0 {
-            return Err(VortexError::InvalidPriceOrTickSpec);
-        }
-        let ref_mark = if mark_price.0 > 0 { mark_price } else { entry_price };
-        let ref_last = if last_price.0 > 0 { last_price } else { entry_price };
-        let sl_bps = Self::elastic_server_sl_distance_bps(realized_vol_5m).0;
-        let raw_delta = (entry_price.0.saturating_mul(sl_bps)) / 1_000_000;
-        let sl_delta_ticks = if raw_delta > 4 { raw_delta } else { 4 };
-        let proposed_sl = match side {
-            Side::Bid => {
-                let min_lm = if ref_mark.0 < ref_last.0 { ref_mark.0 } else { ref_last.0 };
-                let bound = if min_lm < entry_price.0 { min_lm } else { entry_price.0 };
-                let cand = bound - sl_delta_ticks;
-                PriceTicks(if cand > 1 { cand } else { 1 })
-            }
-            Side::Ask => {
-                let max_lm = if ref_mark.0 > ref_last.0 { ref_mark.0 } else { ref_last.0 };
-                let bound = if max_lm > entry_price.0 { max_lm } else { entry_price.0 };
-                PriceTicks(bound.saturating_add(sl_delta_ticks))
-            }
-        };
-        Self::validate_stop_loss_geometry(side, proposed_sl, ref_last, ref_mark)
-    }
-
     /// Exact executed position notional in USDT scaled by 1e8.
     #[inline]
     #[must_use]
@@ -1074,14 +1041,6 @@ mod tests {
             PriceTicks(8_199),
         )
         .is_err());
-        assert!(PairSpec::compute_validated_sl_ticks(
-            Side::Bid,
-            PriceTicks(8_198),
-            PriceTicks(8_198),
-            PriceTicks(8_199),
-            ScaledBps(6_500),
-        )
-        .is_ok());
     }
 
     #[test]

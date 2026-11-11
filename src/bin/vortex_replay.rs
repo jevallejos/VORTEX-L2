@@ -106,17 +106,6 @@ impl FifoQueueSimulator {
     }
 
     #[inline]
-    #[must_use]
-    pub const fn queue_ahead_qty(&self) -> LotQty {
-        match self.state {
-            SimulatedOrderState::RestingInFifoQueue {
-                queue_ahead_qty, ..
-            } => queue_ahead_qty,
-            _ => LotQty(0),
-        }
-    }
-
-    #[inline]
     pub fn submit_post_only(
         &mut self,
         side: Side,

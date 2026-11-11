@@ -575,15 +575,6 @@ impl OnlineAdaptiveGovernor {
 
     #[inline]
     #[must_use]
-    pub const fn wave_anchor_ticks(&self, slot_idx: usize, side: Side) -> i64 {
-        if slot_idx >= MAX_ACTIVE_PAIRS {
-            return 0;
-        }
-        self.wave_anchor_px_1e4[slot_idx][Self::dir_idx(side)] / 10_000
-    }
-
-    #[inline]
-    #[must_use]
     pub const fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
         if slot_idx >= MAX_ACTIVE_PAIRS {
             return false;
@@ -803,25 +794,6 @@ impl OnlineAdaptiveGovernor {
                 self.global_dir_sl_streak[d] -= 1;
             }
         }
-    }
-
-    #[inline]
-    pub fn observe_closed_trade(
-        &mut self,
-        slot_idx: usize,
-        side: Side,
-        net_scaled_bps: ScaledBps,
-        is_maker_exit: bool,
-        ts_ns: TimestampNs,
-    ) {
-        self.observe_closed_trade_at_entry(
-            slot_idx,
-            side,
-            PriceTicks(0),
-            net_scaled_bps,
-            is_maker_exit,
-            ts_ns,
-        );
     }
 
     /// F-07 Fix: Resets pre-fill abort streak on fill or after a 60s calm window.
@@ -1053,24 +1025,6 @@ impl OnlineAdaptiveGovernor {
         cand_comp >= adaptive_threshold
     }
 
-    #[inline]
-    #[must_use]
-    pub fn authorizes_adaptive_entry(
-        &self,
-        slot_idx: usize,
-        side: Side,
-        candidate_snap: &SymbolLobSnapshot,
-        btc_leader_snap: &SymbolLobSnapshot,
-    ) -> bool {
-        self.authorizes_adaptive_entry_with_wallet(
-            slot_idx,
-            side,
-            20_000_000_000,
-            candidate_snap,
-            btc_leader_snap,
-        )
-    }
-
     /// Unified LOSS-LAB Verifier: Certifies 62/62 historical/V2/PAR1 losses + 2,160 manifold.
     #[must_use]
     pub fn audit_unified_62_losses_and_2160_manifold() -> (usize, usize) {
@@ -1195,12 +1149,8 @@ pub struct SlotExecutionEngine {
     pub slot_idx: usize,
     pub state: OrderLifecycleState,
     pub cooldown_until_ns: TimestampNs,
-    pub maker_exits_count: u64,
-    pub taker_sl_exits_count: u64,
     pub tranche1_harvests_count: u64,
     pub lvdbs_deep_surfs_count: u64,
-    pub gross_profit_accum_1e8: i64,
-    pub gross_loss_accum_1e8: i64,
     pub learned_mfe_bps: i64,
     pub last_eff_sl_ticks: PriceTicks,
     pub last_closed_mfe_bps: i64,
@@ -1224,12 +1174,8 @@ impl SlotExecutionEngine {
             slot_idx,
             state: OrderLifecycleState::Idle,
             cooldown_until_ns: TimestampNs(0),
-            maker_exits_count: 0,
-            taker_sl_exits_count: 0,
             tranche1_harvests_count: 0,
             lvdbs_deep_surfs_count: 0,
-            gross_profit_accum_1e8: 0,
-            gross_loss_accum_1e8: 0,
             learned_mfe_bps: 680,
             last_eff_sl_ticks: PriceTicks(0),
             last_closed_mfe_bps: 0,
@@ -2416,19 +2362,6 @@ impl SlotExecutionEngine {
             );
         let net_pnl_1e8 = exchange_closed_pnl_1e8.unwrap_or(calc_pnl_1e8);
 
-        if is_maker_exit {
-            self.maker_exits_count = self.maker_exits_count.saturating_add(1);
-        } else {
-            self.taker_sl_exits_count = self.taker_sl_exits_count.saturating_add(1);
-        }
-        if net_pnl_1e8 >= 0 {
-            self.gross_profit_accum_1e8 =
-                self.gross_profit_accum_1e8.saturating_add(net_pnl_1e8);
-        } else {
-            self.gross_loss_accum_1e8 =
-                self.gross_loss_accum_1e8.saturating_add(net_pnl_1e8.abs());
-        }
-
         ledger.record_closed_trade_with_sinking_split(
             net_pnl_1e8,
             fee_1e8,
@@ -2532,19 +2465,6 @@ impl SlotExecutionEngine {
         let net_bps = gross_bps - fee_bps;
         let net_pnl_1e8 = pnl1.saturating_add(pnl2);
         let fee_1e8 = fee1.saturating_add(fee2);
-
-        if is_maker_exit {
-            self.maker_exits_count = self.maker_exits_count.saturating_add(1);
-        } else {
-            self.taker_sl_exits_count = self.taker_sl_exits_count.saturating_add(1);
-        }
-        if net_pnl_1e8 >= 0 {
-            self.gross_profit_accum_1e8 =
-                self.gross_profit_accum_1e8.saturating_add(net_pnl_1e8);
-        } else {
-            self.gross_loss_accum_1e8 =
-                self.gross_loss_accum_1e8.saturating_add(net_pnl_1e8.abs());
-        }
 
         ledger.record_closed_trade_with_sinking_split(
             net_pnl_1e8,
@@ -2747,7 +2667,7 @@ mod tests {
                 TimestampNs(t0 + step * 120_000_000_000),
             );
         }
-        assert_eq!(gov.wave_anchor_ticks(3, Side::Bid), 8_200);
+        assert_eq!(gov.wave_anchor_px_1e4[3][0], 82_000_000);
         gov.observe_closed_trade_at_entry(
             3,
             Side::Ask,
@@ -2756,7 +2676,7 @@ mod tests {
             true,
             TimestampNs(t0 + 400_000_000_000),
         );
-        assert_eq!(gov.wave_anchor_ticks(3, Side::Bid), 8_200);
+        assert_eq!(gov.wave_anchor_px_1e4[3][0], 82_000_000);
         assert_eq!(
             gov.audit_historical_entry_veto(3, Side::Bid, 8_225, t0 + 600_000_000_000),
             Some("VETO_WAVE_STAIRCASE_25BPS")
@@ -2794,7 +2714,7 @@ mod tests {
             restored.apply_scar_snapshot_json(&scar_json),
             Some(TimestampNs(t0 + 800_000_000_000))
         );
-        assert_eq!(restored.wave_anchor_ticks(3, Side::Bid), 8_200);
+        assert_eq!(restored.wave_anchor_px_1e4[3][0], 82_000_000);
         assert_eq!(restored.slot_direction_diagnostics(4, Side::Ask).1, 1);
     }
 

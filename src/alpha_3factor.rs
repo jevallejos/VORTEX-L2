@@ -584,21 +584,6 @@ impl OrthogonalFactorState {
         (level_idx + 1, book_px, vac_idx)
     }
 
-    /// Selects optimal L1..L4 exit level bounded by an elastic volatility excursion cap.
-    #[inline]
-    #[must_use]
-    pub fn compute_l2_l3_vacuum_surf_target(
-        open_side: Side,
-        snap: &SymbolLobSnapshot,
-        quantum_floor_price: PriceTicks,
-    ) -> (usize, PriceTicks, f64) {
-        Self::compute_l2_l3_vacuum_surf_target_with_structural(
-            open_side,
-            snap,
-            quantum_floor_price,
-            quantum_floor_price,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -620,11 +605,13 @@ mod tests {
         }
         snap.factor_ofi = BoundedScore::new_clamped(0.60);
         snap.factor_tfi = BoundedScore::new_clamped(0.72);
-        let (lvl4, px4, vac4) = OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(
-            Side::Bid,
-            &snap,
-            PriceTicks(8_202),
-        );
+        let (lvl4, px4, vac4) =
+            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
+                Side::Bid,
+                &snap,
+                PriceTicks(8_202),
+                PriceTicks(8_202),
+            );
         assert_eq!(lvl4, 4);
         assert_eq!(px4, PriceTicks(8_211));
         assert!(vac4 >= 2.20);
@@ -632,11 +619,13 @@ mod tests {
         snap.asks[0].qty = LotQty(2_200);
         snap.factor_ofi = BoundedScore::new_clamped(0.10);
         snap.factor_tfi = BoundedScore::new_clamped(0.08);
-        let (lvl1, px1, vac1) = OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(
-            Side::Bid,
-            &snap,
-            PriceTicks(8_202),
-        );
+        let (lvl1, px1, vac1) =
+            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
+                Side::Bid,
+                &snap,
+                PriceTicks(8_202),
+                PriceTicks(8_202),
+            );
         assert_eq!(lvl1, 1);
         assert_eq!(px1, PriceTicks(8_203));
         assert!(vac1 < 1.05);
@@ -716,11 +705,13 @@ mod tests {
         snap.asks[3] = BookLevel { price: PriceTicks(9_200), qty: LotQty(100) };
         snap.factor_ofi = BoundedScore::new_clamped(0.70);
         snap.factor_tfi = BoundedScore::new_clamped(0.80);
-        let (lvl, capped_px, _) = OrthogonalFactorState::compute_l2_l3_vacuum_surf_target(
-            Side::Bid,
-            &snap,
-            PriceTicks(8_504),
-        );
+        let (lvl, capped_px, _) =
+            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
+                Side::Bid,
+                &snap,
+                PriceTicks(8_504),
+                PriceTicks(8_504),
+            );
         assert_eq!(lvl, 4);
         assert_eq!(capped_px, PriceTicks(8_555));
     }
