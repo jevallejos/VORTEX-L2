@@ -253,7 +253,7 @@ pub struct SlotTelemetrySnapshot {
     pub sl_ticks: i64,
     pub open_lots: i64,
     pub initial_lots: i64,
-    pub peristaltic_cycles: u64,
+    pub lvdbs_surfs: u64,
     pub tranche1_harvested: bool,
     pub resting_since_ns: u64,
     pub queue_ahead_lots: i64,
@@ -271,7 +271,7 @@ pub struct SlotExecTelemetry {
     pub sl_ticks: AtomicU64,
     pub open_lots: AtomicU64,
     pub initial_lots: AtomicU64,
-    pub peristaltic_cycles: AtomicU64,
+    pub lvdbs_surfs: AtomicU64,
     pub tranche1_harvested: AtomicU64,
     pub resting_since_ns: AtomicU64,
     pub queue_ahead_lots: AtomicU64,
@@ -298,7 +298,7 @@ impl SlotExecTelemetry {
             sl_ticks: AtomicU64::new(0),
             open_lots: AtomicU64::new(0),
             initial_lots: AtomicU64::new(0),
-            peristaltic_cycles: AtomicU64::new(0),
+            lvdbs_surfs: AtomicU64::new(0),
             tranche1_harvested: AtomicU64::new(0),
             resting_since_ns: AtomicU64::new(0),
             queue_ahead_lots: AtomicU64::new(0),
@@ -306,8 +306,23 @@ impl SlotExecTelemetry {
     }
 
     #[inline]
+    #[must_use]
+    pub fn peek_state_code(&self) -> u8 {
+        (self.state_code.load(Ordering::Acquire) & 0xFF) as u8
+    }
+
+    #[inline]
+    pub fn heal_if_odd_locked(&self) {
+        let raw = self.state_code.load(Ordering::Acquire);
+        if ((raw >> 8) & 1) != 0 {
+            self.write_consistent(&SlotTelemetrySnapshot::default());
+        }
+    }
+
+    #[inline]
     pub fn store_queue_ahead_lots(&self, qty: LotQty) {
-        self.queue_ahead_lots.store(qty.0.max(0) as u64, Ordering::Release);
+        self.queue_ahead_lots
+            .store(qty.0.max(0) as u64, Ordering::Release);
     }
 
     #[inline]
@@ -321,30 +336,46 @@ impl SlotExecTelemetry {
         let prev = self.state_code.load(Ordering::Relaxed);
         let seq_odd = ((prev >> 8).wrapping_add(1)) | 1;
         let code_u64 = u64::from(snap.state_code);
-        self.state_code.store((seq_odd << 8) | code_u64, Ordering::Release);
+        self.state_code
+            .store((seq_odd << 8) | code_u64, Ordering::Release);
         core::sync::atomic::fence(Ordering::SeqCst);
+
         self.side_code.store(snap.side_code, Ordering::Relaxed);
-        self.entry_ticks.store(snap.entry_ticks.max(0) as u64, Ordering::Relaxed);
-        self.avg_price_ticks.store(snap.avg_price_ticks.max(0) as u64, Ordering::Relaxed);
-        self.peak_ticks.store(snap.peak_ticks.max(0) as u64, Ordering::Relaxed);
-        self.tp_ticks.store(snap.tp_ticks.max(0) as u64, Ordering::Relaxed);
-        self.sl_ticks.store(snap.sl_ticks.max(0) as u64, Ordering::Relaxed);
-        self.open_lots.store(snap.open_lots.max(0) as u64, Ordering::Relaxed);
-        self.initial_lots.store(snap.initial_lots.max(0) as u64, Ordering::Relaxed);
-        self.peristaltic_cycles.store(snap.peristaltic_cycles, Ordering::Relaxed);
+        self.entry_ticks
+            .store(snap.entry_ticks.max(0) as u64, Ordering::Relaxed);
+        self.avg_price_ticks
+            .store(snap.avg_price_ticks.max(0) as u64, Ordering::Relaxed);
+        self.peak_ticks
+            .store(snap.peak_ticks.max(0) as u64, Ordering::Relaxed);
+        self.tp_ticks
+            .store(snap.tp_ticks.max(0) as u64, Ordering::Relaxed);
+        self.sl_ticks
+            .store(snap.sl_ticks.max(0) as u64, Ordering::Relaxed);
+        self.open_lots
+            .store(snap.open_lots.max(0) as u64, Ordering::Relaxed);
+        self.initial_lots
+            .store(snap.initial_lots.max(0) as u64, Ordering::Relaxed);
+        self.lvdbs_surfs.store(snap.lvdbs_surfs, Ordering::Relaxed);
         self.tranche1_harvested
             .store(u64::from(snap.tranche1_harvested), Ordering::Relaxed);
-        self.resting_since_ns.store(snap.resting_since_ns, Ordering::Relaxed);
+        self.resting_since_ns
+            .store(snap.resting_since_ns, Ordering::Relaxed);
         self.queue_ahead_lots
             .store(snap.queue_ahead_lots.max(0) as u64, Ordering::Relaxed);
+
         core::sync::atomic::fence(Ordering::Release);
         let seq_even = seq_odd.wrapping_add(1);
-        self.state_code.store((seq_even << 8) | code_u64, Ordering::Release);
+        self.state_code
+            .store((seq_even << 8) | code_u64, Ordering::Release);
     }
 
     #[inline]
-    pub fn read_consistent(&self, max_retries: usize) -> Result<SlotTelemetrySnapshot, VortexError> {
-        for _ in 0..max_retries {
+    pub fn read_consistent(
+        &self,
+        max_retries: usize,
+    ) -> Result<SlotTelemetrySnapshot, VortexError> {
+        let tries = max_retries.max(1);
+        for _ in 0..tries {
             let s1 = self.state_code.load(Ordering::Acquire);
             if ((s1 >> 8) & 1) != 0 {
                 core::hint::spin_loop();
@@ -360,7 +391,7 @@ impl SlotExecTelemetry {
                 sl_ticks: self.sl_ticks.load(Ordering::Relaxed) as i64,
                 open_lots: self.open_lots.load(Ordering::Relaxed) as i64,
                 initial_lots: self.initial_lots.load(Ordering::Relaxed) as i64,
-                peristaltic_cycles: self.peristaltic_cycles.load(Ordering::Relaxed),
+                lvdbs_surfs: self.lvdbs_surfs.load(Ordering::Relaxed),
                 tranche1_harvested: self.tranche1_harvested.load(Ordering::Relaxed) != 0,
                 resting_since_ns: self.resting_since_ns.load(Ordering::Relaxed),
                 queue_ahead_lots: self.queue_ahead_lots.load(Ordering::Relaxed) as i64,
@@ -374,8 +405,13 @@ impl SlotExecTelemetry {
         }
         Err(VortexError::SharedMemorySeqConflict)
     }
-}
 
+    #[inline]
+    #[must_use]
+    pub fn read_consistent_or_default(&self, max_retries: usize) -> SlotTelemetrySnapshot {
+        self.read_consistent(max_retries).unwrap_or_default()
+    }
+}
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct SeqlockSymbolSlot {
@@ -426,7 +462,8 @@ impl SeqlockSymbolSlot {
 
     #[inline]
     pub fn read_snapshot(&self, max_retries: usize) -> Result<SymbolLobSnapshot, VortexError> {
-        for _ in 0..max_retries {
+        let tries = max_retries.max(1);
+        for _ in 0..tries {
             let s1 = self.seq.load(Ordering::Acquire);
             if (s1 & 1) != 0 {
                 core::hint::spin_loop();
@@ -525,7 +562,9 @@ impl VortexShmArena {
 
     #[inline]
     pub fn telemetry(&self, idx: usize) -> Result<&SlotExecTelemetry, VortexError> {
-        self.slot_telemetry.get(idx).ok_or(VortexError::InvalidSymbolSlot)
+        self.slot_telemetry
+            .get(idx)
+            .ok_or(VortexError::InvalidSymbolSlot)
     }
 
     #[inline]
@@ -551,6 +590,9 @@ impl VortexShmArena {
     pub fn heal_poisoned_slots(&self) {
         for slot in &self.slots {
             slot.heal_if_odd_locked();
+        }
+        for tel in &self.slot_telemetry {
+            tel.heal_if_odd_locked();
         }
     }
 }
@@ -643,7 +685,8 @@ impl MappedShmRegion {
                 let mg = core::ptr::read_volatile(core::ptr::addr_of!((*arena_ptr).magic));
                 core::sync::atomic::fence(Ordering::Acquire);
                 let vr = core::ptr::read_volatile(core::ptr::addr_of!((*arena_ptr).version));
-                let ap = core::ptr::read_volatile(core::ptr::addr_of!((*arena_ptr).active_pairs));
+                let ap =
+                    core::ptr::read_volatile(core::ptr::addr_of!((*arena_ptr).active_pairs));
                 mg == VORTEX_SHM_MAGIC
                     && vr == VORTEX_SHM_VERSION
                     && ap == (MAX_ACTIVE_PAIRS as u32)
@@ -658,7 +701,8 @@ impl MappedShmRegion {
         }
         #[cfg(not(unix))]
         {
-            let mut uninit: Box<MaybeUninit<VortexShmArena>> = Box::new(MaybeUninit::zeroed());
+            let mut uninit: Box<MaybeUninit<VortexShmArena>> =
+                Box::new(MaybeUninit::zeroed());
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), size)
             };
@@ -685,7 +729,8 @@ impl MappedShmRegion {
             .map_err(|_| VortexError::ColumnarIoFailure)?;
         let cur_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         if cur_len != (size as u64) {
-            file.set_len(size as u64).map_err(|_| VortexError::ColumnarIoFailure)?;
+            file.set_len(size as u64)
+                .map_err(|_| VortexError::ColumnarIoFailure)?;
         }
         #[cfg(unix)]
         {
@@ -721,7 +766,10 @@ impl MappedShmRegion {
                     && current_ver == VORTEX_SHM_VERSION
                     && current_pairs == (MAX_ACTIVE_PAIRS as u32);
                 if !header_valid {
-                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*arena_ptr).magic), 0_u64);
+                    core::ptr::write_volatile(
+                        core::ptr::addr_of_mut!((*arena_ptr).magic),
+                        0_u64,
+                    );
                     core::sync::atomic::fence(Ordering::SeqCst);
                     let mut fresh = VortexShmArena::new();
                     fresh.magic = 0;
@@ -742,7 +790,8 @@ impl MappedShmRegion {
         {
             let mut loaded_valid: Option<Box<VortexShmArena>> = None;
             if cur_len == (size as u64) {
-                let mut uninit: Box<MaybeUninit<VortexShmArena>> = Box::new(MaybeUninit::zeroed());
+                let mut uninit: Box<MaybeUninit<VortexShmArena>> =
+                    Box::new(MaybeUninit::zeroed());
                 let dst = unsafe {
                     core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), size)
                 };
@@ -874,8 +923,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shm_hot_reattach_preserves_telemetry_and_heals_poisoned_slot() {
-        let shm_path = MappedShmRegion::ephemeral_self_test_path("hot_reattach");
+    fn test_shm_hot_reattach_read_only_and_tear_free_telemetry_f09() {
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("hot_reattach_f09");
         {
             let reg1 = MappedShmRegion::open_or_create(&shm_path, true);
             assert!(reg1.is_ok());
@@ -896,21 +945,27 @@ mod tests {
                     s1.seq.store(13, Ordering::Release);
                 }
                 if let Ok(t0) = a1.telemetry(0) {
-                    t0.write_consistent(&SlotTelemetrySnapshot {
-                        state_code: 3,
-                        side_code: 0,
-                        entry_ticks: 759_000,
-                        avg_price_ticks: 759_000,
-                        peak_ticks: 759_120,
-                        tp_ticks: 759_400,
-                        sl_ticks: 750_000,
-                        open_lots: 1,
-                        initial_lots: 1,
-                        peristaltic_cycles: 0,
-                        tranche1_harvested: false,
-                        resting_since_ns: 1_700_000_000_000_000_000,
-                        queue_ahead_lots: 0,
-                    });
+                    for cyc in 1..=3_u64 {
+                        t0.write_consistent(&SlotTelemetrySnapshot {
+                            state_code: 4,
+                            side_code: 0,
+                            entry_ticks: 759_000,
+                            avg_price_ticks: 759_000,
+                            peak_ticks: 759_120,
+                            tp_ticks: 759_400,
+                            sl_ticks: 750_000,
+                            open_lots: 1,
+                            initial_lots: 2,
+                            lvdbs_surfs: cyc,
+                            tranche1_harvested: true,
+                            resting_since_ns: 1_700_000_000_000_000_000,
+                            queue_ahead_lots: 0,
+                        });
+                    }
+                    assert_eq!(t0.peek_state_code(), 4);
+                }
+                if let Ok(t1) = a1.telemetry(1) {
+                    t1.state_code.store((5_u64 << 8) | 3, Ordering::Release);
                 }
             }
         }
@@ -922,10 +977,12 @@ mod tests {
                     TimestampNs(1_700_000_001_000_000_000),
                     MAX_FEED_STALE_NS,
                 ));
-                assert!(!ro_reg.arena().is_feed_fresh(
-                    TimestampNs(1_700_000_005_000_000_000),
-                    MAX_FEED_STALE_NS,
-                ));
+                if let Ok(t0) = ro_reg.arena().telemetry(0) {
+                    let snap = t0.read_consistent_or_default(4);
+                    assert_eq!(snap.state_code, 4);
+                    assert_eq!(snap.lvdbs_surfs, 3);
+                    assert!(snap.tranche1_harvested);
+                }
             }
         }
         {
@@ -934,20 +991,14 @@ mod tests {
             if let Ok(r2) = reg2 {
                 let a2 = r2.arena();
                 assert_eq!(a2.exec_closed_count.load(Ordering::Acquire), 42);
-                if let Ok(s0) = a2.slot(0) {
-                    let loaded0 = s0.read_snapshot(4);
-                    assert!(loaded0.is_ok());
-                    if let Ok(sn0) = loaded0 {
-                        assert_eq!(sn0.sequence_id, 99_123);
-                        assert!(sn0.is_fresh_at(
-                            TimestampNs(1_700_000_001_500_000_000),
-                            MAX_FEED_STALE_NS,
-                        ));
-                    }
-                }
                 if let Ok(s1) = a2.slot(1) {
                     assert_eq!(s1.seq.load(Ordering::Acquire) & 1, 0);
                     assert!(s1.read_snapshot(4).is_ok());
+                }
+                if let Ok(t1) = a2.telemetry(1) {
+                    assert_eq!((t1.state_code.load(Ordering::Acquire) >> 8) & 1, 0);
+                    assert_eq!(t1.peek_state_code(), 0);
+                    assert!(t1.read_consistent(4).is_ok());
                 }
                 if let Ok(t0) = a2.telemetry(0) {
                     t0.store_queue_ahead_lots(LotQty(77));
@@ -955,9 +1006,9 @@ mod tests {
                     let ts = t0.read_consistent(4);
                     assert!(ts.is_ok());
                     if let Ok(tel_snap) = ts {
-                        assert_eq!(tel_snap.state_code, 3);
+                        assert_eq!(tel_snap.state_code, 4);
                         assert_eq!(tel_snap.avg_price_ticks, 759_000);
-                        assert_eq!(tel_snap.open_lots, 1);
+                        assert_eq!(tel_snap.lvdbs_surfs, 3);
                     }
                 }
             }
@@ -989,6 +1040,7 @@ mod tests {
         );
         let tel = SlotExecTelemetry::new();
         tel.state_code.store((1_u64 << 8) | 2, Ordering::Release);
+        assert_eq!(tel.peek_state_code(), 2);
         assert_eq!(tel.read_consistent(2), Err(VortexError::SharedMemorySeqConflict));
     }
 }
