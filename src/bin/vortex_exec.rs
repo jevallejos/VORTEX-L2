@@ -44,6 +44,7 @@ const MAX_HTTP_BODY_BYTES: usize = 2_097_152;
 const GATEWAY_CMD_CAP: usize = 64;
 const GATEWAY_EVT_CAP: usize = 256;
 const TELEGRAM_QUEUE_CAP: usize = 64;
+const SEED_INDEXER_LAG_NS: i64 = 350_000_000;
 
 const AI_FORENSIC_VAULT_PATH: &str = "data/vault/vortex_ai_forensic_vault.jsonl";
 const RED_LOSS_BOX_PATH: &str = "data/vault/vortex_red_loss_box.jsonl";
@@ -51,6 +52,87 @@ const SCAR_MEMORY_VAULT_PATH: &str = "data/vault/vortex_governor_scar_memory.jso
 const OPEN_POS_STATE_PATH: &str = "data/vault/vortex_open_positions_state.json";
 const DRAIN_LOCK_PATH: &str = "data/vault/DRAIN_MODE.lock";
 const HALT_LOCK_PATH: &str = "data/vault/HALTED_ON_LOSS.lock";
+
+/// Online asymmetric Kalman-EWMA estimator of Bybit /v5/position/closed-pnl indexer lag.
+#[derive(Copy, Clone, Debug)]
+pub struct OnlineIndexerLagEstimator {
+    ewma_lag_ns: i64,
+}
+
+impl Default for OnlineIndexerLagEstimator {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OnlineIndexerLagEstimator {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ewma_lag_ns: SEED_INDEXER_LAG_NS,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn current_lag_ns(self) -> i64 {
+        self.ewma_lag_ns
+    }
+
+    #[inline]
+    pub fn observe_closed_pnl_payload(
+        &mut self,
+        payload: &serde_json::Value,
+        observed_at_ns: i64,
+    ) {
+        if observed_at_ns <= 0 {
+            return;
+        }
+        let Some(first) = payload
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+            .and_then(|a| a.first())
+        else {
+            return;
+        };
+        let upd_ms = first
+            .get("updatedTime")
+            .or_else(|| first.get("createdTime"))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            })
+            .unwrap_or(0);
+        if upd_ms <= 0 {
+            return;
+        }
+        let upd_ns = upd_ms.saturating_mul(1_000_000);
+        let raw_lag = observed_at_ns.saturating_sub(upd_ns).clamp(120_000_000, 2_000_000_000);
+        let next = if raw_lag > self.ewma_lag_ns {
+            (self.ewma_lag_ns * 65 + raw_lag * 35) / 100
+        } else {
+            (self.ewma_lag_ns * 88 + raw_lag * 12) / 100
+        };
+        self.ewma_lag_ns = next.clamp(120_000_000, 1_500_000_000);
+    }
+
+    #[inline]
+    pub fn observe_empty_retry(&mut self) {
+        self.ewma_lag_ns = ((self.ewma_lag_ns * 112) / 100).clamp(150_000_000, 1_500_000_000);
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn adaptive_poll_delay_ns(self, attempt: u8) -> i64 {
+        let mult = i64::from(attempt.clamp(1, MAX_CLOSE_RECONCILE_RETRIES));
+        self.ewma_lag_ns
+            .saturating_mul(mult)
+            .clamp(150_000_000, 2_400_000_000)
+    }
+}
 
 fn load_dotenv_map() -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -653,12 +735,68 @@ impl BybitV5LiveClient {
         Some(false)
     }
 
-    pub fn get_resting_exit_order_info(
+    pub fn cancel_single_order_id(&mut self, symbol: &str, order_id: &str) -> bool {
+        if order_id.is_empty() {
+            return false;
+        }
+        let body = serde_json::json!({
+            "category": "linear",
+            "symbol": symbol,
+            "orderId": order_id,
+        })
+        .to_string();
+        self.post_v5("/v5/order/cancel", &body)
+            .and_then(|v| v.get("retCode")?.as_i64())
+            .is_some_and(|rc| rc == 0 || rc == 110_001)
+    }
+
+    /// Surgically cancels only non-reduceOnly entry orders (preserves TP FIFO & MarkPrice SL).
+    pub fn cancel_non_reduce_only_orders(&mut self, spec: PairSpec) -> usize {
+        let sym = spec.symbol_id.name();
+        let q = format!("category=linear&symbol={sym}");
+        let Some(val) = self.get_v5("/v5/order/realtime", &q) else {
+            return 0;
+        };
+        if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
+            return 0;
+        }
+        let Some(list) = val
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+        else {
+            return 0;
+        };
+        let mut ids_to_cancel = Vec::new();
+        for item in list {
+            let ro = item
+                .get("reduceOnly")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !ro {
+                if let Some(oid) = item.get("orderId").and_then(|v| v.as_str()) {
+                    if !oid.is_empty() {
+                        ids_to_cancel.push(oid.to_string());
+                    }
+                }
+            }
+        }
+        let mut cancelled = 0_usize;
+        for oid in &ids_to_cancel {
+            if self.cancel_single_order_id(sym, oid) {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    /// Single-GET tri-state inspector: reads active reduceOnly TP & purges orphan entry legs.
+    pub fn inspect_exit_and_purge_residual_entries(
         &mut self,
         spec: PairSpec,
     ) -> Option<(PriceTicks, LotQty)> {
         let sym = spec.symbol_id.name();
-        let q = format!("category=linear&symbol={}", sym);
+        let q = format!("category=linear&symbol={sym}");
         let val = self.get_v5("/v5/order/realtime", &q)?;
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return None;
@@ -667,30 +805,41 @@ impl BybitV5LiveClient {
             .get("result")
             .and_then(|r| r.get("list"))
             .and_then(|l| l.as_array())?;
+        let mut exit_info = (PriceTicks(0), LotQty(0));
+        let mut orphan_entry_ids = Vec::new();
         for item in list {
             let ro = item
                 .get("reduceOnly")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if ro {
-                let px_s = item.get("price").and_then(|v| v.as_str()).unwrap_or("0");
-                let qt_s = item
-                    .get("leavesQty")
-                    .filter(|v| {
-                        v.as_str().is_some_and(|s| {
-                            s.bytes().any(|b| b.is_ascii_digit() && b != b'0')
+                if exit_info.0 .0 == 0 {
+                    let px_s = item.get("price").and_then(|v| v.as_str()).unwrap_or("0");
+                    let qt_s = item
+                        .get("leavesQty")
+                        .filter(|v| {
+                            v.as_str().is_some_and(|s| {
+                                s.bytes().any(|b| b.is_ascii_digit() && b != b'0')
+                            })
                         })
-                    })
-                    .or_else(|| item.get("qty"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0");
-                if let Ok(pt) = spec.parse_price_ticks(px_s) {
-                    let lq = spec.parse_lot_qty(qt_s);
-                    return Some((pt, lq));
+                        .or_else(|| item.get("qty"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0");
+                    if let Ok(pt) = spec.parse_price_ticks(px_s) {
+                        let lq = spec.parse_lot_qty(qt_s);
+                        exit_info = (pt, lq);
+                    }
+                }
+            } else if let Some(oid) = item.get("orderId").and_then(|v| v.as_str()) {
+                if !oid.is_empty() {
+                    orphan_entry_ids.push(oid.to_string());
                 }
             }
         }
-        Some((PriceTicks(0), LotQty(0)))
+        for oid in &orphan_entry_ids {
+            let _ = self.cancel_single_order_id(sym, oid);
+        }
+        Some(exit_info)
     }
 
     pub fn query_open_position_verified(
@@ -855,6 +1004,9 @@ pub enum GatewayCommand {
         side: Side,
         aborted_price: PriceTicks,
         sl_hint: PriceTicks,
+    },
+    CancelResidualEntries {
+        slot_idx: usize,
     },
     PollEntryFill {
         slot_idx: usize,
@@ -1151,11 +1303,16 @@ fn process_gateway_command(
                 aborted_price,
             });
         }
+        GatewayCommand::CancelResidualEntries { slot_idx } => {
+            let spec = APPROVED_SPECS[slot_idx];
+            let _ = client.cancel_non_reduce_only_orders(spec);
+        }
         GatewayCommand::PollEntryFill { slot_idx, sl_hint } => {
             let spec = APPROVED_SPECS[slot_idx];
             let sym = spec.symbol_id.name();
             match client.query_open_position_verified(sym) {
                 Some((true, sz_s, r_side, avg_s)) => {
+                    let _ = client.cancel_non_reduce_only_orders(spec);
                     let ver_avg =
                         parse_verified_avg_price_ticks(spec, r_side, &avg_s).ok();
                     let r_lots = spec.parse_lot_qty(&sz_s).max(LotQty(1));
@@ -1259,7 +1416,8 @@ fn process_gateway_command(
             }
             let verified_avg = parse_verified_avg_price_ticks(spec, r_side, &avg_s).ok();
             let real_lots = spec.parse_lot_qty(&sz_s).max(LotQty(1));
-            let Some((resting_tp, resting_qty)) = client.get_resting_exit_order_info(spec)
+            let Some((resting_tp, resting_qty)) =
+                client.inspect_exit_and_purge_residual_entries(spec)
             else {
                 let _ = evt_tx.try_send(GatewayEvent::SlotSyncSkipped { slot_idx });
                 return;
@@ -1667,7 +1825,8 @@ fn format_telegram_close_message(
     let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
     let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
     let qty_s = spec.format_lot_qty_str(summary.closed_lots);
-    let is_partial = matches!(sub_reason, ExitSubReason::Tranche1Harvest50);
+    let is_partial =
+        matches!(sub_reason, ExitSubReason::Tranche1Harvest50) && net_bps_f < 1.00;
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
@@ -1891,6 +2050,7 @@ fn render_live_hud(arena: &VortexShmArena) {
     )];
     print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_footer]);
 }
+
 /// Executive Dashboard using exact executed lot PnL & monotonic 70% Vault.
 fn render_trades_and_executive_dashboard() {
     let mut rows_out = Vec::new();
@@ -1936,13 +2096,9 @@ fn render_trades_and_executive_dashboard() {
             if mkr {
                 maker_closes += 1;
             }
-            let legs_c = v
-                .get("legs_consolidated")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(1);
             let is_partial = (sub_r.contains("Tranche1Harvest50")
                 || sub_r.contains("Partial"))
-                && (legs_c < 2 || n_bps < 1.00);
+                && n_bps < 1.00;
             if is_partial {
                 partials += 1;
             } else if n_bps >= 1.00 {
@@ -2229,7 +2385,15 @@ fn verify_ws_private_parser_self_check() -> bool {
         rx.try_recv(),
         Ok(GatewayEvent::WsEntryOrderTerminated { slot_idx: 10 })
     );
-    ok_w && ok_p && ok_o
+    let mut lag_est = OnlineIndexerLagEstimator::new();
+    let sample_p = serde_json::json!({
+        "result": { "list": [{ "updatedTime": "1700000000000" }] }
+    });
+    lag_est.observe_closed_pnl_payload(&sample_p, 1_700_000_000_600_000_000);
+    lag_est.observe_empty_retry();
+    let ok_lag = lag_est.current_lag_ns() >= 350_000_000
+        && lag_est.adaptive_poll_delay_ns(2) >= 700_000_000;
+    ok_w && ok_p && ok_o && ok_lag
 }
 
 pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
@@ -2320,6 +2484,7 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
         let en_px = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
         let lots =
             spec.compute_bayesian_kelly_lots(eq_1e8, en_px, edge_bps, ir_x100, in_debt);
+        engines[s_idx].sync_governor_for_side(&gov, side);
         if engines[s_idx].try_arm_maker_entry(&snap, verdict, lots).is_err() {
             continue;
         }
@@ -2506,6 +2671,8 @@ pub fn resolve_live_closed_position_step(
     snap: &SymbolLobSnapshot,
     closed_pnl_payload: Option<&serde_json::Value>,
     vac_level_hint: usize,
+    idx_lag: &mut OnlineIndexerLagEstimator,
+    observed_at_ns: i64,
 ) -> Option<LiveCloseStepAction> {
     if !matches!(eng.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
         return None;
@@ -2514,6 +2681,7 @@ pub fn resolve_live_closed_position_step(
     let allow_partial = attempt >= MAX_CLOSE_RECONCILE_RETRIES;
     let outcome = match closed_pnl_payload {
         Some(payload) => {
+            idx_lag.observe_closed_pnl_payload(payload, observed_at_ns);
             eng.reconcile_closed_pnl_payload(payload, vac_level_hint, allow_partial)
         }
         None => ClosedPnlQueryOutcome::TransportOrApiError,
@@ -2526,10 +2694,10 @@ pub fn resolve_live_closed_position_step(
         ClosedPnlQueryOutcome::PendingIndexerRetry
         | ClosedPnlQueryOutcome::TransportOrApiError => {
             if attempt < MAX_CLOSE_RECONCILE_RETRIES {
+                idx_lag.observe_empty_retry();
                 eng.close_reconcile_retries = attempt;
-                Some(LiveCloseStepAction::AwaitNextPoll {
-                    next_poll_delay_ns: 250_000_000,
-                })
+                let next_poll_delay_ns = idx_lag.adaptive_poll_delay_ns(attempt);
+                Some(LiveCloseStepAction::AwaitNextPoll { next_poll_delay_ns })
             } else {
                 eng.close_reconcile_retries = 0;
                 eng.resolve_fallback_unverified_close(snap, vac_level_hint)
@@ -2800,7 +2968,7 @@ fn finalize_and_emit_live_close(
     let is_part = matches!(
         engines[s_idx].last_exit_sub_reason,
         ExitSubReason::Tranche1Harvest50
-    ) && (summary.legs_consolidated < 2 || net_f < 1.00);
+    ) && net_f < 1.00;
     let (col, icon, lbl) = classify_trade_badge(net_f, is_part);
     println!(
         concat!(
@@ -2835,6 +3003,8 @@ fn finalize_and_emit_live_close(
 fn handle_gateway_event(
     evt: GatewayEvent,
     now_ns: TimestampNs,
+    gateway: Option<&BybitAsyncGateway>,
+    idx_lag: &mut OnlineIndexerLagEstimator,
     wallet_1e8: &mut i64,
     slot_rpc_inflight: &mut [bool; MAX_ACTIVE_PAIRS],
     sl_needs_sync: &mut [bool; MAX_ACTIVE_PAIRS],
@@ -2977,6 +3147,7 @@ fn handle_gateway_event(
                 return;
             }
             gov.clear_abort_streak(slot_idx, real_side);
+            engines[slot_idx].sync_governor_for_side(gov, real_side);
             let prev_sl = engines[slot_idx].last_eff_sl_ticks;
             if let Some((eff_s, eff_px, eff_q)) = promote_verified_fill_state(
                 &mut engines[slot_idx],
@@ -3053,6 +3224,7 @@ fn handle_gateway_event(
             slot_rpc_inflight[slot_idx] = false;
             let OrderLifecycleState::PositionOpenMakerExit {
                 side,
+                avg_price_ticks,
                 initial_lots,
                 tranche1_harvested,
                 resting_exit_price: prev_rest_tp,
@@ -3069,17 +3241,29 @@ fn handle_gateway_event(
             }
             let hold_ms = (now_ns.0.saturating_sub(opened_ts.0)).max(0) / 1_000_000;
             let eff_init = initial_lots.max(real_lots);
-            let target_t2_rem = (eff_init.0 + 1) / 2;
+            let ref_exit_px = if prev_rest_tp.0 > 0 {
+                prev_rest_tp
+            } else {
+                defensive_zero_loss_maker_exit_price(side, avg_price_ticks)
+            };
+            let split_t1_opt = SlotExecutionEngine::compute_tranche1_split_lots(
+                slot_idx,
+                eff_init,
+                ref_exit_px,
+                engines[slot_idx].learned_t1_permille,
+            );
             let mut t1_done = tranche1_harvested;
-            if !t1_done
-                && prev_rest_tp.0 > 0
-                && eff_init.0 >= 2
-                && real_lots.0 <= target_t2_rem
-                && hold_ms >= 50
-            {
-                t1_done = true;
-                engines[slot_idx].tranche1_harvests_count =
-                    engines[slot_idx].tranche1_harvests_count.saturating_add(1);
+            if let Some(exp_t1_lots) = split_t1_opt {
+                let target_t2_rem = (eff_init.0 - exp_t1_lots.0).max(1);
+                if !t1_done
+                    && prev_rest_tp.0 > 0
+                    && real_lots.0 <= target_t2_rem
+                    && hold_ms >= 50
+                {
+                    t1_done = true;
+                    engines[slot_idx].tranche1_harvests_count =
+                        engines[slot_idx].tranche1_harvests_count.saturating_add(1);
+                }
             }
             if active_resting_tp.0 > 0 && active_resting_tp != prev_rest_tp {
                 engines[slot_idx].exit_peg_attempts =
@@ -3121,6 +3305,8 @@ fn handle_gateway_event(
                 &cached_snaps[slot_idx],
                 closed_pnl_payload.as_ref(),
                 vac_level,
+                idx_lag,
+                now_ns.0,
             ) else {
                 engines[slot_idx].sync_to_shm_telemetry(arena);
                 return;
@@ -3157,13 +3343,23 @@ fn handle_gateway_event(
             real_lots,
         } => {
             if is_open {
-                if matches!(
-                    engines[slot_idx].state,
-                    OrderLifecycleState::PlacingEntryMaker { .. }
-                        | OrderLifecycleState::RestingEntryQueue { .. }
-                ) {
+                let armed_qty_opt = match engines[slot_idx].state {
+                    OrderLifecycleState::PlacingEntryMaker { qty, .. }
+                    | OrderLifecycleState::RestingEntryQueue { qty, .. } => Some(qty),
+                    OrderLifecycleState::Idle
+                    | OrderLifecycleState::PositionOpenMakerExit { .. } => None,
+                };
+                if let Some(armed_qty) = armed_qty_opt {
                     slot_rpc_inflight[slot_idx] = false;
+                    if real_lots.0 < armed_qty.0 {
+                        if let Some(gw) = gateway {
+                            let _ = gw.try_send(GatewayCommand::CancelResidualEntries {
+                                slot_idx,
+                            });
+                        }
+                    }
                     gov.clear_abort_streak(slot_idx, real_side);
+                    engines[slot_idx].sync_governor_for_side(gov, real_side);
                     if let Some((eff_s, eff_px, eff_q)) = promote_verified_fill_state(
                         &mut engines[slot_idx],
                         now_ns,
@@ -3232,6 +3428,7 @@ fn handle_gateway_event(
 fn bootstrap_live_adopt_if_enabled(
     live_capital: bool,
     arena: &VortexShmArena,
+    gov: &OnlineAdaptiveGovernor,
     wallet_1e8: &mut i64,
     sl_needs_sync: &mut [bool; MAX_ACTIVE_PAIRS],
     entry_forensics: &mut [SlotForensicEntrySnapshot; MAX_ACTIVE_PAIRS],
@@ -3252,6 +3449,7 @@ fn bootstrap_live_adopt_if_enabled(
         else {
             continue;
         };
+        let _ = boot_client.cancel_non_reduce_only_orders(*spec);
         let Ok(bybit_avg_t) = parse_verified_avg_price_ticks(*spec, side_p, &avg_s) else {
             continue;
         };
@@ -3293,6 +3491,7 @@ fn bootstrap_live_adopt_if_enabled(
             .and_then(|s| s.read_snapshot(4))
             .unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
 
+        engines[s_idx].sync_governor_for_side(gov, side_p);
         if let Ok(sl_t) = engines[s_idx].adopt_live_open_position(
             side_p,
             bybit_avg_t,
@@ -3354,6 +3553,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
     let mut engines = SlotExecutionEngine::new_12_slot_array();
     let mut gov = OnlineAdaptiveGovernor::new();
     let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+    let mut idx_lag = OnlineIndexerLagEstimator::new();
 
     let mut cached_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let mut entry_forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
@@ -3377,6 +3577,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
     bootstrap_live_adopt_if_enabled(
         live_capital,
         arena,
+        &gov,
         &mut wallet_1e8,
         &mut sl_needs_sync,
         &mut entry_forensics,
@@ -3387,9 +3588,11 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
     println!(
         concat!(
             "{}\u{1f7e2} [VORTEX-L3 200.0 Hz ARMED] 12 Slot Engines + Async TLS/WS ",
-            "+ Bayesian IR + Order Stream Shield active.{}"
+            "+ Bayesian Split/MAE + IdxLag({}ms) active.{}"
         ),
-        ANSI_GREEN, ANSI_RESET
+        ANSI_GREEN,
+        idx_lag.current_lag_ns() / 1_000_000,
+        ANSI_RESET
     );
 
     loop {
@@ -3419,6 +3622,8 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 handle_gateway_event(
                     evt,
                     now_ns,
+                    Some(gw),
+                    &mut idx_lag,
                     &mut wallet_1e8,
                     &mut slot_rpc_inflight,
                     &mut sl_needs_sync,
@@ -3475,6 +3680,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         continue;
                     }
+                    engines[s_idx].sync_governor_dynamics(&gov);
                     let wait_ns =
                         engines[s_idx].elastic_preflight_window_ns(snap.realized_vol_5m);
                     if now_ns.0.saturating_sub(submitted_ts.0) < wait_ns {
@@ -3725,6 +3931,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         };
                         if cur_q_ahead[s_idx].0 <= 0 || bbo_crossed {
                             gov.clear_abort_streak(s_idx, side);
+                            engines[s_idx].sync_governor_for_side(&gov, side);
                             if let Some((eff_s, eff_px, eff_q)) =
                                 promote_verified_fill_state(
                                     &mut engines[s_idx],
@@ -3763,6 +3970,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     ..
                 } => {
                     open_count += 1;
+                    engines[s_idx].sync_governor_dynamics(&gov);
                     let cur_bbo = match side {
                         Side::Bid => snap.asks[0].price,
                         Side::Ask => snap.bids[0].price,
@@ -3992,6 +4200,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         let lots = spec.compute_bayesian_kelly_lots(
                             wallet_1e8, entry_bbo, edge_bps, ir_x100, in_debt,
                         );
+                        engines[s_idx].sync_governor_for_side(&gov, side);
                         if engines[s_idx]
                             .try_arm_maker_entry(&snap, verdict, lots)
                             .is_ok()
@@ -4141,10 +4350,11 @@ mod tests {
     }
 
     #[test]
-    fn test_f02_f03_verified_fill_and_closed_pnl_retry_reconciliation() {
+    fn test_f02_f03_verified_fill_and_adaptive_indexer_lag_reconciliation() {
         let spec = APPROVED_SPECS[3];
         let mut eng = SlotExecutionEngine::new(3);
         let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let mut idx_lag = OnlineIndexerLagEstimator::new();
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = spec.symbol_id;
         snap.realized_vol_5m = ScaledBps(7_000);
@@ -4173,12 +4383,19 @@ mod tests {
         );
 
         let empty_json = serde_json::json!({ "retCode": 0, "result": { "list": [] } });
-        assert_eq!(
-            resolve_live_closed_position_step(&mut eng, &snap, Some(&empty_json), 2),
-            Some(LiveCloseStepAction::AwaitNextPoll {
-                next_poll_delay_ns: 250_000_000,
-            })
+        let retry_step = resolve_live_closed_position_step(
+            &mut eng,
+            &snap,
+            Some(&empty_json),
+            2,
+            &mut idx_lag,
+            1_700_000_012_100_000_000,
         );
+        assert!(matches!(
+            retry_step,
+            Some(LiveCloseStepAction::AwaitNextPoll { next_poll_delay_ns })
+                if next_poll_delay_ns > 350_000_000
+        ));
 
         let verified_json = serde_json::json!({
             "retCode": 0,
@@ -4196,12 +4413,18 @@ mod tests {
                 }]
             }
         });
-        let step2 =
-            resolve_live_closed_position_step(&mut eng, &snap, Some(&verified_json), 2);
+        let step2 = resolve_live_closed_position_step(
+            &mut eng,
+            &snap,
+            Some(&verified_json),
+            2,
+            &mut idx_lag,
+            1_700_000_012_650_000_000,
+        );
         if let Some(LiveCloseStepAction::FinalizeVerified(res)) = step2 {
             let closed = eng.apply_verified_close_resolution(
                 res,
-                TimestampNs(1_700_000_012_500_000_000),
+                TimestampNs(1_700_000_012_650_000_000),
                 &mut ledger,
             );
             assert!(closed.is_some());
@@ -4239,7 +4462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_f06_f08_keepalive_http_loopback_34040_sl_and_order_vanished() {
+    fn test_f06_f08_keepalive_http_34040_sl_and_residual_entry_purge() {
         let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
             return;
         };
@@ -4268,7 +4491,14 @@ mod tests {
                 let _ = writer.flush();
             }
             if drain_http_request(&mut rdr) {
-                let b2 = "{\"retCode\":0,\"result\":{\"list\":[]}}";
+                let b2 = concat!(
+                    "{\"retCode\":0,\"result\":{\"list\":[",
+                    "{\"orderId\":\"ord_entry_1\",\"reduceOnly\":false,",
+                    "\"price\":\"0.8385\",\"qty\":\"6\"},",
+                    "{\"orderId\":\"ord_tp_1\",\"reduceOnly\":true,",
+                    "\"price\":\"0.8390\",\"leavesQty\":\"10\"}",
+                    "]}}"
+                );
                 let r2 = format!(
                     concat!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n",
@@ -4281,22 +4511,35 @@ mod tests {
                 let _ = writer.flush();
             }
             if drain_http_request(&mut rdr) {
-                let b3 = concat!(
+                let b3 = "{\"retCode\":0,\"retMsg\":\"OK\"}";
+                let r3 = format!(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n",
+                        "Connection: keep-alive\r\n\r\n{}"
+                    ),
+                    b3.len(),
+                    b3
+                );
+                let _ = writer.write_all(r3.as_bytes());
+                let _ = writer.flush();
+            }
+            if drain_http_request(&mut rdr) {
+                let b4 = concat!(
                     "{\"retCode\":0,\"result\":{\"list\":[{",
                     "\"totalWalletBalance\":\"66.2808\",",
                     "\"totalEquity\":\"66.2808\",",
                     "\"totalAvailableBalance\":\"66.2808\",",
                     "\"totalPerpUPL\":\"0\"}]}}"
                 );
-                let r3 = format!(
+                let r4 = format!(
                     concat!(
                         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n",
                         "Connection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n"
                     ),
-                    b3.len(),
-                    b3
+                    b4.len(),
+                    b4
                 );
-                let _ = writer.write_all(r3.as_bytes());
+                let _ = writer.write_all(r4.as_bytes());
                 let _ = writer.flush();
             }
         });
@@ -4312,7 +4555,10 @@ mod tests {
             assert!(
                 client.set_position_trading_stop(APPROVED_SPECS[3], PriceTicks(8_090))
             );
-            assert_eq!(client.has_resting_entry_order(APPROVED_SPECS[3]), Some(false));
+            assert_eq!(
+                client.inspect_exit_and_purge_residual_entries(APPROVED_SPECS[5]),
+                Some((PriceTicks(8_390), LotQty(10)))
+            );
             let w_opt = client.fetch_wallet_and_equity_usdt();
             assert!(w_opt.is_some());
             if let Some((w, eq, av, _)) = w_opt {

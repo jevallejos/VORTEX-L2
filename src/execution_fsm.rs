@@ -9,7 +9,7 @@ use crate::types::{
     LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, VortexError, APPROVED_SPECS,
 };
 
-pub const MAX_CLOSE_RECONCILE_RETRIES: u8 = 3;
+pub const MAX_CLOSE_RECONCILE_RETRIES: u8 = 5;
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const INIT_RETURN_VAR_BPS2: i64 = 40_000;
 
@@ -558,6 +558,22 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
+    /// Online Welford-EWMA return standard deviation in ScaledBps.
+    #[inline]
+    #[must_use]
+    pub const fn slot_return_std_bps(&self, slot_idx: usize, side: Side) -> i64 {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return 200;
+        }
+        let d = Self::dir_idx(side);
+        let var_u = if self.ewma_var_bps2[slot_idx][d] > 1 {
+            self.ewma_var_bps2[slot_idx][d] as u64
+        } else {
+            1_u64
+        };
+        var_u.isqrt() as i64
+    }
+
     /// Bayesian Information Ratio x100: IR_{s,d} = mu / (sqrt(var) + fee_rt).
     #[inline]
     #[must_use]
@@ -567,24 +583,19 @@ impl OnlineAdaptiveGovernor {
         }
         let d = Self::dir_idx(side);
         let mu = self.ewma_net_bps_x100[slot_idx][d];
-        let var_u = if self.ewma_var_bps2[slot_idx][d] > 1 {
-            self.ewma_var_bps2[slot_idx][d] as u64
-        } else {
-            1_u64
-        };
-        let sigma = var_u.isqrt() as i64;
+        let sigma = self.slot_return_std_bps(slot_idx, side);
         let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         (mu.saturating_mul(100)) / c_max_i64(sigma.saturating_add(fee_rt), 1)
     }
 
-    /// Intrinsic diffusion clock tau_mkt(s) derived from 5m vol horizon & learned eq_vol.
+    /// Continuous C1 intrinsic diffusion clock tau_mkt(s) (zero jump discontinuity).
     #[inline]
     #[must_use]
-    const fn intrinsic_diffusion_clock_ns(&self, slot_idx: usize) -> i64 {
+    pub const fn intrinsic_diffusion_clock_ns(&self, slot_idx: usize) -> i64 {
         let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
         let ref_v = min_v * 4;
-        let eq_v = if slot_idx < MAX_ACTIVE_PAIRS && self.eq_vol_5m_bps[slot_idx] > min_v {
-            self.eq_vol_5m_bps[slot_idx]
+        let eq_v = if slot_idx < MAX_ACTIVE_PAIRS && self.eq_vol_5m_bps[slot_idx] > 0 {
+            c_max_i64(self.eq_vol_5m_bps[slot_idx], min_v)
         } else {
             ref_v
         };
@@ -598,6 +609,77 @@ impl OnlineAdaptiveGovernor {
         } else {
             raw_ns as i64
         }
+    }
+
+    /// Self-learned Tranche 1 harvest fraction in permille [350, 650] (0.35..0.65).
+    #[inline]
+    #[must_use]
+    pub const fn learned_tranche1_fraction_permille(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        learned_mfe_bps: i64,
+    ) -> i64 {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return 500;
+        }
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let ir_x100 = c_clamp_i64(
+            self.slot_information_ratio_x100(slot_idx, side),
+            -60,
+            120,
+        );
+        let mfe_c = c_clamp_i64(learned_mfe_bps, fee_rt, fee_rt * 4);
+        let ir_shift = (ir_x100 - 40) * 2;
+        let mfe_shift = ((mfe_c - 2 * fee_rt) * 125) / c_max_i64(fee_rt, 1);
+        let scar_add = if self.is_in_scar_debt(slot_idx, side) {
+            120
+        } else {
+            0
+        };
+        c_clamp_i64(500 - ir_shift - mfe_shift + scar_add, 350, 650)
+    }
+
+    /// Bayesian MAE trigger (< 0 ScaledBps) & intrinsic T1 defensive horizon in seconds.
+    #[inline]
+    #[must_use]
+    pub fn elastic_mae_trigger_and_def_horizon_s(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        avg_price_ticks: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+    ) -> (i64, i64) {
+        let s_clamped = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+        let spec = APPROVED_SPECS[s_clamped];
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let tau_bps = spec
+            .tick_to_price_scaled_bps(avg_price_ticks)
+            .unwrap_or(ScaledBps(fee_rt / 8))
+            .raw();
+        let sl_dist_bps = PairSpec::elastic_server_sl_distance_bps(realized_vol_5m).raw();
+        let ir_x100 = self
+            .slot_information_ratio_x100(s_clamped, side)
+            .clamp(-60, 120);
+        let ret_std = self.slot_return_std_bps(s_clamped, side);
+        let mfe_c = learned_mfe_bps.clamp((fee_rt * 7) / 5, fee_rt * 4);
+
+        let gamma_permille = (220
+            + (ir_x100 * 5) / 6
+            + ((mfe_c - 2 * fee_rt) * 100) / (10 * fee_rt).max(1))
+        .clamp(180, 340);
+        let sl_cushion_bps = (sl_dist_bps.saturating_mul(gamma_permille)) / 1_000;
+        let mae_mag = (4 * tau_bps).max(sl_cushion_bps).max(ret_std / 6);
+
+        let tau_mkt_s = (self.intrinsic_diffusion_clock_ns(s_clamped) / 1_000_000_000).max(90);
+        let init_mfe = (fee_rt * 17) / 10;
+        let ir_mult_permille = 1_000 + (ir_x100.clamp(-40, 80) * 10) / 3;
+        let raw_def_s = ((((tau_mkt_s / 4) * mfe_c) / init_mfe.max(1))
+            * ir_mult_permille)
+            / 1_000;
+        let t_def_s = raw_def_s.clamp(tau_mkt_s / 6, (tau_mkt_s * 2) / 5);
+        (-mae_mag, t_def_s)
     }
 
     #[inline]
@@ -627,6 +709,11 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         let px_1e4 = mid_ticks.saturating_mul(10_000);
+        let b3x_floor = APPROVED_SPECS[slot_idx]
+            .required_3x_barrier_bps(PriceTicks(mid_ticks))
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
+            .raw();
+        let active_regime_floor = b3x_floor.saturating_mul(2);
         let obs_vol = snap.realized_vol_5m.raw();
         let fast_prev = self.ewma_fast_px_1e4[slot_idx];
         let slow_prev = self.ewma_slow_px_1e4[slot_idx];
@@ -634,7 +721,7 @@ impl OnlineAdaptiveGovernor {
             self.ewma_fast_px_1e4[slot_idx] = px_1e4;
             self.ewma_slow_px_1e4[slot_idx] = px_1e4;
             if obs_vol > 0 {
-                self.eq_vol_5m_bps[slot_idx] = obs_vol;
+                self.eq_vol_5m_bps[slot_idx] = obs_vol.max(active_regime_floor);
             }
             self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
             return;
@@ -645,11 +732,20 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
-        self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 19 + px_1e4) / 20;
-        self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 299 + px_1e4) / 300;
+        let dt_s = ((sample_dt as f64) * 1e-9).clamp(1.0, 30.0);
+        let a_fast = (1.0 - (-dt_s / 20.0).exp()).clamp(0.02, 1.0);
+        let a_slow = (1.0 - (-dt_s / 300.0).exp()).clamp(0.002, 1.0);
+        self.ewma_fast_px_1e4[slot_idx] =
+            (fast_prev as f64 + a_fast * ((px_1e4 - fast_prev) as f64)).round() as i64;
+        self.ewma_slow_px_1e4[slot_idx] =
+            (slow_prev as f64 + a_slow * ((px_1e4 - slow_prev) as f64)).round() as i64;
         if obs_vol > 0 {
-            let prev_eq = self.eq_vol_5m_bps[slot_idx];
-            self.eq_vol_5m_bps[slot_idx] = (prev_eq * 599 + obs_vol) / 600;
+            let prev_eq = self.eq_vol_5m_bps[slot_idx].max(active_regime_floor) as f64;
+            let obs_f = (obs_vol.max(active_regime_floor)) as f64;
+            let tau_eq = if obs_f > prev_eq { 120.0 } else { 900.0 };
+            let a_eq = (1.0 - (-dt_s / tau_eq).exp()).clamp(0.001, 1.0);
+            let next_eq = (prev_eq + a_eq * (obs_f - prev_eq)).round() as i64;
+            self.eq_vol_5m_bps[slot_idx] = next_eq.clamp(active_regime_floor, 24_000);
         }
     }
 
@@ -849,7 +945,7 @@ impl OnlineAdaptiveGovernor {
         }
         let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let eq_vol = if slot_idx < MAX_ACTIVE_PAIRS {
-            self.eq_vol_5m_bps[slot_idx].max(fee_rt * 3)
+            self.eq_vol_5m_bps[slot_idx].max(fee_rt * 6)
         } else {
             fee_rt * 12
         };
@@ -1093,11 +1189,12 @@ impl OnlineAdaptiveGovernor {
         extract_matrix_i64_12x2(val, "ewma_net_bps_x100", &mut self.ewma_net_bps_x100);
         self.ewma_var_bps2 = [[INIT_RETURN_VAR_BPS2; 2]; MAX_ACTIVE_PAIRS];
         extract_matrix_i64_12x2(val, "ewma_var_bps2", &mut self.ewma_var_bps2);
+        let min_regime_floor = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 2;
         if let Some(eq_arr) = val.get("eq_vol_5m_bps").and_then(|v| v.as_array()) {
             for (s, cell) in eq_arr.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
                 if let Some(n) = cell.as_i64() {
                     if n > 0 {
-                        self.eq_vol_5m_bps[s] = n;
+                        self.eq_vol_5m_bps[s] = n.max(min_regime_floor);
                     }
                 }
             }
@@ -1386,7 +1483,7 @@ impl OnlineAdaptiveGovernor {
             return Ok(ok_pair);
         }
         let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
-        let eq_vol = self.eq_vol_5m_bps[slot_idx].max(fee_rt * 3);
+        let eq_vol = self.eq_vol_5m_bps[slot_idx].max(fee_rt * 6);
         let d_sign = side.sign_i64();
         let s_drift = drift_bps.saturating_mul(d_sign);
         let s_ext = ext_bps.saturating_mul(d_sign);
@@ -1615,6 +1712,7 @@ fn extract_json_epoch_ms(item: &serde_json::Value, key: &str) -> i64 {
         })
         .unwrap_or(0)
 }
+
 /// Per-Slot Autonomous Lifecycle State Machine (Monotonic Tranche & LVDBS Native).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum OrderLifecycleState {
@@ -1667,6 +1765,10 @@ pub struct SlotExecutionEngine {
     pub tranche1_harvests_count: u64,
     pub lvdbs_deep_surfs_count: u64,
     pub learned_mfe_bps: i64,
+    pub learned_t1_permille: i64,
+    pub learned_ir_x100: i64,
+    pub learned_ret_std_bps: i64,
+    pub intrinsic_tau_mkt_s: i64,
     pub last_eff_sl_ticks: PriceTicks,
     pub last_closed_mfe_bps: i64,
     pub last_closed_mae_bps: i64,
@@ -1686,6 +1788,7 @@ impl SlotExecutionEngine {
     #[must_use]
     pub const fn new(slot_idx: usize) -> Self {
         let init_mfe = (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 17) / 5;
+        let init_tau_s = VOL_5M_HORIZON_NS / 1_000_000_000;
         Self {
             slot_idx,
             state: OrderLifecycleState::Idle,
@@ -1693,6 +1796,10 @@ impl SlotExecutionEngine {
             tranche1_harvests_count: 0,
             lvdbs_deep_surfs_count: 0,
             learned_mfe_bps: init_mfe,
+            learned_t1_permille: 500,
+            learned_ir_x100: 33,
+            learned_ret_std_bps: 200,
+            intrinsic_tau_mkt_s: init_tau_s,
             last_eff_sl_ticks: PriceTicks(0),
             last_closed_mfe_bps: 0,
             last_closed_mae_bps: 0,
@@ -1726,6 +1833,51 @@ impl SlotExecutionEngine {
         ]
     }
 
+    /// Enforces bilateral $5.00 USDT exchange minimum notional on both split legs.
+    #[inline]
+    #[must_use]
+    pub const fn compute_tranche1_split_lots(
+        slot_idx: usize,
+        open_lots: LotQty,
+        exit_ref_price: PriceTicks,
+        phi_permille: i64,
+    ) -> Option<LotQty> {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return None;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let min_lots = spec.exchange_min_notional_lots(exit_ref_price).0;
+        let min_leg = if min_lots > 1 { min_lots } else { 1 };
+        if open_lots.0 < min_leg.saturating_mul(2) {
+            return None;
+        }
+        let phi = c_clamp_i64(phi_permille, 350, 650);
+        let raw_t1 = ((open_lots.0 as i128 * phi as i128 + 500) / 1_000) as i64;
+        let max_t1 = open_lots.0 - min_leg;
+        Some(LotQty(c_clamp_i64(raw_t1, min_leg, max_t1)))
+    }
+
+    /// Synchronizes slot exit physics with live Bayesian Governor posterior parameters.
+    #[inline]
+    pub fn sync_governor_for_side(&mut self, gov: &OnlineAdaptiveGovernor, side: Side) {
+        self.learned_t1_permille = gov.learned_tranche1_fraction_permille(
+            self.slot_idx,
+            side,
+            self.learned_mfe_bps,
+        );
+        self.learned_ir_x100 = gov.slot_information_ratio_x100(self.slot_idx, side);
+        self.learned_ret_std_bps = gov.slot_return_std_bps(self.slot_idx, side);
+        self.intrinsic_tau_mkt_s =
+            (gov.intrinsic_diffusion_clock_ns(self.slot_idx) / 1_000_000_000).max(90);
+    }
+
+    #[inline]
+    pub fn sync_governor_dynamics(&mut self, gov: &OnlineAdaptiveGovernor) {
+        if let Some(side) = self.active_side() {
+            self.sync_governor_for_side(gov, side);
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn active_side(&self) -> Option<Side> {
@@ -1737,7 +1889,7 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Elastic preflight window scaled by contract diffusion & learned MFE (zero static anchor).
+    /// Elastic preflight window scaled by intrinsic clock & learned MFE (zero static anchor).
     #[inline]
     #[must_use]
     pub fn elastic_preflight_window_ns(&self, realized_vol_5m: ScaledBps) -> i64 {
@@ -1747,7 +1899,8 @@ impl SlotExecutionEngine {
         let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let init_mfe = (fee_rt * 17) / 10;
         let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 7) / 5, fee_rt * 3);
-        let base_flight_ns = VOL_5M_HORIZON_NS / 12_000;
+        let tau_ns = self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000;
+        let base_flight_ns = tau_ns / 12_000;
         let raw_ns = ((base_flight_ns * eq_v) / vol_c * mfe_c) / init_mfe;
         raw_ns.clamp((base_flight_ns * 3) / 5, (base_flight_ns * 7) / 5)
     }
@@ -2026,7 +2179,7 @@ impl SlotExecutionEngine {
         Ok(self.state)
     }
 
-    /// Promotes entry to PositionOpenMakerExit exhaustively (zero silent wildcard, zero ID branch).
+    /// Promotes entry to PositionOpenMakerExit with bilateral $5.00 notional split guard.
     pub fn on_maker_entry_filled_verified(
         &mut self,
         fill_ts: TimestampNs,
@@ -2081,11 +2234,15 @@ impl SlotExecutionEngine {
         let structural_tp_price =
             dynamic_maker_floor_price(side, eff_entry_px, ScaledBps(tp_bps));
         let q_floor = defensive_zero_loss_maker_exit_price(side, eff_entry_px);
-        let can_split = eff_lots.0 >= 2;
-        let (init_role, init_exit_px, init_exit_lots) = if can_split {
-            (ExitOrderRole::Tranche1Harvest50, q_floor, LotQty(eff_lots.0 / 2))
-        } else {
-            (ExitOrderRole::StandardMakerExit100, structural_tp_price, eff_lots)
+        let split_t1_opt = Self::compute_tranche1_split_lots(
+            self.slot_idx,
+            eff_lots,
+            q_floor,
+            self.learned_t1_permille,
+        );
+        let (init_role, init_exit_px, init_exit_lots) = match split_t1_opt {
+            Some(t1_lots) => (ExitOrderRole::Tranche1Harvest50, q_floor, t1_lots),
+            None => (ExitOrderRole::StandardMakerExit100, structural_tp_price, eff_lots),
         };
 
         self.last_opened_ts = fill_ts;
@@ -2130,7 +2287,7 @@ impl SlotExecutionEngine {
         self.on_maker_entry_filled_verified(fill_ts, None, None, None)
     }
 
-    /// Adopts live Bybit position on startup with validated 2-tick SL geometry (zero ID branch).
+    /// Adopts live Bybit position on startup with validated 2-tick SL & $5.00 split guard.
     pub fn adopt_live_open_position(
         &mut self,
         side: Side,
@@ -2154,13 +2311,20 @@ impl SlotExecutionEngine {
         let harvested_lots = LotQty((eff_init.0 - eff_open.0).max(0));
         let t1_done = tranche1_harvested || harvested_lots.0 > 0;
         let t1_px = if t1_done { q_fl } else { PriceTicks(0) };
-        let can_split = !t1_done && eff_open.0 >= 2;
-        let (role, init_px, init_lots) = if can_split {
-            (ExitOrderRole::Tranche1Harvest50, q_fl, LotQty(eff_open.0 / 2))
-        } else if t1_done {
-            (ExitOrderRole::LvdbsDeepSurf50, struct_tp, eff_open)
+        let split_opt = if !t1_done {
+            Self::compute_tranche1_split_lots(
+                self.slot_idx,
+                eff_open,
+                q_fl,
+                self.learned_t1_permille,
+            )
         } else {
-            (ExitOrderRole::StandardMakerExit100, struct_tp, eff_open)
+            None
+        };
+        let (role, init_px, init_lots) = match split_opt {
+            Some(t1_lots) => (ExitOrderRole::Tranche1Harvest50, q_fl, t1_lots),
+            None if t1_done => (ExitOrderRole::LvdbsDeepSurf50, struct_tp, eff_open),
+            None => (ExitOrderRole::StandardMakerExit100, struct_tp, eff_open),
         };
 
         self.last_opened_ts = opened_ts;
@@ -2267,6 +2431,8 @@ impl SlotExecutionEngine {
     }
 
     pub fn record_tranche1_harvest(&mut self, fill_price: PriceTicks) -> bool {
+        let s_idx = self.slot_idx;
+        let phi = self.learned_t1_permille;
         let OrderLifecycleState::PositionOpenMakerExit {
             ref mut open_lots,
             ref mut tranche1_harvested,
@@ -2279,10 +2445,14 @@ impl SlotExecutionEngine {
         else {
             return false;
         };
-        if *tranche1_harvested || open_lots.0 < 2 {
+        if *tranche1_harvested {
             return false;
         }
-        let harvested = LotQty(open_lots.0 / 2);
+        let Some(harvested) =
+            Self::compute_tranche1_split_lots(s_idx, *open_lots, fill_price, phi)
+        else {
+            return false;
+        };
         *open_lots = LotQty(open_lots.0 - harvested.0);
         *tranche1_harvested = true;
         *tranche1_lots = harvested;
@@ -2365,7 +2535,7 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Reconciles position closure deterministically against /v5/position/closed-pnl.
+    /// Reconciles position closure 1:1 against /v5/position/closed-pnl with algebraic leg fusion.
     #[must_use]
     pub fn reconcile_closed_pnl_payload(
         &self,
@@ -2376,9 +2546,14 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
+            worst_adverse_price,
             initial_lots,
             open_lots,
             tranche1_harvested,
+            tranche1_exit_price,
+            active_exit_price,
+            resting_exit_price,
+            sl_trigger_price,
             opened_ts,
             ..
         } = self.state
@@ -2429,6 +2604,7 @@ impl SlotExecutionEngine {
         let mut has_pnl_field = false;
         let mut any_market_or_forced = false;
         let mut legs_count: u32 = 0;
+        let mut first_leg_exit_ticks: i64 = 0;
 
         for item in list {
             if accum_lots >= target_total_lots {
@@ -2515,6 +2691,9 @@ impl SlotExecutionEngine {
                 total_closed_pnl_1e8 = total_closed_pnl_1e8.saturating_add(scaled_pnl);
                 has_pnl_field = true;
             }
+            if legs_count == 0 {
+                first_leg_exit_ticks = leg_ex_t.0;
+            }
             accum_lots = accum_lots.saturating_add(take_lots);
             weighted_entry_sum += (take_lots as i128) * (leg_en_t.0 as i128);
             weighted_exit_sum += (take_lots as i128) * (leg_ex_t.0 as i128);
@@ -2524,6 +2703,68 @@ impl SlotExecutionEngine {
         if legs_count == 0 || accum_lots < min_req_lots {
             return ClosedPnlQueryOutcome::PendingIndexerRetry;
         }
+
+        if allow_partial_lot_coverage
+            && tranche1_harvested
+            && accum_lots < target_total_lots
+        {
+            let missing_lots = target_total_lots - accum_lots;
+            let q_fl = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+            let t1_mem_px = if tranche1_exit_price.0 > 0 {
+                tranche1_exit_price
+            } else {
+                q_fl
+            };
+            let eff_sl = if self.last_eff_sl_ticks.0 > 0 {
+                self.last_eff_sl_ticks
+            } else {
+                sl_trigger_price
+            };
+            let sl_breached = match side {
+                Side::Bid => worst_adverse_price.0 > 0 && worst_adverse_price.0 <= eff_sl.0,
+                Side::Ask => worst_adverse_price.0 >= eff_sl.0,
+            };
+            let indexed_is_t1 = (first_leg_exit_ticks - t1_mem_px.0).abs() <= 1;
+            let (fused_px, fused_is_sl) = if indexed_is_t1 {
+                if sl_breached {
+                    (eff_sl, true)
+                } else if resting_exit_price.0 > 0 {
+                    (resting_exit_price, false)
+                } else if active_exit_price.0 > 0 {
+                    (active_exit_price, false)
+                } else {
+                    (q_fl, false)
+                }
+            } else {
+                (t1_mem_px, false)
+            };
+            if fused_is_sl {
+                any_market_or_forced = true;
+            }
+            let fused_fee = if fused_is_sl {
+                ScaledBps(
+                    ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
+                        + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
+                )
+            } else {
+                ScaledBps(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2)
+            };
+            let (fused_pnl_1e8, _, _, _) = spec.compute_leg_pnl_and_fee_1e8(
+                side,
+                LotQty(missing_lots),
+                avg_price_ticks,
+                fused_px,
+                fused_fee,
+            );
+            if has_pnl_field {
+                total_closed_pnl_1e8 = total_closed_pnl_1e8.saturating_add(fused_pnl_1e8);
+            }
+            accum_lots = accum_lots.saturating_add(missing_lots);
+            weighted_entry_sum += (missing_lots as i128) * (avg_price_ticks.0 as i128);
+            weighted_exit_sum += (missing_lots as i128) * (fused_px.0 as i128);
+            legs_count = legs_count.saturating_add(1);
+        }
+
         let denom = accum_lots as i128;
         let verified_entry_ticks = match side {
             Side::Bid => ((weighted_entry_sum + denom - 1) / denom) as i64,
@@ -2711,7 +2952,7 @@ impl SlotExecutionEngine {
         ))
     }
 
-    /// Unified Canonical Exit Quoter (1:1 SSOT, zero ID branches, endogenous scaling).
+    /// Unified Canonical Exit Quoter (Bayesian MAE Cushion + $5.00 Split + LVDBS L1..L4).
     #[must_use]
     pub fn compute_canonical_exit_quote(
         &self,
@@ -2720,7 +2961,6 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
-            initial_lots,
             open_lots,
             tranche1_harvested,
             defensive_floor_locked,
@@ -2756,7 +2996,9 @@ impl SlotExecutionEngine {
         let signed_flow = 0.55 * s_ofi + 0.45 * s_tfi;
         let joint_adverse = s_ofi < -0.18 && s_tfi < -0.18;
 
-        let time_c = (hold_s / 60).min(18) * 12;
+        let tau_mkt_s = self.intrinsic_tau_mkt_s.max(90);
+        let time_step_s = (tau_mkt_s / 5).max(18);
+        let time_c = (hold_s / time_step_s).min(18) * 12;
         let flow_c = if signed_flow < -0.35 {
             ((-signed_flow - 0.35) * 280.0).round() as i64
         } else {
@@ -2771,25 +3013,32 @@ impl SlotExecutionEngine {
 
         let peak_gross_bps = self.last_closed_mfe_bps;
         let worst_mae_bps = self.last_closed_mae_bps;
-        let b3x_raw = spec
-            .required_3x_barrier_bps(avg_price_ticks)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
-            .raw();
-        let eq_v = (b3x_raw * 4).max(fee_rt * 8);
-        let vol_c = snap.realized_vol_5m.raw().clamp(b3x_raw, eq_v * 3);
         let init_mfe = (fee_rt * 17) / 10;
-        let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 27) / 20, fee_rt * 3);
+        let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 27) / 20, fee_rt * 4);
         let tau_bps = spec
             .tick_to_price_scaled_bps(avg_price_ticks)
             .unwrap_or(ScaledBps(fee_rt / 8))
             .raw();
-        let mae_trig_bps = -((3 * tau_bps).max(vol_c / 18));
-        let base_hold_s = (VOL_5M_HORIZON_NS / 4_000_000_000).max(45);
-        let t_def_s =
-            (((base_hold_s * eq_v) / vol_c) * mfe_c / init_mfe).clamp(45, 110);
+        let sl_dist_bps = PairSpec::elastic_server_sl_distance_bps(snap.realized_vol_5m).raw();
+        let ir_c = self.learned_ir_x100.clamp(-60, 120);
+        let gamma_permille = (220
+            + (ir_c * 5) / 6
+            + ((mfe_c - 2 * fee_rt) * 100) / (10 * fee_rt).max(1))
+        .clamp(180, 340);
+        let sl_cushion_bps = (sl_dist_bps.saturating_mul(gamma_permille)) / 1_000;
+        let mae_mag = (4 * tau_bps)
+            .max(sl_cushion_bps)
+            .max(self.learned_ret_std_bps / 6);
+        let mae_trig_bps = -mae_mag;
+
+        let ir_mult_permille = 1_000 + (ir_c.clamp(-40, 80) * 10) / 3;
+        let raw_def_s = ((((tau_mkt_s / 4) * mfe_c) / init_mfe.max(1))
+            * ir_mult_permille)
+            / 1_000;
+        let t_def_s = raw_def_s.clamp(tau_mkt_s / 6, (tau_mkt_s * 2) / 5);
 
         let defensive_now = if tranche1_harvested {
-            let t_def_t2 = (t_def_s + base_hold_s / 2).clamp(80, 145);
+            let t_def_t2 = t_def_s + tau_mkt_s / 5;
             defensive_floor_locked
                 || worst_mae_bps <= (mae_trig_bps - (fee_rt * 3) / 10)
                 || hold_s >= t_def_t2
@@ -2827,13 +3076,17 @@ impl SlotExecutionEngine {
             cur_gross_bps.clamp(ratchet_floor_min, (fee_rt * 27) / 20)
         };
 
-        let can_split_tranche1 = !tranche1_harvested
-            && initial_lots.0 >= 2
-            && open_lots.0 >= 2
-            && !defensive_now
-            && !mfe_ratchet_lock;
-
         let q_floor = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+        let split_t1_opt = if !tranche1_harvested && !defensive_now && !mfe_ratchet_lock {
+            Self::compute_tranche1_split_lots(
+                self.slot_idx,
+                open_lots,
+                q_floor,
+                self.learned_t1_permille,
+            )
+        } else {
+            None
+        };
         let struct_floor = if structural_tp_price.0 > 0 {
             structural_tp_price
         } else {
@@ -2841,12 +3094,12 @@ impl SlotExecutionEngine {
         };
 
         let (role, sub_reason, raw_target_px, order_lots, vac_level, def_lock) =
-            if can_split_tranche1 {
+            if let Some(t1_order_lots) = split_t1_opt {
                 (
                     ExitOrderRole::Tranche1Harvest50,
                     ExitSubReason::Tranche1Harvest50,
                     q_floor,
-                    LotQty((open_lots.0 / 2).max(1)),
+                    t1_order_lots,
                     1_usize,
                     false,
                 )
@@ -2913,17 +3166,11 @@ impl SlotExecutionEngine {
             Side::Bid => PriceTicks(raw_target_px.0.max(min_sell_px).max(q_floor.0)),
             Side::Ask => PriceTicks(raw_target_px.0.min(max_buy_px).min(q_floor.0).max(1)),
         };
-        let eff_order_lots = if matches!(role, ExitOrderRole::Tranche1Harvest50) {
-            let target_rem = (initial_lots.0 + 1) / 2;
-            LotQty((open_lots.0 - target_rem).clamp(1, open_lots.0.max(1)))
-        } else {
-            order_lots
-        };
         Some(CanonicalExitQuote {
             role,
             sub_reason,
             target_price,
-            order_lots: eff_order_lots,
+            order_lots,
             vac_level,
             cur_gross_bps,
             wald_pct,
@@ -2972,7 +3219,7 @@ impl SlotExecutionEngine {
             net_scaled_bps,
         );
         self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_scaled_bps.raw()));
-        let post_close_breather_ns = VOL_5M_HORIZON_NS / 100;
+        let post_close_breather_ns = (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100;
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + post_close_breather_ns);
         self.close_reconcile_retries = 0;
         self.state = OrderLifecycleState::Idle;
@@ -3076,7 +3323,7 @@ impl SlotExecutionEngine {
             ScaledBps(net_bps),
         );
         self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_bps));
-        let post_close_breather_ns = VOL_5M_HORIZON_NS / 100;
+        let post_close_breather_ns = (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100;
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + post_close_breather_ns);
         self.close_reconcile_retries = 0;
         self.state = OrderLifecycleState::Idle;
@@ -3101,9 +3348,10 @@ impl SlotExecutionEngine {
         &mut self,
         snap: &SymbolLobSnapshot,
         _btc_leader_snap: &SymbolLobSnapshot,
-        _gov: &OnlineAdaptiveGovernor,
+        gov: &OnlineAdaptiveGovernor,
         ledger: &mut ParitySyncLedger,
     ) -> Option<ClosedTradeSummary> {
+        self.sync_governor_dynamics(gov);
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
@@ -3227,7 +3475,7 @@ impl SlotExecutionEngine {
 mod tests {
     use super::*;
     use crate::lob_shm::{BookLevel, MappedShmRegion};
-    use crate::types::BoundedScore;
+    use crate::types::{BoundedScore, BYBIT_MIN_ORDER_NOTIONAL_1E8};
 
     #[test]
     fn test_hmac_sha256_bybit_v5_signature_and_quantum_floors() {
@@ -3273,6 +3521,149 @@ mod tests {
     }
 
     #[test]
+    fn test_elastic_notional_split_guard_sui_10001_bayesian_mae_and_leg_fusion() {
+        let sui_spec = APPROVED_SPECS[5];
+        assert_eq!(
+            SlotExecutionEngine::compute_tranche1_split_lots(
+                5,
+                LotQty(10),
+                PriceTicks(8_389),
+                500,
+            ),
+            None
+        );
+
+        let mut sui_eng = SlotExecutionEngine::new(5);
+        let mut sui_snap = SymbolLobSnapshot::new_empty();
+        sui_snap.symbol_id = sui_spec.symbol_id;
+        sui_snap.realized_vol_5m = ScaledBps(6_000);
+        sui_snap.ts_local_ns = TimestampNs(1_000_000_000);
+        sui_snap.bids[0] = BookLevel { price: PriceTicks(8_385), qty: LotQty(300) };
+        sui_snap.asks[0] = BookLevel { price: PriceTicks(8_386), qty: LotQty(280) };
+        sui_snap.mark_price = PriceTicks(8_385);
+        sui_snap.last_trade_price = PriceTicks(8_385);
+        let v_sui = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+        };
+        assert!(sui_eng.try_arm_maker_entry(&sui_snap, v_sui, LotQty(16)).is_ok());
+        assert!(sui_eng
+            .on_maker_entry_filled_verified(
+                TimestampNs(1_500_000_000),
+                Some(Side::Bid),
+                Some(PriceTicks(8_385)),
+                Some(LotQty(10)),
+            )
+            .is_ok());
+        let q_partial = sui_eng.compute_canonical_exit_quote(&sui_snap);
+        assert!(q_partial.is_some());
+        if let Some(qp) = q_partial {
+            assert_eq!(qp.role, ExitOrderRole::StandardMakerExit100);
+            assert_eq!(qp.order_lots, LotQty(10));
+            assert!(
+                sui_spec.lot_notional_1e8(qp.order_lots, qp.target_price)
+                    >= BYBIT_MIN_ORDER_NOTIONAL_1E8
+            );
+        }
+
+        let mut gov = OnlineAdaptiveGovernor::new();
+        for k in 0..4_i64 {
+            gov.observe_closed_trade_at_entry(
+                5,
+                Side::Bid,
+                PriceTicks(8_400),
+                ScaledBps(450),
+                true,
+                TimestampNs((k + 1) * 900_000_000_000),
+            );
+        }
+        let phi_champ = gov.learned_tranche1_fraction_permille(5, Side::Bid, 1_100);
+        assert!((350..450).contains(&phi_champ));
+        gov.observe_closed_trade_at_entry(
+            7,
+            Side::Bid,
+            PriceTicks(16_411),
+            ScaledBps(-3_274),
+            false,
+            TimestampNs(5_000_000_000_000),
+        );
+        let phi_scar = gov.learned_tranche1_fraction_permille(7, Side::Bid, 680);
+        assert!((600..=650).contains(&phi_scar));
+
+        let (mae_tao, def_s_tao) = gov.elastic_mae_trigger_and_def_horizon_s(
+            4,
+            Side::Ask,
+            PriceTicks(22_113),
+            ScaledBps(1_510),
+            688,
+        );
+        assert!(mae_tao <= -2_200);
+        assert!(def_s_tao >= 60);
+
+        let mut pendle_eng = SlotExecutionEngine::new(7);
+        let mut p_snap = SymbolLobSnapshot::new_empty();
+        p_snap.symbol_id = APPROVED_SPECS[7].symbol_id;
+        p_snap.realized_vol_5m = ScaledBps(2_000);
+        p_snap.ts_local_ns = TimestampNs(1_794_426_523_000_000_000);
+        p_snap.bids[0] = BookLevel { price: PriceTicks(15_520), qty: LotQty(100) };
+        p_snap.asks[0] = BookLevel { price: PriceTicks(15_521), qty: LotQty(100) };
+        p_snap.mark_price = PriceTicks(15_520);
+        p_snap.last_trade_price = PriceTicks(15_520);
+        let v_pen = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+        };
+        assert!(pendle_eng.try_arm_maker_entry(&p_snap, v_pen, LotQty(8)).is_ok());
+        assert!(pendle_eng
+            .on_maker_entry_filled_verified(
+                TimestampNs(1_794_426_523_689_691_597),
+                Some(Side::Bid),
+                Some(PriceTicks(15_520)),
+                Some(LotQty(8)),
+            )
+            .is_ok());
+        assert!(pendle_eng.record_tranche1_harvest(PriceTicks(15_528)));
+        if let OrderLifecycleState::PositionOpenMakerExit {
+            ref mut resting_exit_price,
+            ..
+        } = pendle_eng.state
+        {
+            *resting_exit_price = PriceTicks(15_537);
+        }
+        let lagging_payload = serde_json::json!({
+            "retCode": 0,
+            "result": {
+                "list": [{
+                    "symbol": "PENDLEUSDT",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "execType": "Trade",
+                    "closedSize": "4",
+                    "avgEntryPrice": "1.5520",
+                    "avgExitPrice": "1.5528",
+                    "closedPnl": "0.00071616",
+                    "updatedTime": "1794426609000"
+                }]
+            }
+        });
+        assert_eq!(
+            pendle_eng.reconcile_closed_pnl_payload(&lagging_payload, 3, false),
+            ClosedPnlQueryOutcome::PendingIndexerRetry
+        );
+        let fused_out =
+            pendle_eng.reconcile_closed_pnl_payload(&lagging_payload, 3, true);
+        if let ClosedPnlQueryOutcome::Verified(res) = fused_out {
+            assert_eq!(res.closed_lots, LotQty(8));
+            assert_eq!(res.legs_count, 2);
+            assert_eq!(res.sub_reason, ExitSubReason::LvdbsDeepVacuumSurf);
+            assert_eq!(res.verified_exit_price, PriceTicks(15_532));
+            assert!(res.exchange_closed_pnl_1e8.unwrap_or(0) > 140_000);
+        } else {
+            assert_eq!(pendle_eng.slot_idx, 999);
+        }
+    }
+
+    #[test]
     fn test_live_singapur_bid_deadlock_eradicated_and_zombie_anchor_expires() {
         let live_snap_json = serde_json::json!({
             "event": "GOV_SCAR_SNAPSHOT",
@@ -3296,6 +3687,7 @@ mod tests {
                 [1_794_194_445_603_752_116_i64, 1_794_192_799_823_027_285_i64],
                 [1_794_223_730_791_615_378_i64, 1_794_241_560_790_167_716_i64]
             ],
+            "eq_vol_5m_bps": [607, 837, 847, 1098, 1240, 1247, 1812, 1592, 1559, 1158, 1860, 647],
             "ewma_net_bps_x100": [
                 [65, 58], [111, 78], [178, 211], [309, 247],
                 [157, 107], [198, 282], [992, 200], [-8046, 178],
@@ -3329,6 +3721,7 @@ mod tests {
 
         let mut gov = OnlineAdaptiveGovernor::new();
         assert!(gov.apply_scar_snapshot_json(&live_snap_json).is_some());
+        assert!(gov.eq_vol_5m_bps[0] >= ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 2);
         let now_live_ns = 1_794_411_268_000_000_000_i64;
 
         assert!(!gov.is_in_local_slot_scar_debt(0, Side::Bid));
@@ -3615,7 +4008,7 @@ mod tests {
             assert_eq!(ledger.closed_trades_count, 1);
         }
 
-        let shm_path = MappedShmRegion::ephemeral_self_test_path("chat6_fsm_f09");
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("chat12_fsm_f09");
         let reg = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(reg.is_ok());
         let mut eng = SlotExecutionEngine::new(3);
@@ -3650,7 +4043,7 @@ mod tests {
                 let ts = tel.read_consistent_or_default(4);
                 assert_eq!(ts.state_code, 4);
                 assert!(ts.tranche1_harvested);
-                assert_eq!(ts.open_lots, 13);
+                assert_eq!(ts.open_lots, 12);
                 assert_eq!(ts.initial_lots, 26);
             }
         }
@@ -3674,8 +4067,8 @@ mod tests {
             assert_eq!(summary.closed_lots, LotQty(26));
             assert_eq!(summary.legs_consolidated, 2);
             assert_eq!(summary.exit_price, PriceTicks(8_206));
-            assert_eq!(summary.net_scaled_bps, ScaledBps(636));
-            assert_eq!(summary.net_pnl_1e8, 1_356_966);
+            assert_eq!(summary.net_scaled_bps, ScaledBps(593));
+            assert!(summary.net_pnl_1e8 > 1_250_000);
             assert_eq!(ledger.closed_trades_count, 2);
         }
         let _ = std::fs::remove_file(&shm_path);

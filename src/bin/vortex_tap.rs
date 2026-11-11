@@ -406,8 +406,6 @@ fn run_live_bybit_ws_daemon(
 ) -> ! {
     let mut factor_states = [OrthogonalFactorState::new(); MAX_ACTIVE_PAIRS];
     let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
-    let mut vol_anchor_px = [0_i64; MAX_ACTIVE_PAIRS];
-    let mut vol_anchor_ts_ns = [0_i64; MAX_ACTIVE_PAIRS];
     let mut has_live_mark_px = [false; MAX_ACTIVE_PAIRS];
     let mut has_book_snapshot = [false; MAX_ACTIVE_PAIRS];
     let mut batch = Box::<ColumnarParquetBatch>::default();
@@ -551,20 +549,13 @@ fn run_live_bybit_ws_daemon(
                     if snap.last_trade_price.0 <= 0 {
                         snap.last_trade_price = mid_l1;
                     }
-                    let dt_v = local_ns.0.saturating_sub(vol_anchor_ts_ns[slot_idx]);
-                    if vol_anchor_px[slot_idx] <= 0 {
-                        vol_anchor_px[slot_idx] = mid_l1.0;
-                        vol_anchor_ts_ns[slot_idx] = local_ns.0;
-                    } else if dt_v >= 5_000_000_000 {
-                        snap.realized_vol_5m = OrthogonalFactorState::update_realized_vol_5m(
-                            snap.realized_vol_5m,
-                            PriceTicks(vol_anchor_px[slot_idx]),
+                    snap.realized_vol_5m = factor_states[slot_idx]
+                        .observe_mid_and_step_elastic_vol(
+                            APPROVED_SPECS[slot_idx],
                             mid_l1,
-                            dt_v,
+                            local_ns.0,
+                            snap.realized_vol_5m,
                         );
-                        vol_anchor_px[slot_idx] = mid_l1.0;
-                        vol_anchor_ts_ns[slot_idx] = local_ns.0;
-                    }
                     snap.ts_exchange_ns = exch_ns;
                     snap.ts_local_ns = local_ns;
                     factor_states[slot_idx].on_l2_book_update(snap);

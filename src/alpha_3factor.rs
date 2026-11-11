@@ -1,4 +1,4 @@
-//! Orthogonal 3-Factor Alpha Model, Lead-Lag Propagator, and L2/L3 Vacuum Surf (LVDBS).
+//! Orthogonal 3-Factor Alpha, Elastic Parkinson Diffusion & L2/L3 Vacuum Surf (LVDBS).
 
 use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
 use crate::types::{
@@ -7,7 +7,10 @@ use crate::types::{
 
 pub const OFI_DEPTH: usize = 5;
 pub const GEOM_DEPTH: usize = 10;
+const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
+const BASE_VOL_WIN_NS: i64 = VOL_5M_HORIZON_NS / 60;
 const GAUSSIAN_MAD_TO_SIGMA: f64 = 1.253_314_14;
+const PARKINSON_HL_TO_SIGMA: f64 = 0.600_561_20;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SignalVerdict {
@@ -26,6 +29,10 @@ pub struct OrthogonalFactorState {
     prev_asks: [BookLevel; OFI_DEPTH],
     last_l2_ts_ns: i64,
     last_tfi_ts_ns: i64,
+    vol_window_start_ts_ns: i64,
+    vol_anchor_px: PriceTicks,
+    vol_low_px: PriceTicks,
+    vol_high_px: PriceTicks,
     ofi_pos_fast: f64,
     ofi_neg_fast: f64,
     ofi_pos_med: f64,
@@ -57,6 +64,10 @@ impl OrthogonalFactorState {
             prev_asks: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; OFI_DEPTH],
             last_l2_ts_ns: 0,
             last_tfi_ts_ns: 0,
+            vol_window_start_ts_ns: 0,
+            vol_anchor_px: PriceTicks(0),
+            vol_low_px: PriceTicks(0),
+            vol_high_px: PriceTicks(0),
             ofi_pos_fast: 1.0,
             ofi_neg_fast: 1.0,
             ofi_pos_med: 1.0,
@@ -76,7 +87,7 @@ impl OrthogonalFactorState {
         *self = Self::new();
     }
 
-    /// Resets L2 book delta state on snapshot reload while preserving live TFI tape memory.
+    /// Resets L2 book delta state on snapshot reload while preserving TFI & Vol memory.
     #[inline]
     pub fn reset_l2_book_only(&mut self) {
         self.initialized = false;
@@ -163,7 +174,50 @@ impl OrthogonalFactorState {
         BoundedScore::new_clamped(geom_raw)
     }
 
-    /// Unbiased Gaussian diffusion 5m volatility (zero artificial floor, decays to 0 on flat).
+    /// Continuous Parkinson High-Low + Net MAD 5m volatility with asymmetric Kalman-EWMA.
+    #[inline]
+    #[must_use]
+    pub fn update_realized_vol_5m_parkinson(
+        prev_vol: ScaledBps,
+        anchor_px: PriceTicks,
+        low_px: PriceTicks,
+        high_px: PriceTicks,
+        cur_px: PriceTicks,
+        dt_ns: i64,
+    ) -> ScaledBps {
+        let a_px = anchor_px.0.max(1);
+        let eff_cur = if cur_px.0 > 0 { cur_px.0 } else { a_px };
+        let eff_lo = if low_px.0 > 0 {
+            low_px.0.min(a_px).min(eff_cur)
+        } else {
+            a_px.min(eff_cur)
+        };
+        let eff_hi = high_px.0.max(a_px).max(eff_cur);
+        let net_dp = (eff_cur - a_px).abs();
+        let hl_span = (eff_hi - eff_lo).max(0);
+
+        let net_bps = ((net_dp.saturating_mul(1_000_000)) as f64) / (a_px as f64);
+        let hl_bps = ((hl_span.saturating_mul(1_000_000)) as f64) / (a_px as f64);
+        let horizon_s = (VOL_5M_HORIZON_NS as f64) * 1e-9;
+        let dt_s = ((dt_ns.max(500_000_000) as f64) * 1e-9).clamp(0.5, horizon_s);
+        let root_t = (horizon_s / dt_s).sqrt();
+
+        let inst_net = net_bps * GAUSSIAN_MAD_TO_SIGMA * root_t;
+        let inst_hl = hl_bps * PARKINSON_HL_TO_SIGMA * root_t;
+        let inst_v = inst_net.max(inst_hl).clamp(0.0, 24_000.0);
+
+        let prev_f = (prev_vol.raw().max(0) as f64).clamp(0.0, 24_000.0);
+        let tau_s = if inst_v > prev_f {
+            horizon_s / 12.0
+        } else {
+            horizon_s / 4.0
+        };
+        let alpha = (1.0 - (-dt_s / tau_s).exp()).clamp(0.01, 1.0);
+        let next_v = (prev_f + alpha * (inst_v - prev_f)).round() as i64;
+        ScaledBps(next_v.clamp(0, 24_000))
+    }
+
+    /// Unbiased continuous-time 5m diffusion volatility wrapper (delegates to Parkinson SSOT).
     #[inline]
     #[must_use]
     pub fn update_realized_vol_5m(
@@ -172,14 +226,68 @@ impl OrthogonalFactorState {
         cur_px: PriceTicks,
         dt_ns: i64,
     ) -> ScaledBps {
-        let a_px = anchor_px.0.max(1);
-        let dp = (cur_px.0 - a_px).abs();
-        let ret_bps = (dp.saturating_mul(1_000_000)) / a_px;
-        let dt_s = ((dt_ns.max(1_000_000_000) as f64) * 1e-9).clamp(1.0, 300.0);
-        let scale = (300.0 / dt_s).sqrt() * GAUSSIAN_MAD_TO_SIGMA;
-        let inst_v = (((ret_bps as f64) * scale).round() as i64).clamp(0, 24_000);
-        let next_v = ((prev_vol.raw().max(0) * 88 + inst_v * 12) / 100).clamp(0, 24_000);
-        ScaledBps(next_v)
+        let lo = PriceTicks(anchor_px.0.min(cur_px.0));
+        let hi = PriceTicks(anchor_px.0.max(cur_px.0));
+        Self::update_realized_vol_5m_parkinson(prev_vol, anchor_px, lo, hi, cur_px, dt_ns)
+    }
+
+    /// Tracks O(1) intrawindow [low, high] & steps realized_vol_5m over an elastic window.
+    #[inline]
+    pub fn observe_mid_and_step_elastic_vol(
+        &mut self,
+        spec: PairSpec,
+        obs_px: PriceTicks,
+        ts_ns: i64,
+        current_vol: ScaledBps,
+    ) -> ScaledBps {
+        if obs_px.0 <= 0 || ts_ns <= 0 {
+            return current_vol;
+        }
+        if self.vol_anchor_px.0 <= 0 || self.vol_window_start_ts_ns <= 0 {
+            self.vol_anchor_px = obs_px;
+            self.vol_low_px = obs_px;
+            self.vol_high_px = obs_px;
+            self.vol_window_start_ts_ns = ts_ns;
+            return current_vol;
+        }
+        if obs_px.0 < self.vol_low_px.0 {
+            self.vol_low_px = obs_px;
+        }
+        if obs_px.0 > self.vol_high_px.0 {
+            self.vol_high_px = obs_px;
+        }
+        let dt_ns = ts_ns.saturating_sub(self.vol_window_start_ts_ns);
+        let min_win_ns = (BASE_VOL_WIN_NS * 3) / 10;
+        if dt_ns < min_win_ns {
+            return current_vol;
+        }
+        let b3x = spec
+            .required_3x_barrier_bps(self.vol_anchor_px)
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
+            .raw()
+            .max(1);
+        let eq_ref = b3x.saturating_mul(4);
+        let denom_v = current_vol.raw().max(b3x);
+        let raw_win_ns =
+            ((BASE_VOL_WIN_NS as i128 * eq_ref as i128) / (denom_v as i128)) as i64;
+        let max_win_ns = BASE_VOL_WIN_NS * 2;
+        let elastic_win_ns = raw_win_ns.clamp(min_win_ns, max_win_ns);
+        if dt_ns < elastic_win_ns {
+            return current_vol;
+        }
+        let updated_vol = Self::update_realized_vol_5m_parkinson(
+            current_vol,
+            self.vol_anchor_px,
+            self.vol_low_px,
+            self.vol_high_px,
+            obs_px,
+            dt_ns,
+        );
+        self.vol_anchor_px = obs_px;
+        self.vol_low_px = obs_px;
+        self.vol_high_px = obs_px;
+        self.vol_window_start_ts_ns = ts_ns;
+        updated_vol
     }
 
     pub fn on_l2_book_update(&mut self, snap: &mut SymbolLobSnapshot) {
@@ -747,6 +855,54 @@ mod tests {
             .endogenous_min_vol_5m_bps(PriceTicks(15_700))
             .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
         assert!(v.raw() < endog_floor.raw());
+    }
+
+    #[test]
+    fn test_elastic_parkinson_intrawindow_vol_prevents_roundtrip_zero_collapse() {
+        let link_spec = APPROVED_SPECS[9];
+        let base_px = PriceTicks(10_458);
+        let endog_floor = link_spec
+            .endogenous_min_vol_5m_bps(base_px)
+            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
+
+        let mut st = OrthogonalFactorState::new();
+        let mut vol = ScaledBps(2_400);
+        let mut ts = 1_000_000_000_i64;
+        vol = st.observe_mid_and_step_elastic_vol(link_spec, base_px, ts, vol);
+
+        for _ in 0..20 {
+            ts += 2_000_000_000;
+            vol = st.observe_mid_and_step_elastic_vol(
+                link_spec,
+                PriceTicks(base_px.0 + 3),
+                ts,
+                vol,
+            );
+            ts += 2_000_000_000;
+            vol = st.observe_mid_and_step_elastic_vol(
+                link_spec,
+                PriceTicks(base_px.0 - 3),
+                ts,
+                vol,
+            );
+            ts += 4_000_000_000;
+            vol = st.observe_mid_and_step_elastic_vol(link_spec, base_px, ts, vol);
+        }
+        assert!(vol.raw() > endog_floor.raw() + 400);
+
+        let mut flat_st = OrthogonalFactorState::new();
+        let mut flat_vol = ScaledBps(5_000);
+        let mut flat_ts = 1_000_000_000_i64;
+        for _ in 0..30 {
+            flat_ts += 10_000_000_000;
+            flat_vol = flat_st.observe_mid_and_step_elastic_vol(
+                link_spec,
+                base_px,
+                flat_ts,
+                flat_vol,
+            );
+        }
+        assert!(flat_vol.raw() < endog_floor.raw());
     }
 
     #[test]

@@ -865,6 +865,7 @@ pub fn run_parquet_walk_forward_on_dir(
                                 let lots = spec.compute_bayesian_kelly_lots(
                                     eq_1e8, en_px, edge_b, ir_x100, in_debt,
                                 );
+                                engines[s_idx].sync_governor_for_side(&gov, side);
                                 if engines[s_idx]
                                     .try_arm_maker_entry(&cur_snap, verdict, lots)
                                     .is_ok()
@@ -1079,6 +1080,7 @@ pub fn run_parquet_walk_forward_on_dir(
                     sl_trigger_price,
                     ..
                 } => {
+                    engines[s_idx].sync_governor_dynamics(&gov);
                     let ref_px = if cur_snap.last_trade_price.0 > 0 {
                         cur_snap.last_trade_price
                     } else {
