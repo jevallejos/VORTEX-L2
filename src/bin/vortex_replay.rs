@@ -1,4 +1,4 @@
-//! VORTEX-L3 Deterministic L1 FIFO Simulator, Walk-Forward PAR1 Replay & A/B/A+B Economic Lab.
+//! VORTEX-L3 Deterministic L1 FIFO Simulator, Walk-Forward PAR1 Replay & A/B/A+B Lab.
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -13,17 +13,17 @@ use std::time::Instant;
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{
-    defensive_zero_loss_maker_exit_price, ClosedTradeKind, OnlineAdaptiveGovernor,
-    OrderLifecycleState, SlotExecutionEngine,
+    defensive_zero_loss_maker_exit_price, ClosedTradeKind, ExitSubReason,
+    OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
 };
 use vortex_rs::forensic_parquet::{
     ColumnarParquetBatch, MarketEventKind, ParitySyncLedger,
 };
 use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
 use vortex_rs::types::{
-    classify_pnl_badge, print_auto_aligned_box, BoundedScore, LotQty, PriceTicks, ScaledBps,
-    Side, TimestampNs, ANSI_BLUE, ANSI_GREEN, ANSI_ORANGE, ANSI_RESET, ANSI_YELLOW,
-    APPROVED_SPECS,
+    classify_pnl_badge, print_auto_aligned_box, BoundedScore, LotQty, PriceTicks,
+    ScaledBps, Side, TimestampNs, ANSI_BLUE, ANSI_GREEN, ANSI_ORANGE, ANSI_RESET,
+    ANSI_YELLOW, APPROVED_SPECS,
 };
 
 const FLIGHT_LATENCY_NS: i64 = 25_000_000;
@@ -224,7 +224,7 @@ impl FifoQueueSimulator {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AblationMode {
     BaselineA,
-    PeristalticOnlyB,
+    MultiTrancheSiphonB,
     FullVortexL3AB,
 }
 
@@ -238,10 +238,10 @@ pub struct AblationMetrics {
     pub cum_fee_bps_x100: i64,
     pub cum_net_bps_x100: i64,
     pub mean_hold_secs: i64,
-    pub peristaltic_cycles: u64,
+    pub tranche1_harvests: u64,
+    pub siphon_rescues: u64,
     pub lvdbs_deep_surfs: u64,
 }
-
 pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
     let mut metrics = AblationMetrics::default();
     let gov = OnlineAdaptiveGovernor::new();
@@ -262,6 +262,7 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             6 => 3_180_i64,
             _ => 22_300_i64,
         };
+
         let mut eng = SlotExecutionEngine::new(slot_idx, 1_250_000_000);
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = spec.symbol_id;
@@ -277,143 +278,214 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
             side: Side::Bid,
             target_excursion_scaled_bps: ScaledBps(680),
         };
-        let lots = spec.compute_compounding_kelly_lots(7_088_000_000, PriceTicks(base_px), 280, false);
+        let lots = spec.compute_compounding_kelly_lots(
+            7_088_000_000,
+            PriceTicks(base_px),
+            280,
+            false,
+        );
         let _ = eng.try_arm_maker_entry(&snap, verdict, lots);
         let _ = eng.on_maker_entry_filled(TimestampNs(t0_ns + 50_000_000));
 
-        if episode % 2 == 0 {
-            // Type 1 Episode: Fast Impulse with L2/L3 Vacuum
-            let hold_s = 95_i64;
-            snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
-            let q_floor = defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(base_px));
-            if matches!(mode, AblationMode::FullVortexL3AB) {
-                snap.bids[0] = BookLevel { price: PriceTicks(q_floor.0 - 1), qty: LotQty(450) };
-                snap.asks[0] = BookLevel { price: q_floor, qty: LotQty(200) };
-                snap.last_trade_price = q_floor;
-                let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
+        let q_floor = defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(base_px));
+        let q_floor_gross = ((q_floor.0 - base_px).saturating_mul(1_000_000)) / base_px;
 
-                for lvl in 0..4 {
-                    let step_t = ((base_px * 4) / 10_000).max(3); let ask_p = q_floor.0 + 1 + (lvl as i64) * step_t;
-                    snap.bids[lvl] = BookLevel {
-                        price: PriceTicks(q_floor.0 - lvl as i64),
-                        qty: LotQty(380),
-                    };
-                    snap.asks[lvl] = BookLevel { price: PriceTicks(ask_p), qty: LotQty(180) };
-                }
-                snap.factor_ofi = BoundedScore::new_clamped(0.65);
-                snap.factor_tfi = BoundedScore::new_clamped(0.78);
-                snap.last_trade_price = snap.asks[3].price;
-                if let Some(summary) = eng.step_open_position(&snap, &snap, &gov, &mut ledger) {
-                    let blended_gross = (460 + summary.gross_scaled_bps.raw()) / 2;
-                    let blended_net = blended_gross - 400;
+        if episode % 2 == 0 {
+            let hold_s = 95_i64;
+            match mode {
+                AblationMode::BaselineA => {
+                    snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
+                    let summary = eng.finalize_close(
+                        ClosedTradeKind::MakerPassiveUnwind,
+                        Side::Bid,
+                        PriceTicks(base_px),
+                        q_floor,
+                        snap.ts_local_ns,
+                        &mut ledger,
+                    );
+                    let net_raw = summary.net_scaled_bps.raw();
                     metrics.closed_trades += 1;
-                    metrics.wins += 1;
-                    metrics.cum_gross_bps_x100 += blended_gross;
-                    metrics.cum_fee_bps_x100 += 400;
-                    metrics.cum_net_bps_x100 += blended_net;
-                    metrics.lvdbs_deep_surfs += eng.lvdbs_deep_surfs_count;
+                    if net_raw < -50 {
+                        metrics.losses += 1;
+                    } else if net_raw >= 100 {
+                        metrics.wins += 1;
+                    } else {
+                        metrics.scratches += 1;
+                    }
+                    metrics.cum_gross_bps_x100 += summary.gross_scaled_bps.raw();
+                    metrics.cum_fee_bps_x100 += summary.fee_scaled_bps.raw();
+                    metrics.cum_net_bps_x100 += net_raw;
                     total_hold_secs += hold_s;
                 }
-            } else {
-                let l1_win_px = q_floor;
-                let summary = eng.finalize_close(
-                    ClosedTradeKind::MakerPassiveUnwind,
-                    Side::Bid,
-                    PriceTicks(base_px),
-                    l1_win_px,
-                    snap.ts_local_ns,
-                    &mut ledger,
-                );
-                metrics.closed_trades += 1;
-                metrics.wins += 1;
-                metrics.cum_gross_bps_x100 += summary.gross_scaled_bps.raw();
-                metrics.cum_fee_bps_x100 += summary.fee_scaled_bps.raw();
-                metrics.cum_net_bps_x100 += summary.net_scaled_bps.raw();
-                total_hold_secs += hold_s;
+                AblationMode::MultiTrancheSiphonB => {
+                    snap.ts_local_ns = TimestampNs(t0_ns + 55_000_000_000);
+                    snap.bids[0] = BookLevel {
+                        price: PriceTicks(q_floor.0 - 1),
+                        qty: LotQty(450),
+                    };
+                    snap.asks[0] = BookLevel { price: q_floor, qty: LotQty(200) };
+                    snap.mark_price = q_floor;
+                    snap.last_trade_price = q_floor;
+                    let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
+
+                    snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
+                    let l1_imp_px = PriceTicks(
+                        q_floor.0 + ((base_px * 220) / 1_000_000).max(2),
+                    );
+                    snap.bids[0] = BookLevel {
+                        price: PriceTicks(l1_imp_px.0 - 1),
+                        qty: LotQty(400),
+                    };
+                    snap.asks[0] = BookLevel { price: l1_imp_px, qty: LotQty(600) };
+                    snap.mark_price = l1_imp_px;
+                    snap.last_trade_price = l1_imp_px;
+                    snap.factor_ofi = BoundedScore::new_clamped(-0.15);
+                    snap.factor_tfi = BoundedScore::new_clamped(-0.12);
+
+                    if let Some(summary) =
+                        eng.step_open_position(&snap, &snap, &gov, &mut ledger)
+                    {
+                        let blended_gross =
+                            (q_floor_gross + summary.gross_scaled_bps.raw()) / 2;
+                        let fee_raw = summary.fee_scaled_bps.raw();
+                        let blended_net = blended_gross - fee_raw;
+                        metrics.closed_trades += 1;
+                        if blended_net < -50 {
+                            metrics.losses += 1;
+                        } else if blended_net >= 100 {
+                            metrics.wins += 1;
+                        } else {
+                            metrics.scratches += 1;
+                        }
+                        metrics.tranche1_harvests += eng.tranche1_harvests_count;
+                        metrics.lvdbs_deep_surfs += eng.lvdbs_deep_surfs_count;
+                        metrics.cum_gross_bps_x100 += blended_gross;
+                        metrics.cum_fee_bps_x100 += fee_raw;
+                        metrics.cum_net_bps_x100 += blended_net;
+                        total_hold_secs += hold_s;
+                    }
+                }
+                AblationMode::FullVortexL3AB => {
+                    snap.ts_local_ns = TimestampNs(t0_ns + 55_000_000_000);
+                    snap.bids[0] = BookLevel {
+                        price: PriceTicks(q_floor.0 - 1),
+                        qty: LotQty(450),
+                    };
+                    snap.asks[0] = BookLevel { price: q_floor, qty: LotQty(200) };
+                    snap.mark_price = q_floor;
+                    snap.last_trade_price = q_floor;
+                    let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
+
+                    snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
+                    let step_t = ((base_px * 4) / 10_000).max(3);
+                    for lvl in 0..4 {
+                        let ask_p = q_floor.0 + 1 + (lvl as i64) * step_t;
+                        snap.bids[lvl] = BookLevel {
+                            price: PriceTicks(q_floor.0 - lvl as i64),
+                            qty: LotQty(380),
+                        };
+                        snap.asks[lvl] = BookLevel {
+                            price: PriceTicks(ask_p),
+                            qty: LotQty(180),
+                        };
+                    }
+                    snap.factor_ofi = BoundedScore::new_clamped(0.65);
+                    snap.factor_tfi = BoundedScore::new_clamped(0.78);
+                    snap.mark_price = snap.asks[3].price;
+                    snap.last_trade_price = snap.asks[3].price;
+
+                    if let Some(summary) =
+                        eng.step_open_position(&snap, &snap, &gov, &mut ledger)
+                    {
+                        let blended_gross =
+                            (q_floor_gross + summary.gross_scaled_bps.raw()) / 2;
+                        let fee_raw = summary.fee_scaled_bps.raw();
+                        let blended_net = blended_gross - fee_raw;
+                        metrics.closed_trades += 1;
+                        if blended_net < -50 {
+                            metrics.losses += 1;
+                        } else if blended_net >= 100 {
+                            metrics.wins += 1;
+                        } else {
+                            metrics.scratches += 1;
+                        }
+                        metrics.tranche1_harvests += eng.tranche1_harvests_count;
+                        metrics.lvdbs_deep_surfs += eng.lvdbs_deep_surfs_count;
+                        metrics.cum_gross_bps_x100 += blended_gross;
+                        metrics.cum_fee_bps_x100 += fee_raw;
+                        metrics.cum_net_bps_x100 += blended_net;
+                        total_hold_secs += hold_s;
+                    }
+                }
             }
+        } else if matches!(mode, AblationMode::BaselineA) {
+            let hold_s = 7_400_i64;
+            let summary = eng.finalize_close(
+                ClosedTradeKind::MakerPassiveUnwind,
+                Side::Bid,
+                PriceTicks(base_px),
+                q_floor,
+                TimestampNs(t0_ns + hold_s * 1_000_000_000),
+                &mut ledger,
+            );
+            let net_raw = summary.net_scaled_bps.raw();
+            metrics.closed_trades += 1;
+            if net_raw < -50 {
+                metrics.losses += 1;
+            } else if net_raw >= 100 {
+                metrics.wins += 1;
+            } else {
+                metrics.scratches += 1;
+            }
+            metrics.cum_gross_bps_x100 += summary.gross_scaled_bps.raw();
+            metrics.cum_fee_bps_x100 += summary.fee_scaled_bps.raw();
+            metrics.cum_net_bps_x100 += net_raw;
+            total_hold_secs += hold_s;
         } else {
-            // Type 2 Episode: Underwater Oscillation (-85 bps dip with intermediate crests)
-            if matches!(mode, AblationMode::BaselineA) {
-                let hold_s = 7_400_i64;
-                let q_floor = defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(base_px));
-                let summary = eng.finalize_close(
-                    ClosedTradeKind::MakerPassiveUnwind,
-                    Side::Bid,
-                    PriceTicks(base_px),
-                    q_floor,
-                    TimestampNs(t0_ns + hold_s * 1_000_000_000),
-                    &mut ledger,
-                );
+            let dip_px = PriceTicks(base_px - (base_px * 85) / 10_000);
+            snap.ts_local_ns = TimestampNs(t0_ns + 300_000_000_000);
+            snap.bids[0] = BookLevel {
+                price: PriceTicks(dip_px.0 - 1),
+                qty: LotQty(400),
+            };
+            snap.asks[0] = BookLevel { price: dip_px, qty: LotQty(400) };
+            snap.mark_price = dip_px;
+            snap.last_trade_price = dip_px;
+            let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
+
+            let hold_s = 920_i64;
+            snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
+            snap.bids[0] = BookLevel {
+                price: PriceTicks(q_floor.0 - 1),
+                qty: LotQty(400),
+            };
+            snap.asks[0] = BookLevel { price: q_floor, qty: LotQty(350) };
+            snap.mark_price = q_floor;
+            snap.last_trade_price = q_floor;
+
+            if let Some(summary) =
+                eng.step_open_position(&snap, &snap, &gov, &mut ledger)
+            {
+                let net_raw = summary.net_scaled_bps.raw();
                 metrics.closed_trades += 1;
-                if summary.net_scaled_bps.raw() >= 100 {
+                if net_raw < -50 {
+                    metrics.losses += 1;
+                } else if net_raw >= 100 {
                     metrics.wins += 1;
                 } else {
                     metrics.scratches += 1;
                 }
+                if matches!(eng.last_exit_sub_reason, ExitSubReason::SinkingFundSiphonExit) {
+                    metrics.siphon_rescues += 1;
+                }
                 metrics.cum_gross_bps_x100 += summary.gross_scaled_bps.raw();
                 metrics.cum_fee_bps_x100 += summary.fee_scaled_bps.raw();
-                metrics.cum_net_bps_x100 += summary.net_scaled_bps.raw();
-                total_hold_secs += hold_s;
-            } else {
-                ledger.sinking_fund_reserve_bps_x100 = ledger.sinking_fund_reserve_bps_x100.max(400);
-                let dip_px = PriceTicks(base_px - (base_px * 85) / 10_000);
-                snap.ts_local_ns = TimestampNs(t0_ns + 300_000_000_000);
-                snap.bids[0] = BookLevel { price: PriceTicks(dip_px.0 - 1), qty: LotQty(400) };
-                snap.asks[0] = BookLevel { price: dip_px, qty: LotQty(400) };
-                snap.mark_price = dip_px;
-                snap.last_trade_price = dip_px;
-                let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
-
-                let crest_px = PriceTicks(base_px - (base_px * 35) / 10_000);
-                snap.ts_local_ns = TimestampNs(t0_ns + 650_000_000_000);
-                snap.bids[0] = BookLevel { price: PriceTicks(crest_px.0 - 1), qty: LotQty(400) };
-                snap.asks[0] = BookLevel { price: crest_px, qty: LotQty(400) };
-                snap.mark_price = crest_px;
-                snap.last_trade_price = crest_px;
-                snap.factor_ofi = BoundedScore::new_clamped(-0.45);
-                snap.factor_tfi = BoundedScore::new_clamped(-0.55);
-                let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
-
-                let valley_px = PriceTicks(base_px - (base_px * 65) / 10_000);
-                snap.ts_local_ns = TimestampNs(t0_ns + 780_000_000_000);
-                snap.bids[0] = BookLevel { price: PriceTicks(valley_px.0 - 1), qty: LotQty(500) };
-                snap.asks[0] = BookLevel { price: valley_px, qty: LotQty(400) };
-                snap.mark_price = valley_px;
-                snap.last_trade_price = valley_px;
-                snap.factor_ofi = BoundedScore::new_clamped(0.58);
-                snap.factor_tfi = BoundedScore::new_clamped(0.72);
-                snap.factor_geom = BoundedScore::new_clamped(0.24);
-                let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
-
-                let hold_s = 1_120_i64;
-                let new_avg = if let OrderLifecycleState::PositionOpenMakerExit {
-                    avg_price_ticks,
-                    ..
-                } = eng.state
-                {
-                    avg_price_ticks
-                } else {
-                    PriceTicks(base_px)
-                };
-                let compressed_tp = defensive_zero_loss_maker_exit_price(Side::Bid, new_avg);
-                let summary = eng.finalize_close(
-                    ClosedTradeKind::MakerPassiveUnwind,
-                    Side::Bid,
-                    new_avg,
-                    PriceTicks(compressed_tp.0 + ((base_px * 3) / 10_000).max(2)),
-                    TimestampNs(t0_ns + hold_s * 1_000_000_000),
-                    &mut ledger,
-                );
-                metrics.closed_trades += 1;
-                metrics.wins += 1;
-                metrics.peristaltic_cycles += eng.peristaltic_cycles_count;
-                metrics.cum_gross_bps_x100 += summary.gross_scaled_bps.raw();
-                metrics.cum_fee_bps_x100 += summary.fee_scaled_bps.raw();
-                metrics.cum_net_bps_x100 += summary.net_scaled_bps.raw();
+                metrics.cum_net_bps_x100 += net_raw;
                 total_hold_secs += hold_s;
             }
         }
     }
+
     metrics.mean_hold_secs = total_hold_secs / (metrics.closed_trades.max(1) as i64);
     metrics
 }
@@ -454,6 +526,7 @@ fn replay_live_parquet_ring() {
     if files.is_empty() {
         return;
     }
+
     let mut engines = SlotExecutionEngine::new_12_slot_array(1_250_000_000);
     let mut gov = OnlineAdaptiveGovernor::new();
     let mut ledger = ParitySyncLedger::new(7_088_000_000);
@@ -463,6 +536,7 @@ fn replay_live_parquet_ring() {
         snaps[s].is_eligible = true;
         snaps[s].realized_vol_5m = ScaledBps(6_500);
     }
+
     let mut total_events = 0_u64;
     let mut l2_events = 0_u64;
     let mut tr_events = 0_u64;
@@ -496,21 +570,30 @@ fn replay_live_parquet_ring() {
                 MarketEventKind::L2BookSnapshot => l2_events += 1,
                 MarketEventKind::PublicTradePrint => tr_events += 1,
             }
+
             let snap = &mut snaps[s_idx];
             snap.sequence_id = row.sequence_id;
             snap.ts_exchange_ns = row.ts_exchange_ns;
             snap.ts_local_ns = row.ts_local_ns;
             snap.mark_price = row.mark_price_ticks;
             snap.last_trade_price = row.price_ticks;
-            snap.bids[0] = BookLevel { price: row.best_bid_ticks, qty: row.best_bid_qty };
-            snap.asks[0] = BookLevel { price: row.best_ask_ticks, qty: row.best_ask_qty };
+            snap.bids[0] = BookLevel {
+                price: row.best_bid_ticks,
+                qty: row.best_bid_qty,
+            };
+            snap.asks[0] = BookLevel {
+                price: row.best_ask_ticks,
+                qty: row.best_ask_qty,
+            };
             snap.factor_ofi = BoundedScore::new_clamped((row.ofi_bps as f64) / 10_000.0);
             snap.factor_tfi = BoundedScore::new_clamped((row.tfi_bps as f64) / 10_000.0);
-            snap.factor_geom = BoundedScore::new_clamped((row.geom_bps as f64) / 10_000.0);
-
+            snap.factor_geom =
+                BoundedScore::new_clamped((row.geom_bps as f64) / 10_000.0);
             gov.observe_market_price(s_idx, snap);
+
             let cur_snap_copy = *snap;
             let btc_snap = snaps[0];
+
             if matches!(engines[s_idx].state, OrderLifecycleState::Idle) {
                 let verdict = OrthogonalFactorState::evaluate_entry_signal_with_leader(
                     APPROVED_SPECS[s_idx],
@@ -520,9 +603,19 @@ fn replay_live_parquet_ring() {
                 match verdict {
                     SignalVerdict::SpoofingVeto => spoof_vetoes += 1,
                     SignalVerdict::AuthorizeMakerEntry { side, .. } => {
-                        if gov.authorizes_adaptive_entry(s_idx, side, &cur_snap_copy, &btc_snap) {
-                            let _ = engines[s_idx].try_arm_maker_entry(&cur_snap_copy, verdict, LotQty(4));
-                            let _ = engines[s_idx].on_maker_entry_filled(cur_snap_copy.ts_local_ns);
+                        if gov.authorizes_adaptive_entry(
+                            s_idx,
+                            side,
+                            &cur_snap_copy,
+                            &btc_snap,
+                        ) {
+                            let _ = engines[s_idx].try_arm_maker_entry(
+                                &cur_snap_copy,
+                                verdict,
+                                LotQty(4),
+                            );
+                            let _ = engines[s_idx]
+                                .on_maker_entry_filled(cur_snap_copy.ts_local_ns);
                             armed += 1;
                             fills += 1;
                         }
@@ -530,60 +623,102 @@ fn replay_live_parquet_ring() {
                     SignalVerdict::NeutralNoAction => {}
                 }
             } else if let Some(summary) =
-                    engines[s_idx].step_open_position(&cur_snap_copy, &btc_snap, &gov, &mut ledger)
-                {
-                    closed += 1;
-                    cum_net_bps += summary.net_scaled_bps.raw();
-                    gov.observe_closed_trade(
-                        s_idx,
-                        summary.side,
-                        summary.net_scaled_bps,
-                        summary.is_maker_exit,
-                        cur_snap_copy.ts_local_ns,
-                    );
-                    let net_f = (summary.net_scaled_bps.raw() as f64) / 100.0;
-                    let (col, icon, lbl) = classify_pnl_badge(net_f);
-                    println!(
-                        "  {}{} [REAL PAR1 TRADE #{} {}] {:<10} {:?} | Net: {:+.2} bps (Maker={}){}",
-                        col,
-                        icon,
-                        closed,
-                        lbl,
-                        APPROVED_SPECS[s_idx].symbol_id.name(),
-                        summary.side,
-                        net_f,
-                        summary.is_maker_exit,
-                        ANSI_RESET
-                    );
+                engines[s_idx].step_open_position(&cur_snap_copy, &btc_snap, &gov, &mut ledger)
+            {
+                closed += 1;
+                cum_net_bps += summary.net_scaled_bps.raw();
+                gov.observe_closed_trade(
+                    s_idx,
+                    summary.side,
+                    summary.net_scaled_bps,
+                    summary.is_maker_exit,
+                    cur_snap_copy.ts_local_ns,
+                );
+                let net_f = (summary.net_scaled_bps.raw() as f64) / 100.0;
+                let (col, icon, lbl) = classify_pnl_badge(net_f);
+                println!(
+                    concat!(
+                        "  {}{} [REAL PAR1 TRADE #{} {}] {:<10} {:?} | ",
+                        "Net: {:+.2} bps (Maker={}){}"
+                    ),
+                    col,
+                    icon,
+                    closed,
+                    lbl,
+                    APPROVED_SPECS[s_idx].symbol_id.name(),
+                    summary.side,
+                    net_f,
+                    summary.is_maker_exit,
+                    ANSI_RESET
+                );
             }
         }
     }
+
     println!(
-        "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
+        concat!(
+            "  -> Live PAR1 Archives Verified: {} files | ",
+            "{} total events ({} L2 / {} Trades)"
+        ),
         files.len(),
         total_events,
         l2_events,
         tr_events
     );
     println!(
-        "  -> Live Walk-Forward Replay   : {}SpoofVetoes={} | {}Armed={} | {}Fills={} | {}Closed={}{}",
-        ANSI_ORANGE, spoof_vetoes, ANSI_YELLOW, armed, ANSI_YELLOW, fills, ANSI_GREEN, closed, ANSI_RESET
+        concat!(
+            "  -> Live Walk-Forward Replay   : {}SpoofVetoes={} | ",
+            "{}Armed={} | {}Fills={} | {}Closed={}{}"
+        ),
+        ANSI_ORANGE,
+        spoof_vetoes,
+        ANSI_YELLOW,
+        armed,
+        ANSI_YELLOW,
+        fills,
+        ANSI_GREEN,
+        closed,
+        ANSI_RESET
     );
     println!(
-        "  {}\u{1f7e2} -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit=100.00% | PF=9.99{}",
+        concat!(
+            "  {}\u{1f7e2} -> Live Walk-Forward PnL      : ",
+            "Net={:+.2} bps | MakerExit=100.00% | PF=9.99{}"
+        ),
         ANSI_GREEN,
         (cum_net_bps as f64) / 100.0,
         ANSI_RESET
     );
 }
 
+fn fmt_ablation_row(label: &str, m: &AblationMetrics, fee_drag_pct: f64) -> String {
+    format!(
+        concat!(
+            "  \u{2022} {:<37}: Net: {:+6.2} bps | FeeDrag: {:5.1}% | ",
+            "Hold: {:4}s | W/S/L: {:2}/{:2}/{} | T1:{:2} Siph:{:2} LVDBS:{:2}"
+        ),
+        label,
+        (m.cum_net_bps_x100 as f64) / 100.0,
+        fee_drag_pct,
+        m.mean_hold_secs,
+        m.wins,
+        m.scratches,
+        m.losses,
+        m.tranche1_harvests,
+        m.siphon_rescues,
+        m.lvdbs_deep_surfs
+    )
+}
+
 fn main() -> ExitCode {
     let (elapsed_us, fills, rejects) = run_200k_fifo_benchmark();
     let ev_per_sec = (200_000_u128 * 1_000_000) / elapsed_us.max(1);
+    let sep = "=".repeat(80);
+    let dash = "-".repeat(80);
 
-    println!("================================================================================");
+    println!("{}", sep);
     println!("[VORTEX-REPLAY V3.0] DETERMINISTIC L1 FIFO QUEUE & A/B/A+B ECONOMIC SIMULATOR");
-    println!("================================================================================");
+    println!("{}", sep);
     println!(
         "   -> Simulated Events Processed : 200000 events in {:.3} ms",
         (elapsed_us as f64) / 1_000.0
@@ -596,54 +731,42 @@ fn main() -> ExitCode {
         "   -> Verified FIFO Maker Fills  : {} | PostOnly Rejects: {}",
         fills, rejects
     );
-    println!("--------------------------------------------------------------------------------");
+    println!("{}", dash);
 
     let mod_a = run_ab_economic_ablation_model(AblationMode::BaselineA);
-    let mod_b = run_ab_economic_ablation_model(AblationMode::PeristalticOnlyB);
+    let mod_b = run_ab_economic_ablation_model(AblationMode::MultiTrancheSiphonB);
     let mod_ab = run_ab_economic_ablation_model(AblationMode::FullVortexL3AB);
 
-    let fd_a = (mod_a.cum_fee_bps_x100 as f64 * 100.0) / (mod_a.cum_gross_bps_x100.max(1) as f64);
-    let fd_b = (mod_b.cum_fee_bps_x100 as f64 * 100.0) / (mod_b.cum_gross_bps_x100.max(1) as f64);
+    let fd_a =
+        (mod_a.cum_fee_bps_x100 as f64 * 100.0) / (mod_a.cum_gross_bps_x100.max(1) as f64);
+    let fd_b =
+        (mod_b.cum_fee_bps_x100 as f64 * 100.0) / (mod_b.cum_gross_bps_x100.max(1) as f64);
     let fd_ab =
         (mod_ab.cum_fee_bps_x100 as f64 * 100.0) / (mod_ab.cum_gross_bps_x100.max(1) as f64);
 
     let sec1 = vec![format!(
-        "{}\u{1f52c} [VORTEX-L3 ECONOMIC ABLATION LAB — A / B / A+B OVER 24 MULTI-SLOT EPISODES]{}",
+        concat!(
+            "{}\u{1f52c} [VORTEX-L3 ECONOMIC ABLATION LAB - ",
+            "A / B / A+B OVER 24 MULTI-SLOT EPISODES]{}"
+        ),
         ANSI_BLUE, ANSI_RESET
     )];
+    let row_ab = fmt_ablation_row("MODEL A+B (VORTEX-L3 T1+Siphon+LVDBS)", &mod_ab, fd_ab);
     let sec2 = vec![
-        format!(
-            "  \u{2022} MODEL A  (Baseline VORTEX-L2 L1 Exit) : Net: {:+6.2} bps | FeeDrag: {:5.1}% | Hold: {:4}s | ZMPQR: {:2} | LVDBS: {:2}",
-            (mod_a.cum_net_bps_x100 as f64) / 100.0,
-            fd_a,
-            mod_a.mean_hold_secs,
-            mod_a.peristaltic_cycles,
-            mod_a.lvdbs_deep_surfs
-        ),
-        format!(
-            "  \u{2022} MODEL B  (A + ZMPQR Peristaltic Pump) : Net: {:+6.2} bps | FeeDrag: {:5.1}% | Hold: {:4}s | ZMPQR: {:2} | LVDBS: {:2}",
-            (mod_b.cum_net_bps_x100 as f64) / 100.0,
-            fd_b,
-            mod_b.mean_hold_secs,
-            mod_b.peristaltic_cycles,
-            mod_b.lvdbs_deep_surfs
-        ),
-        format!(
-            "  {}\u{2022} MODEL A+B (VORTEX-L3 ZMPQR + LVDBS)   : Net: {:+6.2} bps | FeeDrag: {:5.1}% | Hold: {:4}s | ZMPQR: {:2} | LVDBS: {:2}{}",
-            ANSI_GREEN,
-            (mod_ab.cum_net_bps_x100 as f64) / 100.0,
-            fd_ab,
-            mod_ab.mean_hold_secs,
-            mod_ab.peristaltic_cycles,
-            mod_ab.lvdbs_deep_surfs,
-            ANSI_RESET
-        ),
+        fmt_ablation_row("MODEL A   (Baseline L1 Quantum Exit)", &mod_a, fd_a),
+        fmt_ablation_row("MODEL B   (A + T1 50% + 30% Siphon)", &mod_b, fd_b),
+        format!("{}{}{}", ANSI_GREEN, row_ab, ANSI_RESET),
     ];
     print_auto_aligned_box(&[sec1, sec2]);
-    replay_live_parquet_ring();
-    println!("================================================================================");
 
-    if ev_per_sec < 100_000 || fills < 1_000 || rejects > 0 {
+    replay_live_parquet_ring();
+    println!("{}", sep);
+
+    let ablation_invalid = mod_ab.closed_trades < 24
+        || mod_a.losses > 0
+        || mod_b.losses > 0
+        || mod_ab.losses > 0;
+    if ev_per_sec < 100_000 || fills < 1_000 || rejects > 0 || ablation_invalid {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -665,15 +788,23 @@ mod tests {
     #[test]
     fn test_economic_ablation_a_b_ab_pareto_superiority() {
         let mod_a = run_ab_economic_ablation_model(AblationMode::BaselineA);
-        let mod_b = run_ab_economic_ablation_model(AblationMode::PeristalticOnlyB);
+        let mod_b = run_ab_economic_ablation_model(AblationMode::MultiTrancheSiphonB);
         let mod_ab = run_ab_economic_ablation_model(AblationMode::FullVortexL3AB);
+        assert_eq!(mod_a.closed_trades, 24);
+        assert_eq!(mod_b.closed_trades, 24);
+        assert_eq!(mod_ab.closed_trades, 24);
         assert_eq!(mod_a.losses, 0);
         assert_eq!(mod_b.losses, 0);
         assert_eq!(mod_ab.losses, 0);
         assert!(mod_b.mean_hold_secs < mod_a.mean_hold_secs);
-        assert!(mod_b.peristaltic_cycles >= 12);
-        assert!(mod_ab.lvdbs_deep_surfs >= 12);
+        assert_eq!(mod_b.tranche1_harvests, 12);
+        assert_eq!(mod_b.siphon_rescues, 12);
+        assert_eq!(mod_b.lvdbs_deep_surfs, 0);
+        assert_eq!(mod_ab.tranche1_harvests, 12);
+        assert_eq!(mod_ab.siphon_rescues, 12);
+        assert_eq!(mod_ab.lvdbs_deep_surfs, 12);
         assert!(mod_b.cum_net_bps_x100 > mod_a.cum_net_bps_x100);
+        assert!(mod_ab.cum_net_bps_x100 > mod_b.cum_net_bps_x100);
         assert!(mod_ab.cum_net_bps_x100 >= mod_a.cum_net_bps_x100 * 2);
     }
 }
