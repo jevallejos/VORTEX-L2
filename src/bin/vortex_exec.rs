@@ -21,8 +21,9 @@ use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{
     check_queue_depletion_velocity_abort, defensive_zero_loss_maker_exit_price,
     dynamic_maker_floor_price, parse_verified_avg_price_ticks, sign_bybit_v5_hmac_sha256,
-    ClosedTradeKind, ClosedTradeSummary, ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor,
-    OrderLifecycleState, SlotExecutionEngine,
+    ClosedPnlQueryOutcome, ClosedTradeKind, ClosedTradeSummary, ExitOrderRole,
+    ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
+    VerifiedCloseResolution, MAX_CLOSE_RECONCILE_RETRIES,
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{
@@ -332,6 +333,23 @@ impl BybitV5LiveClient {
     pub fn get_open_position_info(&self, symbol: &str) -> (bool, String, Side, String) {
         self.query_open_position_verified(symbol)
             .unwrap_or((false, "0".to_string(), Side::Bid, "0".to_string()))
+    }
+
+    /// F-03 Fix: Queries Bybit V5 closed-pnl endpoint for authoritative exit reconciliation.
+    pub fn query_closed_pnl_raw(
+        &self,
+        symbol: &str,
+        start_time_ms: i64,
+    ) -> Option<serde_json::Value> {
+        let q = if start_time_ms > 0 {
+            format!(
+                "category=linear&symbol={}&startTime={}&limit=20",
+                symbol, start_time_ms
+            )
+        } else {
+            format!("category=linear&symbol={}&limit=20", symbol)
+        };
+        self.get_v5("/v5/position/closed-pnl", &q)
     }
 
     pub fn cancel_all_symbol_orders(&self, symbol: &str) {
@@ -1257,6 +1275,60 @@ pub fn promote_verified_fill_state(
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LiveCloseStepAction {
+    AwaitNextPoll { next_poll_delay_ns: i64 },
+    FinalizeVerified(VerifiedCloseResolution),
+}
+
+/// F-03 Fix: Reconciles live position closure via Bybit closed-pnl with bounded retries.
+#[must_use]
+pub fn resolve_live_closed_position_step(
+    eng: &mut SlotExecutionEngine,
+    snap: &SymbolLobSnapshot,
+    closed_pnl_payload: Option<&serde_json::Value>,
+    vac_level_hint: usize,
+    siphon_subsidy_bps: i64,
+) -> Option<LiveCloseStepAction> {
+    if !matches!(eng.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
+        return None;
+    }
+    let attempt = eng.close_reconcile_retries.saturating_add(1);
+    let allow_partial = attempt >= MAX_CLOSE_RECONCILE_RETRIES;
+    let outcome = match closed_pnl_payload {
+        Some(payload) => eng.reconcile_closed_pnl_payload(
+            payload,
+            vac_level_hint,
+            siphon_subsidy_bps,
+            allow_partial,
+        ),
+        None => ClosedPnlQueryOutcome::TransportOrApiError,
+    };
+    match outcome {
+        ClosedPnlQueryOutcome::Verified(res) => {
+            eng.close_reconcile_retries = 0;
+            Some(LiveCloseStepAction::FinalizeVerified(res))
+        }
+        ClosedPnlQueryOutcome::PendingIndexerRetry
+        | ClosedPnlQueryOutcome::TransportOrApiError => {
+            if attempt < MAX_CLOSE_RECONCILE_RETRIES {
+                eng.close_reconcile_retries = attempt;
+                Some(LiveCloseStepAction::AwaitNextPoll {
+                    next_poll_delay_ns: 250_000_000,
+                })
+            } else {
+                eng.close_reconcile_retries = 0;
+                eng.resolve_fallback_unverified_close(
+                    snap,
+                    vac_level_hint,
+                    siphon_subsidy_bps,
+                )
+                .map(LiveCloseStepAction::FinalizeVerified)
+            }
+        }
+    }
+}
+
 fn record_and_notify_entry_fill(
     s_idx: usize,
     spec: PairSpec,
@@ -1530,6 +1602,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     entry_forensics[s_idx].armed_ts_ns = opened_ns.0;
                     entry_forensics[s_idx].init_q_lots = init_l.0;
                     engines[s_idx].last_opened_ts = opened_ns;
+                    engines[s_idx].close_reconcile_retries = 0;
                     engines[s_idx].state = OrderLifecycleState::PositionOpenMakerExit {
                         side: side_p,
                         entry_price: bybit_avg_t,
@@ -2057,7 +2130,10 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 engines[s_idx].sync_to_shm_telemetry(arena);
                                 continue;
                             };
-                            if !still_open && cur_gross_bps < 0 {
+                            if !still_open
+                                && cur_gross_bps < 0
+                                && engines[s_idx].close_reconcile_retries == 0
+                            {
                                 match client.query_open_position_verified(sym_name) {
                                     Some((confirmed_open, sz2, side2, avg2)) => {
                                         still_open = confirmed_open;
@@ -2073,97 +2149,49 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             }
 
                             if !still_open {
-                                client.cancel_all_symbol_orders(sym_name);
-                                let q_fl = defensive_zero_loss_maker_exit_price(
-                                    side,
-                                    avg_price_ticks,
-                                );
-                                let t1_fl = dynamic_maker_floor_price(
-                                    side,
-                                    avg_price_ticks,
-                                    ScaledBps(465),
-                                );
-                                let mkt_ref = if snap.mark_price.0 > 0 {
-                                    snap.mark_price
+                                if engines[s_idx].close_reconcile_retries == 0 {
+                                    client.cancel_all_symbol_orders(sym_name);
+                                }
+                                let opened_ms = (opened_ts.0 / 1_000_000).max(0);
+                                let start_ms = if tranche1_harvested {
+                                    opened_ms.saturating_sub(86_400_000)
                                 } else {
-                                    ref_px
+                                    opened_ms.saturating_sub(5_000)
                                 };
-                                let sl_triggered = match side {
-                                    Side::Bid => {
-                                        mkt_ref.0 > 0 && mkt_ref.0 < avg_price_ticks.0 - 2
+                                let closed_pnl_raw =
+                                    client.query_closed_pnl_raw(sym_name, start_ms);
+                                let Some(step_action) = resolve_live_closed_position_step(
+                                    &mut engines[s_idx],
+                                    &snap,
+                                    closed_pnl_raw.as_ref(),
+                                    init_quote.vac_level,
+                                    init_quote.siphon_subsidy_bps,
+                                ) else {
+                                    engines[s_idx].sync_to_shm_telemetry(arena);
+                                    continue;
+                                };
+                                let resolution = match step_action {
+                                    LiveCloseStepAction::AwaitNextPoll {
+                                        next_poll_delay_ns,
+                                    } => {
+                                        engines[s_idx].next_peg_allowed_ts_ns =
+                                            now_ns.0 + next_poll_delay_ns;
+                                        engines[s_idx].sync_to_shm_telemetry(arena);
+                                        continue;
                                     }
-                                    Side::Ask => mkt_ref.0 > avg_price_ticks.0 + 2,
+                                    LiveCloseStepAction::FinalizeVerified(res) => res,
                                 };
-                                let (close_kind, exit_px) = if sl_triggered {
-                                    engines[s_idx].last_exit_sub_reason =
-                                        ExitSubReason::WaldBaseStopLoss;
-                                    (ClosedTradeKind::ServerMarkPriceStopLoss, mkt_ref)
-                                } else {
-                                    let t2_fill_px = if prev_tp_state.0 > 0 {
-                                        match side {
-                                            Side::Bid => {
-                                                PriceTicks(prev_tp_state.0.max(q_fl.0))
-                                            }
-                                            Side::Ask => PriceTicks(
-                                                prev_tp_state.0.min(q_fl.0).max(1),
-                                            ),
-                                        }
-                                    } else {
-                                        q_fl
-                                    };
-                                    let unified_px = if tranche1_harvested {
-                                        match side {
-                                            Side::Bid => PriceTicks(
-                                                ((t1_fl.0 + t2_fill_px.0 + 1) / 2)
-                                                    .max(t1_fl.0),
-                                            ),
-                                            Side::Ask => PriceTicks(
-                                                ((t1_fl.0 + t2_fill_px.0) / 2)
-                                                    .min(t1_fl.0)
-                                                    .max(1),
-                                            ),
-                                        }
-                                    } else {
-                                        t2_fill_px
-                                    };
-                                    let raw_d = match side {
-                                        Side::Bid => unified_px.0 - avg_price_ticks.0,
-                                        Side::Ask => avg_price_ticks.0 - unified_px.0,
-                                    };
-                                    let realized_g_bps =
-                                        (raw_d.saturating_mul(1_000_000)) / avg_denom;
-                                    if init_quote.siphon_subsidy_bps > 0 {
-                                        let _ = ledger.try_consume_sinking_fund_subsidy(
-                                            init_quote.siphon_subsidy_bps,
-                                        );
-                                        engines[s_idx].last_exit_sub_reason =
-                                            ExitSubReason::SinkingFundSiphonExit;
-                                    } else if realized_g_bps >= 500
-                                        || init_quote.vac_level >= 2
-                                    {
-                                        engines[s_idx].lvdbs_deep_surfs_count = engines[s_idx]
-                                            .lvdbs_deep_surfs_count
-                                            .saturating_add(1);
-                                        engines[s_idx].last_exit_sub_reason =
-                                            ExitSubReason::LvdbsDeepVacuumSurf;
-                                    } else if tranche1_harvested {
-                                        engines[s_idx].last_exit_sub_reason =
-                                            ExitSubReason::Tranche1Harvest50;
-                                    } else {
-                                        engines[s_idx].last_exit_sub_reason =
-                                            ExitSubReason::AdverseScratchEscape;
-                                    }
-                                    (ClosedTradeKind::MakerPassiveUnwind, unified_px)
+                                let Some(summary) =
+                                    engines[s_idx].apply_verified_close_resolution(
+                                        resolution,
+                                        init_quote.siphon_subsidy_bps,
+                                        now_ns,
+                                        &mut ledger,
+                                    )
+                                else {
+                                    engines[s_idx].sync_to_shm_telemetry(arena);
+                                    continue;
                                 };
-
-                                let summary = engines[s_idx].finalize_close(
-                                    close_kind,
-                                    side,
-                                    avg_price_ticks,
-                                    exit_px,
-                                    now_ns,
-                                    &mut ledger,
-                                );
                                 gov.observe_closed_trade(
                                     s_idx,
                                     summary.side,
@@ -2189,7 +2217,11 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     spec.format_price_usdt_parts(summary.entry_price);
                                 let (ex_w, ex_f) =
                                     spec.format_price_usdt_parts(summary.exit_price);
-                                let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
+                                let exch_pnl_1e8 = resolution
+                                    .exchange_closed_pnl_1e8
+                                    .unwrap_or(summary.net_pnl_1e8);
+                                let pnl_usdt = (exch_pnl_1e8 as f64) / 100_000_000.0;
+                                let lots_s = spec.format_lot_qty_str(resolution.closed_lots);
                                 let is_part_close = matches!(
                                     engines[s_idx].last_exit_sub_reason,
                                     ExitSubReason::Tranche1Harvest50
@@ -2198,8 +2230,8 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     classify_trade_badge(net_f, is_part_close);
                                 println!(
                                     concat!(
-                                        "{}{} [TRADE CLOSE \u{2014} {}] {} {:?} | ",
-                                        "{}.{:04} -> {}.{:04} | Net: {:+.2} bps ",
+                                        "{}{} [TRADE CLOSE \u{2014} {}] {} {:?} qty={} ",
+                                        "({}L) | {}.{:04} -> {}.{:04} | Net: {:+.2} bps ",
                                         "({:+.4} USDT) | Hold: {}s{}"
                                     ),
                                     col,
@@ -2207,6 +2239,8 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     lbl.trim(),
                                     sym_name,
                                     summary.side,
+                                    lots_s,
+                                    resolution.legs_count,
                                     en_w,
                                     en_f,
                                     ex_w,
@@ -2224,6 +2258,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                     &ledger,
                                 ));
                             } else {
+                                engines[s_idx].close_reconcile_retries = 0;
                                 if let Ok(ver_avg_t) = parse_verified_avg_price_ticks(
                                     spec,
                                     real_side,
@@ -2553,6 +2588,116 @@ mod tests {
             assert_eq!(true_q_floor, PriceTicks(8_210));
             assert_eq!(qt.target_price, PriceTicks(8_210));
             assert_eq!(qt.order_lots, LotQty(12));
+        }
+    }
+
+    #[test]
+    fn test_f03_exec_live_close_retry_and_closed_pnl_verification() {
+        let spec = APPROVED_SPECS[3];
+        let mut eng = SlotExecutionEngine::new(3, BASE_NOTIONAL_1E8);
+        let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = spec.symbol_id;
+        snap.realized_vol_5m = ScaledBps(7_000);
+        snap.ts_local_ns = TimestampNs(1_700_000_010_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(300) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(250) };
+        snap.mark_price = PriceTicks(8_200);
+        snap.last_trade_price = PriceTicks(8_200);
+
+        let verdict = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+        };
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(26)).is_ok());
+        assert!(eng
+            .on_maker_entry_filled(TimestampNs(1_700_000_010_500_000_000))
+            .is_ok());
+
+        // Market dips below entry after a Maker TP fill; indexer lags for 2 polls.
+        snap.mark_price = PriceTicks(8_190);
+        snap.last_trade_price = PriceTicks(8_190);
+        let empty_json = serde_json::json!({
+            "retCode": 0,
+            "result": { "list": [] }
+        });
+        assert_eq!(
+            resolve_live_closed_position_step(&mut eng, &snap, Some(&empty_json), 2, 0),
+            Some(LiveCloseStepAction::AwaitNextPoll {
+                next_poll_delay_ns: 250_000_000,
+            })
+        );
+        assert_eq!(eng.close_reconcile_retries, 1);
+
+        assert_eq!(
+            resolve_live_closed_position_step(&mut eng, &snap, None, 2, 0),
+            Some(LiveCloseStepAction::AwaitNextPoll {
+                next_poll_delay_ns: 250_000_000,
+            })
+        );
+        assert_eq!(eng.close_reconcile_retries, 2);
+
+        let verified_json = serde_json::json!({
+            "retCode": 0,
+            "result": {
+                "list": [{
+                    "symbol": "AVAXUSDT",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "execType": "Trade",
+                    "closedSize": "2.6",
+                    "avgEntryPrice": "8.200",
+                    "avgExitPrice": "8.208",
+                    "closedPnl": "0.01240000",
+                    "updatedTime": "1700000012000"
+                }]
+            }
+        });
+        let step3 = resolve_live_closed_position_step(
+            &mut eng,
+            &snap,
+            Some(&verified_json),
+            2,
+            0,
+        );
+        assert_eq!(eng.close_reconcile_retries, 0);
+        if let Some(LiveCloseStepAction::FinalizeVerified(res)) = step3 {
+            assert_eq!(res.kind, ClosedTradeKind::MakerPassiveUnwind);
+            assert_eq!(res.verified_exit_price, PriceTicks(8_208));
+            assert_eq!(res.exchange_closed_pnl_1e8, Some(1_240_000));
+            let closed = eng.apply_verified_close_resolution(
+                res,
+                0,
+                TimestampNs(1_700_000_012_500_000_000),
+                &mut ledger,
+            );
+            assert!(closed.is_some());
+            if let Some(summary) = closed {
+                assert!(summary.is_maker_exit);
+                assert!(summary.net_scaled_bps.raw() >= 550);
+            }
+        } else {
+            assert_eq!(eng.slot_idx, 999);
+        }
+
+        // True SL breach with 3 consecutive transport failures falls back safely to SL.
+        snap.ts_local_ns = TimestampNs(1_700_000_030_000_000_000);
+        snap.mark_price = PriceTicks(8_200);
+        snap.last_trade_price = PriceTicks(8_200);
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(26)).is_ok());
+        assert!(eng
+            .on_maker_entry_filled(TimestampNs(1_700_000_030_500_000_000))
+            .is_ok());
+        snap.mark_price = PriceTicks(8_010);
+        snap.last_trade_price = PriceTicks(8_010);
+        let _ = resolve_live_closed_position_step(&mut eng, &snap, None, 1, 0);
+        let _ = resolve_live_closed_position_step(&mut eng, &snap, None, 1, 0);
+        let fb_step = resolve_live_closed_position_step(&mut eng, &snap, None, 1, 0);
+        if let Some(LiveCloseStepAction::FinalizeVerified(fb_res)) = fb_step {
+            assert_eq!(fb_res.kind, ClosedTradeKind::ServerMarkPriceStopLoss);
+            assert_eq!(fb_res.sub_reason, ExitSubReason::WaldBaseStopLoss);
+        } else {
+            assert_eq!(eng.slot_idx, 999);
         }
     }
 }

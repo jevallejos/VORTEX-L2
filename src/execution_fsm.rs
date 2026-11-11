@@ -6,6 +6,8 @@ use crate::types::{
     LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, VortexError, APPROVED_SPECS,
 };
 
+pub const MAX_CLOSE_RECONCILE_RETRIES: u8 = 3;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
     MakerPassiveUnwind,
@@ -45,6 +47,24 @@ pub struct CanonicalExitQuote {
     pub wald_pct: i64,
     pub lock_l1_now: bool,
     pub siphon_subsidy_bps: i64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedCloseResolution {
+    pub kind: ClosedTradeKind,
+    pub sub_reason: ExitSubReason,
+    pub verified_entry_price: PriceTicks,
+    pub verified_exit_price: PriceTicks,
+    pub closed_lots: LotQty,
+    pub legs_count: u32,
+    pub exchange_closed_pnl_1e8: Option<i64>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClosedPnlQueryOutcome {
+    Verified(VerifiedCloseResolution),
+    PendingIndexerRetry,
+    TransportOrApiError,
 }
 
 const SHA256_K: [u32; 64] = [
@@ -225,6 +245,73 @@ pub fn parse_verified_avg_price_ticks(
         return Err(VortexError::InvalidPriceOrTickSpec);
     }
     Ok(PriceTicks(ticks as i64))
+}
+
+/// F-03: Parses Bybit V5 avgExitPrice conservatively (floor for Long Bid, ceil for Short Ask).
+#[inline]
+pub fn parse_verified_exit_price_ticks(
+    spec: PairSpec,
+    open_side: Side,
+    decimal_str: &str,
+) -> Result<PriceTicks, VortexError> {
+    parse_verified_avg_price_ticks(spec, open_side.opposite(), decimal_str)
+}
+
+/// F-03: Parses signed decimal strings (e.g. Bybit closedPnl) into exact integer 1e8 units.
+pub fn parse_signed_decimal_1e8(decimal_str: &str) -> Result<i64, VortexError> {
+    let s = decimal_str.trim();
+    if s.is_empty() {
+        return Err(VortexError::AsciiDecimalParseError);
+    }
+    let bytes = s.as_bytes();
+    let (neg, start_idx) = if bytes[0] == b'-' {
+        (true, 1_usize)
+    } else if bytes[0] == b'+' {
+        (false, 1_usize)
+    } else {
+        (false, 0_usize)
+    };
+    if start_idx >= bytes.len() {
+        return Err(VortexError::AsciiDecimalParseError);
+    }
+
+    let mut whole: i128 = 0;
+    let mut frac: i128 = 0;
+    let mut frac_digits: u32 = 0;
+    let mut in_frac = false;
+    let mut saw_digit = false;
+
+    for &b in &bytes[start_idx..] {
+        if b == b'.' {
+            if in_frac {
+                return Err(VortexError::AsciiDecimalParseError);
+            }
+            in_frac = true;
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            return Err(VortexError::AsciiDecimalParseError);
+        }
+        saw_digit = true;
+        let d = i128::from(b - b'0');
+        if !in_frac {
+            whole = whole.saturating_mul(10).saturating_add(d);
+        } else if frac_digits < 8 {
+            frac = frac.saturating_mul(10).saturating_add(d);
+            frac_digits += 1;
+        }
+    }
+    if !saw_digit {
+        return Err(VortexError::AsciiDecimalParseError);
+    }
+    while frac_digits < 8 {
+        frac = frac.saturating_mul(10);
+        frac_digits += 1;
+    }
+
+    let mag = whole.saturating_mul(100_000_000).saturating_add(frac);
+    let clamped = mag.min(i64::MAX as i128) as i64;
+    Ok(if neg { -clamped } else { clamped })
 }
 
 /// Tick-quantized Zero-Loss Quantum Floor (4.00 bps Maker-Maker fee + >= 1 structural tick).
@@ -873,6 +960,16 @@ impl OnlineAdaptiveGovernor {
         (mitigated_62, manifold_blocked)
     }
 }
+#[inline]
+fn extract_json_epoch_ms(item: &serde_json::Value, key: &str) -> i64 {
+    item.get(key)
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        })
+        .unwrap_or(0)
+}
+
 /// Explicit role of the active maker exit order on the exchange.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -947,6 +1044,7 @@ pub struct SlotExecutionEngine {
     pub last_opened_ts: TimestampNs,
     pub next_peg_allowed_ts_ns: i64,
     pub exit_peg_attempts: u32,
+    pub close_reconcile_retries: u8,
 }
 
 #[allow(clippy::manual_clamp, clippy::too_many_arguments)]
@@ -976,6 +1074,7 @@ impl SlotExecutionEngine {
             last_opened_ts: TimestampNs(0),
             next_peg_allowed_ts_ns: 0,
             exit_peg_attempts: 0,
+            close_reconcile_retries: 0,
         }
     }
 
@@ -1332,6 +1431,7 @@ impl SlotExecutionEngine {
         self.last_closed_mae_bps = 0;
         self.last_closed_wald_pct = 0;
         self.exit_peg_attempts = 0;
+        self.close_reconcile_retries = 0;
         self.next_peg_allowed_ts_ns = fill_ts.0;
         self.state = OrderLifecycleState::PositionOpenMakerExit {
             side,
@@ -1397,6 +1497,378 @@ impl SlotExecutionEngine {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn classify_maker_exit_sub_reason(
+        side: Side,
+        entry_px: PriceTicks,
+        exit_px: PriceTicks,
+        tranche1_harvested: bool,
+        legs_count: u32,
+        vac_level_hint: usize,
+        siphon_subsidy_bps: i64,
+    ) -> ExitSubReason {
+        if siphon_subsidy_bps > 0 {
+            return ExitSubReason::SinkingFundSiphonExit;
+        }
+        let raw_d = match side {
+            Side::Bid => exit_px.0 - entry_px.0,
+            Side::Ask => entry_px.0 - exit_px.0,
+        };
+        let gross_bps = (raw_d.saturating_mul(1_000_000)) / entry_px.0.max(1);
+        if gross_bps >= 500 || vac_level_hint >= 2 {
+            ExitSubReason::LvdbsDeepVacuumSurf
+        } else if tranche1_harvested || legs_count >= 2 {
+            ExitSubReason::Tranche1Harvest50
+        } else {
+            ExitSubReason::AdverseScratchEscape
+        }
+    }
+
+    /// F-03 Fix: Reconciles position closure deterministically against /v5/position/closed-pnl.
+    #[must_use]
+    pub fn reconcile_closed_pnl_payload(
+        &self,
+        payload: &serde_json::Value,
+        vac_level_hint: usize,
+        siphon_subsidy_bps: i64,
+        allow_partial_lot_coverage: bool,
+    ) -> ClosedPnlQueryOutcome {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            initial_lots,
+            open_lots,
+            tranche1_harvested,
+            opened_ts,
+            ..
+        } = self.state
+        else {
+            return ClosedPnlQueryOutcome::TransportOrApiError;
+        };
+        if self.slot_idx >= MAX_ACTIVE_PAIRS {
+            return ClosedPnlQueryOutcome::TransportOrApiError;
+        }
+        if payload.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
+            return ClosedPnlQueryOutcome::TransportOrApiError;
+        }
+        let Some(list) = payload
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+        else {
+            return ClosedPnlQueryOutcome::TransportOrApiError;
+        };
+        if list.is_empty() {
+            return ClosedPnlQueryOutcome::PendingIndexerRetry;
+        }
+
+        let spec = APPROVED_SPECS[self.slot_idx];
+        let sym_expected = spec.symbol_id.name();
+        let expected_close_side = match side {
+            Side::Bid => "Sell",
+            Side::Ask => "Buy",
+        };
+        let opened_ms = (opened_ts.0 / 1_000_000).max(0);
+        let min_latest_ms = opened_ms.saturating_sub(1_500);
+        let min_adopt_leg_ms = if tranche1_harvested {
+            opened_ms.saturating_sub(86_400_000)
+        } else {
+            min_latest_ms
+        };
+        let max_entry_tol_ticks = (avg_price_ticks.0.max(1) / 400).max(25);
+        let target_total_lots = initial_lots.0.max(open_lots.0).max(1);
+        let min_req_lots = if allow_partial_lot_coverage {
+            open_lots.0.max(1)
+        } else {
+            target_total_lots
+        };
+
+        let mut accum_lots: i64 = 0;
+        let mut weighted_entry_sum: i128 = 0;
+        let mut weighted_exit_sum: i128 = 0;
+        let mut total_closed_pnl_1e8: i64 = 0;
+        let mut has_pnl_field = false;
+        let mut any_market_or_forced = false;
+        let mut legs_count: u32 = 0;
+
+        for item in list {
+            if accum_lots >= target_total_lots {
+                break;
+            }
+            if let Some(sym_s) = item.get("symbol").and_then(|v| v.as_str()) {
+                if sym_s != sym_expected {
+                    continue;
+                }
+            }
+            if let Some(close_side_s) = item.get("side").and_then(|v| v.as_str()) {
+                if close_side_s != expected_close_side {
+                    continue;
+                }
+            }
+            let upd_ms = extract_json_epoch_ms(item, "updatedTime");
+            let crt_ms = extract_json_epoch_ms(item, "createdTime");
+            let rec_ms = upd_ms.max(crt_ms);
+            let min_bound_ms = if legs_count == 0 {
+                min_latest_ms
+            } else {
+                min_adopt_leg_ms
+            };
+            if rec_ms > 0 && min_bound_ms > 0 && rec_ms < min_bound_ms {
+                continue;
+            }
+
+            let Some(avg_en_s) = item.get("avgEntryPrice").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(avg_ex_s) = item.get("avgExitPrice").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(leg_en_t) = parse_verified_avg_price_ticks(spec, side, avg_en_s) else {
+                continue;
+            };
+            let Ok(leg_ex_t) = parse_verified_exit_price_ticks(spec, side, avg_ex_s) else {
+                continue;
+            };
+            if (leg_en_t.0 - avg_price_ticks.0).abs() > max_entry_tol_ticks {
+                continue;
+            }
+
+            let raw_sz_s = item
+                .get("closedSize")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty() && s.trim() != "0")
+                .or_else(|| item.get("qty").and_then(|v| v.as_str()))
+                .unwrap_or("0");
+            let parsed_lots = spec.parse_lot_qty(raw_sz_s).0;
+            if parsed_lots <= 0 {
+                continue;
+            }
+            let rem_cap = (target_total_lots - accum_lots).max(1);
+            let take_lots = parsed_lots.min(rem_cap);
+
+            let order_type_s = item
+                .get("orderType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Limit");
+            let exec_type_s = item
+                .get("execType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Trade");
+            let is_forced_exec = matches!(
+                exec_type_s,
+                "BustTrade" | "AdlTrade" | "TakeOver" | "Settle"
+            );
+            if order_type_s != "Limit" || is_forced_exec {
+                any_market_or_forced = true;
+            }
+
+            if let Some(pnl_s) = item.get("closedPnl").and_then(|v| v.as_str()) {
+                if let Ok(leg_pnl) = parse_signed_decimal_1e8(pnl_s) {
+                    let scaled_pnl = if take_lots < parsed_lots {
+                        ((leg_pnl as i128 * take_lots as i128) / (parsed_lots as i128)) as i64
+                    } else {
+                        leg_pnl
+                    };
+                    total_closed_pnl_1e8 = total_closed_pnl_1e8.saturating_add(scaled_pnl);
+                    has_pnl_field = true;
+                }
+            }
+
+            accum_lots = accum_lots.saturating_add(take_lots);
+            weighted_entry_sum += (take_lots as i128) * (leg_en_t.0 as i128);
+            weighted_exit_sum += (take_lots as i128) * (leg_ex_t.0 as i128);
+            legs_count = legs_count.saturating_add(1);
+        }
+
+        if legs_count == 0 || accum_lots < min_req_lots {
+            return ClosedPnlQueryOutcome::PendingIndexerRetry;
+        }
+
+        let denom = accum_lots as i128;
+        let verified_entry_ticks = match side {
+            Side::Bid => ((weighted_entry_sum + denom - 1) / denom) as i64,
+            Side::Ask => (weighted_entry_sum / denom).max(1) as i64,
+        };
+        let verified_exit_ticks = match side {
+            Side::Bid => (weighted_exit_sum / denom).max(1) as i64,
+            Side::Ask => ((weighted_exit_sum + denom - 1) / denom) as i64,
+        };
+
+        let verified_entry_price = PriceTicks(verified_entry_ticks.max(1));
+        let verified_exit_price = PriceTicks(verified_exit_ticks.max(1));
+        let (kind, sub_reason) = if any_market_or_forced {
+            (
+                ClosedTradeKind::ServerMarkPriceStopLoss,
+                ExitSubReason::WaldBaseStopLoss,
+            )
+        } else {
+            let sub = Self::classify_maker_exit_sub_reason(
+                side,
+                verified_entry_price,
+                verified_exit_price,
+                tranche1_harvested,
+                legs_count,
+                vac_level_hint,
+                siphon_subsidy_bps,
+            );
+            (ClosedTradeKind::MakerPassiveUnwind, sub)
+        };
+
+        ClosedPnlQueryOutcome::Verified(VerifiedCloseResolution {
+            kind,
+            sub_reason,
+            verified_entry_price,
+            verified_exit_price,
+            closed_lots: LotQty(accum_lots),
+            legs_count,
+            exchange_closed_pnl_1e8: if has_pnl_field {
+                Some(total_closed_pnl_1e8)
+            } else {
+                None
+            },
+        })
+    }
+
+    /// F-03 Safe Fallback: Used only if /v5/position/closed-pnl fails after bounded retries.
+    #[must_use]
+    pub fn resolve_fallback_unverified_close(
+        &self,
+        snap: &SymbolLobSnapshot,
+        vac_level_hint: usize,
+        siphon_subsidy_bps: i64,
+    ) -> Option<VerifiedCloseResolution> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            worst_adverse_price,
+            initial_lots,
+            open_lots,
+            tranche1_harvested,
+            tp_maker_price: prev_tp_state,
+            sl_trigger_price,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+
+        let eff_sl = if self.last_eff_sl_ticks.0 > 0 {
+            self.last_eff_sl_ticks
+        } else {
+            sl_trigger_price
+        };
+        let cur_bbo = match side {
+            Side::Bid => snap.asks[0].price,
+            Side::Ask => snap.bids[0].price,
+        };
+        let mkt_ref = if snap.mark_price.0 > 0 {
+            snap.mark_price
+        } else if snap.last_trade_price.0 > 0 {
+            snap.last_trade_price
+        } else {
+            cur_bbo
+        };
+
+        let sl_breached = match side {
+            Side::Bid => {
+                (mkt_ref.0 > 0 && mkt_ref.0 <= eff_sl.0.saturating_add(2))
+                    || (worst_adverse_price.0 > 0 && worst_adverse_price.0 <= eff_sl.0)
+            }
+            Side::Ask => {
+                (mkt_ref.0 > 0 && mkt_ref.0 >= eff_sl.0.saturating_sub(2))
+                    || worst_adverse_price.0 >= eff_sl.0
+            }
+        };
+        let no_resting_tp_underwater = prev_tp_state.0 <= 0
+            && match side {
+                Side::Bid => mkt_ref.0 > 0 && mkt_ref.0 < avg_price_ticks.0,
+                Side::Ask => mkt_ref.0 > avg_price_ticks.0,
+            };
+
+        if sl_breached || no_resting_tp_underwater {
+            let sl_exit_px = if sl_breached {
+                eff_sl
+            } else {
+                PriceTicks(mkt_ref.0.max(1))
+            };
+            return Some(VerifiedCloseResolution {
+                kind: ClosedTradeKind::ServerMarkPriceStopLoss,
+                sub_reason: ExitSubReason::WaldBaseStopLoss,
+                verified_entry_price: avg_price_ticks,
+                verified_exit_price: sl_exit_px,
+                closed_lots: initial_lots.max(open_lots).max(LotQty(1)),
+                legs_count: 1,
+                exchange_closed_pnl_1e8: None,
+            });
+        }
+
+        let q_fl = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+        let t2_fill_px = if prev_tp_state.0 > 0 {
+            prev_tp_state
+        } else {
+            q_fl
+        };
+        let exit_px = if tranche1_harvested {
+            let t1_fl = dynamic_maker_floor_price(side, avg_price_ticks, ScaledBps(440));
+            match side {
+                Side::Bid => PriceTicks((t1_fl.0 + t2_fill_px.0) / 2),
+                Side::Ask => PriceTicks(((t1_fl.0 + t2_fill_px.0 + 1) / 2).max(1)),
+            }
+        } else {
+            t2_fill_px
+        };
+        let sub_reason = Self::classify_maker_exit_sub_reason(
+            side,
+            avg_price_ticks,
+            exit_px,
+            tranche1_harvested,
+            if tranche1_harvested { 2 } else { 1 },
+            vac_level_hint,
+            siphon_subsidy_bps,
+        );
+
+        Some(VerifiedCloseResolution {
+            kind: ClosedTradeKind::MakerPassiveUnwind,
+            sub_reason,
+            verified_entry_price: avg_price_ticks,
+            verified_exit_price: exit_px,
+            closed_lots: initial_lots.max(open_lots).max(LotQty(1)),
+            legs_count: if tranche1_harvested { 2 } else { 1 },
+            exchange_closed_pnl_1e8: None,
+        })
+    }
+
+    /// Applies a VerifiedCloseResolution atomically and records the canonical close summary.
+    pub fn apply_verified_close_resolution(
+        &mut self,
+        resolution: VerifiedCloseResolution,
+        siphon_subsidy_bps: i64,
+        closed_ts: TimestampNs,
+        ledger: &mut crate::forensic_parquet::ParitySyncLedger,
+    ) -> Option<ClosedTradeSummary> {
+        let OrderLifecycleState::PositionOpenMakerExit { side, .. } = self.state else {
+            return None;
+        };
+        self.last_exit_sub_reason = resolution.sub_reason;
+        if matches!(resolution.kind, ClosedTradeKind::MakerPassiveUnwind) {
+            if matches!(resolution.sub_reason, ExitSubReason::SinkingFundSiphonExit)
+                && siphon_subsidy_bps > 0
+            {
+                let _ = ledger.try_consume_sinking_fund_subsidy(siphon_subsidy_bps);
+            } else if matches!(resolution.sub_reason, ExitSubReason::LvdbsDeepVacuumSurf) {
+                self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
+            }
+        }
+        Some(self.finalize_close(
+            resolution.kind,
+            side,
+            resolution.verified_entry_price,
+            resolution.verified_exit_price,
+            closed_ts,
+            ledger,
+        ))
     }
 
     /// Innovation #2 (LVDBS): Executes Tranche 1 (50%) harvest at quantum floor.
@@ -1656,6 +2128,7 @@ impl SlotExecutionEngine {
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, ScaledBps(net_bps));
         self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_bps));
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + 3_000_000_000);
+        self.close_reconcile_retries = 0;
         self.state = OrderLifecycleState::Idle;
 
         ClosedTradeSummary {
@@ -2070,6 +2543,161 @@ mod tests {
         let q_synced = eng.compute_canonical_exit_quote(&snap, 0);
         if let Some(qt2) = q_synced {
             assert_eq!(qt2.target_price, PriceTicks(8_213));
+        }
+    }
+
+    #[test]
+    fn test_f03_closed_pnl_reconciler_eradicates_false_sl_and_catches_real_sl() {
+        assert_eq!(parse_signed_decimal_1e8("-0.2845"), Ok(-28_450_000));
+        assert_eq!(parse_signed_decimal_1e8("0.01250000"), Ok(1_250_000));
+
+        let spec = APPROVED_SPECS[3];
+        assert_eq!(
+            parse_verified_exit_price_ticks(spec, Side::Bid, "8.2065"),
+            Ok(PriceTicks(8_206))
+        );
+        assert_eq!(
+            parse_verified_exit_price_ticks(spec, Side::Ask, "8.1935"),
+            Ok(PriceTicks(8_194))
+        );
+
+        let mut eng = SlotExecutionEngine::new(3, 1_250_000_000);
+        let mut ledger = crate::forensic_parquet::ParitySyncLedger::new(7_088_000_000);
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = spec.symbol_id;
+        snap.realized_vol_5m = ScaledBps(7_000);
+        snap.ts_local_ns = TimestampNs(1_700_000_010_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(300) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(250) };
+        snap.mark_price = PriceTicks(8_200);
+        snap.last_trade_price = PriceTicks(8_200);
+
+        let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+        };
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(26)).is_ok());
+        assert!(eng
+            .on_maker_entry_filled(TimestampNs(1_700_000_010_500_000_000))
+            .is_ok());
+
+        // Case 1: Maker win filled @ 8.207, then market dipped to 8.195 (< avg - 2).
+        snap.mark_price = PriceTicks(8_195);
+        snap.last_trade_price = PriceTicks(8_195);
+        let win_payload = serde_json::json!({
+            "retCode": 0,
+            "result": {
+                "list": [{
+                    "symbol": "AVAXUSDT",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "execType": "Trade",
+                    "closedSize": "2.6",
+                    "avgEntryPrice": "8.200",
+                    "avgExitPrice": "8.207",
+                    "closedPnl": "0.00968000",
+                    "updatedTime": "1700000012000"
+                }]
+            }
+        });
+        let out1 = eng.reconcile_closed_pnl_payload(&win_payload, 2, 0, false);
+        if let ClosedPnlQueryOutcome::Verified(res1) = out1 {
+            assert_eq!(res1.kind, ClosedTradeKind::MakerPassiveUnwind);
+            assert_eq!(res1.sub_reason, ExitSubReason::LvdbsDeepVacuumSurf);
+            assert_eq!(res1.verified_exit_price, PriceTicks(8_207));
+            assert_eq!(res1.exchange_closed_pnl_1e8, Some(968_000));
+            let closed1 = eng.apply_verified_close_resolution(
+                res1,
+                0,
+                TimestampNs(1_700_000_012_500_000_000),
+                &mut ledger,
+            );
+            assert!(closed1.is_some());
+            if let Some(s1) = closed1 {
+                assert!(s1.is_maker_exit);
+                assert!(s1.net_scaled_bps.raw() >= 450);
+            }
+        } else {
+            assert_eq!(eng.slot_idx, 999);
+        }
+
+        // Case 2: 2-leg trade where Leg 1 closed Limit and Leg 2 hit Market SL (indexer lag).
+        snap.ts_local_ns = TimestampNs(1_700_000_030_000_000_000);
+        snap.mark_price = PriceTicks(8_202);
+        snap.last_trade_price = PriceTicks(8_202);
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(26)).is_ok());
+        assert!(eng
+            .on_maker_entry_filled(TimestampNs(1_700_000_030_500_000_000))
+            .is_ok());
+
+        let partial_lag_payload = serde_json::json!({
+            "retCode": 0,
+            "result": {
+                "list": [{
+                    "symbol": "AVAXUSDT",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "execType": "Trade",
+                    "closedSize": "1.3",
+                    "avgEntryPrice": "8.200",
+                    "avgExitPrice": "8.204",
+                    "closedPnl": "0.00093000",
+                    "updatedTime": "1700000035000"
+                }]
+            }
+        });
+        assert_eq!(
+            eng.reconcile_closed_pnl_payload(&partial_lag_payload, 1, 0, false),
+            ClosedPnlQueryOutcome::PendingIndexerRetry
+        );
+
+        let full_sl_payload = serde_json::json!({
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "symbol": "AVAXUSDT",
+                        "side": "Sell",
+                        "orderType": "Market",
+                        "execType": "Trade",
+                        "closedSize": "1.3",
+                        "avgEntryPrice": "8.200",
+                        "avgExitPrice": "8.050",
+                        "closedPnl": "-0.20300000",
+                        "updatedTime": "1700000042000"
+                    },
+                    {
+                        "symbol": "AVAXUSDT",
+                        "side": "Sell",
+                        "orderType": "Limit",
+                        "execType": "Trade",
+                        "closedSize": "1.3",
+                        "avgEntryPrice": "8.200",
+                        "avgExitPrice": "8.204",
+                        "closedPnl": "0.00093000",
+                        "updatedTime": "1700000035000"
+                    }
+                ]
+            }
+        });
+        let out2 = eng.reconcile_closed_pnl_payload(&full_sl_payload, 1, 0, false);
+        if let ClosedPnlQueryOutcome::Verified(res2) = out2 {
+            assert_eq!(res2.kind, ClosedTradeKind::ServerMarkPriceStopLoss);
+            assert_eq!(res2.sub_reason, ExitSubReason::WaldBaseStopLoss);
+            assert_eq!(res2.verified_exit_price, PriceTicks(8_127));
+            assert_eq!(res2.legs_count, 2);
+            assert_eq!(res2.exchange_closed_pnl_1e8, Some(-20_207_000));
+        } else {
+            assert_eq!(eng.slot_idx, 999);
+        }
+
+        // Case 3: Fallback does NOT trigger false SL at 8.195 when resting TP > 0 & SL ~ 8.044.
+        snap.mark_price = PriceTicks(8_195);
+        let fb = eng.resolve_fallback_unverified_close(&snap, 1, 0);
+        assert!(fb.is_some());
+        if let Some(fb_res) = fb {
+            assert_eq!(fb_res.kind, ClosedTradeKind::MakerPassiveUnwind);
+            assert!(fb_res.verified_exit_price.0 >= 8_204);
         }
     }
 }
