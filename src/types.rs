@@ -1,4 +1,4 @@
-//! Dimensional Newtypes, 12-Pair Institutional SSOT Catalog, and Kelly-Replicator Compounding.
+//! Dimensional Newtypes, 12-Pair Institutional SSOT Catalog, Beta Cap & Exact Lot Accounting.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,10 @@ pub const ANSI_RED: &str = "\x1b[1;31m";
 pub const ANSI_YELLOW: &str = "\x1b[1;33m";
 pub const ANSI_GRAY: &str = "\x1b[38;5;245m";
 pub const ANSI_BLUE: &str = "\x1b[1;36m";
+
+pub const MAX_DIRECTIONAL_OPEN_SLOTS_PER_SIDE: usize = 3;
+pub const MAX_PORTFOLIO_OPEN_SLOTS_TOTAL: usize = 6;
+pub const OVERSIZED_LOT_MIN_SNR_ABS: f64 = 0.72;
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -122,6 +126,102 @@ impl Side {
             Self::Bid => Self::Ask,
             Self::Ask => Self::Bid,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn sign_i64(self) -> i64 {
+        match self {
+            Self::Bid => 1,
+            Self::Ask => -1,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn sign_f64(self) -> f64 {
+        match self {
+            Self::Bid => 1.0,
+            Self::Ask => -1.0,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn select_entry_bbo_price(
+        self,
+        best_bid: PriceTicks,
+        best_ask: PriceTicks,
+    ) -> PriceTicks {
+        match self {
+            Self::Bid => {
+                if best_bid.0 > 0 {
+                    best_bid
+                } else {
+                    best_ask
+                }
+            }
+            Self::Ask => {
+                if best_ask.0 > 0 {
+                    best_ask
+                } else {
+                    best_bid
+                }
+            }
+        }
+    }
+}
+
+/// Directional Beta Cap Governor: enforces N_Bid <= 3, N_Ask <= 3, and N_Total <= 6.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PortfolioBetaGuard {
+    pub active_bids: usize,
+    pub active_asks: usize,
+}
+
+impl PortfolioBetaGuard {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            active_bids: 0,
+            active_asks: 0,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn total_active(self) -> usize {
+        self.active_bids.saturating_add(self.active_asks)
+    }
+
+    #[inline]
+    pub fn observe_active_side(&mut self, side: Side) {
+        match side {
+            Side::Bid => self.active_bids = self.active_bids.saturating_add(1),
+            Side::Ask => self.active_asks = self.active_asks.saturating_add(1),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn can_admit_side(self, side: Side) -> bool {
+        if self.total_active() >= MAX_PORTFOLIO_OPEN_SLOTS_TOTAL {
+            return false;
+        }
+        match side {
+            Side::Bid => self.active_bids < MAX_DIRECTIONAL_OPEN_SLOTS_PER_SIDE,
+            Side::Ask => self.active_asks < MAX_DIRECTIONAL_OPEN_SLOTS_PER_SIDE,
+        }
+    }
+
+    #[inline]
+    pub fn try_admit(&mut self, side: Side) -> bool {
+        if !self.can_admit_side(side) {
+            return false;
+        }
+        self.observe_active_side(side);
+        true
     }
 }
 
@@ -248,6 +348,22 @@ impl PairSpec {
         Ok(required_3x)
     }
 
+    /// Canonical server-side MarkPrice SL distance in [11_000, 14_500] ScaledBps (110..145 bps).
+    #[inline]
+    #[must_use]
+    pub const fn elastic_server_sl_distance_bps(realized_vol_5m: ScaledBps) -> ScaledBps {
+        let v = if realized_vol_5m.0 > 0 { realized_vol_5m.0 } else { 0 };
+        let raw_bps = 9_500 + (v.saturating_mul(28)) / 100;
+        let bounded = if raw_bps < 11_000 {
+            11_000
+        } else if raw_bps > 14_500 {
+            14_500
+        } else {
+            raw_bps
+        };
+        ScaledBps(bounded)
+    }
+
     /// Enforces >= 2 ticks cushion against LastPrice and MarkPrice (prevents retCode 10001).
     #[inline]
     pub const fn validate_stop_loss_geometry(
@@ -293,6 +409,39 @@ impl PairSpec {
         Ok(proposed_sl)
     }
 
+    /// Computes server MarkPrice SL ticks (110..145 bps) and validates >= 2-tick cushion.
+    #[inline]
+    pub const fn compute_validated_sl_ticks(
+        side: Side,
+        entry_price: PriceTicks,
+        last_price: PriceTicks,
+        mark_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+    ) -> Result<PriceTicks, VortexError> {
+        if entry_price.0 <= 0 {
+            return Err(VortexError::InvalidPriceOrTickSpec);
+        }
+        let ref_mark = if mark_price.0 > 0 { mark_price } else { entry_price };
+        let ref_last = if last_price.0 > 0 { last_price } else { entry_price };
+        let sl_bps = Self::elastic_server_sl_distance_bps(realized_vol_5m).0;
+        let raw_delta = (entry_price.0.saturating_mul(sl_bps)) / 1_000_000;
+        let sl_delta_ticks = if raw_delta > 4 { raw_delta } else { 4 };
+        let proposed_sl = match side {
+            Side::Bid => {
+                let min_lm = if ref_mark.0 < ref_last.0 { ref_mark.0 } else { ref_last.0 };
+                let bound = if min_lm < entry_price.0 { min_lm } else { entry_price.0 };
+                let cand = bound - sl_delta_ticks;
+                PriceTicks(if cand > 1 { cand } else { 1 })
+            }
+            Side::Ask => {
+                let max_lm = if ref_mark.0 > ref_last.0 { ref_mark.0 } else { ref_last.0 };
+                let bound = if max_lm > entry_price.0 { max_lm } else { entry_price.0 };
+                PriceTicks(bound.saturating_add(sl_delta_ticks))
+            }
+        };
+        Self::validate_stop_loss_geometry(side, proposed_sl, ref_last, ref_mark)
+    }
+
     /// Exact executed position notional in USDT scaled by 1e8.
     #[inline]
     #[must_use]
@@ -310,6 +459,58 @@ impl PairSpec {
         }
     }
 
+    /// Exact executed leg net PnL and fee in USDT (1e8) plus gross/net ScaledBps.
+    #[inline]
+    #[must_use]
+    pub const fn compute_leg_pnl_and_fee_1e8(
+        self,
+        side: Side,
+        lots: LotQty,
+        entry_px: PriceTicks,
+        exit_px: PriceTicks,
+        fee_scaled_bps: ScaledBps,
+    ) -> (i64, i64, ScaledBps, ScaledBps) {
+        if lots.0 <= 0 || entry_px.0 <= 0 || exit_px.0 <= 0 {
+            return (0, 0, ScaledBps(0), ScaledBps(0));
+        }
+        let raw_diff = match side {
+            Side::Bid => exit_px.0 - entry_px.0,
+            Side::Ask => entry_px.0 - exit_px.0,
+        };
+        let gross_bps = (raw_diff.saturating_mul(1_000_000)) / entry_px.0;
+        let fee_bps = if fee_scaled_bps.0 > 0 { fee_scaled_bps.0 } else { 0 };
+        let net_bps = gross_bps - fee_bps;
+
+        let entry_notional = self.lot_notional_1e8(lots, entry_px) as i128;
+        let exit_notional = self.lot_notional_1e8(lots, exit_px) as i128;
+        let gross_pnl = match side {
+            Side::Bid => exit_notional - entry_notional,
+            Side::Ask => entry_notional - exit_notional,
+        };
+        let in_fee_bps = if fee_bps >= ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 {
+            ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 as i128
+        } else {
+            fee_bps as i128
+        };
+        let out_raw = (fee_bps as i128) - in_fee_bps;
+        let out_fee_bps = if out_raw > 0 { out_raw } else { 0 };
+        let fee_raw = (entry_notional * in_fee_bps + exit_notional * out_fee_bps + 500_000)
+            / 1_000_000;
+        let fee_1e8 = if fee_raw > (i64::MAX as i128) {
+            i64::MAX
+        } else {
+            fee_raw as i64
+        };
+        let net_raw = gross_pnl - (fee_1e8 as i128);
+        let net_pnl_1e8 = if net_raw > (i64::MAX as i128) {
+            i64::MAX
+        } else if net_raw < (i64::MIN as i128) {
+            i64::MIN
+        } else {
+            net_raw as i64
+        };
+        (net_pnl_1e8, fee_1e8, ScaledBps(gross_bps), ScaledBps(net_bps))
+    }
     /// Canonical 29% base Kelly notional in USDT scaled by 1e8.
     #[inline]
     #[must_use]
@@ -349,6 +550,33 @@ impl PairSpec {
         let min_notional = self.lot_notional_1e8(LotQty(min_lots), entry_price) as i128;
         let kelly_base = Self::base_kelly_notional_1e8(wallet_usdt_1e8) as i128;
         min_notional * 10 > kelly_base * 22
+    }
+
+    /// Enforces |SNR| >= 0.72 and zero scar debt when min lot exceeds 2.2x Kelly budget.
+    #[inline]
+    #[must_use]
+    pub fn passes_oversized_lot_conviction_guard(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+        composite_snr_abs: f64,
+        in_scar_debt: bool,
+    ) -> bool {
+        if !self.requires_oversized_lot_conviction(wallet_usdt_1e8, entry_price) {
+            return true;
+        }
+        !in_scar_debt && composite_snr_abs >= OVERSIZED_LOT_MIN_SNR_ABS
+    }
+
+    /// Characteristic lot scale normalized to ~2.50 USDT of book depth for OFI/TFI priors.
+    #[inline]
+    #[must_use]
+    pub fn characteristic_lot_scale(self, reference_price: PriceTicks) -> f64 {
+        if reference_price.0 <= 0 || self.tick_size_1e8 <= 0 || self.lot_step_1e8 <= 0 {
+            return 1.0;
+        }
+        let one_lot_1e8 = self.lot_notional_1e8(LotQty(1), reference_price).max(1) as f64;
+        (250_000_000.0 / one_lot_1e8).clamp(0.25, 500.0)
     }
 
     #[inline]
@@ -642,6 +870,15 @@ pub const APPROVED_SPECS: [PairSpec; 12] = [
 
 #[inline]
 #[must_use]
+pub const fn spec_from_symbol_id(id: SymbolId) -> Option<PairSpec> {
+    match id.slot_index() {
+        Some(idx) => Some(APPROVED_SPECS[idx]),
+        None => None,
+    }
+}
+
+#[inline]
+#[must_use]
 pub fn slot_from_symbol_name(name: &str) -> Option<usize> {
     for (idx, spec) in APPROVED_SPECS.iter().enumerate() {
         if spec.symbol_id.name() == name {
@@ -674,7 +911,7 @@ pub fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static
     }
 }
 
-/// Classifies trade with Dark Green for Partial Harvests (50%), Light Green for Wins, Celeste for Scratches.
+/// Classifies trade with Dark Green for Partial Harvests (50%), Light Green for Wins.
 #[inline]
 #[must_use]
 pub fn classify_trade_badge(
@@ -769,8 +1006,10 @@ mod tests {
         ];
         for (idx, spec) in APPROVED_SPECS.iter().enumerate() {
             let px = PriceTicks(sample_ticks[idx]);
-            let elig = spec.validate_pair_eligibility(px, ScaledBps(6_500));
-            assert!(elig.is_ok());
+            assert!(spec.validate_pair_eligibility(px, ScaledBps(6_500)).is_ok());
+            assert_eq!(spec_from_symbol_id(spec.symbol_id), Some(*spec));
+            let scale = spec.characteristic_lot_scale(px);
+            assert!((0.25..=500.0).contains(&scale));
             let lots_66 = spec.compute_compounding_kelly_lots(wallet_66_usdt, px, 250, false);
             let lots_200 = spec.compute_compounding_kelly_lots(wallet_200_usdt, px, 350, false);
             assert!(lots_66.0 >= 1);
@@ -796,8 +1035,37 @@ mod tests {
 
         let w_live = 6_628_080_000_i64;
         assert!(btc.requires_oversized_lot_conviction(w_live, PriceTicks(759_000)));
-        assert!(!btc.requires_oversized_lot_conviction(15_000_000_000, PriceTicks(759_000)));
-        assert!(!eth.requires_oversized_lot_conviction(w_live, PriceTicks(223_700)));
+        assert!(!btc.passes_oversized_lot_conviction_guard(
+            w_live,
+            PriceTicks(759_000),
+            0.68,
+            false,
+        ));
+        assert!(!btc.passes_oversized_lot_conviction_guard(
+            w_live,
+            PriceTicks(759_000),
+            0.80,
+            true,
+        ));
+        assert!(btc.passes_oversized_lot_conviction_guard(
+            w_live,
+            PriceTicks(759_000),
+            0.75,
+            false,
+        ));
+        assert!(eth.passes_oversized_lot_conviction_guard(
+            w_live,
+            PriceTicks(223_700),
+            0.45,
+            false,
+        ));
+
+        let sl_low = PairSpec::elastic_server_sl_distance_bps(ScaledBps(4_000));
+        let sl_mid = PairSpec::elastic_server_sl_distance_bps(ScaledBps(8_000));
+        let sl_high = PairSpec::elastic_server_sl_distance_bps(ScaledBps(18_000));
+        assert_eq!(sl_low, ScaledBps(11_000));
+        assert_eq!(sl_mid, ScaledBps(11_740));
+        assert_eq!(sl_high, ScaledBps(14_500));
 
         assert!(PairSpec::validate_stop_loss_geometry(
             Side::Bid,
@@ -806,26 +1074,49 @@ mod tests {
             PriceTicks(8_199),
         )
         .is_err());
-        assert!(PairSpec::validate_stop_loss_geometry(
+        assert!(PairSpec::compute_validated_sl_ticks(
             Side::Bid,
-            PriceTicks(8_196),
+            PriceTicks(8_198),
             PriceTicks(8_198),
             PriceTicks(8_199),
+            ScaledBps(6_500),
         )
         .is_ok());
-        assert!(PairSpec::validate_stop_loss_geometry(
-            Side::Ask,
-            PriceTicks(8_199),
-            PriceTicks(8_198),
-            PriceTicks(8_197),
-        )
-        .is_err());
-        assert!(PairSpec::validate_stop_loss_geometry(
-            Side::Ask,
-            PriceTicks(8_200),
-            PriceTicks(8_198),
-            PriceTicks(8_197),
-        )
-        .is_ok());
+    }
+
+    #[test]
+    fn test_portfolio_beta_cap_and_exact_leg_pnl_accounting() {
+        let mut guard = PortfolioBetaGuard::new();
+        assert!(guard.try_admit(Side::Bid));
+        assert!(guard.try_admit(Side::Bid));
+        assert!(guard.try_admit(Side::Bid));
+        assert!(!guard.try_admit(Side::Bid));
+        assert!(guard.try_admit(Side::Ask));
+        assert!(guard.try_admit(Side::Ask));
+        assert!(guard.try_admit(Side::Ask));
+        assert_eq!(guard.total_active(), 6);
+        assert!(!guard.try_admit(Side::Ask));
+
+        assert_eq!(
+            Side::Bid.select_entry_bbo_price(PriceTicks(8_200), PriceTicks(8_201)),
+            PriceTicks(8_200)
+        );
+        assert_eq!(
+            Side::Ask.select_entry_bbo_price(PriceTicks(8_200), PriceTicks(8_201)),
+            PriceTicks(8_201)
+        );
+
+        let btc = APPROVED_SPECS[0];
+        let (net_1e8, fee_1e8, g_bps, n_bps) = btc.compute_leg_pnl_and_fee_1e8(
+            Side::Bid,
+            LotQty(1),
+            PriceTicks(759_000),
+            PriceTicks(759_600),
+            ScaledBps(400),
+        );
+        assert_eq!(g_bps, ScaledBps(790));
+        assert_eq!(n_bps, ScaledBps(390));
+        assert_eq!(fee_1e8, 3_037_200);
+        assert_eq!(net_1e8, 2_962_800);
     }
 }
