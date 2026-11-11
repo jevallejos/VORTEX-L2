@@ -1,56 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "================================================================================"
-echo "[VORTEX-L3 DEPLOY] SHA-LOCKED INSTALLER & HARDWARE/OS TUNER FOR SNIPER-SINGAPUR"
-echo "================================================================================"
+SEP="================================================================================"
+echo "${SEP}"
+echo "[VORTEX-L3 DEPLOY] SHA256-LOCKED INSTALLER & OS TUNER FOR SNIPER-SINGAPUR"
+echo "${SEP}"
 
 VORTEX_DIR="/home/ubuntu/vortex-rs"
 BIN_DIR="${VORTEX_DIR}/bin"
 DATA_DIR="${VORTEX_DIR}/data"
 VAULT_DIR="${DATA_DIR}/vault"
 BACKUP_DIR="${VORTEX_DIR}/backups"
-RELEASE_BASE="https://github.com/jevallejos/VORTEX-L2/releases/download/latest-linux-x86_64"
+REL_REPO="https://github.com/jevallejos/VORTEX-L2/releases/download"
+RELEASE_BASE="${REL_REPO}/latest-linux-x86_64"
 RELEASE_URL="${RELEASE_BASE}/vortex-linux-x86_64.tar.gz"
 SHA_URL="${RELEASE_BASE}/COMMIT_SHA"
+SHA256_URL="${RELEASE_BASE}/SHA256SUMS"
 
 mkdir -p "${BIN_DIR}" "${DATA_DIR}" "${VAULT_DIR}" "${BACKUP_DIR}"
 cd "${VORTEX_DIR}"
 
-if [ -f "${DATA_DIR}/vortex_ai_forensic_vault.jsonl" ] && [ ! -f "${VAULT_DIR}/vortex_ai_forensic_vault.jsonl" ]; then
-    cp -f "${DATA_DIR}/vortex_ai_forensic_vault.jsonl" "${VAULT_DIR}/vortex_ai_forensic_vault.jsonl" || true
+if [ ! -f "${VORTEX_DIR}/.env" ] && [ -f "/home/ubuntu/Denk-sekka/.env" ]; then
+    cp -f "/home/ubuntu/Denk-sekka/.env" "${VORTEX_DIR}/.env" || true
+fi
+if [ -f "${VORTEX_DIR}/.env" ]; then
+    chmod 600 "${VORTEX_DIR}/.env" || true
+fi
+
+OLD_VAULT="${DATA_DIR}/vortex_ai_forensic_vault.jsonl"
+NEW_VAULT="${VAULT_DIR}/vortex_ai_forensic_vault.jsonl"
+if [ -f "${OLD_VAULT}" ] && [ ! -f "${NEW_VAULT}" ]; then
+    cp -f "${OLD_VAULT}" "${NEW_VAULT}" || true
 fi
 
 TARGET_SHA=$(git rev-parse HEAD)
 SHORT_TARGET=$(echo "${TARGET_SHA}" | cut -c1-7)
 echo "[SHA LOCK] Target Git HEAD: ${TARGET_SHA}"
 
+STAGE_DIR=$(mktemp -d "/tmp/vortex_stage_XXXXXX")
+trap 'rm -rf "${STAGE_DIR}"' EXIT
+
 VERIFIED=0
 for attempt in $(seq 1 36); do
-    REMOTE_SHA=$(curl -fsSL --max-time 5 "${SHA_URL}" 2>/dev/null | tr -d '[:space:]' || true)
+    REMOTE_SHA=$(curl -fsSL --max-time 5 "${SHA_URL}" 2>/dev/null \
+        | tr -d '[:space:]' || true)
     if [ "${REMOTE_SHA}" = "${TARGET_SHA}" ]; then
-        echo "[OK] Verified exact binary SHA match (${TARGET_SHA}) on attempt #${attempt} (0% CPU jitter)."
-        VERIFIED=1
-        break
+        if curl -fsSL --retry 2 --max-time 15 "${RELEASE_URL}" \
+            -o "${STAGE_DIR}/vortex-linux-x86_64.tar.gz" \
+            && curl -fsSL --max-time 5 "${SHA256_URL}" \
+            -o "${STAGE_DIR}/SHA256SUMS"; then
+            if (cd "${STAGE_DIR}" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+                mkdir -p "${STAGE_DIR}/extracted"
+                tar -xzf "${STAGE_DIR}/vortex-linux-x86_64.tar.gz" \
+                    -C "${STAGE_DIR}/extracted"
+                INNER_SHA=$(tr -d '[:space:]' \
+                    < "${STAGE_DIR}/extracted/COMMIT_SHA" 2>/dev/null || true)
+                if [ "${INNER_SHA}" = "${TARGET_SHA}" ]; then
+                    echo "[OK] Verified COMMIT_SHA + SHA256 on attempt #${attempt}."
+                    VERIFIED=1
+                    break
+                fi
+            fi
+        fi
     fi
     SHORT_REMOTE=$(echo "${REMOTE_SHA}" | cut -c1-7)
-    echo "  [WAIT ${attempt}/36] Release binary SHA (${SHORT_REMOTE:-none}) != HEAD (${SHORT_TARGET}). GitHub Actions building... waiting 5s"
+    echo "  [WAIT ${attempt}/36] Remote (${SHORT_REMOTE:-none}) != HEAD (${SHORT_TARGET})..."
     sleep 5
 done
 
 if [ "${VERIFIED}" -ne 1 ]; then
-    echo "[ABORT] Binary SHA verification timed out. Refusing unverified deploy."
+    echo "[ABORT] Binary SHA/SHA256 verification timed out. Refusing deploy."
     exit 1
 fi
 
-curl -fsSL --retry 3 --retry-delay 2 "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"
 sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
-tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
-rm -f "/tmp/vortex-linux-x86_64.tar.gz"
-chmod +x "${BIN_DIR}/vortex_tap" "${BIN_DIR}/vortex_replay" "${BIN_DIR}/vortex_exec"
+for bin_name in "vortex_tap" "vortex_replay" "vortex_exec"; do
+    cp -f "${STAGE_DIR}/extracted/${bin_name}" "${BIN_DIR}/${bin_name}"
+    chmod +x "${BIN_DIR}/${bin_name}"
+done
 
-# 1. Kernel Network & Memory HFT Profile (BBR + fq + tcp_slow_start_after_idle=0 + THP off)
-sudo tee /etc/sysctl.d/99-vortex-hft.conf > /dev/null <<EOF
+# 1. Kernel Network & Memory HFT Profile (BBR + fq + THP never + swappiness=1)
+sudo tee /etc/sysctl.d/99-vortex-hft.conf > /dev/null <<'EOF'
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
@@ -69,35 +99,44 @@ vm.dirty_ratio = 10
 vm.dirty_background_ratio = 3
 EOF
 sudo sysctl --system >/dev/null 2>&1 || true
-if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
-    echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true
-    echo never | sudo tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1 || true
+
+THP_DIR="/sys/kernel/mm/transparent_hugepage"
+if [ -f "${THP_DIR}/enabled" ]; then
+    echo never | sudo tee "${THP_DIR}/enabled" >/dev/null 2>&1 || true
+    echo never | sudo tee "${THP_DIR}/defrag" >/dev/null 2>&1 || true
 fi
 
-# 2. VORTEX-DOCTOR (Hardware, TSC Clock, Chrony Atomic NTP & BBR Auto-Healer)
-sudo tee /usr/local/bin/vortex-doctor > /dev/null << 'DOCTOR_EOF'
+# 2. VORTEX-DOCTOR (TSC Clock, Chrony Atomic NTP, BBR & Nice Auto-Healer)
+sudo tee /usr/local/bin/vortex-doctor > /dev/null <<'DOCTOR_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "================================================================================"
-echo "[VORTEX-DOCTOR V3.0] HARDWARE, TSC/CHRONY CLOCK, BBR NETWORK & OS AUTO-HEALER"
-echo "================================================================================"
-CLK=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null || echo "unknown")
+SEP="================================================================================"
+echo "${SEP}"
+echo "[VORTEX-DOCTOR V3.0] HARDWARE, TSC/CHRONY CLOCK, BBR & OS AUTO-HEALER"
+echo "${SEP}"
+CS_PATH="/sys/devices/system/clocksource/clocksource0/current_clocksource"
+CLK=$(cat "${CS_PATH}" 2>/dev/null || echo "unknown")
 if [ "${CLK}" != "tsc" ]; then
-    echo "tsc" | sudo tee /sys/devices/system/clocksource/clocksource0/current_clocksource >/dev/null 2>&1 || true
+    echo "tsc" | sudo tee "${CS_PATH}" >/dev/null 2>&1 || true
 fi
-echo "  🟢 [1/5 CLOCKSOURCE] Kernel clocksource locked to: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null || echo tsc)"
-OFFSET_NS=$(chronyc -c tracking 2>/dev/null | awk -F',' '{printf "%.0f", ($5 < 0 ? -$5 : $5) * 1000000000}' || echo "0")
+NOW_CLK=$(cat "${CS_PATH}" 2>/dev/null || echo "tsc")
+echo "  [1/5 CLOCKSOURCE] Kernel clocksource locked to: ${NOW_CLK}"
+
+OFFSET_NS=$(chronyc -c tracking 2>/dev/null \
+    | awk -F',' '{printf "%.0f", ($5 < 0 ? -$5 : $5) * 1000000000}' || echo "0")
 if [ "${OFFSET_NS:-0}" -gt 1000000 ]; then
     sudo chronyc makestep >/dev/null 2>&1 || true
-    echo "  🟠 [2/5 CHRONY SYNC] Offset (${OFFSET_NS} ns > 1ms) auto-stepped to AWS Atomic Clock!"
+    echo "  [2/5 CHRONY SYNC] Offset (${OFFSET_NS} ns > 1ms) stepped to AWS Clock!"
 else
-    echo "  🟢 [2/5 CHRONY SYNC] Atomic NTP Offset: ${OFFSET_NS:-0} ns (< 1,000,000 ns gate)"
+    echo "  [2/5 CHRONY SYNC] Atomic NTP Offset: ${OFFSET_NS:-0} ns (< 1ms gate)"
 fi
+
 sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 sudo sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
 sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
 sudo sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
-echo "  🟢 [3/5 TCP HFT STACK] BBR + fq + tcp_slow_start_after_idle=0 + tcp_tw_reuse=1 enforced"
+echo "  [3/5 TCP HFT STACK] BBR + fq + tcp_slow_start_after_idle=0 enforced"
+
 for svc_pair in "vortex-tap.service:-10" "vortex-exec.service:-15"; do
     svc="${svc_pair%%:*}"
     target_nice="${svc_pair##*:}"
@@ -106,15 +145,17 @@ for svc_pair in "vortex-tap.service:-10" "vortex-exec.service:-15"; do
         sudo renice -n "${target_nice}" -p "${pid}" >/dev/null 2>&1 || true
     fi
 done
-echo "  🟢 [4/5 DAEMON SHIELD] vortex-tap (Nice=-10) & vortex-exec (Nice=-15) priorities verified"
+echo "  [4/5 DAEMON SHIELD] vortex-tap (-10) & vortex-exec (-15) verified"
+
 sudo journalctl --vacuum-size=100M >/dev/null 2>&1 || true
-PAR_COUNT=$(ls -1 /home/ubuntu/vortex-rs/data/*.parquet 2>/dev/null | wc -l || echo "0")
-echo "  🟢 [5/5 STORAGE & SHM] SHM v12 intact | PAR1 Ring: ${PAR_COUNT} files | Vault isolated in data/vault/"
-echo "================================================================================"
+PAR_COUNT=$(find /home/ubuntu/vortex-rs/data -maxdepth 1 \
+    -name "vortex_l2_segment_*.parquet" 2>/dev/null | wc -l || echo "0")
+echo "  [5/5 STORAGE & SHM] SHM v12 | PAR1 Ring: ${PAR_COUNT} | Vault isolated"
+echo "${SEP}"
 DOCTOR_EOF
 sudo chmod +x /usr/local/bin/vortex-doctor
 
-sudo tee /etc/systemd/system/vortex-doctor.service > /dev/null <<EOF
+sudo tee /etc/systemd/system/vortex-doctor.service > /dev/null <<'EOF'
 [Unit]
 Description=VORTEX-L3 Autonomous Hardware, Clock & Network Auto-Healer
 After=network-online.target
@@ -126,7 +167,7 @@ Nice=19
 IOSchedulingClass=idle
 EOF
 
-sudo tee /etc/systemd/system/vortex-doctor.timer > /dev/null <<EOF
+sudo tee /etc/systemd/system/vortex-doctor.timer > /dev/null <<'EOF'
 [Unit]
 Description=Run VORTEX-DOCTOR every 10 minutes with idle priority
 
@@ -140,8 +181,8 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-# 3. VORTEX-MAINTENANCE (Zero-Jitter Vault Backups & PAR1 Ring Pruning)
-sudo tee /usr/local/bin/vortex-maintenance.sh > /dev/null << 'MAINT_EOF'
+# 3. VORTEX-MAINTENANCE (Zero-Jitter Vault Backups & PAR1 4,096 Ring Pruning)
+sudo tee /usr/local/bin/vortex-maintenance.sh > /dev/null <<'MAINT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 VORTEX_DIR="/home/ubuntu/vortex-rs"
@@ -149,22 +190,26 @@ DATA_DIR="${VORTEX_DIR}/data"
 VAULT_DIR="${DATA_DIR}/vault"
 BACKUP_DIR="${VORTEX_DIR}/backups"
 mkdir -p "${BACKUP_DIR}" "${VAULT_DIR}"
-if [ -f "${DATA_DIR}/vortex_shadow_trades.jsonl" ]; then
-    cp -f "${DATA_DIR}/vortex_shadow_trades.jsonl" "${BACKUP_DIR}/vortex_shadow_trades.jsonl.bak" || true
-fi
-for vf in "vortex_ai_forensic_vault.jsonl" "vortex_red_loss_box.jsonl" "vortex_open_positions_state.json"; do
+
+for vf in \
+    "vortex_ai_forensic_vault.jsonl" \
+    "vortex_red_loss_box.jsonl" \
+    "vortex_governor_scar_memory.jsonl" \
+    "vortex_open_positions_state.json"; do
     if [ -f "${VAULT_DIR}/${vf}" ]; then
         cp -f "${VAULT_DIR}/${vf}" "${BACKUP_DIR}/${vf}.bak" || true
     fi
 done
+
 rm -rf "${DATA_DIR}/lakehouse_par1" || true
 find "${BACKUP_DIR}" -type f -name "*.parquet" -delete 2>/dev/null || true
-find "${DATA_DIR}" -maxdepth 1 -name "vortex_l2_segment_*.parquet" | sort | head -n -4096 | xargs -r rm -f || true
+find "${DATA_DIR}" -maxdepth 1 -name "vortex_l2_segment_*.parquet" \
+    | sort | head -n -4096 | xargs -r rm -f || true
 sudo journalctl --vacuum-time=3d --vacuum-size=100M >/dev/null 2>&1 || true
 MAINT_EOF
 sudo chmod +x /usr/local/bin/vortex-maintenance.sh
 
-sudo tee /etc/systemd/system/vortex-maint.service > /dev/null <<EOF
+sudo tee /etc/systemd/system/vortex-maint.service > /dev/null <<'EOF'
 [Unit]
 Description=VORTEX-L3 Zero-Jitter Storage & Vault Backup Maintenance
 After=network.target
@@ -179,7 +224,7 @@ CPUWeight=10
 ExecStart=/usr/local/bin/vortex-maintenance.sh
 EOF
 
-sudo tee /etc/systemd/system/vortex-maint.timer > /dev/null <<EOF
+sudo tee /etc/systemd/system/vortex-maint.timer > /dev/null <<'EOF'
 [Unit]
 Description=Run VORTEX-L3 Maintenance every 6 hours with idle IO
 
@@ -195,7 +240,7 @@ EOF
 # 4. VORTEX-TAP & VORTEX-EXEC Systemd Services
 sudo tee /etc/systemd/system/vortex-tap.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L3 Bybit UTA V5 12-Pair Public L2 + Trade Tape Seqlock Daemon (SHM v12)
+Description=VORTEX-L3 Bybit UTA V5 12-Pair L2 + Trade + Ticker Seqlock Daemon (SHM v12)
 After=network-online.target
 Wants=network-online.target
 
@@ -217,7 +262,7 @@ EOF
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L3 200Hz Autonomous 12-Slot Execution Daemon (ZMPQR + LVDBS)
+Description=VORTEX-L3 200Hz Autonomous 12-Slot Execution Daemon (Async TLS/WS + LVDBS)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -237,43 +282,53 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 EOF
 
-# 5. Unified 12-Command VORTEX CLI (/usr/local/bin/vortex)
-sudo tee /usr/local/bin/vortex > /dev/null << 'VORTEX_CLI_EOF'
+# 5. Unified VORTEX Operational CLI (/usr/local/bin/vortex)
+sudo tee /usr/local/bin/vortex > /dev/null <<'VORTEX_CLI_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 VORTEX_DIR="/home/ubuntu/vortex-rs"
 BIN_DIR="/home/ubuntu/vortex-rs/bin"
+VAULT_DIR="${VORTEX_DIR}/data/vault"
 
 case "${1:-live}" in
     360)
-        echo "=== [1. VORTEX-L3 LIVE HUD (SHM v12)] ==="
+        echo "=== [1. VORTEX-L3 LIVE HUD (SHM v12 READ-ONLY)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --live
         echo "=== [2. BYBIT V5 LIVE ORDERS & QUEUE TELEMETRY] ==="
-        journalctl -u vortex-exec.service -n 35 --no-pager | grep -E "VORTEX-L3|BYBIT V5|QUEUE|FILL|CLOSE|ADOPT|REHYDRATE|DRAIN" || true
+        journalctl -u vortex-exec.service -n 35 --no-pager \
+            | grep -E "VORTEX-L3|BYBIT V5|FILL|CLOSE|ADOPT|REHYDRATE|DRAIN" || true
         echo "=== [3. CLOSED TRADES LEDGER & EXECUTIVE DASHBOARD] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --trades
         echo "=== [4. WALK-FORWARD PAR1 REPLAY & A/B/A+B ECONOMIC LAB] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
-        echo "=== [5. AI FORENSIC VAULT (data/vault/vortex_ai_forensic_vault.jsonl)] ==="
-        tail -n 15 "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
-        echo "=== [6. RED LOSS FORENSIC BOX (data/vault/vortex_red_loss_box.jsonl)] ==="
-        cat "${VORTEX_DIR}/data/vault/vortex_red_loss_box.jsonl" 2>/dev/null || true
+        echo "=== [5. AI FORENSIC VAULT (vortex_ai_forensic_vault.jsonl)] ==="
+        tail -n 15 "${VAULT_DIR}/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        echo "=== [6. GOVERNOR SCAR MEMORY & RED LOSS BOX] ==="
+        tail -n 5 "${VAULT_DIR}/vortex_governor_scar_memory.jsonl" 2>/dev/null || true
+        cat "${VAULT_DIR}/vortex_red_loss_box.jsonl" 2>/dev/null || true
         ;;
     drain|drenar)
-        mkdir -p "${VORTEX_DIR}/data/vault"
-        touch "${VORTEX_DIR}/data/vault/DRAIN_MODE.lock"
-        echo "🟢 [MODO DRENAJE ACTIVADO] Custodiando en verde las posiciones abiertas hasta 0..."
+        mkdir -p "${VAULT_DIR}"
+        touch "${VAULT_DIR}/DRAIN_MODE.lock"
+        echo "  [DRAIN MODE ACTIVE] Harvesting open positions in green down to 0..."
         sleep 1
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --live
         ;;
     normal|resume|undrain)
-        rm -f "${VORTEX_DIR}/data/vault/DRAIN_MODE.lock" "${VORTEX_DIR}/data/vault/HALTED_ON_LOSS.lock"
+        if [ -f "${VAULT_DIR}/HALTED_ON_LOSS.lock" ]; then
+            echo "[BLOCKED] HALTED_ON_LOSS.lock active. Inspect 'vortex redbox' first."
+            exit 1
+        fi
+        rm -f "${VAULT_DIR}/DRAIN_MODE.lock"
+        if ! systemctl is-active --quiet vortex-tap.service; then
+            sudo systemctl start vortex-tap.service
+            sleep 1
+        fi
         if ! systemctl is-active --quiet vortex-exec.service; then
             sudo systemctl start vortex-exec.service
             sleep 1
         fi
-        echo "🟢 [MODO NORMAL RESTAURADO] 12/12 motores autonomos activos en vivo."
+        echo "  [NORMAL MODE RESTORED] 12/12 autonomous engines active."
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --live
         ;;
     live|-l)
@@ -288,17 +343,20 @@ case "${1:-live}" in
         journalctl -u vortex-exec.service -u vortex-tap.service -f -n 30 --output=cat
         ;;
     baul|vault)
-        tail -n 30 "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        tail -n 30 "${VAULT_DIR}/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        ;;
+    scars)
+        tail -n 20 "${VAULT_DIR}/vortex_governor_scar_memory.jsonl" 2>/dev/null || true
         ;;
     redbox)
-        cat "${VORTEX_DIR}/data/vault/vortex_red_loss_box.jsonl" 2>/dev/null || true
+        cat "${VAULT_DIR}/vortex_red_loss_box.jsonl" 2>/dev/null || true
         ;;
     doctor)
         /usr/local/bin/vortex-doctor
         ;;
     maint)
         sudo /usr/local/bin/vortex-maintenance.sh
-        echo "🟢 [VORTEX-MAINT] Backups .bak sellados en ~/vortex-rs/backups y PAR1 ring verificado."
+        echo "  [VORTEX-MAINT] Vault .bak backups sealed & PAR1 4,096 ring verified."
         ;;
     replay|-r)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
@@ -310,9 +368,9 @@ case "${1:-live}" in
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec"
         ;;
     status|-s)
-        systemctl status vortex-tap.service vortex-exec.service --no-pager
-        ls -lh /dev/shm/vortex_lob.mmap || true
-        ls -lh "${VORTEX_DIR}/data/vault/" || true
+        systemctl status vortex-tap.service vortex-exec.service --no-pager || true
+        ls -lh /dev/shm/vortex_lob.mmap 2>/dev/null || true
+        ls -lh "${VAULT_DIR}/" 2>/dev/null || true
         ;;
     logs)
         journalctl -u vortex-tap.service -u vortex-exec.service -n 40 --no-pager
@@ -325,23 +383,28 @@ case "${1:-live}" in
         /usr/local/bin/vortex-doctor
         ;;
     *)
-        echo "Usage: vortex {360|drain|normal|live|trades|follow|baul|redbox|doctor|maint|replay|audit|oos|status|logs|all}"
+        U1="360|drain|normal|live|trades|follow|baul|scars"
+        U2="redbox|doctor|maint|replay|audit|oos|status|logs|all"
+        echo "Usage: vortex {${U1}|${U2}}"
         exit 1
         ;;
 esac
 VORTEX_CLI_EOF
-
 sudo chmod +x /usr/local/bin/vortex
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now vortex-doctor.timer vortex-maint.timer >/dev/null 2>&1 || true
 /usr/local/bin/vortex-doctor || true
-if [ "${1:-}" = "--start-daemons" ] && [ ! -f "${VAULT_DIR}/DRAIN_MODE.lock" ] && [ ! -f "${VAULT_DIR}/HALTED_ON_LOSS.lock" ]; then
+
+if [ "${1:-}" = "--start-daemons" ] \
+    && [ ! -f "${VAULT_DIR}/DRAIN_MODE.lock" ] \
+    && [ ! -f "${VAULT_DIR}/HALTED_ON_LOSS.lock" ]; then
     sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true
     sudo systemctl restart vortex-tap.service
     sleep 2
     sudo systemctl restart vortex-exec.service
     sleep 1
-    echo "[OK] VORTEX-L3 Daemons + Doctor + Maint active (Commit SHA Verified)."
+    echo "[OK] VORTEX-L3 Daemons + Doctor + Maint active (SHA + SHA256 Verified)."
 else
     echo "[OK] VORTEX-L3 Binaries + Doctor + Maint installed (Daemons STOPPED / LOCKED)."
 fi
