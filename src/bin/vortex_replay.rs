@@ -6,8 +6,7 @@
     clippy::too_many_arguments
 )]
 
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -31,6 +30,7 @@ use vortex_rs::types::{
 pub const FLIGHT_LATENCY_NS: i64 = 25_000_000;
 const INITIAL_REPLAY_EQUITY_1E8: i64 = 6_628_080_000;
 const SCAR_MEMORY_VAULT_PATH: &str = "data/vault/vortex_governor_scar_memory.jsonl";
+const RED_LOSS_BOX_PATH: &str = "data/vault/vortex_red_loss_box.jsonl";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SimulatedOrderState {
@@ -724,21 +724,11 @@ pub struct WalkForwardReport {
 }
 
 fn rehydrate_governor_scars_if_present(gov: &mut OnlineAdaptiveGovernor) {
-    let Ok(file) = File::open(SCAR_MEMORY_VAULT_PATH) else {
-        return;
-    };
-    let reader = BufReader::new(file);
-    let mut latest_json: Option<serde_json::Value> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if val.get("event").and_then(|v| v.as_str()) == Some("GOV_SCAR_SNAPSHOT") {
-                latest_json = Some(val);
-            }
-        }
-    }
-    if let Some(ref snap_v) = latest_json {
-        let _ = gov.apply_scar_snapshot_json(snap_v);
-    }
+    let _ = gov.rehydrate_from_scar_and_loss_files(
+        Path::new(SCAR_MEMORY_VAULT_PATH),
+        Path::new(RED_LOSS_BOX_PATH),
+        None,
+    );
 }
 
 /// F-10 Fix: Continuous Walk-Forward PAR1 Replay with 25ms L1..L4 FIFO & Honest PF.
@@ -776,6 +766,7 @@ pub fn run_parquet_walk_forward_on_dir(
     let mut exit_fifo = [FifoQueueSimulator::new(); MAX_ACTIVE_PAIRS];
     let mut exit_role_latch = [ExitOrderRole::None; MAX_ACTIVE_PAIRS];
     let mut init_q_ahead = [LotQty(0); MAX_ACTIVE_PAIRS];
+    let mut armed_ts_latch = [0_i64; MAX_ACTIVE_PAIRS];
     let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     for s in 0..MAX_ACTIVE_PAIRS {
         snaps[s].symbol_id = APPROVED_SPECS[s].symbol_id;
@@ -865,6 +856,7 @@ pub fn run_parquet_walk_forward_on_dir(
                                         OrderLifecycleState::PlacingEntryMaker { .. }
                                     )
                                 {
+                                    armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
                                     entry_fifo[s_idx].submit_post_only(
                                         side,
                                         en_px,
@@ -930,6 +922,14 @@ pub fn run_parquet_walk_forward_on_dir(
                                     cur_snap.realized_vol_5m.raw().clamp(4_000, 12_500);
                                 let timeout_ns = ((15_000_000_000_i64 * 6_500) / vol_q)
                                     .clamp(10_000_000_000, 20_000_000_000);
+                                let total_chase_ns = cur_snap
+                                    .ts_local_ns
+                                    .0
+                                    .saturating_sub(armed_ts_latch[s_idx]);
+                                let max_chase_ns =
+                                    OnlineAdaptiveGovernor::max_total_entry_chase_ns(
+                                        cur_snap.realized_vol_5m,
+                                    );
                                 let at_l1 = match side {
                                     Side::Bid => cur_snap.bids[0].price == entry_price,
                                     Side::Ask => cur_snap.asks[0].price == entry_price,
@@ -946,7 +946,10 @@ pub fn run_parquet_walk_forward_on_dir(
                                         &cur_snap,
                                     ))
                                     || flow_imp <= -0.48;
-                                if elapsed_ns >= timeout_ns || dq_abort {
+                                if elapsed_ns >= timeout_ns
+                                    || total_chase_ns >= max_chase_ns
+                                    || dq_abort
+                                {
                                     gov.observe_entry_abort(
                                         s_idx,
                                         side,
@@ -1139,7 +1142,7 @@ pub fn run_parquet_walk_forward_on_dir(
                             || (peg_ready
                                 && ((moving_closer
                                     && tp_diff >= 1
-                                    && (quote.defensive_lock_active || tp_diff >= 2))
+                                    && (quote.urgent_close_repeg || tp_diff >= 2))
                                     || (!moving_closer
                                         && quote.cur_gross_bps < 200
                                         && tp_diff >= 4)));

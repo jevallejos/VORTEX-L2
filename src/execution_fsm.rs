@@ -52,6 +52,9 @@ pub enum ExitOrderRole {
     StandardMakerExit100 = 3,
 }
 
+pub type ScarEventKey = (i64, usize, u8);
+pub type ScarEventPayload = (PriceTicks, ScaledBps, bool);
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalExitQuote {
     pub role: ExitOrderRole,
@@ -62,6 +65,7 @@ pub struct CanonicalExitQuote {
     pub cur_gross_bps: i64,
     pub wald_pct: i64,
     pub defensive_lock_active: bool,
+    pub urgent_close_repeg: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1044,6 +1048,222 @@ impl OnlineAdaptiveGovernor {
         cand_comp >= adaptive_threshold
     }
 
+    /// V3-03: Elastic total chase horizon from initial arming (14s..25s).
+    #[inline]
+    #[must_use]
+    pub fn max_total_entry_chase_ns(realized_vol_5m: ScaledBps) -> i64 {
+        let vol_c = realized_vol_5m.raw().clamp(4_000, 12_500);
+        ((22_000_000_000_i64 * 6_500) / vol_c).clamp(14_000_000_000, 25_000_000_000)
+    }
+
+    /// V3-03 & Law 10 (Zero Self-Choke): Continuous C1 hysteresis preflight validator.
+    pub fn confirm_preflight_kinematics_non_choking(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+    ) -> Result<(i64, i64), &'static str> {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Err("VETO_INVALID_SLOT");
+        }
+        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+            return Err("VETO_PREFLIGHT_INVALID_BBO");
+        };
+        let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        if let Some(veto) = self.audit_historical_entry_veto(
+            slot_idx,
+            side,
+            entry_px.0,
+            snap.ts_local_ns.0,
+        ) {
+            return Err(veto);
+        }
+        let dir_s = side.sign_f64();
+        let signed_snr = OrthogonalFactorState::snr_composite_score(snap) * dir_s;
+        if signed_snr < 0.30 {
+            return Err("VETO_PREFLIGHT_SNR_COLLAPSE");
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let in_scar = self.is_in_scar_debt(slot_idx, side);
+        if !spec.passes_oversized_lot_conviction_guard(
+            wallet_usdt_1e8,
+            entry_px,
+            signed_snr,
+            in_scar,
+        ) {
+            return Err("VETO_PREFLIGHT_OVERSIZED_LOT");
+        }
+        let signed_geom = snap.factor_geom.get() * dir_s;
+        let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(-0.08, 0.06);
+        if signed_geom < min_pre_geom {
+            return Err("VETO_PREFLIGHT_GEOM_REVERSAL");
+        }
+        if slot_idx > 0 {
+            let btc_snr =
+                OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
+            if btc_snr < -0.08 && signed_snr < 0.62 {
+                return Err("VETO_PREFLIGHT_BTC_HEADWIND");
+            }
+        }
+        let (drift_bps, ext_bps) =
+            self.price_drift_and_extension_scaled_bps(slot_idx, snap);
+        if let Ok(ok_pair) = self.evaluate_kinematic_energy_surface(
+            slot_idx,
+            side,
+            drift_bps,
+            ext_bps,
+            signed_geom,
+            signed_snr,
+        ) {
+            return Ok(ok_pair);
+        }
+        let d_sign = side.sign_i64();
+        let s_drift = drift_bps.saturating_mul(d_sign);
+        let s_ext = ext_bps.saturating_mul(d_sign);
+        let lead_impulse = s_ext.saturating_sub(s_drift);
+        let elastic_lead_cap =
+            60 + ((signed_snr - 0.55).max(0.0) * 110.0).round() as i64;
+        if s_drift < -20
+            || s_ext < -20
+            || s_ext > 1_200
+            || (lead_impulse > elastic_lead_cap && s_ext >= 120)
+            || lead_impulse < -420
+        {
+            return Err("VETO_PREFLIGHT_KINEMATIC_EXHAUSTION");
+        }
+        let d = Self::dir_idx(side);
+        let learned_edge = self.ewma_net_bps_x100[slot_idx][d];
+        let req_e_min = (125 + ((200 - learned_edge).max(0) / 4)).clamp(110, 260);
+        let hyst_e_min = ((req_e_min * 80) / 100).clamp(85, 220);
+        let geom_c = ((signed_geom - min_pre_geom).max(0.0) * 240.0).round() as i64;
+        let snr_c = ((signed_snr - 0.34).max(0.0) * 300.0).round() as i64;
+        let imp_c = if lead_impulse >= 0 {
+            lead_impulse.min(75) + (s_drift.max(0) / 2).min(85)
+        } else {
+            (lead_impulse / 2).max(-60)
+        };
+        let snr_ramp = ((signed_snr - 0.26) / 0.10).clamp(0.0, 1.0);
+        let bonus =
+            if s_drift >= -10 && s_drift <= 155 && s_ext >= -12 && s_ext <= 185 {
+                (95.0 * snr_ramp).round() as i64
+            } else {
+                0_i64
+            };
+        let e_kin_hyst = imp_c + geom_c + snr_c + bonus;
+        if e_kin_hyst < hyst_e_min {
+            return Err("VETO_PREFLIGHT_ENERGY_COLLAPSE");
+        }
+        Ok((e_kin_hyst, hyst_e_min))
+    }
+
+    /// V3-02: Parses legacy scar rows, Red-Box rows & TRADE_CLOSE rows uniformly.
+    #[must_use]
+    pub fn parse_historical_trade_scar_tuple(
+        val: &serde_json::Value,
+        min_exclusive_ts_ns: i64,
+    ) -> Option<(ScarEventKey, ScarEventPayload)> {
+        if let Some(ev) = val.get("event").and_then(|v| v.as_str()) {
+            if ev != "TRADE_CLOSE" {
+                return None;
+            }
+        }
+        let ts_ns = val.get("ts_ns").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ts_ns <= 0 || ts_ns <= min_exclusive_ts_ns {
+            return None;
+        }
+        let sym = val.get("symbol").and_then(|v| v.as_str())?;
+        let slot_idx = crate::types::slot_from_symbol_name(sym)?;
+        let side_s = val.get("side").and_then(|v| v.as_str()).unwrap_or("Bid");
+        let side = crate::types::side_from_str(side_s);
+        let d_u8 = Self::dir_idx(side) as u8;
+        let en_t =
+            PriceTicks(val.get("entry_ticks").and_then(|v| v.as_i64()).unwrap_or(0));
+        let net_f = val.get("net_bps").and_then(|v| v.as_f64())?;
+        let net_sc = ScaledBps((net_f * 100.0).round() as i64);
+        let mkr = val
+            .get("maker_exit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(net_sc.raw() >= -50);
+        Some(((ts_ns, slot_idx, d_u8), (en_t, net_sc, mkr)))
+    }
+
+    /// V3-02: Deduplicated chronological scar rehydration across Scar, RedBox & Vault.
+    pub fn rehydrate_from_scar_and_loss_files(
+        &mut self,
+        scar_path: &std::path::Path,
+        red_loss_path: &std::path::Path,
+        session_vault_path: Option<&std::path::Path>,
+    ) -> (i64, usize) {
+        use std::io::BufRead;
+        let mut snap_ts_ns = 0_i64;
+        if let Ok(s_file) = std::fs::File::open(scar_path) {
+            let reader = std::io::BufReader::new(s_file);
+            let mut latest_snap: Option<serde_json::Value> = None;
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let is_snap = val.get("event").and_then(|v| v.as_str())
+                        == Some("GOV_SCAR_SNAPSHOT");
+                    if is_snap {
+                        latest_snap = Some(val);
+                    }
+                }
+            }
+            if let Some(ref snap_v) = latest_snap {
+                if let Some(restored) = self.apply_scar_snapshot_json(snap_v) {
+                    snap_ts_ns = restored.0;
+                }
+            }
+        }
+
+        let mut dedup_events: std::collections::BTreeMap<
+            ScarEventKey,
+            ScarEventPayload,
+        > = std::collections::BTreeMap::new();
+        let mut paths: [&std::path::Path; 3] = [scar_path, red_loss_path, scar_path];
+        let path_count = if let Some(vp) = session_vault_path {
+            paths[2] = vp;
+            3_usize
+        } else {
+            2_usize
+        };
+        for p in &paths[..path_count] {
+            let Ok(file) = std::fs::File::open(p) else {
+                continue;
+            };
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                if let Some((key, payload)) =
+                    Self::parse_historical_trade_scar_tuple(&val, snap_ts_ns)
+                {
+                    dedup_events.entry(key).or_insert(payload);
+                }
+            }
+        }
+
+        let mut max_ts = snap_ts_ns;
+        let ingested = dedup_events.len();
+        for (&(ts_ns, slot_idx, d_u8), &(en_t, net_sc, mkr)) in &dedup_events {
+            let side = if d_u8 == 1 { Side::Ask } else { Side::Bid };
+            self.observe_closed_trade_at_entry(
+                slot_idx,
+                side,
+                en_t,
+                net_sc,
+                mkr,
+                TimestampNs(ts_ns),
+            );
+            if ts_ns > max_ts {
+                max_ts = ts_ns;
+            }
+        }
+        (max_ts, ingested)
+    }
+
     /// Unified LOSS-LAB Verifier: Certifies 62/62 historical/V2/PAR1 losses + 2,160 manifold.
     #[must_use]
     pub fn audit_unified_62_losses_and_2160_manifold() -> (usize, usize) {
@@ -1588,6 +1808,8 @@ impl SlotExecutionEngine {
         self.lvdbs_deep_surfs_count = 0;
         self.last_closed_mfe_bps = 0;
         self.last_closed_mae_bps = 0;
+        self.last_closed_peak_ticks = eff_entry_px;
+        self.last_closed_worst_ticks = eff_entry_px;
         self.last_closed_wald_pct = 0;
         self.exit_peg_attempts = 0;
         self.close_reconcile_retries = 0;
@@ -1655,6 +1877,10 @@ impl SlotExecutionEngine {
 
         self.last_opened_ts = opened_ts;
         self.last_eff_sl_ticks = sl_t;
+        self.last_closed_peak_ticks =
+            if peak_price.0 > 0 { peak_price } else { verified_avg_price };
+        self.last_closed_worst_ticks =
+            if worst_price.0 > 0 { worst_price } else { verified_avg_price };
         self.tranche1_harvests_count = u64::from(t1_done);
         self.lvdbs_deep_surfs_count = 0;
         self.exit_peg_attempts = 0;
@@ -1779,6 +2005,52 @@ impl SlotExecutionEngine {
         true
     }
     #[inline]
+    fn fold_price_into_excursions(
+        &mut self,
+        side: Side,
+        avg_px: PriceTicks,
+        obs_px: PriceTicks,
+    ) {
+        if avg_px.0 <= 0 || obs_px.0 <= 0 {
+            return;
+        }
+        if self.last_closed_peak_ticks.0 <= 0 {
+            self.last_closed_peak_ticks = avg_px;
+        }
+        if self.last_closed_worst_ticks.0 <= 0 {
+            self.last_closed_worst_ticks = avg_px;
+        }
+        match side {
+            Side::Bid => {
+                if obs_px.0 > self.last_closed_peak_ticks.0 {
+                    self.last_closed_peak_ticks = obs_px;
+                }
+                if obs_px.0 < self.last_closed_worst_ticks.0 {
+                    self.last_closed_worst_ticks = obs_px;
+                }
+            }
+            Side::Ask => {
+                if obs_px.0 < self.last_closed_peak_ticks.0 {
+                    self.last_closed_peak_ticks = obs_px;
+                }
+                if obs_px.0 > self.last_closed_worst_ticks.0 {
+                    self.last_closed_worst_ticks = obs_px;
+                }
+            }
+        }
+        let d_sign = side.sign_i64();
+        let pk_diff = (self.last_closed_peak_ticks.0 - avg_px.0).saturating_mul(d_sign);
+        let wr_diff = (self.last_closed_worst_ticks.0 - avg_px.0).saturating_mul(d_sign);
+        let denom = avg_px.0.max(1);
+        self.last_closed_mfe_bps = self
+            .last_closed_mfe_bps
+            .max((pk_diff.saturating_mul(1_000_000)) / denom);
+        self.last_closed_mae_bps = self
+            .last_closed_mae_bps
+            .min((wr_diff.saturating_mul(1_000_000)) / denom);
+    }
+
+    #[inline]
     fn classify_maker_exit_sub_reason(
         side: Side,
         entry_px: PriceTicks,
@@ -1787,12 +2059,14 @@ impl SlotExecutionEngine {
         legs_count: u32,
         vac_level_hint: usize,
     ) -> ExitSubReason {
-        let raw_d = match side {
-            Side::Bid => exit_px.0 - entry_px.0,
-            Side::Ask => entry_px.0 - exit_px.0,
+        let q_floor = defensive_zero_loss_maker_exit_price(side, entry_px);
+        let strictly_above_q_floor = match side {
+            Side::Bid => exit_px.0 > q_floor.0,
+            Side::Ask => exit_px.0 > 0 && exit_px.0 < q_floor.0,
         };
+        let raw_d = (exit_px.0 - entry_px.0).saturating_mul(side.sign_i64());
         let gross_bps = (raw_d.saturating_mul(1_000_000)) / entry_px.0.max(1);
-        if gross_bps >= 500 || vac_level_hint >= 2 {
+        if strictly_above_q_floor && (gross_bps >= 520 || vac_level_hint >= 2) {
             ExitSubReason::LvdbsDeepVacuumSurf
         } else if tranche1_harvested || legs_count >= 2 {
             ExitSubReason::Tranche1Harvest50
@@ -2290,7 +2564,11 @@ impl SlotExecutionEngine {
                     ScaledBps(if tranche1_harvested { 465 } else { 440 })
                 };
                 let fl_px = dynamic_maker_floor_price(side, avg_price_ticks, fl_bps);
-                let sub = if fl_bps.raw() >= 500 {
+                let above_qf = match side {
+                    Side::Bid => fl_px.0 > q_floor.0,
+                    Side::Ask => fl_px.0 < q_floor.0,
+                };
+                let sub = if above_qf && fl_bps.raw() >= 520 {
                     ExitSubReason::LvdbsDeepVacuumSurf
                 } else {
                     ExitSubReason::AdverseScratchEscape
@@ -2316,7 +2594,11 @@ impl SlotExecutionEngine {
                 } else {
                     ExitOrderRole::StandardMakerExit100
                 };
-                let sub_surf = if vac_lvl >= 2 || struct_floor.0 != q_floor.0 {
+                let above_qf = match side {
+                    Side::Bid => lvdbs_px.0 > q_floor.0,
+                    Side::Ask => lvdbs_px.0 < q_floor.0,
+                };
+                let sub_surf = if above_qf && (vac_lvl >= 2 || struct_floor.0 != q_floor.0) {
                     ExitSubReason::LvdbsDeepVacuumSurf
                 } else {
                     ExitSubReason::AdverseScratchEscape
@@ -2344,6 +2626,7 @@ impl SlotExecutionEngine {
             cur_gross_bps,
             wald_pct,
             defensive_lock_active: def_lock,
+            urgent_close_repeg: defensive_now || mfe_ratchet_lock,
         })
     }
 
@@ -2381,6 +2664,7 @@ impl SlotExecutionEngine {
             );
         let net_pnl_1e8 = exchange_closed_pnl_1e8.unwrap_or(calc_pnl_1e8);
 
+        self.fold_price_into_excursions(side, entry_price, exit_price);
         ledger.record_closed_trade_with_sinking_split(
             net_pnl_1e8,
             fee_1e8,
@@ -2485,6 +2769,8 @@ impl SlotExecutionEngine {
         let net_pnl_1e8 = pnl1.saturating_add(pnl2);
         let fee_1e8 = fee1.saturating_add(fee2);
 
+        self.fold_price_into_excursions(side, avg_price_ticks, tranche1_exit_price);
+        self.fold_price_into_excursions(side, avg_price_ticks, leg2_exit_price);
         ledger.record_closed_trade_with_sinking_split(
             net_pnl_1e8,
             fee_1e8,
@@ -2612,7 +2898,15 @@ impl SlotExecutionEngine {
         }
 
         self.exit_peg_attempts = self.exit_peg_attempts.saturating_add(1);
-        if quote.vac_level >= 2 || matches!(quote.sub_reason, ExitSubReason::LvdbsDeepVacuumSurf) {
+        let q_fl = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+        let above_qf = match side {
+            Side::Bid => quote.target_price.0 > q_fl.0,
+            Side::Ask => quote.target_price.0 < q_fl.0,
+        };
+        if above_qf
+            && (quote.vac_level >= 2
+                || matches!(quote.sub_reason, ExitSubReason::LvdbsDeepVacuumSurf))
+        {
             self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
             self.last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
         } else {
@@ -2983,5 +3277,178 @@ mod tests {
             assert_eq!(ledger.closed_trades_count, 2);
         }
         let _ = std::fs::remove_file(&shm_path);
+    }
+
+    #[test]
+    fn test_v3_forensic_shield_suite_v301_to_v306_and_zero_self_choke() {
+        let tmp_scar = std::env::temp_dir().join("vortex_v3_scar_dedup_test.jsonl");
+        let tmp_red = std::env::temp_dir().join("vortex_v3_red_loss_test.jsonl");
+        let scar_lines = concat!(
+            "{\"ts_ns\":1793979746124021595,\"symbol\":\"TAOUSDT\",",
+            "\"side\":\"Bid\",\"entry_ticks\":22413,",
+            "\"net_bps\":0.46,\"maker_exit\":true}\n",
+            "{\"ts_ns\":1793979746124021595,\"symbol\":\"TAOUSDT\",",
+            "\"kind\":\"MakerPassiveUnwind\",\"side\":\"Bid\",",
+            "\"entry_ticks\":22413,\"net_bps\":0.46,\"maker_exit\":true}\n",
+            "{\"ts_ns\":1793979820548628565,\"symbol\":\"SUIUSDT\",",
+            "\"side\":\"Bid\",\"entry_ticks\":8695,",
+            "\"net_bps\":4.05,\"maker_exit\":true}\n"
+        );
+        let red_line = concat!(
+            "{\"event\":\"TRADE_CLOSE\",\"ts_ns\":1794242514128285563,",
+            "\"symbol\":\"PENDLEUSDT\",\"side\":\"Bid\",\"entry_ticks\":16411,",
+            "\"net_bps\":-327.4,\"maker_exit\":false}\n"
+        );
+        assert!(std::fs::write(&tmp_scar, scar_lines).is_ok());
+        assert!(std::fs::write(&tmp_red, red_line).is_ok());
+
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let (max_ts, unique_cnt) =
+            gov.rehydrate_from_scar_and_loss_files(&tmp_scar, &tmp_red, Some(&tmp_red));
+        let _ = std::fs::remove_file(&tmp_scar);
+        let _ = std::fs::remove_file(&tmp_red);
+        assert_eq!(unique_cnt, 3);
+        assert_eq!(max_ts, 1_794_242_514_128_285_563);
+        assert!(gov.is_in_scar_debt(7, Side::Bid));
+        assert_eq!(gov.slot_direction_diagnostics(5, Side::Bid).2, 1);
+
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.ts_local_ns = TimestampNs(1_800_000_000_000_000_000);
+        btc.realized_vol_5m = ScaledBps(6_500);
+        btc.bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(400) };
+        btc.asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(300) };
+        btc.factor_ofi = BoundedScore::new_clamped(0.55);
+        btc.factor_tfi = BoundedScore::new_clamped(0.60);
+        btc.factor_geom = BoundedScore::new_clamped(0.25);
+
+        let mut link = SymbolLobSnapshot::new_empty();
+        link.symbol_id = APPROVED_SPECS[9].symbol_id;
+        link.ts_local_ns = TimestampNs(1_800_000_000_000_000_000);
+        link.realized_vol_5m = ScaledBps(6_100);
+        link.bids[0] = BookLevel { price: PriceTicks(10_500), qty: LotQty(320) };
+        link.asks[0] = BookLevel { price: PriceTicks(10_501), qty: LotQty(240) };
+        link.factor_ofi = BoundedScore::new_clamped(0.42);
+        link.factor_tfi = BoundedScore::new_clamped(0.44);
+        link.factor_geom = BoundedScore::new_clamped(0.08);
+        assert!(gov
+            .confirm_preflight_kinematics_non_choking(
+                9,
+                Side::Bid,
+                6_628_080_000,
+                &link,
+                &btc,
+            )
+            .is_ok());
+
+        // Trade #29 LTCUSDT +5.86 bps archetype (high SNR=0.71 with geom=-0.04) passes!
+        let mut ltc = link;
+        ltc.symbol_id = APPROVED_SPECS[11].symbol_id;
+        ltc.factor_ofi = BoundedScore::new_clamped(0.84);
+        ltc.factor_tfi = BoundedScore::new_clamped(0.97);
+        ltc.factor_geom = BoundedScore::new_clamped(-0.04);
+        assert!(gov
+            .confirm_preflight_kinematics_non_choking(
+                11,
+                Side::Bid,
+                6_628_080_000,
+                &ltc,
+                &btc,
+            )
+            .is_ok());
+
+        // Genuine book reversal on mild SNR must abort at $0.00 cost.
+        link.factor_geom = BoundedScore::new_clamped(-0.04);
+        assert!(gov
+            .confirm_preflight_kinematics_non_choking(
+                9,
+                Side::Bid,
+                6_628_080_000,
+                &link,
+                &btc,
+            )
+            .is_err());
+
+        let mut eng = SlotExecutionEngine::new(5);
+        let mut ledger = ParitySyncLedger::new(6_628_080_000);
+        let mut sui = SymbolLobSnapshot::new_empty();
+        sui.symbol_id = APPROVED_SPECS[5].symbol_id;
+        sui.realized_vol_5m = ScaledBps(6_800);
+        sui.ts_local_ns = TimestampNs(1_000_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_265), qty: LotQty(500) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_266), qty: LotQty(400) };
+        sui.mark_price = PriceTicks(8_265);
+        sui.last_trade_price = PriceTicks(8_265);
+        let v_sui = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+        };
+        assert!(eng.try_arm_maker_entry(&sui, v_sui, LotQty(1)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(1_025_000_000)).is_ok());
+        assert_eq!(eng.last_closed_peak_ticks, PriceTicks(8_265));
+        assert_eq!(eng.last_closed_worst_ticks, PriceTicks(8_265));
+
+        eng.last_closed_mfe_bps = 720;
+        sui.ts_local_ns = TimestampNs(20_000_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_270), qty: LotQty(500) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_271), qty: LotQty(500) };
+        sui.factor_ofi = BoundedScore::new_clamped(-0.15);
+        sui.factor_tfi = BoundedScore::new_clamped(-0.12);
+        let q_ratchet = eng.compute_canonical_exit_quote(&sui);
+        assert!(q_ratchet.is_some());
+        if let Some(qr) = q_ratchet {
+            assert!(!qr.defensive_lock_active);
+            assert!(qr.urgent_close_repeg);
+        }
+
+        let summary = eng.finalize_close_with_lots(
+            ClosedTradeKind::MakerPassiveUnwind,
+            Side::Bid,
+            PriceTicks(8_265),
+            PriceTicks(8_270),
+            LotQty(24),
+            1,
+            None,
+            TimestampNs(25_000_000_000),
+            &mut ledger,
+        );
+        assert_eq!(summary.exit_price, PriceTicks(8_270));
+        assert_eq!(eng.last_closed_peak_ticks, PriceTicks(8_270));
+        let qf_sui =
+            defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(8_265));
+        assert_eq!(qf_sui, PriceTicks(8_269));
+        assert_eq!(
+            SlotExecutionEngine::classify_maker_exit_sub_reason(
+                Side::Bid,
+                PriceTicks(8_265),
+                qf_sui,
+                false,
+                1,
+                1,
+            ),
+            ExitSubReason::AdverseScratchEscape
+        );
+        assert_eq!(
+            SlotExecutionEngine::classify_maker_exit_sub_reason(
+                Side::Bid,
+                PriceTicks(5_074),
+                PriceTicks(5_077),
+                false,
+                1,
+                2,
+            ),
+            ExitSubReason::AdverseScratchEscape
+        );
+        assert_eq!(
+            SlotExecutionEngine::classify_maker_exit_sub_reason(
+                Side::Bid,
+                PriceTicks(8_265),
+                PriceTicks(8_270),
+                false,
+                1,
+                2,
+            ),
+            ExitSubReason::LvdbsDeepVacuumSurf
+        );
     }
 }
