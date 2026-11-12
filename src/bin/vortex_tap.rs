@@ -400,11 +400,80 @@ fn run_live_bybit_ws_daemon(
 }
 
 #[cfg(target_os = "linux")]
+fn fetch_bybit_public_json(query_path: &str) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    let mut addrs = ("api.bybit.com", 443_u16).to_socket_addrs().ok()?;
+    let addr = addrs.next()?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(4)));
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(4)));
+    let connector = native_tls::TlsConnector::new().ok()?;
+    let mut tls = connector.connect("api.bybit.com", tcp).ok()?;
+    let req = format!(
+        concat!(
+            "GET {} HTTP/1.1\r\nHost: api.bybit.com\r\n",
+            "User-Agent: vortex-l3-tap/1.0\r\nAccept: application/json\r\n",
+            "Connection: close\r\n\r\n"
+        ),
+        query_path
+    );
+    tls.write_all(req.as_bytes()).ok()?;
+    tls.flush().ok()?;
+    let mut raw = Vec::with_capacity(16_384);
+    tls.take(524_288).read_to_end(&mut raw).ok()?;
+    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let body = &raw[sep + 4..];
+    let start = body.iter().position(|&b| b == b'{')?;
+    let end = body.iter().rposition(|&b| b == b'}')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_slice(&body[start..=end]).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn warm_start_elliott_wave_states(
+    wave_states: &mut [vortex_rs::wave_elliott::CausalElliottWaveState; MAX_ACTIVE_PAIRS],
+    active_snaps: &mut [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+) {
+    for s in 0..MAX_ACTIVE_PAIRS {
+        let spec = APPROVED_SPECS[s];
+        let sym = spec.symbol_id.name();
+        let p5 = format!(
+            "/v5/market/kline?category=linear&symbol={}&interval=5&limit=120",
+            sym
+        );
+        let p1 = format!(
+            "/v5/market/kline?category=linear&symbol={}&interval=1&limit=90",
+            sym
+        );
+        let po = format!(
+            "/v5/market/open-interest?category=linear&symbol={}&intervalTime=5min&limit=60",
+            sym
+        );
+        let k5 = fetch_bybit_public_json(&p5);
+        let k1 = fetch_bybit_public_json(&p1);
+        let oi = fetch_bybit_public_json(&po);
+        let bars = wave_states[s].warm_start_from_bybit_bundle(
+            spec,
+            k5.as_ref(),
+            k1.as_ref(),
+            oi.as_ref(),
+        );
+        if bars > 0 {
+            active_snaps[s].set_wave_observables(wave_states[s].observables());
+        }
+    }
+}
+#[cfg(target_os = "linux")]
 fn run_live_bybit_ws_daemon(
     arena: &VortexShmArena,
     writer: AsyncParquetRingWriter,
 ) -> ! {
     let mut factor_states = [OrthogonalFactorState::new(); MAX_ACTIVE_PAIRS];
+    let mut wave_states =
+        [vortex_rs::wave_elliott::CausalElliottWaveState::new(); MAX_ACTIVE_PAIRS];
     let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let mut has_live_mark_px = [false; MAX_ACTIVE_PAIRS];
     let mut has_book_snapshot = [false; MAX_ACTIVE_PAIRS];
@@ -413,6 +482,7 @@ fn run_live_bybit_ws_daemon(
     loop {
         for s in 0..MAX_ACTIVE_PAIRS {
             factor_states[s].reset();
+            wave_states[s].reset();
             active_snaps[s] = SymbolLobSnapshot::new_empty();
             active_snaps[s].symbol_id = APPROVED_SPECS[s].symbol_id;
             active_snaps[s].is_eligible = true;
@@ -420,15 +490,18 @@ fn run_live_bybit_ws_daemon(
             has_live_mark_px[s] = false;
             has_book_snapshot[s] = false;
         }
+        #[cfg(target_os = "linux")]
+        warm_start_elliott_wave_states(&mut wave_states, &mut active_snaps);
 
         if let Ok((mut socket, _)) = tungstenite::connect(BYBIT_PUBLIC_LINEAR_WS) {
             configure_ws_tcp_stream(&mut socket);
-            let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 3);
+            let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 4);
             for spec in &APPROVED_SPECS {
                 let sym = spec.symbol_id.name();
                 topics.push(format!("\"orderbook.50.{}\"", sym));
                 topics.push(format!("\"publicTrade.{}\"", sym));
                 topics.push(format!("\"tickers.{}\"", sym));
+                topics.push(format!("\"allLiquidation.{}\"", sym));
             }
             let sub_msg = format!(
                 "{{\"op\":\"subscribe\",\"args\":[{}]}}",
@@ -558,6 +631,13 @@ fn run_live_bybit_ws_daemon(
                         );
                     snap.ts_exchange_ns = exch_ns;
                     snap.ts_local_ns = local_ns;
+                    let w_obs = wave_states[slot_idx].observe_price_tick(
+                        APPROVED_SPECS[slot_idx],
+                        mid_l1,
+                        local_ns.0,
+                        snap.realized_vol_5m,
+                    );
+                    snap.set_wave_observables(w_obs);
                     factor_states[slot_idx].on_l2_book_update(snap);
                     if let Ok(slot_ref) = arena.slot(slot_idx) {
                         slot_ref.write_snapshot(snap);
@@ -613,12 +693,63 @@ fn run_live_bybit_ws_daemon(
                             }
                         }
                     }
+                } else if let Some(sym_name) = topic.strip_prefix("allLiquidation.") {
+                    let Some(slot_idx) = slot_from_symbol_name(sym_name) else {
+                        continue;
+                    };
+                    let spec = APPROVED_SPECS[slot_idx];
+                    let snap = &mut active_snaps[slot_idx];
+                    if let Some(data_v) = val.get("data") {
+                        let items: Vec<&serde_json::Value> =
+                            if let Some(arr) = data_v.as_array() {
+                                arr.iter().collect()
+                            } else {
+                                vec![data_v]
+                            };
+                        for liq in items {
+                            let s_str = liq
+                                .get("s")
+                                .or_else(|| liq.get("side"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Buy");
+                            let q_str = liq
+                                .get("v")
+                                .or_else(|| liq.get("size"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            let l_side = if s_str == "Sell" {
+                                Side::Ask
+                            } else {
+                                Side::Bid
+                            };
+                            let l_qty = spec.parse_lot_qty(q_str);
+                            let w_obs = wave_states[slot_idx].observe_liquidation_print(
+                                spec, l_side, l_qty, local_ns.0,
+                            );
+                            snap.set_wave_observables(w_obs);
+                        }
+                    }
                 } else if let Some(sym_name) = topic.strip_prefix("tickers.") {
                     let Some(slot_idx) = slot_from_symbol_name(sym_name) else {
                         continue;
                     };
                     let spec = APPROVED_SPECS[slot_idx];
                     let snap = &mut active_snaps[slot_idx];
+                    let oi_opt = val.get("data").and_then(|d| {
+                        d.get("openInterest")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                d.as_array()
+                                    .and_then(|a| a.first())
+                                    .and_then(|o| o.get("openInterest"))
+                                    .and_then(|v| v.as_str())
+                            })
+                    });
+                    if let Some(Ok(oi_f)) = oi_opt.map(|s| s.trim().parse::<f64>()) {
+                        let w_obs = wave_states[slot_idx]
+                            .observe_open_interest(spec, oi_f, local_ns.0);
+                        snap.set_wave_observables(w_obs);
+                    }
                     let mp_opt = val.get("data").and_then(|d| {
                         d.get("markPrice")
                             .and_then(|v| v.as_str())

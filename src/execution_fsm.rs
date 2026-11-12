@@ -1401,13 +1401,25 @@ impl OnlineAdaptiveGovernor {
                 }
             }
         }
+        let btc_signed_snr =
+            OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
+        let Ok(wave_mod) =
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                candidate_snap.wave_observables(),
+                side,
+                btc_signed_snr,
+            )
+        else {
+            return false;
+        };
         let adaptive_threshold = (0.42
             + 0.08 * sl_s
             + debt_penalty
             + global_penalty
             + staircase_penalty
+            + wave_mod.snr_threshold_delta
             - ir_adj)
-            .clamp(0.36, 0.80);
+            .clamp(0.36, 0.82);
         cand_comp >= adaptive_threshold
     }
 
@@ -1491,13 +1503,17 @@ impl OnlineAdaptiveGovernor {
         if signed_geom < min_pre_geom {
             return Err("VETO_PREFLIGHT_GEOM_REVERSAL");
         }
-        if slot_idx > 0 {
-            let btc_snr =
-                OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
-            if btc_snr < -0.08 && signed_snr < 0.62 {
-                return Err("VETO_PREFLIGHT_BTC_HEADWIND");
-            }
+        let btc_snr =
+            OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
+        if slot_idx > 0 && btc_snr < -0.08 && signed_snr < 0.62 {
+            return Err("VETO_PREFLIGHT_BTC_HEADWIND");
         }
+        let _ =
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                snap.wave_observables(),
+                side,
+                btc_snr,
+            )?;
         let (drift_bps, ext_bps) =
             self.price_drift_and_extension_scaled_bps(slot_idx, snap);
         if let Ok(ok_pair) = self.evaluate_kinematic_energy_surface(
@@ -3224,12 +3240,20 @@ impl SlotExecutionEngine {
         };
 
         let q_floor = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
+        let wave_t1_adj =
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                snap.wave_observables(),
+                side,
+                0.50,
+            )
+            .map_or(0, |m| m.tranche1_permille_delta);
+        let eff_t1_permille = (self.learned_t1_permille + wave_t1_adj).clamp(350, 650);
         let split_t1_opt = if !tranche1_harvested && !defensive_now && !mfe_ratchet_lock {
             Self::compute_tranche1_split_lots(
                 self.slot_idx,
                 open_lots,
                 q_floor,
-                self.learned_t1_permille,
+                eff_t1_permille,
             )
         } else {
             None

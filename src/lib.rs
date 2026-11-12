@@ -5,3 +5,4 @@ pub mod execution_fsm;
 pub mod forensic_parquet;
 pub mod lob_shm;
 pub mod types;
+pub mod wave_elliott;

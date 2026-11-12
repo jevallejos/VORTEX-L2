@@ -2884,6 +2884,10 @@ fn dispatch_closed_trade_logs(
         "exit_peg_attempts": eng.exit_peg_attempts,
         "wald_contraction_pct": eng.last_closed_wald_pct,
         "lvdbs_surfs": eng.lvdbs_deep_surfs_count,
+        "wave_regime": exit_snap.wave_observables().regime.label(),
+        "wave_hurst": (exit_snap.wave_observables().hurst_exponent() * 1000.0).round() / 1000.0,
+        "wave_macro": (exit_snap.wave_macro_phase.get() * 100.0).round() / 100.0,
+        "wave_oi_imp": (exit_snap.wave_oi_impulse.get() * 100.0).round() / 100.0,
     })
     .to_string();
 
@@ -3007,6 +3011,7 @@ fn handle_gateway_event(
     idx_lag: &mut OnlineIndexerLagEstimator,
     wallet_1e8: &mut i64,
     slot_rpc_inflight: &mut [bool; MAX_ACTIVE_PAIRS],
+    abort_cmd_inflight: &mut [bool; MAX_ACTIVE_PAIRS],
     sl_needs_sync: &mut [bool; MAX_ACTIVE_PAIRS],
     init_q_ahead: &mut [LotQty; MAX_ACTIVE_PAIRS],
     cur_q_ahead: &mut [LotQty; MAX_ACTIVE_PAIRS],
@@ -3104,6 +3109,7 @@ fn handle_gateway_event(
             aborted_price,
         } => {
             slot_rpc_inflight[slot_idx] = false;
+            abort_cmd_inflight[slot_idx] = false;
             if matches!(
                 engines[slot_idx].state,
                 OrderLifecycleState::PlacingEntryMaker { .. }
@@ -3118,11 +3124,19 @@ fn handle_gateway_event(
         GatewayEvent::EntryOrderVanished { slot_idx }
         | GatewayEvent::WsEntryOrderTerminated { slot_idx } => {
             slot_rpc_inflight[slot_idx] = false;
-            if matches!(
-                engines[slot_idx].state,
-                OrderLifecycleState::PlacingEntryMaker { .. }
-                    | OrderLifecycleState::RestingEntryQueue { .. }
-            ) {
+            let state_copy = engines[slot_idx].state;
+            if let OrderLifecycleState::PlacingEntryMaker {
+                side, entry_price, ..
+            }
+            | OrderLifecycleState::RestingEntryQueue {
+                side, entry_price, ..
+            } = state_copy
+            {
+                if abort_cmd_inflight[slot_idx] {
+                    abort_cmd_inflight[slot_idx] = false;
+                    gov.observe_entry_abort(slot_idx, side, entry_price, now_ns);
+                    arena.exec_abort_count.fetch_add(1, Ordering::Relaxed);
+                }
                 engines[slot_idx].state = OrderLifecycleState::Idle;
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             }
@@ -3139,6 +3153,7 @@ fn handle_gateway_event(
             tag,
         } => {
             slot_rpc_inflight[slot_idx] = false;
+            abort_cmd_inflight[slot_idx] = false;
             if !matches!(
                 engines[slot_idx].state,
                 OrderLifecycleState::PlacingEntryMaker { .. }
@@ -3351,6 +3366,7 @@ fn handle_gateway_event(
                 };
                 if let Some(armed_qty) = armed_qty_opt {
                     slot_rpc_inflight[slot_idx] = false;
+                    abort_cmd_inflight[slot_idx] = false;
                     if real_lots.0 < armed_qty.0 {
                         if let Some(gw) = gateway {
                             let _ = gw.try_send(GatewayCommand::CancelResidualEntries {
@@ -3563,6 +3579,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
     let mut last_l1_q_obs = [LotQty(0); MAX_ACTIVE_PAIRS];
     let mut last_opp_trades = [LotQty(0); MAX_ACTIVE_PAIRS];
     let mut slot_rpc_inflight = [false; MAX_ACTIVE_PAIRS];
+    let mut abort_cmd_inflight = [false; MAX_ACTIVE_PAIRS];
     let mut sl_needs_sync = [false; MAX_ACTIVE_PAIRS];
     let mut sl_retry_after_ns = [0_i64; MAX_ACTIVE_PAIRS];
 
@@ -3626,6 +3643,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     &mut idx_lag,
                     &mut wallet_1e8,
                     &mut slot_rpc_inflight,
+                    &mut abort_cmd_inflight,
                     &mut sl_needs_sync,
                     &mut init_q_ahead,
                     &mut cur_q_ahead,
@@ -3845,6 +3863,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                                 sl_hint: sl_trigger_price,
                             }) {
                                 slot_rpc_inflight[s_idx] = true;
+                                abort_cmd_inflight[s_idx] = true;
                             }
                         } else {
                             gov.observe_entry_abort(s_idx, side, entry_price, now_ns);

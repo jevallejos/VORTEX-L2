@@ -15,7 +15,7 @@ use crate::types::{
 pub const LOB_DEPTH: usize = 50;
 pub const MAX_ACTIVE_PAIRS: usize = 12;
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C33;
-pub const VORTEX_SHM_VERSION: u32 = 12;
+pub const VORTEX_SHM_VERSION: u32 = 13;
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -67,6 +67,12 @@ pub struct SymbolLobSnapshot {
     pub factor_ofi: BoundedScore,
     pub factor_tfi: BoundedScore,
     pub factor_geom: BoundedScore,
+    pub wave_regime_code: u8,
+    pub wave_hurst: BoundedScore,
+    pub wave_oi_impulse: BoundedScore,
+    pub wave_macro_phase: BoundedScore,
+    pub wave_retracement: BoundedScore,
+    pub wave_climax: BoundedScore,
     pub bids: [BookLevel; LOB_DEPTH],
     pub asks: [BookLevel; LOB_DEPTH],
 }
@@ -98,8 +104,37 @@ impl SymbolLobSnapshot {
             factor_ofi: BoundedScore::ZERO,
             factor_tfi: BoundedScore::ZERO,
             factor_geom: BoundedScore::ZERO,
+            wave_regime_code: 0,
+            wave_hurst: BoundedScore::ZERO,
+            wave_oi_impulse: BoundedScore::ZERO,
+            wave_macro_phase: BoundedScore::ZERO,
+            wave_retracement: BoundedScore::ZERO,
+            wave_climax: BoundedScore::ZERO,
             bids: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; LOB_DEPTH],
             asks: [BookLevel { price: PriceTicks(0), qty: LotQty(0) }; LOB_DEPTH],
+        }
+    }
+
+    #[inline]
+    pub fn set_wave_observables(&mut self, obs: crate::wave_elliott::WaveObservables) {
+        self.wave_regime_code = obs.regime as u8;
+        self.wave_hurst = obs.hurst_score;
+        self.wave_oi_impulse = obs.oi_impulse;
+        self.wave_macro_phase = obs.macro_phase;
+        self.wave_retracement = obs.retracement_ratio;
+        self.wave_climax = obs.climax_intensity;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn wave_observables(&self) -> crate::wave_elliott::WaveObservables {
+        crate::wave_elliott::WaveObservables {
+            regime: crate::wave_elliott::WaveRegimeKind::from_code(self.wave_regime_code),
+            hurst_score: self.wave_hurst,
+            oi_impulse: self.wave_oi_impulse,
+            macro_phase: self.wave_macro_phase,
+            retracement_ratio: self.wave_retracement,
+            climax_intensity: self.wave_climax,
         }
     }
 
@@ -857,7 +892,7 @@ mod tests {
         assert!(region.is_ok());
         if let Ok(reg) = region {
             let arena = reg.arena();
-            assert_eq!(arena.version, 12);
+            assert_eq!(arena.version, 13);
             assert_eq!(arena.active_pairs, 12);
             let mut snap = SymbolLobSnapshot::new_empty();
             snap.symbol_id = SymbolId(4);

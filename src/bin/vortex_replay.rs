@@ -766,6 +766,8 @@ pub fn run_parquet_walk_forward_on_dir(
 
     let mut engines = SlotExecutionEngine::new_12_slot_array();
     let mut gov = OnlineAdaptiveGovernor::new();
+    let mut wave_states =
+        [vortex_rs::wave_elliott::CausalElliottWaveState::new(); MAX_ACTIVE_PAIRS];
     if verbose {
         rehydrate_governor_scars_if_present(&mut gov);
     }
@@ -796,6 +798,19 @@ pub fn run_parquet_walk_forward_on_dir(
             };
             rep.total_events += 1;
             row.apply_to_lob_snapshot(&mut snaps[s_idx]);
+            if snaps[s_idx].bids[0].price.0 > 0 && snaps[s_idx].asks[0].price.0 > 0 {
+                let mid_w = PriceTicks(i64::midpoint(
+                    snaps[s_idx].bids[0].price.0,
+                    snaps[s_idx].asks[0].price.0,
+                ));
+                let w_obs = wave_states[s_idx].observe_price_tick(
+                    APPROVED_SPECS[s_idx],
+                    mid_w,
+                    snaps[s_idx].ts_local_ns.0,
+                    snaps[s_idx].realized_vol_5m,
+                );
+                snaps[s_idx].set_wave_observables(w_obs);
+            }
             gov.observe_market_price(s_idx, &snaps[s_idx]);
 
             match row.event_kind {
@@ -1326,12 +1341,18 @@ fn print_walk_forward_summary(rep: &WalkForwardReport) {
         rep.losses,
         ANSI_RESET
     );
+    let (wf_col, wf_ico) = if rep.cum_net_bps_x100 >= 0 && rep.losses == 0 {
+        (ANSI_GREEN, "\u{1f7e2}")
+    } else {
+        (vortex_rs::types::ANSI_RED, "\u{1f534}")
+    };
     println!(
         concat!(
-            "  {}\u{1f7e2} -> Live Walk-Forward PnL      : ",
+            "  {}{} -> Live Walk-Forward PnL      : ",
             "Net={:+.2} bps ({:+.4} USDT) | MakerExit={:.2}% | PF={}{}"
         ),
-        ANSI_GREEN,
+        wf_col,
+        wf_ico,
         (rep.cum_net_bps_x100 as f64) / 100.0,
         pnl_usdt,
         mkr_pct,
