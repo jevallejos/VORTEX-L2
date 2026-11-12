@@ -3844,6 +3844,14 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     let flow_imp = (0.55 * snap.factor_ofi.get()
                         + 0.45 * snap.factor_tfi.get())
                         * side.sign_f64();
+                    let btc_q_snr =
+                        OrthogonalFactorState::snr_composite_score(&btc_snap)
+                            * side.sign_f64();
+                    let headwind_erosion = s_idx > 0
+                        && resting_elapsed_ns >= 2_200_000_000
+                        && init_q_ahead[s_idx].0 > 0
+                        && cur_q_ahead[s_idx].0 * 100 <= init_q_ahead[s_idx].0 * 65
+                        && (btc_q_snr < -0.02 || flow_imp < 0.38);
                     let dq_abort = (resting_elapsed_ns >= 25_000_000
                         && at_l1
                         && check_queue_depletion_velocity_abort(
@@ -3852,6 +3860,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             cur_q_ahead[s_idx],
                             &snap,
                         ))
+                        || headwind_erosion
                         || flow_imp <= -0.42;
 
                     if drain_active

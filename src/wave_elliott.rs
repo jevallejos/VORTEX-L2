@@ -539,9 +539,11 @@ impl CausalElliottWaveState {
             .unwrap_or(ScaledBps(50))
             .raw() as f64)
             / 100.0;
-        let min_v30 = (tau_tick_bps * tau_tick_bps).max(0.04);
-        let vr_10 = (self.ewma_var_300s_bps2 / (10.0 * self.ewma_var_30s_bps2.max(min_v30)))
-            .clamp(0.05, 25.0);
+        let bounce_var = 2.0 * tau_tick_bps * tau_tick_bps;
+        let min_v30 = (0.5 * tau_tick_bps * tau_tick_bps).max(0.04);
+        let clean_v30 = (self.ewma_var_30s_bps2 - bounce_var).max(min_v30);
+        let clean_v300 = (self.ewma_var_300s_bps2 - bounce_var).max(min_v30 * 2.0);
+        let vr_10 = (clean_v300 / (10.0 * clean_v30)).clamp(0.05, 25.0);
         let hurst_h = (0.50 + vr_10.ln() / TWO_LN_10).clamp(0.20, 0.85);
         let hurst_score = BoundedScore::new_clamped(2.0 * (hurst_h - 0.50));
 
@@ -774,12 +776,21 @@ impl CausalElliottWaveState {
             (Side::Bid, WaveRegimeKind::CorrectiveBounceInBear)
                 | (Side::Ask, WaveRegimeKind::CorrectivePullbackInBull)
         );
-        if (signed_macro < -0.38 || is_corrective_counter)
-            && signed_macro < -0.22
+        let hurst_h = obs.hurst_exponent();
+        if (signed_macro < -0.32 || is_corrective_counter)
+            && signed_macro < -0.18
             && signed_oi < 0.18
             && btc_leader_snr_signed < 0.28
         {
             return Err("VETO_COUNTER_TREND_CORRECTIVE_WAVE");
+        }
+        let req_chop_h = (0.48 + 0.35 * signed_macro).clamp(0.36, 0.48);
+        if signed_macro < -0.12
+            && (hurst_h < req_chop_h || hurst_h < 0.46)
+            && signed_oi < 0.22
+            && btc_leader_snr_signed < 0.25
+        {
+            return Err("VETO_COUNTER_TREND_SUBDIFFUSIVE_CHOP");
         }
         if matches!(obs.regime, WaveRegimeKind::TerminalExhaustionClimax)
             && signed_macro > 0.35

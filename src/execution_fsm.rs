@@ -1173,6 +1173,75 @@ impl OnlineAdaptiveGovernor {
         self.abort_last_ts_ns[slot_idx][d] = ts_ns.0;
     }
 
+    /// SCAR-LOCK #64: Post-abort adverse sweep, BTC debt floor & compression decel shield.
+    pub fn audit_scar64_entry_and_sweep_shield(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        btc_signed_snr: f64,
+    ) -> Result<(), &'static str> {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Ok(());
+        }
+        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+            return Ok(());
+        };
+        let d = Self::dir_idx(side);
+        let d_sign = side.sign_i64();
+        let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        if self.abort_streak[slot_idx][d] >= 1
+            && self.abort_anchor_px_1e4[slot_idx][d] > 0
+            && snap.ts_local_ns.0 > 0
+        {
+            let vol_raw = snap.realized_vol_5m.raw().clamp(1_200, 15_000);
+            let sweep_ttl_ns = ((25_000_000_000_i64 * 6_000) / vol_raw)
+                .clamp(18_000_000_000, 45_000_000_000);
+            let since_abort_ns =
+                snap.ts_local_ns.0.saturating_sub(self.abort_last_ts_ns[slot_idx][d]);
+            let cur_1e4 = entry_px.0.saturating_mul(10_000);
+            let move_1e4 = (cur_1e4 - self.abort_anchor_px_1e4[slot_idx][d])
+                .saturating_mul(d_sign);
+            if since_abort_ns < sweep_ttl_ns && move_1e4 < 0 {
+                return Err("VETO_POST_ABORT_ADVERSE_SWEEP");
+            }
+        }
+        if slot_idx > 0 {
+            let glob_debt = (-self.global_dir_debt_bps_x100[d]).max(0) as f64;
+            let opp_macro = (-snap.wave_macro_phase.get() * side.sign_f64()).max(0.0);
+            if glob_debt >= 8_000.0
+                || self.global_dir_sl_streak[d] >= 1
+                || opp_macro > 0.05
+            {
+                let min_btc_snr = (-0.04
+                    + 0.04 * (glob_debt / 10_000.0).tanh()
+                    + 0.85 * (opp_macro - 0.05).max(0.0))
+                    .clamp(-0.04, 0.28);
+                if btc_signed_snr < min_btc_snr {
+                    return Err("VETO_SCAR64_BTC_DEBT_HEADWIND");
+                }
+            }
+            let fast_1e4 = self.ewma_fast_px_1e4[slot_idx];
+            let slow_1e4 = self.ewma_slow_px_1e4[slot_idx];
+            if fast_1e4 > 0 && slow_1e4 > 0 {
+                let mid_t = i64::midpoint(best_bid.price.0, best_ask.price.0);
+                let px_1e4 = mid_t.saturating_mul(10_000);
+                let s_drift = (((fast_1e4 - slow_1e4).saturating_mul(1_000_000))
+                    / slow_1e4)
+                    .saturating_mul(d_sign);
+                let s_ext = (((px_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4)
+                    .saturating_mul(d_sign);
+                let lead_impulse = s_ext.saturating_sub(s_drift);
+                if s_drift > 0
+                    && lead_impulse < -15
+                    && (snap.realized_vol_5m.raw() < 2_500 || btc_signed_snr < 0.08)
+                {
+                    return Err("VETO_FOLLOWER_DECEL_UNDER_COMPRESSION");
+                }
+            }
+        }
+        Ok(())
+    }
     #[must_use]
     pub fn to_scar_snapshot_json(&self, ts_ns: TimestampNs) -> serde_json::Value {
         serde_json::json!({
@@ -1412,6 +1481,17 @@ impl OnlineAdaptiveGovernor {
         else {
             return false;
         };
+        if self
+            .audit_scar64_entry_and_sweep_shield(
+                slot_idx,
+                side,
+                candidate_snap,
+                btc_signed_snr,
+            )
+            .is_err()
+        {
+            return false;
+        }
         let adaptive_threshold = (0.42
             + 0.08 * sl_s
             + debt_penalty
@@ -1518,6 +1598,7 @@ impl OnlineAdaptiveGovernor {
         if slot_idx > 0 && btc_snr < -0.08 && signed_snr < 0.62 {
             return Err("VETO_PREFLIGHT_BTC_HEADWIND");
         }
+        self.audit_scar64_entry_and_sweep_shield(slot_idx, side, snap, btc_snr)?;
         let _ =
             crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
                 snap.wave_observables(),
@@ -4712,6 +4793,95 @@ mod tests {
                 2,
             ),
             ExitSubReason::LvdbsDeepVacuumSurf
+        );
+    }
+
+    #[test]
+    fn test_scar64_taousdt_bid_loss23_all_4_shields_and_win_preservation() {
+        let obs_t23 = crate::wave_elliott::WaveObservables {
+            regime: crate::wave_elliott::WaveRegimeKind::NeutralEquilibrium,
+            hurst_score: BoundedScore::new_clamped(-0.60),
+            oi_impulse: BoundedScore::new_clamped(0.14),
+            macro_phase: BoundedScore::new_clamped(-0.19),
+            retracement_ratio: BoundedScore::new_clamped(0.42),
+            climax_intensity: BoundedScore::ZERO,
+        };
+        assert_eq!(
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                obs_t23, Side::Bid, -0.07,
+            ),
+            Err("VETO_COUNTER_TREND_SUBDIFFUSIVE_CHOP")
+        );
+        assert!(
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                obs_t23, Side::Bid, 0.80,
+            )
+            .is_ok()
+        );
+
+        let t0 = 1_794_456_163_000_000_000_i64;
+        let mut tao = SymbolLobSnapshot::new_empty();
+        tao.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao.is_eligible = true;
+        tao.realized_vol_5m = ScaledBps(1_868);
+        tao.ts_local_ns = TimestampNs(t0 + 14_000_000_000);
+        tao.bids[0] = BookLevel { price: PriceTicks(21_548), qty: LotQty(268) };
+        tao.asks[0] = BookLevel { price: PriceTicks(21_549), qty: LotQty(90) };
+        tao.mark_price = PriceTicks(21_548);
+        tao.factor_ofi = BoundedScore::new_clamped(0.62);
+        tao.factor_tfi = BoundedScore::new_clamped(0.73);
+        tao.factor_geom = BoundedScore::new_clamped(0.81);
+
+        let mut gov_swp = OnlineAdaptiveGovernor::new();
+        gov_swp.observe_entry_abort(4, Side::Bid, PriceTicks(21_550), TimestampNs(t0));
+        assert_eq!(
+            gov_swp.audit_scar64_entry_and_sweep_shield(4, Side::Bid, &tao, 0.25),
+            Err("VETO_POST_ABORT_ADVERSE_SWEEP")
+        );
+        let mut tao_step_up = tao;
+        tao_step_up.bids[0] = BookLevel { price: PriceTicks(21_552), qty: LotQty(300) };
+        tao_step_up.asks[0] = BookLevel { price: PriceTicks(21_553), qty: LotQty(100) };
+        assert!(gov_swp
+            .audit_scar64_entry_and_sweep_shield(4, Side::Bid, &tao_step_up, 0.25)
+            .is_ok());
+
+        let mut gov_debt = OnlineAdaptiveGovernor::new();
+        gov_debt.observe_closed_trade_at_entry(
+            9,
+            Side::Bid,
+            PriceTicks(10_468),
+            ScaledBps(-11_735),
+            false,
+            TimestampNs(t0 - 600_000_000_000),
+        );
+        let mut tao_macro = tao;
+        tao_macro.set_wave_observables(obs_t23);
+        assert_eq!(
+            gov_debt.audit_scar64_entry_and_sweep_shield(4, Side::Bid, &tao_macro, -0.07),
+            Err("VETO_SCAR64_BTC_DEBT_HEADWIND")
+        );
+        assert!(gov_debt
+            .audit_scar64_entry_and_sweep_shield(0, Side::Bid, &tao_macro, 0.80)
+            .is_ok());
+
+        let mut gov_kin = OnlineAdaptiveGovernor::new();
+        let mut s_warm = tao;
+        s_warm.ts_local_ns = TimestampNs(t0);
+        s_warm.bids[0] = BookLevel { price: PriceTicks(21_500), qty: LotQty(300) };
+        s_warm.asks[0] = BookLevel { price: PriceTicks(21_501), qty: LotQty(100) };
+        gov_kin.observe_market_price(4, &s_warm);
+        for k in 1..=10_i64 {
+            s_warm.ts_local_ns = TimestampNs(t0 + k * 5_000_000_000);
+            s_warm.bids[0] = BookLevel { price: PriceTicks(21_530), qty: LotQty(300) };
+            s_warm.asks[0] = BookLevel { price: PriceTicks(21_531), qty: LotQty(100) };
+            gov_kin.observe_market_price(4, &s_warm);
+        }
+        s_warm.ts_local_ns = TimestampNs(t0 + 51_000_000_000);
+        s_warm.bids[0] = BookLevel { price: PriceTicks(21_518), qty: LotQty(268) };
+        s_warm.asks[0] = BookLevel { price: PriceTicks(21_519), qty: LotQty(90) };
+        assert_eq!(
+            gov_kin.audit_scar64_entry_and_sweep_shield(4, Side::Bid, &s_warm, 0.20),
+            Err("VETO_FOLLOWER_DECEL_UNDER_COMPRESSION")
         );
     }
 }

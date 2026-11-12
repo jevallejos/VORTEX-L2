@@ -1030,7 +1030,17 @@ pub fn run_parquet_walk_forward_on_dir(
                         let flow_imp = (0.55 * cur_snap.factor_ofi.get()
                             + 0.45 * cur_snap.factor_tfi.get())
                             * side.sign_f64();
-                        let dq_abort = (elapsed_ns >= 25_000_000
+                        let btc_q_snr =
+                            OrthogonalFactorState::snr_composite_score(&btc_snap)
+                                * side.sign_f64();
+                        let q_eroded = init_q_ahead[s_idx].0 > 0
+                            && queue_ahead_qty.0 * 100 <= init_q_ahead[s_idx].0 * 65;
+                        let headwind_erosion = s_idx > 0
+                            && elapsed_ns >= 2_200_000_000
+                            && q_eroded
+                            && (btc_q_snr < -0.02 || flow_imp < 0.38);
+                        let dq_abort = headwind_erosion
+                            || (elapsed_ns >= 25_000_000
                             && at_l1
                             && check_queue_depletion_velocity_abort(
                                 side,
