@@ -1250,11 +1250,26 @@ impl OnlineAdaptiveGovernor {
                 let s_ext = (((px_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4)
                     .saturating_mul(d_sign);
                 let lead_impulse = s_ext.saturating_sub(s_drift);
+                let signed_ofi = snap.factor_ofi.get() * side.sign_f64();
+                let sym_sl_tot = self.sl_streak[slot_idx][0]
+                    .saturating_add(self.sl_streak[slot_idx][1]);
+                if sym_sl_tot >= 1 && (signed_ofi < 0.34 || lead_impulse < 0) {
+                    return Err("VETO_SYMBOL_CROSS_SCAR_WEAK_IMPULSE");
+                }
+                let low_vol_decel = snap.realized_vol_5m.raw() < 2_500
+                    || (snap.realized_vol_5m.raw() < 3_000 && signed_ofi < 0.35);
                 if s_drift > 0
                     && lead_impulse < -15
-                    && (snap.realized_vol_5m.raw() < 2_500 || btc_signed_snr < 0.08)
+                    && (low_vol_decel || btc_signed_snr < 0.08)
                 {
                     return Err("VETO_FOLLOWER_DECEL_UNDER_COMPRESSION");
+                }
+            } else {
+                let signed_ofi = snap.factor_ofi.get() * side.sign_f64();
+                let sym_sl_tot = self.sl_streak[slot_idx][0]
+                    .saturating_add(self.sl_streak[slot_idx][1]);
+                if sym_sl_tot >= 1 && signed_ofi < 0.34 {
+                    return Err("VETO_SYMBOL_CROSS_SCAR_WEAK_IMPULSE");
                 }
             }
         }
@@ -5032,5 +5047,75 @@ mod tests {
         if let Some(s25) = closed_t25 {
             assert!(s25.net_scaled_bps.raw() >= 120);
         }
+    }
+
+    #[test]
+    fn test_scar65_taousdt_ask_loss33_coupled_chop_l1_dust_and_win_preservation() {
+        let obs_t33 = crate::wave_elliott::WaveObservables {
+            regime: crate::wave_elliott::WaveRegimeKind::NeutralEquilibrium,
+            hurst_score: BoundedScore::new_clamped(-0.152),
+            oi_impulse: BoundedScore::new_clamped(-0.19),
+            macro_phase: BoundedScore::new_clamped(0.36),
+            retracement_ratio: BoundedScore::new_clamped(0.45),
+            climax_intensity: BoundedScore::ZERO,
+        };
+        assert_eq!(
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                obs_t33, Side::Ask, 0.26,
+            ),
+            Err("VETO_COUNTER_TREND_SUBDIFFUSIVE_CHOP")
+        );
+        assert!(
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                obs_t33, Side::Ask, 0.81,
+            )
+            .is_ok()
+        );
+
+        let tao_spec = APPROVED_SPECS[4];
+        assert!(!tao_spec.passes_l1_queue_depth_and_wall_guard(
+            PriceTicks(20_916),
+            ScaledBps(2_530),
+            75,
+            LotQty(6),
+            LotQty(120),
+            LotQty(400),
+            0.24,
+            0.98,
+        ));
+        assert!(tao_spec.passes_l1_queue_depth_and_wall_guard(
+            PriceTicks(20_916),
+            ScaledBps(2_530),
+            75,
+            LotQty(218),
+            LotQty(120),
+            LotQty(600),
+            0.50,
+            0.83,
+        ));
+
+        let mut gov = OnlineAdaptiveGovernor::new();
+        gov.observe_closed_trade_at_entry(
+            4,
+            Side::Bid,
+            PriceTicks(21_548),
+            ScaledBps(-5_852),
+            false,
+            TimestampNs(1_794_457_992_000_000_000),
+        );
+        let mut tao = SymbolLobSnapshot::new_empty();
+        tao.symbol_id = tao_spec.symbol_id;
+        tao.is_eligible = true;
+        tao.realized_vol_5m = ScaledBps(2_530);
+        tao.ts_local_ns = TimestampNs(1_794_513_852_000_000_000);
+        tao.bids[0] = BookLevel { price: PriceTicks(20_915), qty: LotQty(150) };
+        tao.asks[0] = BookLevel { price: PriceTicks(20_916), qty: LotQty(84) };
+        tao.factor_ofi = BoundedScore::new_clamped(-0.24);
+        tao.factor_tfi = BoundedScore::new_clamped(-0.98);
+        tao.factor_geom = BoundedScore::new_clamped(-0.66);
+        assert_eq!(
+            gov.audit_scar64_entry_and_sweep_shield(4, Side::Ask, &tao, 0.26),
+            Err("VETO_SYMBOL_CROSS_SCAR_WEAK_IMPULSE")
+        );
     }
 }

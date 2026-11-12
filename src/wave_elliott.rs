@@ -785,10 +785,15 @@ impl CausalElliottWaveState {
             return Err("VETO_COUNTER_TREND_CORRECTIVE_WAVE");
         }
         let req_chop_h = (0.48 + 0.35 * signed_macro).clamp(0.36, 0.48);
+        let opp_excess = (-signed_macro - 0.12).max(0.0);
+        let chop_depth = (0.48 - hurst_h).max(0.0);
+        let req_btc_override =
+            (0.25 + 0.65 * opp_excess + 0.80 * chop_depth).clamp(0.25, 0.52);
+        let req_oi_override = (0.22 + 0.50 * opp_excess).clamp(0.22, 0.42);
         if signed_macro < -0.12
             && (hurst_h < req_chop_h || hurst_h < 0.46)
-            && signed_oi < 0.22
-            && btc_leader_snr_signed < 0.25
+            && signed_oi < req_oi_override
+            && btc_leader_snr_signed < req_btc_override
         {
             return Err("VETO_COUNTER_TREND_SUBDIFFUSIVE_CHOP");
         }

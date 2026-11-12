@@ -647,6 +647,10 @@ impl PairSpec {
         if own_l1_lots.0 <= 0 || entry_price.0 <= 0 {
             return false;
         }
+        let min_l1_notional_1e8 = 2_400_000_000_i64;
+        if self.lot_notional_1e8(own_l1_lots, entry_price) < min_l1_notional_1e8 {
+            return false;
+        }
         let eff_deep_lots = LotQty(own_deep_l1_l5_lots.0.max(own_l1_lots.0));
         let min_support = self.min_resting_l1_lots(entry_price, realized_vol_5m);
         if eff_deep_lots.0 < min_support.0 {
