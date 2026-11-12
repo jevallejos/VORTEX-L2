@@ -397,11 +397,15 @@ impl PairSpec {
     #[must_use]
     pub const fn elastic_server_sl_distance_bps(realized_vol_5m: ScaledBps) -> ScaledBps {
         let v = if realized_vol_5m.0 > 0 { realized_vol_5m.0 } else { 0 };
-        let raw_bps = 9_500 + (v.saturating_mul(28)) / 100;
-        let bounded = if raw_bps < 11_000 {
-            11_000
-        } else if raw_bps > 14_500 {
-            14_500
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 * 2;
+        let base_sl = fee_rt * 11;
+        let raw_bps = base_sl + (v.saturating_mul(68)) / 100;
+        let min_sl = (fee_rt * 29) / 2;
+        let max_sl = (fee_rt * 125) / 4;
+        let bounded = if raw_bps < min_sl {
+            min_sl
+        } else if raw_bps > max_sl {
+            max_sl
         } else {
             raw_bps
         };
@@ -1171,12 +1175,12 @@ mod tests {
             .validate_pair_eligibility(PriceTicks(5_520), ScaledBps(4_800))
             .is_err());
 
-        let sl_low = PairSpec::elastic_server_sl_distance_bps(ScaledBps(4_000));
-        let sl_mid = PairSpec::elastic_server_sl_distance_bps(ScaledBps(8_000));
+        let sl_low = PairSpec::elastic_server_sl_distance_bps(ScaledBps(2_000));
+        let sl_mid = PairSpec::elastic_server_sl_distance_bps(ScaledBps(6_000));
         let sl_high = PairSpec::elastic_server_sl_distance_bps(ScaledBps(18_000));
-        assert_eq!(sl_low, ScaledBps(11_000));
-        assert_eq!(sl_mid, ScaledBps(11_740));
-        assert_eq!(sl_high, ScaledBps(14_500));
+        assert_eq!(sl_low, ScaledBps(5_800));
+        assert_eq!(sl_mid, ScaledBps(8_480));
+        assert_eq!(sl_high, ScaledBps(12_500));
 
         assert!(PairSpec::validate_stop_loss_geometry(
             Side::Bid,

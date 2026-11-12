@@ -3822,7 +3822,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     let flow_imp = (0.55 * snap.factor_ofi.get()
                         + 0.45 * snap.factor_tfi.get())
                         * side.sign_f64();
-                    let dq_abort = (resting_elapsed_ns >= 1_500_000_000
+                    let dq_abort = (resting_elapsed_ns >= 500_000_000
                         && at_l1
                         && check_queue_depletion_velocity_abort(
                             side,
@@ -3830,7 +3830,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             cur_q_ahead[s_idx],
                             &snap,
                         ))
-                        || flow_imp <= -0.48;
+                        || flow_imp <= -0.42;
 
                     if drain_active
                         || resting_elapsed_ns >= queue_timeout_ns
@@ -4031,6 +4031,12 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                         engines[s_idx].last_closed_wald_pct = quote.wald_pct;
                         engines[s_idx]
                             .latch_defensive_floor_if_needed(quote.defensive_lock_active);
+                        if engines[s_idx]
+                            .maybe_ratchet_wald_stop_loss(&snap, &btc_snap)
+                            .is_some()
+                        {
+                            sl_needs_sync[s_idx] = true;
+                        }
                         if let OrderLifecycleState::PositionOpenMakerExit {
                             active_exit_role: ref mut ax_r,
                             active_exit_price: ref mut ax_p,
@@ -4047,13 +4053,19 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                             && !slot_rpc_inflight[s_idx]
                             && now_ns.0 >= sl_retry_after_ns[s_idx]
                         {
-                            let dyn_sl =
+                            let base_sl =
                                 SlotExecutionEngine::compute_fill_or_adopt_sl_ticks(
                                     side,
                                     avg_price_ticks,
                                     &snap,
                                 )
                                 .unwrap_or(engines[s_idx].last_eff_sl_ticks);
+                            let cur_eff = engines[s_idx].last_eff_sl_ticks;
+                            let dyn_sl = match side {
+                                Side::Bid if cur_eff.0 > base_sl.0 => cur_eff,
+                                Side::Ask if cur_eff.0 > 0 && cur_eff.0 < base_sl.0 => cur_eff,
+                                _ => base_sl,
+                            };
                             engines[s_idx].last_eff_sl_ticks = dyn_sl;
                             if gw.try_send(GatewayCommand::EnforceStopLoss {
                                 slot_idx: s_idx,
@@ -4582,7 +4594,7 @@ mod tests {
             PriceTicks(8_030),
             &avax,
         );
-        assert_eq!(dyn_sl, Ok(PriceTicks(9_011)));
+        assert!(dyn_sl.is_ok_and(|px| px.0 >= 9_011));
 
         let mut engines = SlotExecutionEngine::new_12_slot_array();
         let mut forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];

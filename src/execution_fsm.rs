@@ -1,4 +1,4 @@
-//! Execution FSM, Quantum Floors, Moallemi dQ/dt Shield & Bayesian 12x2 Governor.
+//! Execution FSM, Quantum Floors, Anti-Sweep dQ/dt, Wald SL Ratchet & Bayesian Governor.
 
 use crate::alpha_3factor::OrthogonalFactorState;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -10,6 +10,7 @@ use crate::types::{
 };
 
 pub const MAX_CLOSE_RECONCILE_RETRIES: u8 = 5;
+pub const UNIFIED_LOSS_LAB_COUNT: usize = 63;
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const INIT_RETURN_VAR_BPS2: i64 = 40_000;
 
@@ -417,7 +418,7 @@ pub const fn dynamic_maker_floor_price(
     }
 }
 
-/// Moallemi-Yuan L1 Queue Depletion Velocity Shield (dQ/dt) coupled to endogenous barrier.
+/// Moallemi-Yuan L1 Queue Depletion & Decoupled L2 Sweep Shield (anti-Picked-Off Fill).
 #[inline]
 #[must_use]
 pub fn check_queue_depletion_velocity_abort(
@@ -429,8 +430,9 @@ pub fn check_queue_depletion_velocity_abort(
     let dir_s = side.sign_f64();
     let signed_ofi = snap.factor_ofi.get() * dir_s;
     let signed_tfi = snap.factor_tfi.get() * dir_s;
+    let signed_geom = snap.factor_geom.get() * dir_s;
     let flow_impulse = 0.55 * signed_ofi + 0.45 * signed_tfi;
-    if flow_impulse <= -0.48 {
+    if flow_impulse <= -0.42 || (signed_ofi <= -0.22 && signed_geom <= -0.05) {
         return true;
     }
     if init_queue_ahead.0 <= 0 {
@@ -446,7 +448,12 @@ pub fn check_queue_depletion_velocity_abort(
     let nu_sigma = vol_ratio.sqrt().clamp(0.80, 1.35);
     let depleted_lots = (init_queue_ahead.0 - current_queue_ahead.0).max(0) as f64;
     let depleted_frac = depleted_lots / (init_queue_ahead.0 as f64);
-    depleted_frac >= (0.55 * nu_sigma) && flow_impulse <= (-0.05 * nu_sigma)
+    let sweep_book_weak = flow_impulse <= (-0.04 * nu_sigma)
+        || signed_ofi <= 0.02
+        || signed_geom <= -0.10;
+    let tail_exposed =
+        depleted_frac >= (0.78 * nu_sigma).min(0.88) && signed_ofi < 0.14;
+    (depleted_frac >= (0.50 * nu_sigma) && sweep_book_weak) || tail_exposed
 }
 
 #[inline]
@@ -487,7 +494,7 @@ fn extract_matrix_u32_12x2(
     }
 }
 
-/// 12x2 Online Bayesian Governor with Welford-EWMA Variance, Intrinsic Clock & E_kin Surface.
+/// 12x2 Online Bayesian Governor with Lyapunov Crest Shield, Welford Var & Intrinsic Clock.
 #[derive(Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; MAX_ACTIVE_PAIRS],
@@ -922,7 +929,7 @@ impl OnlineAdaptiveGovernor {
         None
     }
 
-    /// Evaluates C1 Kinematic Free-Energy Surface coupled to Bayesian IR & learned eq_vol.
+    /// Evaluates C1 Kinematic Free-Energy & Lyapunov Crest-Reversal Boundary (SCAR #63).
     #[inline]
     pub fn evaluate_kinematic_energy_surface(
         &self,
@@ -962,11 +969,18 @@ impl OnlineAdaptiveGovernor {
         let lead_ext_gate = (fee_rt * 29) / 100;
         let elastic_lead_cap = base_lead
             + (((snr_abs - 0.58).max(0.0) * (eq_vol as f64 / 20.0)).round() as i64);
+
+        let snr_pull = ((snr_abs - 0.50) / 0.35).clamp(0.0, 1.0);
+        let base_neg_lead =
+            -(fee_rt / 3 + (((fee_rt as f64) * 0.25 * snr_pull).round() as i64));
+        let ext_crest_tighten = (s_drift - (fee_rt * 5) / 4).max(0) / 2;
+        let min_lead_floor = base_neg_lead + ext_crest_tighten;
+
         if s_drift < pullback_floor
             || s_ext < pullback_floor
             || s_ext > max_ext_cap
             || (lead_impulse > 0 && lead_impulse > elastic_lead_cap && s_ext >= lead_ext_gate)
-            || lead_impulse < -fee_rt - 20
+            || lead_impulse < min_lead_floor
         {
             return Err("VETO_KINEMATIC_PHASE_OR_EXHAUSTION");
         }
@@ -1397,6 +1411,7 @@ impl OnlineAdaptiveGovernor {
         cand_comp >= adaptive_threshold
     }
 
+    /// Elastic L1 queue chase horizon coupled to 5.0s flow half-life & slot IR [3.2s..5.6s].
     #[inline]
     #[must_use]
     pub fn max_total_entry_chase_ns(&self, slot_idx: usize, realized_vol_5m: ScaledBps) -> i64 {
@@ -1407,12 +1422,22 @@ impl OnlineAdaptiveGovernor {
             min_v * 4
         };
         let vol_c = realized_vol_5m.raw().max(min_v);
-        let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
-        let base_chase = tau_ns / 14;
-        ((base_chase.saturating_mul(eq_v)) / vol_c).clamp(tau_ns / 24, tau_ns / 10)
+        let base_flow_ns = VOL_5M_HORIZON_NS / 60;
+        let ir_best = c_max_i64(
+            self.slot_information_ratio_x100(slot_idx, Side::Bid),
+            self.slot_information_ratio_x100(slot_idx, Side::Ask),
+        )
+        .clamp(-40, 80);
+        let ir_permille = 1_000 + ir_best * 2;
+        let raw_ns = (((base_flow_ns as i128 * eq_v as i128) / (vol_c as i128))
+            * (ir_permille as i128))
+            / 1_000;
+        let lo = (base_flow_ns * 16) / 25;
+        let hi = (base_flow_ns * 28) / 25;
+        (raw_ns as i64).clamp(lo, hi)
     }
 
-    /// Continuous C1 hysteresis preflight validator (Law 10: Zero Self-Choke).
+    /// Continuous C1 hysteresis preflight validator with OFI sign & crest-reversal guard.
     pub fn confirm_preflight_kinematics_non_choking(
         &self,
         slot_idx: usize,
@@ -1444,6 +1469,9 @@ impl OnlineAdaptiveGovernor {
             return Err(veto);
         }
         let dir_s = side.sign_f64();
+        if (ofi * dir_s) < 0.08 {
+            return Err("VETO_PREFLIGHT_OFI_DECAY");
+        }
         let signed_snr = OrthogonalFactorState::snr_composite_score(snap) * dir_s;
         if signed_snr < 0.30 {
             return Err("VETO_PREFLIGHT_SNR_COLLAPSE");
@@ -1493,11 +1521,18 @@ impl OnlineAdaptiveGovernor {
         let max_pre_ext = (eq_vol / 2).max(fee_rt * 3) + (fee_rt / 8);
         let elastic_lead_cap = (fee_rt * 15) / 100
             + (((signed_snr - 0.55).max(0.0) * (eq_vol as f64 / 18.0)).round() as i64);
+
+        let snr_pull = ((signed_snr - 0.50) / 0.35).clamp(0.0, 1.0);
+        let base_neg_lead =
+            -(fee_rt / 3 + (((fee_rt as f64) * 0.25 * snr_pull).round() as i64));
+        let ext_crest_tighten = (s_drift - (fee_rt * 5) / 4).max(0) / 2;
+        let min_pre_lead = base_neg_lead + ext_crest_tighten - (fee_rt / 10);
+
         if s_drift < pre_pullback
             || s_ext < pre_pullback
             || s_ext > max_pre_ext
             || (lead_impulse > elastic_lead_cap && s_ext >= (fee_rt * 3) / 10)
-            || lead_impulse < -fee_rt - 20
+            || lead_impulse < min_pre_lead
         {
             return Err("VETO_PREFLIGHT_KINEMATIC_EXHAUSTION");
         }
@@ -1636,11 +1671,11 @@ impl OnlineAdaptiveGovernor {
         (max_ts, ingested)
     }
 
-    /// Unified LOSS-LAB Verifier: Certifies 62/62 historical/V2/PAR1 losses + 2,160 manifold.
+    /// Unified LOSS-LAB Verifier: Certifies 63/63 (incl. SCAR #63 LINK Bid) + 2,160 manifold.
     #[must_use]
     pub fn audit_unified_62_losses_and_2160_manifold() -> (usize, usize) {
         let gov = Self::new();
-        let cases: [(usize, Side, i64, i64, f64, f64); 62] = [
+        let cases: [(usize, Side, i64, i64, f64, f64); UNIFIED_LOSS_LAB_COUNT] = [
             (0, Side::Ask, -331, -347, 0.11, 0.55), (3, Side::Bid, 113, 120, 0.11, 0.52),
             (0, Side::Bid, 182, 248, 0.38, 0.58), (1, Side::Bid, 142, 267, 0.25, 0.54),
             (0, Side::Bid, 247, 157, 0.16, 0.44), (0, Side::Bid, 109, 36, 0.20, 0.45),
@@ -1672,11 +1707,12 @@ impl OnlineAdaptiveGovernor {
             (0, Side::Ask, -136, -198, 0.13, 0.47), (3, Side::Ask, -151, -216, 0.14, 0.48),
             (0, Side::Ask, -165, -234, 0.16, 0.50), (1, Side::Ask, -159, -225, 0.15, 0.49),
             (0, Side::Ask, -161, -228, 0.15, 0.49), (4, Side::Bid, 146, 211, 0.14, 0.48),
+            (9, Side::Bid, 898, 591, 0.51, 0.70),
         ];
-        let mut mitigated_62 = 0_usize;
+        let mut mitigated_all = 0_usize;
         for &(s_idx, side, dr, ex, gm, snr) in &cases {
             if gov.evaluate_kinematic_energy_surface(s_idx, side, dr, ex, gm, snr).is_err() {
-                mitigated_62 += 1;
+                mitigated_all += 1;
             }
         }
         let mut manifold_blocked = 0_usize;
@@ -1699,7 +1735,7 @@ impl OnlineAdaptiveGovernor {
                 }
             }
         }
-        (mitigated_62, manifold_blocked)
+        (mitigated_all, manifold_blocked)
     }
 }
 
@@ -1713,7 +1749,7 @@ fn extract_json_epoch_ms(item: &serde_json::Value, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Per-Slot Autonomous Lifecycle State Machine (Monotonic Tranche & LVDBS Native).
+/// Per-Slot Autonomous Lifecycle State Machine (Monotonic Tranche, Wald SL & LVDBS Native).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum OrderLifecycleState {
     #[default]
@@ -1916,7 +1952,7 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Enforces 110..145 bps server SL distance & >= 2-tick Mark/Last cushion.
+    /// Enforces regime-scaled 58..125 bps server SL distance & >= 2-tick Mark/Last cushion.
     #[inline]
     pub fn compute_fill_or_adopt_sl_ticks(
         side: Side,
@@ -1951,6 +1987,112 @@ impl SlotExecutionEngine {
             }
         };
         PairSpec::validate_stop_loss_geometry(side, raw_sl, ref_last, ref_mark)
+    }
+
+    /// Monotonically contracts Server SL via Abraham Wald SPRT when a trade stalls (MFE ~ 0).
+    pub fn maybe_ratchet_wald_stop_loss(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+    ) -> Option<PriceTicks> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            sl_trigger_price: cur_sl,
+            opened_ts,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        if avg_price_ticks.0 <= 0 || self.last_closed_wald_pct < 12 {
+            return None;
+        }
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        if self.last_closed_mfe_bps >= (fee_rt * 13) / 10 {
+            return None;
+        }
+        let hold_s = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0) / 1_000_000_000;
+        let min_stall_s = (self.intrinsic_tau_mkt_s.max(90) / 5).max(45);
+        if hold_s < min_stall_s {
+            return None;
+        }
+        let dir_s = side.sign_f64();
+        let own_flow =
+            (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+        let btc_snr =
+            OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
+        if own_flow >= -0.05 && btc_snr >= -0.20 {
+            return None;
+        }
+
+        let base_sl_bps =
+            PairSpec::elastic_server_sl_distance_bps(snap.realized_vol_5m).raw();
+        let btc_headwind = if btc_snr < -0.25 {
+            ((-btc_snr - 0.25) * 20.0).round() as i64
+        } else {
+            0
+        };
+        let eff_wald_pct = (self.last_closed_wald_pct + btc_headwind).clamp(12, 42);
+        let min_wald_sl_bps = fee_rt * 12;
+        let contracted_bps =
+            ((base_sl_bps * (100 - eff_wald_pct)) / 100).max(min_wald_sl_bps);
+        let sl_delta =
+            ((avg_price_ticks.0.saturating_mul(contracted_bps)) / 1_000_000).max(4);
+        let ref_mark = if snap.mark_price.0 > 0 {
+            snap.mark_price
+        } else {
+            avg_price_ticks
+        };
+        let ref_last = if snap.last_trade_price.0 > 0 {
+            snap.last_trade_price
+        } else {
+            ref_mark
+        };
+        let cand_sl = match side {
+            Side::Bid => {
+                let nominal = avg_price_ticks.0 - sl_delta;
+                let live_cap = ref_mark.0.min(ref_last.0) - 4;
+                PriceTicks(nominal.min(live_cap).max(1))
+            }
+            Side::Ask => {
+                let nominal = avg_price_ticks.0.saturating_add(sl_delta);
+                let live_floor = ref_mark.0.max(ref_last.0).saturating_add(4);
+                PriceTicks(nominal.max(live_floor))
+            }
+        };
+        let Ok(valid_sl) =
+            PairSpec::validate_stop_loss_geometry(side, cand_sl, ref_last, ref_mark)
+        else {
+            return None;
+        };
+        let prev_sl = if self.last_eff_sl_ticks.0 > 0 {
+            self.last_eff_sl_ticks
+        } else {
+            cur_sl
+        };
+        let tighter_by_3_ticks = match side {
+            Side::Bid => {
+                valid_sl.0 >= prev_sl.0.saturating_add(3)
+                    && valid_sl.0 < avg_price_ticks.0
+            }
+            Side::Ask => {
+                valid_sl.0 <= prev_sl.0.saturating_sub(3)
+                    && valid_sl.0 > avg_price_ticks.0
+            }
+        };
+        if !tighter_by_3_ticks {
+            return None;
+        }
+        self.last_eff_sl_ticks = valid_sl;
+        if let OrderLifecycleState::PositionOpenMakerExit {
+            sl_trigger_price: ref mut sl_p,
+            ..
+        } = self.state
+        {
+            *sl_p = valid_sl;
+        }
+        Some(valid_sl)
     }
 
     /// Publishes tear-free Seqlock telemetry via SlotExecTelemetry::write_consistent.
@@ -2230,9 +2372,6 @@ impl SlotExecutionEngine {
         };
         let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let min_win_gross = (fee_rt * 13) / 10;
-        let tp_bps = target_excursion.raw().max(min_win_gross);
-        let structural_tp_price =
-            dynamic_maker_floor_price(side, eff_entry_px, ScaledBps(tp_bps));
         let q_floor = defensive_zero_loss_maker_exit_price(side, eff_entry_px);
         let split_t1_opt = Self::compute_tranche1_split_lots(
             self.slot_idx,
@@ -2240,6 +2379,14 @@ impl SlotExecutionEngine {
             q_floor,
             self.learned_t1_permille,
         );
+        let tp_bps = if split_t1_opt.is_some() {
+            target_excursion.raw().max(min_win_gross)
+        } else {
+            let unit_cap = self.learned_mfe_bps.clamp(min_win_gross, (fee_rt * 9) / 4);
+            target_excursion.raw().min(unit_cap).max(min_win_gross)
+        };
+        let structural_tp_price =
+            dynamic_maker_floor_price(side, eff_entry_px, ScaledBps(tp_bps));
         let (init_role, init_exit_px, init_exit_lots) = match split_t1_opt {
             Some(t1_lots) => (ExitOrderRole::Tranche1Harvest50, q_floor, t1_lots),
             None => (ExitOrderRole::StandardMakerExit100, structural_tp_price, eff_lots),
@@ -3347,7 +3494,7 @@ impl SlotExecutionEngine {
     pub fn step_open_position(
         &mut self,
         snap: &SymbolLobSnapshot,
-        _btc_leader_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
         gov: &OnlineAdaptiveGovernor,
         ledger: &mut ParitySyncLedger,
     ) -> Option<ClosedTradeSummary> {
@@ -3415,17 +3562,20 @@ impl SlotExecutionEngine {
         self.last_closed_mae_bps = (worst_diff.saturating_mul(1_000_000)) / avg_denom;
         self.last_closed_peak_ticks = peak_favorable_price;
         self.last_closed_worst_ticks = worst_adverse_price;
-        self.last_eff_sl_ticks = sl_trigger_price;
+        if self.last_eff_sl_ticks.0 <= 0 {
+            self.last_eff_sl_ticks = sl_trigger_price;
+        }
 
+        let eff_sl_now = self.last_eff_sl_ticks;
         let sl_hit = match side {
-            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= sl_trigger_price.0,
-            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= sl_trigger_price.0,
+            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_now.0,
+            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_now.0,
         };
         if sl_hit {
             self.last_exit_sub_reason = ExitSubReason::WaldBaseStopLoss;
             return self.finalize_open_position_close(
                 ClosedTradeKind::ServerMarkPriceStopLoss,
-                sl_trigger_price,
+                eff_sl_now,
                 snap.ts_local_ns,
                 ledger,
             );
@@ -3434,6 +3584,7 @@ impl SlotExecutionEngine {
         let quote = self.compute_canonical_exit_quote(snap)?;
         self.last_closed_wald_pct = quote.wald_pct;
         self.latch_defensive_floor_if_needed(quote.defensive_lock_active);
+        let _ = self.maybe_ratchet_wald_stop_loss(snap, btc_leader_snap);
 
         let reached_target = match side {
             Side::Bid => ref_trade.0 >= quote.target_price.0,
@@ -3502,13 +3653,23 @@ mod tests {
             LotQty(300),
             &snap,
         ));
+
+        snap.factor_ofi = BoundedScore::new_clamped(0.01);
+        snap.factor_tfi = BoundedScore::new_clamped(0.85);
+        snap.factor_geom = BoundedScore::new_clamped(-0.15);
+        assert!(check_queue_depletion_velocity_abort(
+            Side::Bid,
+            LotQty(717),
+            LotQty(90),
+            &snap,
+        ));
     }
 
     #[test]
     fn test_governor_12x2_loss_lab_62_of_62_and_2160_manifold() {
-        let (mitigated_62, manifold_2160) =
+        let (mitigated_all, manifold_2160) =
             OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold();
-        assert_eq!(mitigated_62, 62);
+        assert_eq!(mitigated_all, UNIFIED_LOSS_LAB_COUNT);
         assert_eq!(manifold_2160, 2_160);
 
         let gov = OnlineAdaptiveGovernor::new();
@@ -3516,8 +3677,17 @@ mod tests {
             .evaluate_kinematic_energy_surface(1, Side::Bid, 105, 148, 0.24, 0.60)
             .is_ok());
         assert!(gov
+            .evaluate_kinematic_energy_surface(7, Side::Bid, 514, 381, 0.71, 0.84)
+            .is_ok());
+        assert!(gov
+            .evaluate_kinematic_energy_surface(9, Side::Bid, 898, 591, 0.51, 0.70)
+            .is_err());
+        assert!(gov
             .evaluate_kinematic_energy_surface(1, Side::Bid, 220, 150, 0.22, 0.47)
             .is_err());
+
+        let chase_ns = gov.max_total_entry_chase_ns(9, ScaledBps(2_090));
+        assert!((3_200_000_000..=5_600_000_000).contains(&chase_ns));
     }
 
     #[test]
@@ -3597,8 +3767,46 @@ mod tests {
             ScaledBps(1_510),
             688,
         );
-        assert!(mae_tao <= -2_200);
+        assert!(mae_tao <= -1_300);
         assert!(def_s_tao >= 60);
+
+        let mut link_eng = SlotExecutionEngine::new(9);
+        let mut link_snap = SymbolLobSnapshot::new_empty();
+        link_snap.symbol_id = APPROVED_SPECS[9].symbol_id;
+        link_snap.realized_vol_5m = ScaledBps(2_090);
+        link_snap.ts_local_ns = TimestampNs(1_000_000_000);
+        link_snap.bids[0] = BookLevel { price: PriceTicks(10_468), qty: LotQty(200) };
+        link_snap.asks[0] = BookLevel { price: PriceTicks(10_469), qty: LotQty(200) };
+        link_snap.mark_price = PriceTicks(10_468);
+        link_snap.last_trade_price = PriceTicks(10_468);
+        let v_link = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(650),
+        };
+        assert!(link_eng.try_arm_maker_entry(&link_snap, v_link, LotQty(12)).is_ok());
+        assert!(link_eng
+            .on_maker_entry_filled(TimestampNs(2_000_000_000))
+            .is_ok());
+        let init_sl = link_eng.last_eff_sl_ticks;
+        assert!(init_sl.0 >= 10_405 && init_sl.0 < 10_468);
+        link_snap.ts_local_ns = TimestampNs(320_000_000_000);
+        link_snap.mark_price = PriceTicks(10_450);
+        link_snap.last_trade_price = PriceTicks(10_450);
+        link_snap.factor_ofi = BoundedScore::new_clamped(-0.64);
+        link_snap.factor_tfi = BoundedScore::new_clamped(-0.45);
+        link_snap.factor_geom = BoundedScore::new_clamped(-0.35);
+        let mut btc_bear = link_snap;
+        btc_bear.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc_bear.factor_ofi = BoundedScore::new_clamped(-0.55);
+        btc_bear.factor_tfi = BoundedScore::new_clamped(-0.75);
+        if let Some(q_l) = link_eng.compute_canonical_exit_quote(&link_snap) {
+            link_eng.last_closed_wald_pct = q_l.wald_pct;
+        }
+        let ratcheted = link_eng.maybe_ratchet_wald_stop_loss(&link_snap, &btc_bear);
+        assert!(ratcheted.is_some());
+        if let Some(new_sl) = ratcheted {
+            assert!(new_sl.0 >= init_sl.0 + 3);
+        }
 
         let mut pendle_eng = SlotExecutionEngine::new(7);
         let mut p_snap = SymbolLobSnapshot::new_empty();
@@ -3679,7 +3887,7 @@ mod tests {
                 [1_794_191_589_360_755_839_i64, 1_794_189_735_509_464_253_i64],
                 [1_794_211_446_079_196_625_i64, 1_794_223_784_956_420_890_i64],
                 [1_794_235_041_996_258_884_i64, 1_794_241_637_703_685_870_i64],
-                [1_794_239_784_220_319_099_i64, 1_794_241_195_997_668_400_i64],
+                [1_794_239_784_220_319_099_i64, 1_794_241_195_997_923_027_i64],
                 [1_794_214_953_878_548_667_i64, 0],
                 [1_794_242_814_128_285_563_i64, 1_794_092_589_432_475_272_i64],
                 [1_794_239_440_385_316_436_i64, 0],
@@ -3857,7 +4065,7 @@ mod tests {
         assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(26)).is_ok());
         if let OrderLifecycleState::PlacingEntryMaker { sl_trigger_price, .. } = eng.state {
             let sl_dist_bps = ((8_200 - sl_trigger_price.0) * 1_000_000) / 8_200;
-            assert!((11_000..=14_500).contains(&sl_dist_bps));
+            assert!((5_800..=12_500).contains(&sl_dist_bps));
         } else {
             assert_eq!(eng.slot_idx, 999);
         }
@@ -4008,7 +4216,7 @@ mod tests {
             assert_eq!(ledger.closed_trades_count, 1);
         }
 
-        let shm_path = MappedShmRegion::ephemeral_self_test_path("chat12_fsm_f09");
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("chat13_fsm_f09");
         let reg = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(reg.is_ok());
         let mut eng = SlotExecutionEngine::new(3);
@@ -4162,6 +4370,19 @@ mod tests {
                 &btc,
             )
             .is_err());
+
+        link.factor_geom = BoundedScore::new_clamped(0.25);
+        link.factor_ofi = BoundedScore::new_clamped(0.02);
+        assert_eq!(
+            gov.confirm_preflight_kinematics_non_choking(
+                9,
+                Side::Bid,
+                6_628_080_000,
+                &link,
+                &btc,
+            ),
+            Err("VETO_PREFLIGHT_OFI_DECAY")
+        );
 
         let mut eng = SlotExecutionEngine::new(5);
         let mut ledger = ParitySyncLedger::new(6_628_080_000);

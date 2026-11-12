@@ -1008,7 +1008,7 @@ pub fn run_parquet_walk_forward_on_dir(
                                 queue_ahead_qty,
                                 &cur_snap,
                             ))
-                            || flow_imp <= -0.48;
+                            || flow_imp <= -0.42;
                         if elapsed_ns >= timeout_ns
                             || total_chase_ns >= max_chase_ns
                             || dq_abort
