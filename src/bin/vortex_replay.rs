@@ -474,6 +474,11 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
         let _ = eng.on_maker_entry_filled(TimestampNs(t0_ns + 50_000_000));
 
         let q_floor = defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(base_px));
+        let win1_px = vortex_rs::execution_fsm::offensive_win_maker_exit_price(
+            Side::Bid,
+            PriceTicks(base_px),
+            0.50,
+        );
 
         if episode % 2 == 0 {
             let hold_s = 95_i64;
@@ -508,12 +513,12 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
                 AblationMode::ElasticMultiTrancheB => {
                     snap.ts_local_ns = TimestampNs(t0_ns + 20_000_000_000);
                     snap.bids[0] = BookLevel {
-                        price: PriceTicks(q_floor.0 - 1),
+                        price: PriceTicks(win1_px.0 - 1),
                         qty: LotQty(450),
                     };
-                    snap.asks[0] = BookLevel { price: q_floor, qty: LotQty(200) };
-                    snap.mark_price = q_floor;
-                    snap.last_trade_price = q_floor;
+                    snap.asks[0] = BookLevel { price: win1_px, qty: LotQty(200) };
+                    snap.mark_price = win1_px;
+                    snap.last_trade_price = win1_px;
                     let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
 
                     snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
@@ -560,12 +565,12 @@ pub fn run_ab_economic_ablation_model(mode: AblationMode) -> AblationMetrics {
                 AblationMode::FullVortexL3AB => {
                     snap.ts_local_ns = TimestampNs(t0_ns + 20_000_000_000);
                     snap.bids[0] = BookLevel {
-                        price: PriceTicks(q_floor.0 - 1),
+                        price: PriceTicks(win1_px.0 - 1),
                         qty: LotQty(450),
                     };
-                    snap.asks[0] = BookLevel { price: q_floor, qty: LotQty(200) };
-                    snap.mark_price = q_floor;
-                    snap.last_trade_price = q_floor;
+                    snap.asks[0] = BookLevel { price: win1_px, qty: LotQty(200) };
+                    snap.mark_price = win1_px;
+                    snap.last_trade_price = win1_px;
                     let _ = eng.step_open_position(&snap, &snap, &gov, &mut ledger);
 
                     snap.ts_local_ns = TimestampNs(t0_ns + hold_s * 1_000_000_000);
@@ -1630,15 +1635,15 @@ mod tests {
         // At t = 25s (hold = 22s, offensive mode), Tranche 1 (50%) harvests @ 8_204.
         avax.sequence_id = 7;
         avax.ts_local_ns = TimestampNs(25_000_000_000);
-        avax.mark_price = PriceTicks(8_204);
+        avax.mark_price = PriceTicks(8_205);
         avax.bids[0] = BookLevel { price: PriceTicks(8_203), qty: LotQty(420) };
-        avax.asks[0] = BookLevel { price: PriceTicks(8_204), qty: LotQty(100) };
+        avax.asks[0] = BookLevel { price: PriceTicks(8_205), qty: LotQty(100) };
         assert!(seg1
             .push_row(&ColumnarMarketRow::from_lob_snapshot(
                 &avax,
                 MarketEventKind::L2BookSnapshot,
                 Side::Bid,
-                PriceTicks(8_204),
+                PriceTicks(8_205),
                 LotQty(420),
             ))
             .is_ok());
@@ -1649,7 +1654,7 @@ mod tests {
                 &avax,
                 MarketEventKind::L2BookSnapshot,
                 Side::Bid,
-                PriceTicks(8_204),
+                PriceTicks(8_205),
                 LotQty(420),
             ))
             .is_ok());
@@ -1660,7 +1665,7 @@ mod tests {
                 &avax,
                 MarketEventKind::PublicTradePrint,
                 Side::Bid,
-                PriceTicks(8_204),
+                PriceTicks(8_205),
                 LotQty(140),
             ))
             .is_ok());

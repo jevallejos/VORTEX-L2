@@ -16,6 +16,7 @@ pub const MAX_DIRECTIONAL_OPEN_SLOTS_PER_SIDE: usize = 3;
 pub const MAX_PORTFOLIO_OPEN_SLOTS_TOTAL: usize = 6;
 pub const OVERSIZED_LOT_MIN_SNR_ABS: f64 = 0.72;
 pub const BYBIT_MIN_ORDER_NOTIONAL_1E8: i64 = 500_000_000;
+pub const SPLIT_LEG_MIN_NOTIONAL_1E8: i64 = 525_000_000;
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -371,6 +371,24 @@ pub fn parse_signed_decimal_1e8(decimal_str: &str) -> Result<i64, VortexError> {
     Ok(if neg { -clamped } else { clamped })
 }
 
+pub const OFFENSIVE_WIN_FLOOR_GROSS_BPS: i64 = 515;
+
+/// Offensive Maker WIN floor (>= +5.15..+5.70 bps gross => >= +1.15..+1.70 bps net WIN).
+#[inline]
+#[must_use]
+pub fn offensive_win_maker_exit_price(
+    side: Side,
+    avg_price_ticks: PriceTicks,
+    hurst_exponent: f64,
+) -> PriceTicks {
+    let h_bonus = if hurst_exponent > 0.52 {
+        (((hurst_exponent - 0.52) * 160.0).round() as i64).clamp(0, 55)
+    } else {
+        0
+    };
+    let win_bps = ScaledBps(OFFENSIVE_WIN_FLOOR_GROSS_BPS + h_bonus);
+    dynamic_maker_floor_price(side, avg_price_ticks, win_bps)
+}
 /// Tick-quantized Zero-Loss Quantum Floor (4.00 bps Maker-Maker fee + >= 0.40 bps net).
 #[inline]
 #[must_use]
@@ -1980,28 +1998,40 @@ impl SlotExecutionEngine {
         ]
     }
 
-    /// Enforces bilateral $5.00 USDT exchange minimum notional on both split legs.
     #[inline]
     #[must_use]
-    pub const fn compute_tranche1_split_lots(
+    pub fn compute_tranche1_split_lots(
         slot_idx: usize,
         open_lots: LotQty,
-        exit_ref_price: PriceTicks,
-        phi_permille: i64,
+        exit_price: PriceTicks,
+        t1_permille: i64,
     ) -> Option<LotQty> {
-        if slot_idx >= MAX_ACTIVE_PAIRS {
+        if slot_idx == 0
+            || slot_idx >= MAX_ACTIVE_PAIRS
+            || open_lots.0 < 2
+            || exit_price.0 <= 0
+        {
             return None;
         }
         let spec = APPROVED_SPECS[slot_idx];
-        let min_lots = spec.exchange_min_notional_lots(exit_ref_price).0;
-        let min_leg = if min_lots > 1 { min_lots } else { 1 };
-        if open_lots.0 < min_leg.saturating_mul(2) {
+        let one_lot_1e8 = spec.lot_notional_1e8(LotQty(1), exit_price);
+        if one_lot_1e8 <= 0 {
             return None;
         }
-        let phi = c_clamp_i64(phi_permille, 350, 650);
-        let raw_t1 = ((open_lots.0 as i128 * phi as i128 + 500) / 1_000) as i64;
-        let max_t1 = open_lots.0 - min_leg;
-        Some(LotQty(c_clamp_i64(raw_t1, min_leg, max_t1)))
+        let min_leg_1e8 = crate::types::SPLIT_LEG_MIN_NOTIONAL_1E8;
+        let tot_1e8 = spec.lot_notional_1e8(open_lots, exit_price);
+        if tot_1e8 < min_leg_1e8.saturating_mul(2) {
+            return None;
+        }
+        let min_leg_lots = (min_leg_1e8 + one_lot_1e8 - 1) / one_lot_1e8;
+        let max_t1_lots = open_lots.0 - min_leg_lots;
+        if min_leg_lots < 1 || min_leg_lots > max_t1_lots {
+            return None;
+        }
+        let pct = t1_permille.clamp(350, 650);
+        let raw_t1 = (open_lots.0.saturating_mul(pct) + 500) / 1_000;
+        let t1_lots = raw_t1.clamp(min_leg_lots, max_t1_lots);
+        Some(LotQty(t1_lots))
     }
 
     /// Synchronizes slot exit physics with live Bayesian Governor posterior parameters.
@@ -2484,15 +2514,15 @@ impl SlotExecutionEngine {
         };
         let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let min_win_gross = (fee_rt * 13) / 10;
-        let q_floor = defensive_zero_loss_maker_exit_price(side, eff_entry_px);
+        let win1_px = offensive_win_maker_exit_price(side, eff_entry_px, 0.50);
         let split_t1_opt = Self::compute_tranche1_split_lots(
             self.slot_idx,
             eff_lots,
-            q_floor,
+            win1_px,
             self.learned_t1_permille,
         );
         let tp_bps = if split_t1_opt.is_some() {
-            target_excursion.raw().max(min_win_gross)
+            target_excursion.raw().max(min_win_gross + 40)
         } else {
             let vol_raw = self.open_vol_5m_bps.raw();
             let vol_unit_cap = if vol_raw > 0 {
@@ -2507,7 +2537,7 @@ impl SlotExecutionEngine {
         let structural_tp_price =
             dynamic_maker_floor_price(side, eff_entry_px, ScaledBps(tp_bps));
         let (init_role, init_exit_px, init_exit_lots) = match split_t1_opt {
-            Some(t1_lots) => (ExitOrderRole::Tranche1Harvest50, q_floor, t1_lots),
+            Some(t1_lots) => (ExitOrderRole::Tranche1Harvest50, win1_px, t1_lots),
             None => (ExitOrderRole::StandardMakerExit100, structural_tp_price, eff_lots),
         };
 
@@ -3325,28 +3355,48 @@ impl SlotExecutionEngine {
             + ((mfe_c - 2 * fee_rt) * 100) / (10 * fee_rt).max(1))
         .clamp(180, 340);
         let sl_cushion_bps = (sl_dist_bps.saturating_mul(gamma_permille)) / 1_000;
-        let mae_mag = (4 * tau_bps)
+        let mae_mag = 1_200_i64
+            .max(4 * tau_bps)
             .max(sl_cushion_bps)
-            .max(self.learned_ret_std_bps / 6);
+            .max(self.learned_ret_std_bps / 5);
         let mae_trig_bps = -mae_mag;
 
+        let hurst_h = snap.wave_observables().hurst_exponent();
+        let wave_mod_opt =
+            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
+                snap.wave_observables(),
+                side,
+                0.50,
+            )
+            .ok();
+        let wave_def_mult = wave_mod_opt.map_or(1_000, |m| m.def_horizon_permille_mult);
+        let flow_persist_mult = if signed_flow > 0.12 {
+            let f_b = ((signed_flow - 0.12) * 620.0).round() as i64;
+            let h_b = ((hurst_h - 0.50).max(0.0) * 450.0).round() as i64;
+            (1_000 + f_b + h_b).clamp(1_000, 1_650)
+        } else {
+            1_000
+        };
         let ir_mult_permille = 1_000 + (ir_c.clamp(-40, 80) * 10) / 3;
         let raw_def_s = ((((tau_mkt_s / 4) * mfe_c) / init_mfe.max(1))
             * ir_mult_permille)
             / 1_000;
-        let t_def_s = raw_def_s.clamp(tau_mkt_s / 6, (tau_mkt_s * 2) / 5);
+        let base_t_def_s = raw_def_s.clamp(40, 75);
+        let t_def_s = (((base_t_def_s * wave_def_mult) / 1_000) * flow_persist_mult)
+            / 1_000;
+        let win_window_s = if signed_flow > 0.12 { 40 } else { 25 };
+        let t_scratch_s = t_def_s + win_window_s;
 
+        let hard_adverse = worst_mae_bps <= mae_trig_bps
+            || (hold_s >= t_def_s / 3 && joint_adverse);
         let defensive_now = if tranche1_harvested {
-            let t_def_t2 = t_def_s + tau_mkt_s / 5;
+            let t_def_t2 = t_scratch_s + 30;
             defensive_floor_locked
                 || worst_mae_bps <= (mae_trig_bps - (fee_rt * 3) / 10)
                 || hold_s >= t_def_t2
                 || (hold_s >= (t_def_s * 3) / 5 && joint_adverse)
         } else {
-            defensive_floor_locked
-                || worst_mae_bps <= mae_trig_bps
-                || hold_s >= t_def_s
-                || (hold_s >= t_def_s / 3 && joint_adverse)
+            defensive_floor_locked || hard_adverse || hold_s >= t_scratch_s
         };
 
         let win_gross = (fee_rt * 13) / 10;
@@ -3399,19 +3449,14 @@ impl SlotExecutionEngine {
         };
 
         let q_floor = defensive_zero_loss_maker_exit_price(side, avg_price_ticks);
-        let wave_t1_adj =
-            crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
-                snap.wave_observables(),
-                side,
-                0.50,
-            )
-            .map_or(0, |m| m.tranche1_permille_delta);
+        let win1_floor = offensive_win_maker_exit_price(side, avg_price_ticks, hurst_h);
+        let wave_t1_adj = wave_mod_opt.map_or(0, |m| m.tranche1_permille_delta);
         let eff_t1_permille = (self.learned_t1_permille + wave_t1_adj).clamp(350, 650);
         let split_t1_opt = if !tranche1_harvested && !defensive_now && !mfe_ratchet_lock {
             Self::compute_tranche1_split_lots(
                 self.slot_idx,
                 open_lots,
-                q_floor,
+                win1_floor,
                 eff_t1_permille,
             )
         } else {
@@ -3423,13 +3468,27 @@ impl SlotExecutionEngine {
             dynamic_maker_floor_price(side, avg_price_ticks, ScaledBps(win_gross))
         };
 
+        let win_harvest_stage = !tranche1_harvested
+            && !defensive_now
+            && !mfe_ratchet_lock
+            && hold_s >= t_def_s;
+
         let (role, sub_reason, raw_target_px, order_lots, vac_level, def_lock) =
             if let Some(t1_order_lots) = split_t1_opt {
                 (
                     ExitOrderRole::Tranche1Harvest50,
                     ExitSubReason::Tranche1Harvest50,
-                    q_floor,
+                    win1_floor,
                     t1_order_lots,
+                    1_usize,
+                    false,
+                )
+            } else if win_harvest_stage {
+                (
+                    ExitOrderRole::StandardMakerExit100,
+                    ExitSubReason::LvdbsDeepVacuumSurf,
+                    win1_floor,
+                    open_lots,
                     1_usize,
                     false,
                 )
@@ -4438,10 +4497,10 @@ mod tests {
         assert!(eng.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
 
         snap.ts_local_ns = TimestampNs(10_000_000_000);
-        snap.bids[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(400) };
-        snap.asks[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(200) };
-        snap.mark_price = PriceTicks(8_202);
-        snap.last_trade_price = PriceTicks(8_202);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(400) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_203), qty: LotQty(200) };
+        snap.mark_price = PriceTicks(8_203);
+        snap.last_trade_price = PriceTicks(8_203);
         assert!(eng.step_open_position(&snap, &snap, &gov, &mut ledger).is_none());
         assert_eq!(eng.tranche1_harvests_count, 1);
         assert_eq!(ledger.closed_trades_count, 1);
@@ -4476,7 +4535,7 @@ mod tests {
             assert_eq!(summary.closed_lots, LotQty(26));
             assert_eq!(summary.legs_consolidated, 2);
             assert_eq!(summary.exit_price, PriceTicks(8_206));
-            assert_eq!(summary.net_scaled_bps, ScaledBps(593));
+            assert_eq!(summary.net_scaled_bps, ScaledBps(659));
             assert!(summary.net_pnl_1e8 > 1_250_000);
             assert_eq!(ledger.closed_trades_count, 2);
         }
@@ -4883,5 +4942,95 @@ mod tests {
             gov_kin.audit_scar64_entry_and_sweep_shield(4, Side::Bid, &s_warm, 0.20),
             Err("VETO_FOLLOWER_DECEL_UNDER_COMPRESSION")
         );
+    }
+
+    #[test]
+    fn test_offensive_win_floor_515bps_1050_split_and_trade25_tao_win_conversion() {
+        assert_eq!(
+            SlotExecutionEngine::compute_tranche1_split_lots(
+                5, LotQty(14), PriceTicks(8_000), 380,
+            ),
+            Some(LotQty(7))
+        );
+        assert_eq!(
+            SlotExecutionEngine::compute_tranche1_split_lots(
+                4, LotQty(10), PriceTicks(21_120), 500,
+            ),
+            Some(LotQty(5))
+        );
+
+        let gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = ParitySyncLedger::new(6_612_720_000);
+        let mut tao_eng = SlotExecutionEngine::new(4);
+        let mut tao = SymbolLobSnapshot::new_empty();
+        tao.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao.is_eligible = true;
+        tao.realized_vol_5m = ScaledBps(1_994);
+        tao.ts_local_ns = TimestampNs(1_000_000_000);
+        tao.bids[0] = BookLevel { price: PriceTicks(21_130), qty: LotQty(200) };
+        tao.asks[0] = BookLevel { price: PriceTicks(21_131), qty: LotQty(218) };
+        tao.mark_price = PriceTicks(21_131);
+        tao.last_trade_price = PriceTicks(21_131);
+        tao.factor_ofi = BoundedScore::new_clamped(-0.50);
+        tao.factor_tfi = BoundedScore::new_clamped(-0.83);
+        tao.factor_geom = BoundedScore::new_clamped(-0.32);
+        tao.set_wave_observables(crate::wave_elliott::WaveObservables {
+            regime: crate::wave_elliott::WaveRegimeKind::MotiveImpulseBear,
+            hurst_score: BoundedScore::new_clamped(0.268),
+            oi_impulse: BoundedScore::new_clamped(-0.42),
+            macro_phase: BoundedScore::new_clamped(-0.78),
+            retracement_ratio: BoundedScore::new_clamped(0.12),
+            climax_intensity: BoundedScore::ZERO,
+        });
+
+        let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(750),
+        };
+        assert!(tao_eng.try_arm_maker_entry(&tao, verdict, LotQty(10)).is_ok());
+        assert!(tao_eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
+
+        tao.ts_local_ns = TimestampNs(30_000_000_000);
+        tao.bids[0] = BookLevel { price: PriceTicks(21_142), qty: LotQty(180) };
+        tao.asks[0] = BookLevel { price: PriceTicks(21_143), qty: LotQty(180) };
+        tao.mark_price = PriceTicks(21_143);
+        tao.last_trade_price = PriceTicks(21_143);
+        assert!(tao_eng.step_open_position(&tao, &tao, &gov, &mut ledger).is_none());
+
+        tao.ts_local_ns = TimestampNs(60_000_000_000);
+        tao.factor_ofi = BoundedScore::new_clamped(-0.72);
+        tao.factor_tfi = BoundedScore::new_clamped(-0.99);
+        tao.bids[0] = BookLevel { price: PriceTicks(21_119), qty: LotQty(150) };
+        tao.asks[0] = BookLevel { price: PriceTicks(21_120), qty: LotQty(220) };
+        tao.mark_price = PriceTicks(21_119);
+        tao.last_trade_price = PriceTicks(21_119);
+        let q_58s = tao_eng.compute_canonical_exit_quote(&tao);
+        assert!(q_58s.is_some());
+        if let Some(q) = q_58s {
+            assert!(!q.defensive_lock_active);
+            assert_eq!(q.order_lots, LotQty(5));
+        }
+        assert!(tao_eng.step_open_position(&tao, &tao, &gov, &mut ledger).is_none());
+        assert_eq!(tao_eng.tranche1_harvests_count, 1);
+
+        tao.ts_local_ns = TimestampNs(61_000_000_000);
+        tao.bids[0] = BookLevel { price: PriceTicks(21_116), qty: LotQty(120) };
+        tao.asks[0] = BookLevel { price: PriceTicks(21_117), qty: LotQty(180) };
+        tao.mark_price = PriceTicks(21_116);
+        tao.last_trade_price = PriceTicks(21_116);
+        assert!(tao_eng.step_open_position(&tao, &tao, &gov, &mut ledger).is_none());
+
+        tao.ts_local_ns = TimestampNs(260_000_000_000);
+        tao.factor_ofi = BoundedScore::ZERO;
+        tao.factor_tfi = BoundedScore::ZERO;
+        tao.bids[0] = BookLevel { price: PriceTicks(21_120), qty: LotQty(160) };
+        tao.asks[0] = BookLevel { price: PriceTicks(21_121), qty: LotQty(160) };
+        tao.mark_price = PriceTicks(21_120);
+        tao.last_trade_price = PriceTicks(21_120);
+        let closed_t25 = tao_eng.step_open_position(&tao, &tao, &gov, &mut ledger);
+        assert!(closed_t25.is_some());
+        if let Some(s25) = closed_t25 {
+            assert!(s25.net_scaled_bps.raw() >= 120);
+        }
     }
 }

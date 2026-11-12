@@ -2500,7 +2500,8 @@ pub fn run_oos_520_certification_suite() -> (u64, f64, f64, f64, i64) {
             snap.mark_price = sl_px;
             snap.last_trade_price = sl_px;
         } else {
-            let q_fl = defensive_zero_loss_maker_exit_price(side, en_px);
+            let q_fl =
+                vortex_rs::execution_fsm::offensive_win_maker_exit_price(side, en_px, 0.50);
             snap.bids[0] = BookLevel { price: PriceTicks(q_fl.0 - 1), qty: LotQty(450) };
             snap.asks[0] = BookLevel { price: q_fl, qty: LotQty(200) };
             snap.mark_price = q_fl;
