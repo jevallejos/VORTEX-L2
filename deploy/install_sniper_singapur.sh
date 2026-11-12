@@ -150,7 +150,7 @@ echo "  [4/5 DAEMON SHIELD] vortex-tap (-10) & vortex-exec (-15) verified"
 sudo journalctl --vacuum-size=100M >/dev/null 2>&1 || true
 PAR_COUNT=$(find /home/ubuntu/vortex-rs/data -maxdepth 1 \
     -name "vortex_l2_segment_*.parquet" 2>/dev/null | wc -l || echo "0")
-echo "  [5/5 STORAGE & SHM] SHM v12 | PAR1 Ring: ${PAR_COUNT} | Vault isolated"
+echo "  [5/5 STORAGE & SHM] SHM v13 | PAR1 Ring: ${PAR_COUNT} | Vault isolated"
 echo "${SEP}"
 DOCTOR_EOF
 sudo chmod +x /usr/local/bin/vortex-doctor
@@ -240,7 +240,7 @@ EOF
 # 4. VORTEX-TAP & VORTEX-EXEC Systemd Services
 sudo tee /etc/systemd/system/vortex-tap.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L3 Bybit UTA V5 12-Pair L2 + Trade + Ticker Seqlock Daemon (SHM v12)
+Description=VORTEX-L3 Bybit UTA V5 12-Pair L2 + Trade + Ticker Seqlock Daemon (SHM v13)
 After=network-online.target
 Wants=network-online.target
 
@@ -292,7 +292,7 @@ VAULT_DIR="${VORTEX_DIR}/data/vault"
 
 case "${1:-live}" in
     360)
-        echo "=== [1. VORTEX-L3 LIVE HUD (SHM v12 READ-ONLY)] ==="
+        echo "=== [1. VORTEX-L3 LIVE HUD (SHM v13 READ-ONLY)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --live
         echo "=== [2. BYBIT V5 LIVE ORDERS & QUEUE TELEMETRY] ==="
         journalctl -u vortex-exec.service -n 35 --no-pager \

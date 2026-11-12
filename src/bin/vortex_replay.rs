@@ -735,7 +735,7 @@ fn rehydrate_governor_scars_if_present(gov: &mut OnlineAdaptiveGovernor) {
     let _ = gov.rehydrate_from_scar_and_loss_files(
         Path::new(SCAR_MEMORY_VAULT_PATH),
         Path::new(RED_LOSS_BOX_PATH),
-        None,
+        Some(Path::new("data/vault/vortex_ai_forensic_vault.jsonl")),
     );
 }
 
@@ -777,6 +777,8 @@ pub fn run_parquet_walk_forward_on_dir(
     let mut exit_role_latch = [ExitOrderRole::None; MAX_ACTIVE_PAIRS];
     let mut init_q_ahead = [LotQty(0); MAX_ACTIVE_PAIRS];
     let mut armed_ts_latch = [0_i64; MAX_ACTIVE_PAIRS];
+    let mut first_ring_ts_ns = 0_i64;
+    let require_ring_warmup = files.len() >= 64;
     let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let init_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 4);
     for s in 0..MAX_ACTIVE_PAIRS {
@@ -810,6 +812,9 @@ pub fn run_parquet_walk_forward_on_dir(
                     snaps[s_idx].realized_vol_5m,
                 );
                 snaps[s_idx].set_wave_observables(w_obs);
+            }
+            if first_ring_ts_ns == 0 && snaps[s_idx].ts_local_ns.0 > 0 {
+                first_ring_ts_ns = snaps[s_idx].ts_local_ns.0;
             }
             gov.observe_market_price(s_idx, &snaps[s_idx]);
 
@@ -877,6 +882,16 @@ pub fn run_parquet_walk_forward_on_dir(
                                     cur_snap.bids[0].price,
                                     cur_snap.asks[0].price,
                                 );
+                                let warm_dt = cur_snap
+                                    .ts_local_ns
+                                    .0
+                                    .saturating_sub(first_ring_ts_ns);
+                                if require_ring_warmup
+                                    && (first_ring_ts_ns <= 0
+                                        || warm_dt < 300_000_000_000)
+                                {
+                                    continue;
+                                }
                                 let lots = spec.compute_bayesian_kelly_lots(
                                     eq_1e8, en_px, edge_b, ir_x100, in_debt,
                                 );
@@ -1015,7 +1030,7 @@ pub fn run_parquet_walk_forward_on_dir(
                         let flow_imp = (0.55 * cur_snap.factor_ofi.get()
                             + 0.45 * cur_snap.factor_tfi.get())
                             * side.sign_f64();
-                        let dq_abort = (elapsed_ns >= 1_500_000_000
+                        let dq_abort = (elapsed_ns >= 25_000_000
                             && at_l1
                             && check_queue_depletion_velocity_abort(
                                 side,

@@ -941,7 +941,7 @@ impl OnlineAdaptiveGovernor {
         snr_abs: f64,
     ) -> Result<(i64, i64), &'static str> {
         let min_geom_floor = if snr_abs > 0.58 {
-            (0.106 - (snr_abs - 0.58) * 1.15).clamp(-0.05, 0.15)
+            (0.106 - (snr_abs - 0.58) * 0.85).clamp(0.02, 0.15)
         } else if snr_abs >= 0.50 {
             (0.15 - (snr_abs - 0.50) * 0.55).clamp(0.05, 0.15)
         } else {
@@ -1499,7 +1499,17 @@ impl OnlineAdaptiveGovernor {
             return Err("VETO_PREFLIGHT_OVERSIZED_LOT");
         }
         let signed_geom = snap.factor_geom.get() * dir_s;
-        let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(-0.08, 0.06);
+        let (own_q_pre, opp_q_pre) = match side {
+            Side::Bid => (best_bid.qty.0, best_ask.qty.0),
+            Side::Ask => (best_ask.qty.0, best_bid.qty.0),
+        };
+        let geom_floor_lo = if signed_snr >= 0.68 && own_q_pre >= opp_q_pre {
+            -0.06
+        } else {
+            0.00
+        };
+        let min_pre_geom =
+            (0.06 - (signed_snr - 0.42) * 0.45).clamp(geom_floor_lo, 0.06);
         if signed_geom < min_pre_geom {
             return Err("VETO_PREFLIGHT_GEOM_REVERSAL");
         }
@@ -1822,6 +1832,8 @@ pub struct SlotExecutionEngine {
     pub learned_ret_std_bps: i64,
     pub intrinsic_tau_mkt_s: i64,
     pub last_eff_sl_ticks: PriceTicks,
+    pub open_vol_5m_bps: ScaledBps,
+    pub ratchet_locked_gross_bps: i64,
     pub last_closed_mfe_bps: i64,
     pub last_closed_mae_bps: i64,
     pub last_closed_peak_ticks: PriceTicks,
@@ -1853,6 +1865,8 @@ impl SlotExecutionEngine {
             learned_ret_std_bps: 200,
             intrinsic_tau_mkt_s: init_tau_s,
             last_eff_sl_ticks: PriceTicks(0),
+            open_vol_5m_bps: ScaledBps(6_000),
+            ratchet_locked_gross_bps: 0,
             last_closed_mfe_bps: 0,
             last_closed_mae_bps: 0,
             last_closed_peak_ticks: PriceTicks(0),
@@ -2236,6 +2250,7 @@ impl SlotExecutionEngine {
         let entry_price = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         let sl_trigger_price = Self::compute_fill_or_adopt_sl_ticks(side, entry_price, snap)?;
 
+        self.open_vol_5m_bps = snap.realized_vol_5m;
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side,
             entry_price,
@@ -2398,7 +2413,14 @@ impl SlotExecutionEngine {
         let tp_bps = if split_t1_opt.is_some() {
             target_excursion.raw().max(min_win_gross)
         } else {
-            let unit_cap = self.learned_mfe_bps.clamp(min_win_gross, (fee_rt * 9) / 4);
+            let vol_raw = self.open_vol_5m_bps.raw();
+            let vol_unit_cap = if vol_raw > 0 {
+                ((vol_raw * 27) / 100).clamp(min_win_gross + 15, (fee_rt * 9) / 4)
+            } else {
+                (fee_rt * 9) / 4
+            };
+            let mfe_cap = self.learned_mfe_bps.clamp(min_win_gross + 15, (fee_rt * 9) / 4);
+            let unit_cap = mfe_cap.min(vol_unit_cap);
             target_excursion.raw().min(unit_cap).max(min_win_gross)
         };
         let structural_tp_price =
@@ -2410,6 +2432,7 @@ impl SlotExecutionEngine {
 
         self.last_opened_ts = fill_ts;
         self.last_eff_sl_ticks = eff_sl_px;
+        self.ratchet_locked_gross_bps = 0;
         self.tranche1_harvests_count = 0;
         self.lvdbs_deep_surfs_count = 0;
         self.last_closed_mfe_bps = 0;
@@ -2492,6 +2515,8 @@ impl SlotExecutionEngine {
 
         self.last_opened_ts = opened_ts;
         self.last_eff_sl_ticks = sl_t;
+        self.open_vol_5m_bps = snap.realized_vol_5m;
+        self.ratchet_locked_gross_bps = 0;
         self.last_closed_peak_ticks =
             if peak_price.0 > 0 { peak_price } else { verified_avg_price };
         self.last_closed_worst_ticks =
@@ -2581,6 +2606,29 @@ impl SlotExecutionEngine {
 
     #[inline]
     pub fn latch_defensive_floor_if_needed(&mut self, lock_active: bool) {
+        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let ratchet_arm = (fee_rt * 139) / 100;
+        let state_mfe = if let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            peak_favorable_price,
+            ..
+        } = self.state
+        {
+            let diff =
+                (peak_favorable_price.0 - avg_price_ticks.0).saturating_mul(side.sign_i64());
+            (diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1)
+        } else {
+            0
+        };
+        let best_mfe = self.last_closed_mfe_bps.max(state_mfe);
+        if best_mfe >= ratchet_arm {
+            let win_fl = fee_rt + (fee_rt * 3) / 10;
+            let cand = (fee_rt + ((best_mfe - fee_rt) * 72) / 100).max(win_fl);
+            if cand > self.ratchet_locked_gross_bps {
+                self.ratchet_locked_gross_bps = cand;
+            }
+        }
         if !lock_active {
             return;
         }
@@ -3124,6 +3172,7 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
+            peak_favorable_price,
             open_lots,
             tranche1_harvested,
             defensive_floor_locked,
@@ -3174,7 +3223,13 @@ impl SlotExecutionEngine {
         };
         let wald_pct = ((time_c + flow_c + depth_c) / 10).clamp(0, 48);
 
-        let peak_gross_bps = self.last_closed_mfe_bps;
+        let state_pk_diff =
+            (peak_favorable_price.0 - avg_price_ticks.0).saturating_mul(side.sign_i64());
+        let state_pk_bps = (state_pk_diff.saturating_mul(1_000_000)) / avg_denom;
+        let peak_gross_bps = self
+            .last_closed_mfe_bps
+            .max(state_pk_bps)
+            .max(cur_gross_bps);
         let worst_mae_bps = self.last_closed_mae_bps;
         let init_mfe = (fee_rt * 17) / 10;
         let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 27) / 20, fee_rt * 4);
@@ -3214,27 +3269,50 @@ impl SlotExecutionEngine {
         };
 
         let win_gross = (fee_rt * 13) / 10;
-        let ratchet_arm = (fee_rt * 7) / 5;
+        let ratchet_arm = (fee_rt * 139) / 100;
         let ratchet_floor_min = fee_rt + (fee_rt * 16) / 100;
+        let win_ratchet_floor = fee_rt + (fee_rt * 3) / 10;
+        let retrace_from_peak = peak_gross_bps.saturating_sub(cur_gross_bps);
+        let dyn_win_floor = if peak_gross_bps >= ratchet_arm {
+            (fee_rt + ((peak_gross_bps - fee_rt) * 72) / 100).max(win_ratchet_floor)
+        } else {
+            0
+        };
+        let eff_latched_win = self.ratchet_locked_gross_bps.max(
+            if peak_gross_bps >= ratchet_arm
+                && (retrace_from_peak >= (fee_rt * 29) / 100
+                    || (retrace_from_peak >= fee_rt / 8 && signed_flow < 0.12))
+            {
+                dyn_win_floor
+            } else {
+                0
+            },
+        );
         let mfe_ratchet_lock = if tranche1_harvested {
             (hold_s >= (t_def_s * 3) / 5
                 && cur_gross_bps >= fee_rt + (fee_rt * 21) / 100
                 && signed_flow < -0.10)
                 || (peak_gross_bps >= fee_rt * 2 + 100
                     && cur_gross_bps >= win_gross
-                    && cur_gross_bps <= peak_gross_bps - (fee_rt * 5) / 8
+                    && retrace_from_peak >= (fee_rt * 5) / 8
                     && signed_flow < 0.05)
         } else {
-            peak_gross_bps >= ratchet_arm
-                && cur_gross_bps >= ratchet_floor_min
-                && signed_flow < 0.12
-                && (cur_gross_bps <= peak_gross_bps - (fee_rt * 3) / 20
-                    || signed_flow < -0.05)
+            eff_latched_win >= win_ratchet_floor
+                || (peak_gross_bps >= ratchet_arm
+                    && cur_gross_bps >= ratchet_floor_min
+                    && signed_flow < 0.12
+                    && (retrace_from_peak >= (fee_rt * 3) / 20 || signed_flow < -0.05))
         };
 
-        let ratchet_bps = if peak_gross_bps > fee_rt * 2 {
-            let r70 = fee_rt + ((peak_gross_bps - fee_rt) * 70) / 100;
-            r70.min(cur_gross_bps.max(ratchet_floor_min))
+        let ratchet_bps = if eff_latched_win >= win_ratchet_floor && !tranche1_harvested {
+            if cur_gross_bps >= win_ratchet_floor {
+                eff_latched_win.min(cur_gross_bps.max(win_ratchet_floor))
+            } else {
+                win_ratchet_floor
+            }
+        } else if peak_gross_bps > fee_rt * 2 {
+            let r72 = fee_rt + ((peak_gross_bps - fee_rt) * 72) / 100;
+            r72.min(cur_gross_bps.max(win_ratchet_floor))
         } else {
             cur_gross_bps.clamp(ratchet_floor_min, (fee_rt * 27) / 20)
         };
@@ -3275,7 +3353,9 @@ impl SlotExecutionEngine {
                     false,
                 )
             } else if defensive_now || mfe_ratchet_lock {
-                let fl_bps = if mfe_ratchet_lock {
+                let use_win_ratchet = mfe_ratchet_lock
+                    && (!defensive_now || cur_gross_bps >= win_ratchet_floor);
+                let fl_bps = if use_win_ratchet {
                     ScaledBps(ratchet_bps)
                 } else {
                     ScaledBps(if tranche1_harvested {
@@ -3373,7 +3453,7 @@ impl SlotExecutionEngine {
         };
         let eff_lots = LotQty(closed_lots.0.max(1));
         let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
-        let (calc_pnl_1e8, fee_1e8, gross_scaled_bps, net_scaled_bps) =
+        let (calc_pnl_1e8, fee_1e8, calc_gross_bps, calc_net_bps) =
             spec.compute_leg_pnl_and_fee_1e8(
                 side,
                 eff_lots,
@@ -3382,6 +3462,22 @@ impl SlotExecutionEngine {
                 fee_scaled_bps,
             );
         let net_pnl_1e8 = exchange_closed_pnl_1e8.unwrap_or(calc_pnl_1e8);
+        let entry_notional_1e8 = spec.lot_notional_1e8(eff_lots, entry_price);
+        let (gross_scaled_bps, net_scaled_bps) = if exchange_closed_pnl_1e8.is_some()
+            && entry_notional_1e8 > 0
+        {
+            let exact_net =
+                ((net_pnl_1e8 as i128 * 1_000_000) / (entry_notional_1e8 as i128)) as i64;
+            let exact_gross = exact_net.saturating_add(fee_scaled_bps.raw());
+            let is_t1_sub =
+                matches!(self.last_exit_sub_reason, ExitSubReason::Tranche1Harvest50);
+            if exact_net >= 100 && is_t1_sub {
+                self.last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
+            }
+            (ScaledBps(exact_gross), ScaledBps(exact_net))
+        } else {
+            (calc_gross_bps, calc_net_bps)
+        };
 
         self.fold_price_into_excursions(side, entry_price, exit_price);
         ledger.record_closed_trade_with_sinking_split(
@@ -4458,6 +4554,48 @@ mod tests {
         let qf_sui =
             defensive_zero_loss_maker_exit_price(Side::Bid, PriceTicks(8_265));
         assert_eq!(qf_sui, PriceTicks(8_269));
+        let mut eth22 = SlotExecutionEngine::new(1);
+        let mut eth_s = SymbolLobSnapshot::new_empty();
+        eth_s.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth_s.realized_vol_5m = ScaledBps(1_992);
+        eth_s.ts_local_ns = TimestampNs(1_000_000_000);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(205_217), qty: LotQty(500) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(205_218), qty: LotQty(500) };
+        eth_s.mark_price = PriceTicks(205_218);
+        eth_s.last_trade_price = PriceTicks(205_218);
+        let v_eth = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(900),
+        };
+        assert!(eth22.try_arm_maker_entry(&eth_s, v_eth, LotQty(1)).is_ok());
+        assert!(eth22.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
+        eth_s.ts_local_ns = TimestampNs(12_000_000_000);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(205_084), qty: LotQty(400) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(205_085), qty: LotQty(400) };
+        eth_s.mark_price = PriceTicks(205_084);
+        eth_s.last_trade_price = PriceTicks(205_084);
+        let eth_win = eth22.step_open_position(&eth_s, &btc, &gov, &mut ledger);
+        assert!(eth_win.is_some());
+        if let Some(ew) = eth_win {
+            assert!(ew.net_scaled_bps.raw() >= 100);
+        }
+
+        let mut tao_bad = link;
+        tao_bad.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao_bad.bids[0] = BookLevel { price: PriceTicks(21_609), qty: LotQty(47) };
+        tao_bad.asks[0] = BookLevel { price: PriceTicks(21_610), qty: LotQty(190) };
+        tao_bad.factor_ofi = BoundedScore::new_clamped(0.68);
+        tao_bad.factor_tfi = BoundedScore::new_clamped(0.93);
+        tao_bad.factor_geom = BoundedScore::new_clamped(-0.02);
+        assert!(gov
+            .confirm_preflight_kinematics_non_choking(
+                4,
+                Side::Bid,
+                6_628_080_000,
+                &tao_bad,
+                &btc,
+            )
+            .is_err());
         assert_eq!(
             SlotExecutionEngine::classify_maker_exit_sub_reason(
                 Side::Bid,
@@ -4469,6 +4607,48 @@ mod tests {
             ),
             ExitSubReason::AdverseScratchEscape
         );
+        let mut eth22 = SlotExecutionEngine::new(1);
+        let mut eth_s = SymbolLobSnapshot::new_empty();
+        eth_s.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth_s.realized_vol_5m = ScaledBps(1_992);
+        eth_s.ts_local_ns = TimestampNs(1_000_000_000);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(205_217), qty: LotQty(500) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(205_218), qty: LotQty(500) };
+        eth_s.mark_price = PriceTicks(205_218);
+        eth_s.last_trade_price = PriceTicks(205_218);
+        let v_eth = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(900),
+        };
+        assert!(eth22.try_arm_maker_entry(&eth_s, v_eth, LotQty(1)).is_ok());
+        assert!(eth22.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
+        eth_s.ts_local_ns = TimestampNs(12_000_000_000);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(205_084), qty: LotQty(400) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(205_085), qty: LotQty(400) };
+        eth_s.mark_price = PriceTicks(205_084);
+        eth_s.last_trade_price = PriceTicks(205_084);
+        let eth_win = eth22.step_open_position(&eth_s, &btc, &gov, &mut ledger);
+        assert!(eth_win.is_some());
+        if let Some(ew) = eth_win {
+            assert!(ew.net_scaled_bps.raw() >= 100);
+        }
+
+        let mut tao_bad = link;
+        tao_bad.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao_bad.bids[0] = BookLevel { price: PriceTicks(21_609), qty: LotQty(47) };
+        tao_bad.asks[0] = BookLevel { price: PriceTicks(21_610), qty: LotQty(190) };
+        tao_bad.factor_ofi = BoundedScore::new_clamped(0.68);
+        tao_bad.factor_tfi = BoundedScore::new_clamped(0.93);
+        tao_bad.factor_geom = BoundedScore::new_clamped(-0.02);
+        assert!(gov
+            .confirm_preflight_kinematics_non_choking(
+                4,
+                Side::Bid,
+                6_628_080_000,
+                &tao_bad,
+                &btc,
+            )
+            .is_err());
         assert_eq!(
             SlotExecutionEngine::classify_maker_exit_sub_reason(
                 Side::Bid,
@@ -4480,6 +4660,48 @@ mod tests {
             ),
             ExitSubReason::AdverseScratchEscape
         );
+        let mut eth22 = SlotExecutionEngine::new(1);
+        let mut eth_s = SymbolLobSnapshot::new_empty();
+        eth_s.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth_s.realized_vol_5m = ScaledBps(1_992);
+        eth_s.ts_local_ns = TimestampNs(1_000_000_000);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(205_217), qty: LotQty(500) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(205_218), qty: LotQty(500) };
+        eth_s.mark_price = PriceTicks(205_218);
+        eth_s.last_trade_price = PriceTicks(205_218);
+        let v_eth = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(900),
+        };
+        assert!(eth22.try_arm_maker_entry(&eth_s, v_eth, LotQty(1)).is_ok());
+        assert!(eth22.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
+        eth_s.ts_local_ns = TimestampNs(12_000_000_000);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(205_084), qty: LotQty(400) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(205_085), qty: LotQty(400) };
+        eth_s.mark_price = PriceTicks(205_084);
+        eth_s.last_trade_price = PriceTicks(205_084);
+        let eth_win = eth22.step_open_position(&eth_s, &btc, &gov, &mut ledger);
+        assert!(eth_win.is_some());
+        if let Some(ew) = eth_win {
+            assert!(ew.net_scaled_bps.raw() >= 100);
+        }
+
+        let mut tao_bad = link;
+        tao_bad.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao_bad.bids[0] = BookLevel { price: PriceTicks(21_609), qty: LotQty(47) };
+        tao_bad.asks[0] = BookLevel { price: PriceTicks(21_610), qty: LotQty(190) };
+        tao_bad.factor_ofi = BoundedScore::new_clamped(0.68);
+        tao_bad.factor_tfi = BoundedScore::new_clamped(0.93);
+        tao_bad.factor_geom = BoundedScore::new_clamped(-0.02);
+        assert!(gov
+            .confirm_preflight_kinematics_non_choking(
+                4,
+                Side::Bid,
+                6_628_080_000,
+                &tao_bad,
+                &btc,
+            )
+            .is_err());
         assert_eq!(
             SlotExecutionEngine::classify_maker_exit_sub_reason(
                 Side::Bid,

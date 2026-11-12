@@ -1577,6 +1577,7 @@ enum VaultPersistTask {
         scar_line: String,
         is_red_loss: bool,
     },
+    FlushSync(std::sync::mpsc::SyncSender<()>),
 }
 
 fn write_closed_trade_to_disk(vault_line: &str, scar_line: &str, is_red_loss: bool) {
@@ -1613,6 +1614,9 @@ fn spawn_bounded_vault_persister() -> SyncSender<VaultPersistTask> {
         let _ = fs::create_dir_all("data/vault");
         while let Ok(task) = rx.recv() {
             match task {
+                VaultPersistTask::FlushSync(ack_tx) => {
+                    let _ = ack_tx.send(());
+                }
                 VaultPersistTask::SaveOpenPositions(json_txt) => {
                     let _ = fs::write(OPEN_POS_STATE_PATH, json_txt);
                 }
@@ -3840,7 +3844,7 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                     let flow_imp = (0.55 * snap.factor_ofi.get()
                         + 0.45 * snap.factor_tfi.get())
                         * side.sign_f64();
-                    let dq_abort = (resting_elapsed_ns >= 500_000_000
+                    let dq_abort = (resting_elapsed_ns >= 25_000_000
                         && at_l1
                         && check_queue_depletion_velocity_abort(
                             side,
@@ -4171,10 +4175,15 @@ fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> 
                 )
                 .to_string(),
             );
+            let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+            if vault_tx.send(VaultPersistTask::FlushSync(ack_tx)).is_ok() {
+                let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+            }
+            thread::sleep(Duration::from_millis(120));
             println!(
                 concat!(
                     "{}\u{1f7e2} [DRAIN_COMPLETE_STOPPED] ",
-                    "0 open positions verified. Exiting cleanly.{}"
+                    "0 open positions verified. Vault flushed.{}"
                 ),
                 ANSI_GREEN, ANSI_RESET
             );
