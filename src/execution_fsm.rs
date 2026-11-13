@@ -371,6 +371,292 @@ pub fn parse_signed_decimal_1e8(decimal_str: &str) -> Result<i64, VortexError> {
     Ok(if neg { -clamped } else { clamped })
 }
 
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OrderLinkRole {
+    Entry = 0,
+    Tranche1 = 1,
+    Runner2 = 2,
+}
+
+impl OrderLinkRole {
+    #[inline]
+    #[must_use]
+    pub const fn code_str(self) -> &'static str {
+        match self {
+            Self::Entry => "E",
+            Self::Tranche1 => "T1",
+            Self::Runner2 => "R2",
+        }
+    }
+}
+
+/// Bijective stack-allocated generator for Bybit V5 orderLinkId (<= 32 ASCII bytes) and reqId.
+#[inline]
+#[must_use]
+pub fn format_bijective_order_link_id(
+    boot_hash32: u32,
+    slot_idx: usize,
+    cycle_id: u32,
+    role: OrderLinkRole,
+    sub_idx: u16,
+) -> String {
+    let s_clamped = slot_idx.min(99);
+    let cyc24 = cycle_id & 0x00FF_FFFF;
+    let sub12 = sub_idx & 0x0FFF;
+    format!(
+        "vx-{boot_hash32:08x}-s{s_clamped:02}-c{cyc24:06x}-{}{sub12:03x}",
+        role.code_str()
+    )
+}
+
+#[inline]
+#[must_use]
+pub fn format_ws_trade_req_id(boot_hash32: u32, seq_id: u32) -> String {
+    format!("r-{boot_hash32:08x}-{seq_id:08x}")
+}
+
+/// Exact LeavesQty conservation equation for Bybit V5 order.amend: q_tot' = q_exec + q_des.
+#[inline]
+#[must_use]
+pub const fn compute_amend_total_lots(
+    cum_exec_lots: LotQty,
+    desired_leaves_lots: LotQty,
+) -> LotQty {
+    let exec_pos = if cum_exec_lots.0 > 0 { cum_exec_lots.0 } else { 0 };
+    let des_pos = if desired_leaves_lots.0 > 1 { desired_leaves_lots.0 } else { 1 };
+    LotQty(exec_pos.saturating_add(des_pos))
+}
+
+/// Exact FIFO priority transition T_amend: preserves queue_ahead when P'=P and q_des' <= q_cur.
+#[inline]
+#[must_use]
+pub const fn amend_fifo_queue_priority(
+    cur_price: PriceTicks,
+    cur_leaves_qty: LotQty,
+    cur_queue_ahead: LotQty,
+    new_price: PriceTicks,
+    new_leaves_qty: LotQty,
+    book_level_total_qty: LotQty,
+) -> (PriceTicks, LotQty, LotQty) {
+    let clamped_q = LotQty(if new_leaves_qty.0 > 1 { new_leaves_qty.0 } else { 1 });
+    if cur_price.0 == new_price.0 && clamped_q.0 <= cur_leaves_qty.0 {
+        (new_price, clamped_q, cur_queue_ahead)
+    } else {
+        let tail_q = if book_level_total_qty.0 > 0 {
+            book_level_total_qty
+        } else {
+            LotQty(0)
+        };
+        (new_price, clamped_q, tail_q)
+    }
+}
+/// Asymmetric recv_window (ms): 2,000ms for speculative entry create, 10,000ms for protective ops.
+#[inline]
+#[must_use]
+pub const fn asymmetric_recv_window_ms(is_entry_create: bool) -> u32 {
+    if is_entry_create {
+        2_000
+    } else {
+        10_000
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WsOrderRank {
+    Dispatched = 0,
+    GatewayAccepted = 1,
+    RestingBook = 2,
+    PartialFill = 3,
+    Terminal = 4,
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WsTerminalKind {
+    None = 0,
+    Filled = 1,
+    Cancelled = 2,
+    PostOnlyRejected = 3,
+    ExchangeRejected = 4,
+}
+
+/// Commutative join-semilattice state for full-duplex WS Trade + WS Private synchronization.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WsOrderLatticeState {
+    pub rank: WsOrderRank,
+    pub price_ticks: PriceTicks,
+    pub total_lots: LotQty,
+    pub cum_exec_lots: LotQty,
+    pub terminal_kind: WsTerminalKind,
+}
+
+impl WsOrderLatticeState {
+    #[inline]
+    #[must_use]
+    pub const fn new_dispatched(price_ticks: PriceTicks, total_lots: LotQty) -> Self {
+        Self {
+            rank: WsOrderRank::Dispatched,
+            price_ticks,
+            total_lots,
+            cum_exec_lots: LotQty(0),
+            terminal_kind: WsTerminalKind::None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn join(self, other: Self) -> Self {
+        let r_self = self.rank as u8;
+        let r_oth = other.rank as u8;
+        if r_oth > r_self {
+            let max_exec = if other.cum_exec_lots.0 > self.cum_exec_lots.0 {
+                other.cum_exec_lots
+            } else {
+                self.cum_exec_lots
+            };
+            Self {
+                cum_exec_lots: max_exec,
+                ..other
+            }
+        } else if r_self > r_oth {
+            let max_exec = if self.cum_exec_lots.0 > other.cum_exec_lots.0 {
+                self.cum_exec_lots
+            } else {
+                other.cum_exec_lots
+            };
+            Self {
+                cum_exec_lots: max_exec,
+                ..self
+            }
+        } else {
+            let max_exec = if other.cum_exec_lots.0 >= self.cum_exec_lots.0 {
+                other.cum_exec_lots
+            } else {
+                self.cum_exec_lots
+            };
+            let px = if other.price_ticks.0 > 0 {
+                other.price_ticks
+            } else {
+                self.price_ticks
+            };
+            let tot = if other.total_lots.0 > 0 {
+                other.total_lots
+            } else {
+                self.total_lots
+            };
+            let term = if (other.terminal_kind as u8) > (self.terminal_kind as u8) {
+                other.terminal_kind
+            } else {
+                self.terminal_kind
+            };
+            Self {
+                rank: self.rank,
+                price_ticks: px,
+                total_lots: tot,
+                cum_exec_lots: max_exec,
+                terminal_kind: term,
+            }
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WsMutationOp {
+    Create = 0,
+    Amend = 1,
+    Cancel = 2,
+}
+
+/// Orthogonal VIP-0 3x10 req/s token-bucket governor with 2-token emergency reserve.
+#[derive(Copy, Clone, Debug)]
+pub struct Vip0WsRateGovernor {
+    pub srv_remaining: [i64; 3],
+    pub reset_ts_ns: [i64; 3],
+    pub inflight: [i64; 3],
+}
+
+impl Default for Vip0WsRateGovernor {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vip0WsRateGovernor {
+    pub const VIP0_LIMIT_PER_SEC: i64 = 10;
+    pub const EMERGENCY_RESERVE_TOKENS: i64 = 2;
+
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            srv_remaining: [Self::VIP0_LIMIT_PER_SEC; 3],
+            reset_ts_ns: [0; 3],
+            inflight: [0; 3],
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn available_tokens(&self, op: WsMutationOp, now_ns: i64) -> i64 {
+        let idx = op as usize;
+        let base = if now_ns >= self.reset_ts_ns[idx] {
+            Self::VIP0_LIMIT_PER_SEC
+        } else {
+            self.srv_remaining[idx]
+        };
+        let avail = base - self.inflight[idx];
+        if avail > 0 { avail } else { 0 }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn authorizes_mutation(
+        &self,
+        op: WsMutationOp,
+        is_defensive_or_abort: bool,
+        now_ns: i64,
+    ) -> bool {
+        let avail = self.available_tokens(op, now_ns);
+        if is_defensive_or_abort {
+            avail >= 1
+        } else {
+            avail > Self::EMERGENCY_RESERVE_TOKENS
+        }
+    }
+
+    #[inline]
+    pub fn on_dispatch(&mut self, op: WsMutationOp, now_ns: i64) {
+        let idx = op as usize;
+        if now_ns >= self.reset_ts_ns[idx] {
+            self.srv_remaining[idx] = Self::VIP0_LIMIT_PER_SEC;
+            self.reset_ts_ns[idx] = now_ns.saturating_add(1_000_000_000);
+        }
+        self.inflight[idx] = self.inflight[idx].saturating_add(1);
+    }
+
+    #[inline]
+    pub fn on_ack_headers(
+        &mut self,
+        op: WsMutationOp,
+        limit_status: Option<i64>,
+        reset_ts_ms: Option<i64>,
+    ) {
+        let idx = op as usize;
+        self.inflight[idx] = (self.inflight[idx] - 1).max(0);
+        if let Some(rem) = limit_status {
+            self.srv_remaining[idx] = rem.clamp(0, Self::VIP0_LIMIT_PER_SEC);
+        } else {
+            self.srv_remaining[idx] = (self.srv_remaining[idx] - 1).max(0);
+        }
+        if let Some(rst_ms) = reset_ts_ms {
+            self.reset_ts_ns[idx] = rst_ms.saturating_mul(1_000_000);
+        }
+    }
+}
 pub const OFFENSIVE_WIN_FLOOR_GROSS_BPS: i64 = 515;
 
 /// Offensive Maker WIN floor (>= +5.15..+5.70 bps gross => >= +1.15..+1.70 bps net WIN).
@@ -5182,5 +5468,49 @@ mod tests {
             assert!(qs.defensive_lock_active);
             assert_eq!(qs.target_price, PriceTicks(8_018));
         }
+    }
+
+    #[test]
+    fn test_ws_trade_bijective_link_id_commutative_lattice_and_vip0_rate_governor() {
+        let id_e0 = format_bijective_order_link_id(0xABCD_1234, 4, 15, OrderLinkRole::Entry, 0);
+        let id_t1 = format_bijective_order_link_id(0xABCD_1234, 4, 15, OrderLinkRole::Tranche1, 0);
+        let id_r2 = format_bijective_order_link_id(0xABCD_1234, 4, 15, OrderLinkRole::Runner2, 0);
+        assert!(id_e0.len() <= 32);
+        assert!(id_t1.len() <= 32);
+        assert_ne!(id_e0, id_t1);
+        assert_ne!(id_t1, id_r2);
+        assert_eq!(
+            compute_amend_total_lots(LotQty(6), LotQty(10)),
+            LotQty(16)
+        );
+        assert_eq!(asymmetric_recv_window_ms(true), 2_000);
+        assert_eq!(asymmetric_recv_window_ms(false), 10_000);
+
+        let s_disp = WsOrderLatticeState::new_dispatched(PriceTicks(21_000), LotQty(10));
+        let s_ack = WsOrderLatticeState {
+            rank: WsOrderRank::GatewayAccepted,
+            price_ticks: PriceTicks(21_000),
+            total_lots: LotQty(10),
+            cum_exec_lots: LotQty(0),
+            terminal_kind: WsTerminalKind::None,
+        };
+        let s_fill = WsOrderLatticeState {
+            rank: WsOrderRank::Terminal,
+            price_ticks: PriceTicks(21_000),
+            total_lots: LotQty(10),
+            cum_exec_lots: LotQty(10),
+            terminal_kind: WsTerminalKind::Filled,
+        };
+        assert_eq!(s_disp.join(s_ack).join(s_fill), s_disp.join(s_fill).join(s_ack));
+        assert_eq!(s_disp.join(s_fill).join(s_ack).rank, WsOrderRank::Terminal);
+
+        let mut rg = Vip0WsRateGovernor::new();
+        let t0 = 1_000_000_000_i64;
+        for _ in 0..8 {
+            assert!(rg.authorizes_mutation(WsMutationOp::Amend, false, t0));
+            rg.on_dispatch(WsMutationOp::Amend, t0);
+        }
+        assert!(!rg.authorizes_mutation(WsMutationOp::Amend, false, t0));
+        assert!(rg.authorizes_mutation(WsMutationOp::Amend, true, t0));
     }
 }

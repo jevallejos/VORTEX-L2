@@ -539,10 +539,371 @@ fn spawn_bounded_telegram_notifier() -> SyncSender<String> {
     tx
 }
 
+fn boot_session_hash32() -> u32 {
+    static BOOT_H: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BOOT_H.get_or_init(|| {
+        let ns = now_epoch_ns().0 as u64;
+        let pid = u64::from(std::process::id());
+        let mixed = ns.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (pid << 16);
+        ((mixed >> 32) as u32) ^ (mixed as u32) ^ 0x5658_4C33
+    })
+}
+
+#[derive(Clone, Debug)]
+struct SlotWsOrderTracker {
+    cycle_id: u32,
+    entry_sub_idx: u16,
+    entry_link_id: String,
+    entry_lattice: vortex_rs::execution_fsm::WsOrderLatticeState,
+    exit_sub_idx: u16,
+    exit_link_id: String,
+    exit_lattice: vortex_rs::execution_fsm::WsOrderLatticeState,
+}
+
+impl SlotWsOrderTracker {
+    fn new() -> Self {
+        use vortex_rs::execution_fsm::WsOrderLatticeState;
+        Self {
+            cycle_id: 1,
+            entry_sub_idx: 0,
+            entry_link_id: String::new(),
+            entry_lattice: WsOrderLatticeState::new_dispatched(PriceTicks(0), LotQty(0)),
+            exit_sub_idx: 0,
+            exit_link_id: String::new(),
+            exit_lattice: WsOrderLatticeState::new_dispatched(PriceTicks(0), LotQty(0)),
+        }
+    }
+
+    fn advance_cycle(&mut self) {
+        use vortex_rs::execution_fsm::WsOrderLatticeState;
+        self.cycle_id = self.cycle_id.wrapping_add(1).max(1);
+        self.entry_sub_idx = 0;
+        self.entry_link_id.clear();
+        self.entry_lattice = WsOrderLatticeState::new_dispatched(PriceTicks(0), LotQty(0));
+        self.exit_sub_idx = 0;
+        self.exit_link_id.clear();
+        self.exit_lattice = WsOrderLatticeState::new_dispatched(PriceTicks(0), LotQty(0));
+    }
+}
+
+fn global_ws_trackers() -> &'static std::sync::Mutex<[SlotWsOrderTracker; MAX_ACTIVE_PAIRS]> {
+    static TRACKERS: std::sync::OnceLock<
+        std::sync::Mutex<[SlotWsOrderTracker; MAX_ACTIVE_PAIRS]>,
+    > = std::sync::OnceLock::new();
+    TRACKERS.get_or_init(|| {
+        std::sync::Mutex::new(std::array::from_fn(|_| SlotWsOrderTracker::new()))
+    })
+}
+
+fn build_ws_trade_envelope_json(
+    req_id: &str,
+    ts_ms: i64,
+    recv_window_ms: u32,
+    op_name: &str,
+    arg_obj: &serde_json::Value,
+) -> String {
+    serde_json::json!({
+        "reqId": req_id,
+        "header": {
+            "X-BAPI-TIMESTAMP": ts_ms.to_string(),
+            "X-BAPI-RECV-WINDOW": recv_window_ms.to_string(),
+        },
+        "op": op_name,
+        "args": [arg_obj],
+    })
+    .to_string()
+}
+
+fn parse_ws_trade_ack_frame(
+    txt: &str,
+    expected_req_id: &str,
+) -> Option<(i64, Option<i64>, Option<i64>, bool)> {
+    let val = serde_json::from_str::<serde_json::Value>(txt).ok()?;
+    if val.get("op").and_then(|o| o.as_str()) == Some("pong")
+        || val.get("ret_msg").and_then(|m| m.as_str()) == Some("pong")
+        || val.get("retMsg").and_then(|m| m.as_str()) == Some("pong")
+    {
+        return None;
+    }
+    let rc = val.get("retCode").and_then(|v| v.as_i64())?;
+    if rc == 10_019 {
+        return Some((rc, None, None, true));
+    }
+    let ack_req = val.get("reqId").and_then(|v| v.as_str()).unwrap_or("");
+    if !ack_req.is_empty() && !expected_req_id.is_empty() && ack_req != expected_req_id {
+        return None;
+    }
+    let hdr = val.get("header");
+    let lim_status = hdr
+        .and_then(|h| h.get("X-Bapi-Limit-Status"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok());
+    let rst_ms = hdr
+        .and_then(|h| h.get("X-Bapi-Limit-Reset-Timestamp"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok());
+    Some((rc, lim_status, rst_ms, false))
+}
+
+#[cfg(target_os = "linux")]
+type WsTradeStream =
+    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
+
+struct WsTradeTunnel {
+    enabled: bool,
+    ws_url: String,
+    req_seq: u32,
+    rate_gov: vortex_rs::execution_fsm::Vip0WsRateGovernor,
+    #[cfg(target_os = "linux")]
+    socket: Option<WsTradeStream>,
+    #[cfg(target_os = "linux")]
+    last_ping_ns: i64,
+    #[cfg(target_os = "linux")]
+    next_reconnect_ns: i64,
+}
+
+impl std::fmt::Debug for WsTradeTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsTradeTunnel")
+            .field("enabled", &self.enabled)
+            .field("ws_url", &self.ws_url)
+            .field("req_seq", &self.req_seq)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WsTradeTunnel {
+    fn new_disabled() -> Self {
+        Self {
+            enabled: false,
+            ws_url: String::new(),
+            req_seq: 0,
+            rate_gov: vortex_rs::execution_fsm::Vip0WsRateGovernor::new(),
+            #[cfg(target_os = "linux")]
+            socket: None,
+            #[cfg(target_os = "linux")]
+            last_ping_ns: 0,
+            #[cfg(target_os = "linux")]
+            next_reconnect_ns: 0,
+        }
+    }
+
+    fn enable_with_url(&mut self, ws_url: String, api_key: &str, api_secret: &str) {
+        self.enabled = cfg!(target_os = "linux");
+        self.ws_url = ws_url;
+        self.maintain_heartbeat(api_key, api_secret);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn maintain_heartbeat(&mut self, _api_key: &str, _api_secret: &str) {
+        if !self.enabled {
+            self.req_seq = 0;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_stream_read_timeout(sock: &mut WsTradeStream, millis: u64) {
+        let tcp_opt = match sock.get_mut() {
+            tungstenite::stream::MaybeTlsStream::Plain(s) => Some(s),
+            tungstenite::stream::MaybeTlsStream::NativeTls(tls) => Some(tls.get_mut()),
+            _ => None,
+        };
+        if let Some(tcp) = tcp_opt {
+            let _ = tcp.set_read_timeout(Some(Duration::from_millis(millis)));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_connected(&mut self, api_key: &str, api_secret: &str) -> bool {
+        if self.socket.is_some() {
+            return true;
+        }
+        let now_ns = now_epoch_ns().0;
+        if !self.enabled || now_ns < self.next_reconnect_ns {
+            return false;
+        }
+        self.next_reconnect_ns = now_ns.saturating_add(2_000_000_000);
+        let Ok((mut sock, _)) = tungstenite::connect(self.ws_url.as_str()) else {
+            return false;
+        };
+        let tcp_opt = match sock.get_mut() {
+            tungstenite::stream::MaybeTlsStream::Plain(s) => Some(s),
+            tungstenite::stream::MaybeTlsStream::NativeTls(tls) => Some(tls.get_mut()),
+            _ => None,
+        };
+        if let Some(tcp) = tcp_opt {
+            let _ = tcp.set_nodelay(true);
+            let _ = tcp.set_read_timeout(Some(Duration::from_millis(2_200)));
+            let _ = tcp.set_write_timeout(Some(Duration::from_millis(2_000)));
+        }
+        let exp_ms = (now_ns / 1_000_000).max(1) + 10_000;
+        let sig = sign_bybit_v5_hmac_sha256(api_secret, &format!("GET/realtime{exp_ms}"));
+        let auth_msg = serde_json::json!({
+            "op": "auth",
+            "args": [api_key, exp_ms, sig],
+        })
+        .to_string();
+        if sock.send(tungstenite::Message::Text(auth_msg)).is_err() {
+            return false;
+        }
+        if let Ok(tungstenite::Message::Text(reply)) = sock.read() {
+            let ok_auth = serde_json::from_str::<serde_json::Value>(&reply)
+                .ok()
+                .is_some_and(|v| {
+                    v.get("retCode").and_then(|c| c.as_i64()) == Some(0)
+                        || v.get("success").and_then(|b| b.as_bool()) == Some(true)
+                });
+            if ok_auth {
+                println!(
+                    concat!(
+                        "{}\u{1f7e2} [BYBIT V5 WS TRADE TUNNEL] ",
+                        "Persistent {} armed (Atomic Amend).{}"
+                    ),
+                    ANSI_GREEN, self.ws_url, ANSI_RESET
+                );
+                self.last_ping_ns = now_ns;
+                self.socket = Some(sock);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn maintain_heartbeat(&mut self, api_key: &str, api_secret: &str) {
+        if !self.enabled || !self.ensure_connected(api_key, api_secret) {
+            return;
+        }
+        let now_ns = now_epoch_ns().0;
+        if now_ns.saturating_sub(self.last_ping_ns) < 12_000_000_000 {
+            return;
+        }
+        let mut healthy = false;
+        if let Some(ref mut sock) = self.socket {
+            if sock
+                .send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string()))
+                .is_ok()
+            {
+                Self::set_stream_read_timeout(sock, 400);
+                match sock.read() {
+                    Ok(tungstenite::Message::Text(_))
+                    | Ok(tungstenite::Message::Pong(_)) => {
+                        healthy = true;
+                    }
+                    Ok(tungstenite::Message::Ping(p)) => {
+                        let _ = sock.send(tungstenite::Message::Pong(p));
+                        healthy = true;
+                    }
+                    Err(tungstenite::Error::Io(ref e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        healthy = true;
+                    }
+                    _ => {}
+                }
+                Self::set_stream_read_timeout(sock, 2_200);
+            }
+        }
+        if healthy {
+            self.last_ping_ns = now_ns;
+        } else {
+            self.socket = None;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn execute_ws_op(
+        &mut self,
+        _api_key: &str,
+        _api_secret: &str,
+        op: vortex_rs::execution_fsm::WsMutationOp,
+        op_name: &str,
+        recv_window_ms: u32,
+        arg_obj: &serde_json::Value,
+    ) -> Option<i64> {
+        let req_id =
+            vortex_rs::execution_fsm::format_ws_trade_req_id(boot_session_hash32(), self.req_seq);
+        let frame = build_ws_trade_envelope_json(&req_id, 1, recv_window_ms, op_name, arg_obj);
+        if !self.enabled {
+            let _ = parse_ws_trade_ack_frame(&frame, &req_id);
+            return None;
+        }
+        self.req_seq = self.req_seq.wrapping_add(1);
+        let (rc, lim, rst, _) = parse_ws_trade_ack_frame(&frame, &req_id)?;
+        self.rate_gov.on_ack_headers(op, lim, rst);
+        Some(rc)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn execute_ws_op(
+        &mut self,
+        api_key: &str,
+        api_secret: &str,
+        op: vortex_rs::execution_fsm::WsMutationOp,
+        op_name: &str,
+        recv_window_ms: u32,
+        arg_obj: &serde_json::Value,
+    ) -> Option<i64> {
+        if !self.ensure_connected(api_key, api_secret) {
+            return None;
+        }
+        let now_ns = now_epoch_ns().0;
+        self.req_seq = self.req_seq.wrapping_add(1);
+        let req_id =
+            vortex_rs::execution_fsm::format_ws_trade_req_id(boot_session_hash32(), self.req_seq);
+        let ts_ms = (now_ns / 1_000_000).max(1);
+        let frame =
+            build_ws_trade_envelope_json(&req_id, ts_ms, recv_window_ms, op_name, arg_obj);
+        self.rate_gov.on_dispatch(op, now_ns);
+
+        let Some(ref mut sock) = self.socket else {
+            self.rate_gov.on_ack_headers(op, None, None);
+            return None;
+        };
+        if sock.send(tungstenite::Message::Text(frame)).is_err() {
+            self.socket = None;
+            self.rate_gov.on_ack_headers(op, None, None);
+            return None;
+        }
+        self.last_ping_ns = now_ns;
+        for _ in 0..64 {
+            match sock.read() {
+                Ok(tungstenite::Message::Text(txt)) => {
+                    if let Some((rc, lim, rst, is_maint)) =
+                        parse_ws_trade_ack_frame(&txt, &req_id)
+                    {
+                        self.rate_gov.on_ack_headers(op, lim, rst);
+                        if is_maint {
+                            self.socket = None;
+                            return None;
+                        }
+                        return Some(rc);
+                    }
+                }
+                Ok(tungstenite::Message::Ping(p)) => {
+                    let _ = sock.send(tungstenite::Message::Pong(p));
+                }
+                Ok(tungstenite::Message::Pong(_)) => {}
+                _ => {
+                    self.socket = None;
+                    self.rate_gov.on_ack_headers(op, None, None);
+                    return None;
+                }
+            }
+        }
+        self.socket = None;
+        self.rate_gov.on_ack_headers(op, None, None);
+        None
+    }
+}
 pub struct BybitV5LiveClient {
     api_key: String,
     api_secret: String,
     conn: KeepAliveHttpConn,
+    ws_trade: WsTradeTunnel,
 }
 
 impl std::fmt::Debug for BybitV5LiveClient {
@@ -570,6 +931,7 @@ impl BybitV5LiveClient {
             api_key,
             api_secret,
             conn: KeepAliveHttpConn::new(parsed),
+            ws_trade: WsTradeTunnel::new_disabled(),
         })
     }
 
@@ -886,6 +1248,188 @@ impl BybitV5LiveClient {
         self.get_v5("/v5/position/closed-pnl", &q)
     }
 
+    pub fn enable_ws_trade_from_env(&mut self) {
+        let env_map = load_dotenv_map();
+        let ws_url = env_map
+            .get("BYBIT_TRADE_WS_URL")
+            .cloned()
+            .unwrap_or_else(|| "wss://stream.bybit.com/v5/trade".to_string());
+        let k = self.api_key.clone();
+        let s = self.api_secret.clone();
+        self.ws_trade.enable_with_url(ws_url, &k, &s);
+    }
+
+    pub fn maintain_ws_trade_heartbeat(&mut self) {
+        let k = self.api_key.clone();
+        let s = self.api_secret.clone();
+        self.ws_trade.maintain_heartbeat(&k, &s);
+    }
+
+    pub fn authorizes_ws_mutation(
+        &self,
+        op: vortex_rs::execution_fsm::WsMutationOp,
+        is_defensive_or_abort: bool,
+    ) -> bool {
+        self.ws_trade
+            .rate_gov
+            .authorizes_mutation(op, is_defensive_or_abort, now_epoch_ns().0)
+    }
+
+    pub fn place_order_ws_or_rest(
+        &mut self,
+        spec: PairSpec,
+        order_side: Side,
+        price: PriceTicks,
+        qty: LotQty,
+        sl_price: Option<PriceTicks>,
+        reduce_only: bool,
+        order_link_id: &str,
+        is_entry_create: bool,
+    ) -> i64 {
+        if order_link_id.is_empty() {
+            return self.place_post_only_order(
+                spec,
+                order_side,
+                price,
+                qty,
+                sl_price,
+                reduce_only,
+            );
+        }
+        let sym = spec.symbol_id.name();
+        let side_str = match order_side {
+            Side::Bid => "Buy",
+            Side::Ask => "Sell",
+        };
+        let px_str = spec.format_price_ticks_str(price);
+        let qty_str = spec.format_lot_qty_str(qty);
+        let mut arg_obj = serde_json::json!({
+            "category": "linear",
+            "symbol": sym,
+            "side": side_str,
+            "orderType": "Limit",
+            "qty": qty_str,
+            "price": px_str,
+            "timeInForce": "PostOnly",
+            "reduceOnly": reduce_only,
+            "positionIdx": 0,
+            "orderLinkId": order_link_id,
+        });
+        if let Some(sl_t) = sl_price {
+            if !reduce_only && sl_t.0 > 0 {
+                let sl_exact = spec.format_price_ticks_str(sl_t);
+                if let Some(obj) = arg_obj.as_object_mut() {
+                    obj.insert("stopLoss".to_string(), serde_json::Value::String(sl_exact));
+                    obj.insert(
+                        "slTriggerBy".to_string(),
+                        serde_json::Value::String("MarkPrice".to_string()),
+                    );
+                    obj.insert(
+                        "tpslMode".to_string(),
+                        serde_json::Value::String("Full".to_string()),
+                    );
+                }
+            }
+        }
+        let recv_ms = vortex_rs::execution_fsm::asymmetric_recv_window_ms(is_entry_create);
+        let k = self.api_key.clone();
+        let s = self.api_secret.clone();
+        if let Some(ws_rc) = self.ws_trade.execute_ws_op(
+            &k,
+            &s,
+            vortex_rs::execution_fsm::WsMutationOp::Create,
+            "order.create",
+            recv_ms,
+            &arg_obj,
+        ) {
+            return if ws_rc == 110_072 { 0 } else { ws_rc };
+        }
+        let body = arg_obj.to_string();
+        let rc = self
+            .post_v5("/v5/order/create", &body)
+            .and_then(|v| v.get("retCode")?.as_i64())
+            .unwrap_or(-1);
+        if rc == 110_072 { 0 } else { rc }
+    }
+
+    pub fn amend_order_ws_or_rest(
+        &mut self,
+        spec: PairSpec,
+        order_link_id: &str,
+        new_price: PriceTicks,
+        new_total_qty: LotQty,
+        new_sl_price: Option<PriceTicks>,
+    ) -> i64 {
+        if order_link_id.is_empty() || new_price.0 <= 0 || new_total_qty.0 <= 0 {
+            return -1;
+        }
+        let mut arg_obj = serde_json::json!({
+            "category": "linear",
+            "symbol": spec.symbol_id.name(),
+            "orderLinkId": order_link_id,
+            "qty": spec.format_lot_qty_str(new_total_qty),
+            "price": spec.format_price_ticks_str(new_price),
+        });
+        if let Some(sl_t) = new_sl_price {
+            if sl_t.0 > 0 {
+                let sl_exact = spec.format_price_ticks_str(sl_t);
+                if let Some(obj) = arg_obj.as_object_mut() {
+                    obj.insert("stopLoss".to_string(), serde_json::Value::String(sl_exact));
+                    obj.insert(
+                        "slTriggerBy".to_string(),
+                        serde_json::Value::String("MarkPrice".to_string()),
+                    );
+                }
+            }
+        }
+        let recv_ms = vortex_rs::execution_fsm::asymmetric_recv_window_ms(false);
+        let k = self.api_key.clone();
+        let s = self.api_secret.clone();
+        if let Some(ws_rc) = self.ws_trade.execute_ws_op(
+            &k,
+            &s,
+            vortex_rs::execution_fsm::WsMutationOp::Amend,
+            "order.amend",
+            recv_ms,
+            &arg_obj,
+        ) {
+            return if ws_rc == 34_040 { 0 } else { ws_rc };
+        }
+        let body = arg_obj.to_string();
+        let rc = self
+            .post_v5("/v5/order/amend", &body)
+            .and_then(|v| v.get("retCode")?.as_i64())
+            .unwrap_or(-1);
+        if rc == 34_040 { 0 } else { rc }
+    }
+
+    pub fn cancel_order_ws_or_rest(&mut self, spec: PairSpec, order_link_id: &str) -> i64 {
+        if order_link_id.is_empty() {
+            return -1;
+        }
+        let arg_obj = serde_json::json!({
+            "category": "linear",
+            "symbol": spec.symbol_id.name(),
+            "orderLinkId": order_link_id,
+        });
+        let recv_ms = vortex_rs::execution_fsm::asymmetric_recv_window_ms(false);
+        let k = self.api_key.clone();
+        let s = self.api_secret.clone();
+        if let Some(ws_rc) = self.ws_trade.execute_ws_op(
+            &k,
+            &s,
+            vortex_rs::execution_fsm::WsMutationOp::Cancel,
+            "order.cancel",
+            recv_ms,
+            &arg_obj,
+        ) {
+            return ws_rc;
+        }
+        let body = arg_obj.to_string();
+        self.post_v5("/v5/order/cancel", &body)
+            .and_then(|v| v.get("retCode")?.as_i64())
+            .unwrap_or(-1)
+    }
     pub fn cancel_all_symbol_orders(&mut self, symbol: &str) -> bool {
         let body = serde_json::json!({
             "category": "linear",
@@ -1170,25 +1714,56 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
                 .get("reduceOnly")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if reduce_only {
-                continue;
-            }
             let status = item
                 .get("orderStatus")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if matches!(status, "Cancelled" | "Rejected" | "Deactivated") {
-                let cum_exec_lots = APPROVED_SPECS[slot_idx]
-                    .parse_lot_qty(
-                        item.get("cumExecQty")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0"),
-                    )
-                    .0;
-                if cum_exec_lots <= 0 {
-                    let _ = evt_tx
-                        .try_send(GatewayEvent::WsEntryOrderTerminated { slot_idx });
+            let cum_exec_q = APPROVED_SPECS[slot_idx].parse_lot_qty(
+                item.get("cumExecQty")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0"),
+            );
+            let link_s = item
+                .get("orderLinkId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !link_s.is_empty() {
+                use vortex_rs::execution_fsm::{
+                    WsOrderLatticeState, WsOrderRank, WsTerminalKind,
+                };
+                let (rk, tk) = match status {
+                    "Filled" => (WsOrderRank::Terminal, WsTerminalKind::Filled),
+                    "Cancelled" | "Deactivated" => {
+                        (WsOrderRank::Terminal, WsTerminalKind::Cancelled)
+                    }
+                    "Rejected" => (WsOrderRank::Terminal, WsTerminalKind::PostOnlyRejected),
+                    "PartiallyFilled" => (WsOrderRank::PartialFill, WsTerminalKind::None),
+                    _ => (WsOrderRank::RestingBook, WsTerminalKind::None),
+                };
+                let inc = WsOrderLatticeState {
+                    rank: rk,
+                    price_ticks: PriceTicks(0),
+                    total_lots: LotQty(0),
+                    cum_exec_lots: cum_exec_q,
+                    terminal_kind: tk,
+                };
+                if let Ok(mut trks) = global_ws_trackers().lock() {
+                    let tr = &mut trks[slot_idx];
+                    if tr.entry_link_id == link_s {
+                        tr.entry_lattice = tr.entry_lattice.join(inc);
+                    } else if tr.exit_link_id == link_s {
+                        tr.exit_lattice = tr.exit_lattice.join(inc);
+                    }
                 }
+            }
+            if reduce_only {
+                continue;
+            }
+            if matches!(status, "Cancelled" | "Rejected" | "Deactivated")
+                && cum_exec_q.0 <= 0
+            {
+                let _ =
+                    evt_tx.try_send(GatewayEvent::WsEntryOrderTerminated { slot_idx });
             }
         }
     }
@@ -1215,18 +1790,79 @@ fn process_gateway_command(
             qty,
             sl_price,
         } => {
+            use vortex_rs::execution_fsm::{
+                format_bijective_order_link_id, OrderLinkRole, WsMutationOp,
+                WsOrderLatticeState, WsOrderRank, WsTerminalKind,
+            };
+            if !client.authorizes_ws_mutation(WsMutationOp::Create, false) {
+                let _ = evt_tx.try_send(GatewayEvent::EntryPlaced {
+                    slot_idx,
+                    accepted: false,
+                    entry_price,
+                    sl_price,
+                });
+                return;
+            }
             let spec = APPROVED_SPECS[slot_idx];
-            let rc = client.place_post_only_order(
+            let link_id = if let Ok(mut trks) = global_ws_trackers().lock() {
+                let tr = &mut trks[slot_idx];
+                if tr.entry_lattice.rank == WsOrderRank::Terminal {
+                    tr.entry_sub_idx = tr.entry_sub_idx.wrapping_add(1);
+                }
+                let lid = format_bijective_order_link_id(
+                    boot_session_hash32(),
+                    slot_idx,
+                    tr.cycle_id,
+                    OrderLinkRole::Entry,
+                    tr.entry_sub_idx,
+                );
+                tr.entry_link_id.clone_from(&lid);
+                tr.entry_lattice = WsOrderLatticeState::new_dispatched(entry_price, qty);
+                lid
+            } else {
+                String::new()
+            };
+            let rc = client.place_order_ws_or_rest(
                 spec,
                 side,
                 entry_price,
                 qty,
                 Some(sl_price),
                 false,
+                &link_id,
+                true,
             );
+            let mut accepted = rc == 0;
+            if let Ok(mut trks) = global_ws_trackers().lock() {
+                let tr = &mut trks[slot_idx];
+                let ack_st = if accepted {
+                    WsOrderLatticeState {
+                        rank: WsOrderRank::GatewayAccepted,
+                        price_ticks: entry_price,
+                        total_lots: qty,
+                        cum_exec_lots: LotQty(0),
+                        terminal_kind: WsTerminalKind::None,
+                    }
+                } else {
+                    WsOrderLatticeState {
+                        rank: WsOrderRank::Terminal,
+                        price_ticks: entry_price,
+                        total_lots: qty,
+                        cum_exec_lots: LotQty(0),
+                        terminal_kind: WsTerminalKind::ExchangeRejected,
+                    }
+                };
+                tr.entry_lattice = tr.entry_lattice.join(ack_st);
+                if tr.entry_lattice.rank == WsOrderRank::Terminal
+                    && tr.entry_lattice.cum_exec_lots.0 <= 0
+                    && tr.entry_lattice.terminal_kind != WsTerminalKind::Filled
+                {
+                    accepted = false;
+                }
+            }
             let _ = evt_tx.try_send(GatewayEvent::EntryPlaced {
                 slot_idx,
-                accepted: rc == 0,
+                accepted,
                 entry_price,
                 sl_price,
             });
@@ -1238,9 +1874,50 @@ fn process_gateway_command(
             qty,
             new_sl_price,
         } => {
+            use vortex_rs::execution_fsm::{
+                compute_amend_total_lots, format_bijective_order_link_id, OrderLinkRole,
+                WsMutationOp, WsOrderLatticeState, WsOrderRank,
+            };
             let spec = APPROVED_SPECS[slot_idx];
             let sym = spec.symbol_id.name();
-            let _ = client.cancel_all_symbol_orders(sym);
+            let (cur_link, cur_exec, cur_rank) =
+                if let Ok(trks) = global_ws_trackers().lock() {
+                    let tr = &trks[slot_idx];
+                    (
+                        tr.entry_link_id.clone(),
+                        tr.entry_lattice.cum_exec_lots,
+                        tr.entry_lattice.rank,
+                    )
+                } else {
+                    (String::new(), LotQty(0), WsOrderRank::Terminal)
+                };
+            if !cur_link.is_empty()
+                && cur_rank != WsOrderRank::Terminal
+                && client.authorizes_ws_mutation(WsMutationOp::Amend, false)
+            {
+                let am_lots = compute_amend_total_lots(cur_exec, qty);
+                let rc_am = client.amend_order_ws_or_rest(
+                    spec,
+                    &cur_link,
+                    new_price,
+                    am_lots,
+                    Some(new_sl_price),
+                );
+                if rc_am == 0 {
+                    if let Ok(mut trks) = global_ws_trackers().lock() {
+                        trks[slot_idx].entry_lattice.price_ticks = new_price;
+                        trks[slot_idx].entry_lattice.total_lots = am_lots;
+                    }
+                    let _ = evt_tx.try_send(GatewayEvent::EntryRepegged {
+                        slot_idx,
+                        accepted: true,
+                        new_price,
+                        new_sl_price,
+                    });
+                    return;
+                }
+            }
+            let _ = client.cancel_non_reduce_only_orders(spec);
             if let Some((true, sz_s, r_side, avg_s)) =
                 client.query_open_position_verified(sym)
             {
@@ -1257,13 +1934,31 @@ fn process_gateway_command(
                 });
                 return;
             }
-            let rc = client.place_post_only_order(
+            let new_link = if let Ok(mut trks) = global_ws_trackers().lock() {
+                let tr = &mut trks[slot_idx];
+                tr.entry_sub_idx = tr.entry_sub_idx.wrapping_add(1);
+                let lid = format_bijective_order_link_id(
+                    boot_session_hash32(),
+                    slot_idx,
+                    tr.cycle_id,
+                    OrderLinkRole::Entry,
+                    tr.entry_sub_idx,
+                );
+                tr.entry_link_id.clone_from(&lid);
+                tr.entry_lattice = WsOrderLatticeState::new_dispatched(new_price, qty);
+                lid
+            } else {
+                String::new()
+            };
+            let rc = client.place_order_ws_or_rest(
                 spec,
                 side,
                 new_price,
                 qty,
                 Some(new_sl_price),
                 false,
+                &new_link,
+                true,
             );
             let _ = evt_tx.try_send(GatewayEvent::EntryRepegged {
                 slot_idx,
@@ -1280,28 +1975,47 @@ fn process_gateway_command(
         } => {
             let spec = APPROVED_SPECS[slot_idx];
             let sym = spec.symbol_id.name();
-            let _ = client.cancel_all_symbol_orders(sym);
-            if let Some((true, sz_s, r_side, avg_s)) =
-                client.query_open_position_verified(sym)
-            {
-                let ver_avg = parse_verified_avg_price_ticks(spec, r_side, &avg_s).ok();
-                let r_lots = spec.parse_lot_qty(&sz_s).max(LotQty(1));
-                let sl_ok = client.set_position_trading_stop(spec, sl_hint);
-                let _ = evt_tx.try_send(GatewayEvent::EntryFilledLive {
-                    slot_idx,
-                    real_side: r_side,
-                    verified_avg: ver_avg,
-                    real_lots: r_lots,
-                    sl_verified: sl_ok,
-                    tag: "MAKER FILL ABORT",
-                });
-                return;
+            let cur_link = if let Ok(trks) = global_ws_trackers().lock() {
+                trks[slot_idx].entry_link_id.clone()
+            } else {
+                String::new()
+            };
+            let mut canceled_targeted = false;
+            if !cur_link.is_empty() {
+                canceled_targeted = client.cancel_order_ws_or_rest(spec, &cur_link) == 0;
             }
-            let _ = evt_tx.try_send(GatewayEvent::EntryAborted {
-                slot_idx,
-                side,
-                aborted_price,
-            });
+            if !canceled_targeted {
+                let _ = client.cancel_non_reduce_only_orders(spec);
+            }
+            match client.query_open_position_verified(sym) {
+                Some((true, sz_s, r_side, avg_s)) => {
+                    let ver_avg =
+                        parse_verified_avg_price_ticks(spec, r_side, &avg_s).ok();
+                    let r_lots = spec.parse_lot_qty(&sz_s).max(LotQty(1));
+                    let sl_ok = client.set_position_trading_stop(spec, sl_hint);
+                    let _ = evt_tx.try_send(GatewayEvent::EntryFilledLive {
+                        slot_idx,
+                        real_side: r_side,
+                        verified_avg: ver_avg,
+                        real_lots: r_lots,
+                        sl_verified: sl_ok,
+                        tag: "MAKER FILL ABORT",
+                    });
+                }
+                Some((false, ..)) => {
+                    if let Ok(mut trks) = global_ws_trackers().lock() {
+                        trks[slot_idx].advance_cycle();
+                    }
+                    let _ = evt_tx.try_send(GatewayEvent::EntryAborted {
+                        slot_idx,
+                        side,
+                        aborted_price,
+                    });
+                }
+                None => {
+                    let _ = evt_tx.try_send(GatewayEvent::EntryOrderVanished { slot_idx });
+                }
+            }
         }
         GatewayCommand::CancelResidualEntries { slot_idx } => {
             let spec = APPROVED_SPECS[slot_idx];
@@ -1399,6 +2113,9 @@ fn process_gateway_command(
                 }
             }
             if !still_open {
+                if let Ok(mut trks) = global_ws_trackers().lock() {
+                    trks[slot_idx].advance_cycle();
+                }
                 let _ = client.cancel_all_symbol_orders(sym);
                 let opened_ms = (opened_ts_ns / 1_000_000).max(0);
                 let start_ms = if tranche1_harvested {
@@ -1433,19 +2150,90 @@ fn process_gateway_command(
                 || (moving_closer && tp_diff >= 1 && (defensive_lock || tp_diff >= 2))
                 || (!moving_closer && cur_gross_bps < 200 && tp_diff >= 4);
 
-            let active_resting_tp = if should_repeg {
-                if resting_tp.0 > 0 || resting_qty.0 > 0 {
-                    let _ = client.cancel_all_symbol_orders(sym);
+            let desired_role = if !tranche1_harvested && eff_lots.0 < real_lots.0 {
+                vortex_rs::execution_fsm::OrderLinkRole::Tranche1
+            } else {
+                vortex_rs::execution_fsm::OrderLinkRole::Runner2
+            };
+            if resting_tp.0 == 0 {
+                if let Ok(mut trks) = global_ws_trackers().lock() {
+                    trks[slot_idx].exit_link_id.clear();
                 }
-                let rc = client.place_post_only_order(
-                    spec,
-                    r_side.opposite(),
-                    target_px,
-                    eff_lots,
-                    None,
-                    true,
-                );
-                if rc == 0 { target_px } else { PriceTicks(0) }
+            }
+            let active_resting_tp = if should_repeg {
+                use vortex_rs::execution_fsm::{
+                    compute_amend_total_lots, format_bijective_order_link_id,
+                    WsMutationOp, WsOrderLatticeState,
+                };
+                let (cur_ex_link, cur_ex_exec) =
+                    if let Ok(trks) = global_ws_trackers().lock() {
+                        let tr = &trks[slot_idx];
+                        (tr.exit_link_id.clone(), tr.exit_lattice.cum_exec_lots)
+                    } else {
+                        (String::new(), LotQty(0))
+                    };
+                let mut amended_ok = false;
+                if resting_tp.0 > 0
+                    && !cur_ex_link.is_empty()
+                    && client.authorizes_ws_mutation(WsMutationOp::Amend, defensive_lock)
+                {
+                    let am_tot = compute_amend_total_lots(cur_ex_exec, eff_lots);
+                    let rc_am = client.amend_order_ws_or_rest(
+                        spec,
+                        &cur_ex_link,
+                        target_px,
+                        am_tot,
+                        None,
+                    );
+                    if rc_am == 0 {
+                        amended_ok = true;
+                        if let Ok(mut trks) = global_ws_trackers().lock() {
+                            trks[slot_idx].exit_lattice.price_ticks = target_px;
+                            trks[slot_idx].exit_lattice.total_lots = am_tot;
+                        }
+                    }
+                }
+                if amended_ok {
+                    target_px
+                } else if client.authorizes_ws_mutation(WsMutationOp::Create, true) {
+                    if resting_tp.0 > 0 || resting_qty.0 > 0 {
+                        if !cur_ex_link.is_empty() {
+                            let _ = client.cancel_order_ws_or_rest(spec, &cur_ex_link);
+                        } else {
+                            let _ = client.cancel_all_symbol_orders(sym);
+                        }
+                    }
+                    let new_ex_link = if let Ok(mut trks) = global_ws_trackers().lock() {
+                        let tr = &mut trks[slot_idx];
+                        tr.exit_sub_idx = tr.exit_sub_idx.wrapping_add(1);
+                        let lid = format_bijective_order_link_id(
+                            boot_session_hash32(),
+                            slot_idx,
+                            tr.cycle_id,
+                            desired_role,
+                            tr.exit_sub_idx,
+                        );
+                        tr.exit_link_id.clone_from(&lid);
+                        tr.exit_lattice =
+                            WsOrderLatticeState::new_dispatched(target_px, eff_lots);
+                        lid
+                    } else {
+                        String::new()
+                    };
+                    let rc = client.place_order_ws_or_rest(
+                        spec,
+                        r_side.opposite(),
+                        target_px,
+                        eff_lots,
+                        None,
+                        true,
+                        &new_ex_link,
+                        false,
+                    );
+                    if rc == 0 { target_px } else { PriceTicks(0) }
+                } else {
+                    resting_tp
+                }
             } else {
                 resting_tp
             };
@@ -1550,8 +2338,15 @@ impl BybitAsyncGateway {
         let evt_ws = evt_tx.clone();
 
         thread::spawn(move || {
-            while let Ok(cmd) = cmd_rx.recv() {
-                process_gateway_command(&mut client, cmd, &evt_tx);
+            client.enable_ws_trade_from_env();
+            loop {
+                match cmd_rx.recv_timeout(Duration::from_secs(12)) {
+                    Ok(cmd) => process_gateway_command(&mut client, cmd, &evt_tx),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        client.maintain_ws_trade_heartbeat();
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         });
         spawn_private_ws_listener(evt_ws);
@@ -4711,5 +5506,69 @@ mod tests {
         }
         assert_eq!(ok_count, 1_000);
         assert!(t0.elapsed().as_millis() < 50);
+    }
+
+    #[test]
+    fn test_ws_trade_envelope_ack_headers_and_commutative_tracker() {
+        let arg = serde_json::json!({
+            "category": "linear",
+            "symbol": "AVAXUSDT",
+            "orderLinkId": "vx-abcd1234-s03-c000001-T1001",
+            "qty": "0.8",
+            "price": "8.3180",
+        });
+        let env_s = build_ws_trade_envelope_json(
+            "r-abcd1234-00000007",
+            1_763_000_000_123,
+            10_000,
+            "order.amend",
+            &arg,
+        );
+        assert!(env_s.contains("\"op\":\"order.amend\""));
+        assert!(env_s.contains("\"X-BAPI-RECV-WINDOW\":\"10000\""));
+
+        let ack_json = concat!(
+            "{\"reqId\":\"r-abcd1234-00000007\",\"retCode\":0,\"op\":\"order.amend\",",
+            "\"header\":{\"X-Bapi-Limit-Status\":\"8\",",
+            "\"X-Bapi-Limit-Reset-Timestamp\":\"1763000001000\"}}"
+        );
+        let parsed = parse_ws_trade_ack_frame(ack_json, "r-abcd1234-00000007");
+        assert_eq!(parsed, Some((0, Some(8), Some(1_763_000_001_000), false)));
+
+        let (_, new_q, new_ahead) = vortex_rs::execution_fsm::amend_fifo_queue_priority(
+            PriceTicks(8_318),
+            LotQty(16),
+            LotQty(420),
+            PriceTicks(8_318),
+            LotQty(8),
+            LotQty(1_900),
+        );
+        assert_eq!(new_q, LotQty(8));
+        assert_eq!(new_ahead, LotQty(420));
+
+        let (tx, _rx) = mpsc::sync_channel::<GatewayEvent>(8);
+        if let Ok(mut trks) = global_ws_trackers().lock() {
+            trks[3].exit_link_id = "vx-test-s03-c000009-T1001".to_string();
+            trks[3].exit_lattice = vortex_rs::execution_fsm::WsOrderLatticeState::new_dispatched(
+                PriceTicks(8_318),
+                LotQty(16),
+            );
+        }
+        let ord_frame = concat!(
+            "{\"topic\":\"order\",\"data\":[{\"symbol\":\"AVAXUSDT\",",
+            "\"reduceOnly\":true,\"orderLinkId\":\"vx-test-s03-c000009-T1001\",",
+            "\"orderStatus\":\"PartiallyFilled\",\"cumExecQty\":\"0.6\"}]}"
+        );
+        parse_ws_private_frame(ord_frame, &tx);
+        if let Ok(trks) = global_ws_trackers().lock() {
+            assert_eq!(trks[3].exit_lattice.cum_exec_lots, LotQty(6));
+            assert_eq!(
+                vortex_rs::execution_fsm::compute_amend_total_lots(
+                    trks[3].exit_lattice.cum_exec_lots,
+                    LotQty(10),
+                ),
+                LotQty(16)
+            );
+        }
     }
 }
