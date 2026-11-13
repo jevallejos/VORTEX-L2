@@ -747,23 +747,22 @@ impl WsTradeTunnel {
             return false;
         }
         if let Ok(tungstenite::Message::Text(reply)) = sock.read() {
-            let ok_auth = serde_json::from_str::<serde_json::Value>(&reply)
-                .ok()
-                .is_some_and(|v| {
-                    v.get("retCode").and_then(|c| c.as_i64()) == Some(0)
-                        || v.get("success").and_then(|b| b.as_bool()) == Some(true)
-                });
-            if ok_auth {
-                println!(
-                    concat!(
-                        "{}\u{1f7e2} [BYBIT V5 WS TRADE TUNNEL] ",
-                        "Persistent {} armed (Atomic Amend).{}"
-                    ),
-                    ANSI_GREEN, self.ws_url, ANSI_RESET
-                );
-                self.last_ping_ns = now_ns;
-                self.socket = Some(sock);
-                return true;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
+                let ok_auth =
+                    v.get("retCode").and_then(serde_json::Value::as_i64) == Some(0)
+                        || v.get("success").and_then(serde_json::Value::as_bool) == Some(true);
+                if ok_auth {
+                    println!(
+                        concat!(
+                            "{}\u{1f7e2} [BYBIT V5 WS TRADE TUNNEL] ",
+                            "Persistent {} armed (Atomic Amend).{}"
+                        ),
+                        ANSI_GREEN, self.ws_url, ANSI_RESET
+                    );
+                    self.last_ping_ns = now_ns;
+                    self.socket = Some(sock);
+                    return true;
+                }
             }
         }
         false
@@ -778,39 +777,34 @@ impl WsTradeTunnel {
         if now_ns.saturating_sub(self.last_ping_ns) < 12_000_000_000 {
             return;
         }
-        let mut healthy = false;
-        if let Some(ref mut sock) = self.socket {
-            if sock
-                .send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string()))
-                .is_ok()
-            {
-                Self::set_stream_read_timeout(sock, 400);
-                match sock.read() {
-                    Ok(tungstenite::Message::Text(_))
-                    | Ok(tungstenite::Message::Pong(_)) => {
-                        healthy = true;
-                    }
-                    Ok(tungstenite::Message::Ping(p)) => {
-                        let _ = sock.send(tungstenite::Message::Pong(p));
-                        healthy = true;
-                    }
-                    Err(tungstenite::Error::Io(ref e))
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        healthy = true;
-                    }
-                    _ => {}
+        let Some(mut sock) = self.socket.take() else {
+            return;
+        };
+        if sock
+            .send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string()))
+            .is_err()
+        {
+            return;
+        }
+        let mut closed = false;
+        Self::set_stream_read_timeout(&mut sock, 25);
+        for _ in 0..4 {
+            match sock.read() {
+                Ok(tungstenite::Message::Ping(p)) => {
+                    let _ = sock.send(tungstenite::Message::Pong(p));
                 }
-                Self::set_stream_read_timeout(sock, 2_200);
+                Ok(tungstenite::Message::Close(_)) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
-        if healthy {
+        Self::set_stream_read_timeout(&mut sock, 2_200);
+        if !closed {
             self.last_ping_ns = now_ns;
-        } else {
-            self.socket = None;
+            self.socket = Some(sock);
         }
     }
 
@@ -850,6 +844,9 @@ impl WsTradeTunnel {
         if !self.ensure_connected(api_key, api_secret) {
             return None;
         }
+        let Some(mut sock) = self.socket.take() else {
+            return None;
+        };
         let now_ns = now_epoch_ns().0;
         self.req_seq = self.req_seq.wrapping_add(1);
         let req_id =
@@ -859,12 +856,7 @@ impl WsTradeTunnel {
             build_ws_trade_envelope_json(&req_id, ts_ms, recv_window_ms, op_name, arg_obj);
         self.rate_gov.on_dispatch(op, now_ns);
 
-        let Some(ref mut sock) = self.socket else {
-            self.rate_gov.on_ack_headers(op, None, None);
-            return None;
-        };
         if sock.send(tungstenite::Message::Text(frame)).is_err() {
-            self.socket = None;
             self.rate_gov.on_ack_headers(op, None, None);
             return None;
         }
@@ -877,24 +869,19 @@ impl WsTradeTunnel {
                     {
                         self.rate_gov.on_ack_headers(op, lim, rst);
                         if is_maint {
-                            self.socket = None;
                             return None;
                         }
+                        self.socket = Some(sock);
                         return Some(rc);
                     }
                 }
                 Ok(tungstenite::Message::Ping(p)) => {
                     let _ = sock.send(tungstenite::Message::Pong(p));
                 }
-                Ok(tungstenite::Message::Pong(_)) => {}
-                _ => {
-                    self.socket = None;
-                    self.rate_gov.on_ack_headers(op, None, None);
-                    return None;
-                }
+                Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
             }
         }
-        self.socket = None;
         self.rate_gov.on_ack_headers(op, None, None);
         None
     }
