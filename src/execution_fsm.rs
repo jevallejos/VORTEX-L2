@@ -3332,7 +3332,8 @@ impl SlotExecutionEngine {
         let s_tfi = snap.factor_tfi.get() * dir_s;
         let s_geom = snap.factor_geom.get() * dir_s;
         let signed_flow = 0.55 * s_ofi + 0.45 * s_tfi;
-        let joint_adverse = s_ofi < -0.18 && s_tfi < -0.18;
+        let deep_joint_adverse =
+            s_ofi <= -0.32 && s_tfi <= -0.35 && signed_flow <= -0.38;
 
         let tau_mkt_s = self.intrinsic_tau_mkt_s.max(90);
         let time_step_s = (tau_mkt_s / 5).max(18);
@@ -3356,7 +3357,7 @@ impl SlotExecutionEngine {
             .last_closed_mfe_bps
             .max(state_pk_bps)
             .max(cur_gross_bps);
-        let worst_mae_bps = self.last_closed_mae_bps;
+        let worst_mae_bps = self.last_closed_mae_bps.min(cur_gross_bps.min(0));
         let init_mfe = (fee_rt * 17) / 10;
         let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 27) / 20, fee_rt * 4);
         let tau_bps = spec
@@ -3399,17 +3400,30 @@ impl SlotExecutionEngine {
         let base_t_def_s = raw_def_s.clamp(40, 75);
         let t_def_s = (((base_t_def_s * wave_def_mult) / 1_000) * flow_persist_mult)
             / 1_000;
-        let win_window_s = if signed_flow > 0.12 { 40 } else { 25 };
+        let flow_w_s = (signed_flow.max(0.0) * 30.0).round() as i64;
+        let calm_w_s = if signed_flow > 0.08 && worst_mae_bps > -600 {
+            ((600 + worst_mae_bps).clamp(0, 600) * 12) / 600
+        } else {
+            0
+        };
+        let win_window_s = 25 + flow_w_s + calm_w_s;
         let t_scratch_s = t_def_s + win_window_s;
 
+        let adverse_stress_bps = -((mae_mag * 3) / 5);
+        let confirmed_joint_adverse = deep_joint_adverse
+            && cur_gross_bps <= adverse_stress_bps
+            && worst_mae_bps <= adverse_stress_bps;
         let hard_adverse = worst_mae_bps <= mae_trig_bps
-            || (hold_s >= t_def_s / 3 && joint_adverse);
+            || (hold_s >= (t_def_s * 3) / 5 && confirmed_joint_adverse);
         let defensive_now = if tranche1_harvested {
             let t_def_t2 = t_scratch_s + 30;
+            let t2_joint_adv = deep_joint_adverse
+                && cur_gross_bps <= mae_trig_bps
+                && worst_mae_bps <= mae_trig_bps;
             defensive_floor_locked
                 || worst_mae_bps <= (mae_trig_bps - (fee_rt * 3) / 10)
                 || hold_s >= t_def_t2
-                || (hold_s >= (t_def_s * 3) / 5 && joint_adverse)
+                || (hold_s >= t_def_s && t2_joint_adv)
         } else {
             defensive_floor_locked || hard_adverse || hold_s >= t_scratch_s
         };
@@ -5117,5 +5131,56 @@ mod tests {
             gov.audit_scar64_entry_and_sweep_shield(4, Side::Ask, &tao, 0.26),
             Err("VETO_SYMBOL_CROSS_SCAR_WEAK_IMPULSE")
         );
+    }
+
+    #[test]
+    fn test_joint_adverse_anti_flicker_preserves_win_floor_and_confirms_real_stress() {
+        let mut sui_eng = SlotExecutionEngine::new(5);
+        let mut sui = SymbolLobSnapshot::new_empty();
+        sui.symbol_id = APPROVED_SPECS[5].symbol_id;
+        sui.is_eligible = true;
+        sui.realized_vol_5m = ScaledBps(4_717);
+        sui.ts_local_ns = TimestampNs(1_000_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_021), qty: LotQty(6_470) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_022), qty: LotQty(5_200) };
+        sui.mark_price = PriceTicks(8_022);
+        sui.last_trade_price = PriceTicks(8_022);
+        sui.factor_ofi = BoundedScore::new_clamped(-0.55);
+        sui.factor_tfi = BoundedScore::new_clamped(-0.92);
+        sui.factor_geom = BoundedScore::new_clamped(-0.16);
+
+        let verdict = crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(700),
+        };
+        assert!(sui_eng.try_arm_maker_entry(&sui, verdict, LotQty(20)).is_ok());
+        assert!(sui_eng.on_maker_entry_filled(TimestampNs(2_000_000_000)).is_ok());
+
+        sui.ts_local_ns = TimestampNs(22_000_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_024), qty: LotQty(3_200) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_025), qty: LotQty(3_200) };
+        sui.mark_price = PriceTicks(8_025);
+        sui.factor_ofi = BoundedScore::new_clamped(0.28);
+        sui.factor_tfi = BoundedScore::new_clamped(0.26);
+        let q_flicker = sui_eng.compute_canonical_exit_quote(&sui);
+        assert!(q_flicker.is_some());
+        if let Some(qf) = q_flicker {
+            assert!(!qf.defensive_lock_active);
+            assert_eq!(qf.role, ExitOrderRole::Tranche1Harvest50);
+            assert_eq!(qf.target_price, PriceTicks(8_017));
+        }
+
+        sui.ts_local_ns = TimestampNs(52_000_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_038), qty: LotQty(3_200) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_039), qty: LotQty(3_200) };
+        sui.mark_price = PriceTicks(8_038);
+        sui.factor_ofi = BoundedScore::new_clamped(0.55);
+        sui.factor_tfi = BoundedScore::new_clamped(0.65);
+        let q_stress = sui_eng.compute_canonical_exit_quote(&sui);
+        assert!(q_stress.is_some());
+        if let Some(qs) = q_stress {
+            assert!(qs.defensive_lock_active);
+            assert_eq!(qs.target_price, PriceTicks(8_018));
+        }
     }
 }
