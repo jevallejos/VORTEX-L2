@@ -844,9 +844,7 @@ impl WsTradeTunnel {
         if !self.ensure_connected(api_key, api_secret) {
             return None;
         }
-        let Some(mut sock) = self.socket.take() else {
-            return None;
-        };
+        let mut sock = self.socket.take()?;
         let now_ns = now_epoch_ns().0;
         self.req_seq = self.req_seq.wrapping_add(1);
         let req_id =
