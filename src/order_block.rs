@@ -461,3 +461,100 @@ mod tests {
         assert!(win_44 >= 2_200 && win_44 > loss_43);
     }
 }
+
+pub const OB_PLASTICITY_VAULT_PATH: &str = "data/vault/vortex_ob_plasticity.json";
+
+impl CausalOrderBlockEngine {
+    #[inline]
+    #[must_use]
+    pub const fn learned_efficacy_permille(&self) -> i64 {
+        self.learned_efficacy_pm
+    }
+
+    #[inline]
+    pub fn set_learned_efficacy_permille(&mut self, efficacy_pm: i64) {
+        if efficacy_pm > 0 {
+            let clamped = efficacy_pm.clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
+            self.learned_efficacy_pm = clamped;
+            self.cached_obs.learned_efficacy_pm = clamped;
+        }
+    }
+
+    pub fn reset_preserving_plasticity(&mut self) {
+        let keep_pm = self.learned_efficacy_pm;
+        *self = Self::new();
+        self.set_learned_efficacy_permille(keep_pm);
+    }
+
+    pub fn save_plasticity_array_to_path<const N: usize>(
+        engines: &[Self; N],
+        path: &std::path::Path,
+        ts_ns: i64,
+    ) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let vals: Vec<i64> = engines.iter().map(Self::learned_efficacy_permille).collect();
+        let payload = serde_json::json!({
+            "event": "OB_PLASTICITY_V44",
+            "ts_ns": ts_ns,
+            "learned_efficacy_pm": vals,
+        });
+        if let Ok(txt) = serde_json::to_string(&payload) {
+            let _ = std::fs::write(path, txt);
+        }
+    }
+
+    #[must_use]
+    pub fn load_plasticity_array_from_path<const N: usize>(
+        engines: &mut [Self; N],
+        path: &std::path::Path,
+    ) -> usize {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return 0;
+        };
+        let Some(arr) = val.get("learned_efficacy_pm").and_then(|v| v.as_array()) else {
+            return 0;
+        };
+        let mut loaded = 0_usize;
+        for (idx, item) in arr.iter().take(N).enumerate() {
+            if let Some(pm) = item.as_i64() {
+                if (MIN_EFFICACY_PM..=MAX_EFFICACY_PM).contains(&pm) {
+                    engines[idx].set_learned_efficacy_permille(pm);
+                    loaded += 1;
+                }
+            }
+        }
+        loaded
+    }
+}
+
+#[cfg(test)]
+mod omega_v441_plasticity_tests {
+    use super::*;
+
+    #[test]
+    fn test_ob_plasticity_vault_roundtrip_and_reconnect_preservation() {
+        let tmp = std::env::temp_dir().join(format!("vortex_ob_plast_{}.json", std::process::id()));
+        let mut src = [CausalOrderBlockEngine::new(); 12];
+        for (idx, eng) in src.iter_mut().enumerate() {
+            eng.set_learned_efficacy_permille(500 + (idx as i64) * 25);
+        }
+        CausalOrderBlockEngine::save_plasticity_array_to_path(&src, &tmp, 1_794_690_000_000_000_000);
+
+        let mut dst = [CausalOrderBlockEngine::new(); 12];
+        let loaded = CausalOrderBlockEngine::load_plasticity_array_from_path(&mut dst, &tmp);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(loaded, 12);
+        assert_eq!(dst[0].learned_efficacy_permille(), 500);
+        assert_eq!(dst[11].learned_efficacy_permille(), 775);
+
+        dst[3].reset_preserving_plasticity();
+        assert_eq!(dst[3].learned_efficacy_permille(), 575);
+        assert_eq!(dst[3].observables().learned_efficacy_pm, 575);
+    }
+}
