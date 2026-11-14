@@ -1,5 +1,6 @@
 //! Columnar PAR1 L1..L4 Market Recorder and ParitySyncLedger with 30%/70% Sinking Fund.
 
+use core::cmp::Ordering;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -267,6 +268,7 @@ impl ColumnarParquetBatch {
         self.len += 1;
         Ok(())
     }
+
     #[inline]
     #[must_use]
     pub const fn get_row(&self, idx: usize) -> Option<ColumnarMarketRow> {
@@ -403,7 +405,6 @@ impl ColumnarParquetBatch {
         if stored_checksum != calc_checksum {
             return Err(VortexError::ColumnarFormatCorrupted);
         }
-
         let mut n_bytes = [0_u8; 4];
         n_bytes.copy_from_slice(&buf[4..8]);
         let n = u32::from_le_bytes(n_bytes) as usize;
@@ -422,7 +423,6 @@ impl ColumnarParquetBatch {
         } else {
             return Err(VortexError::ColumnarFormatCorrupted);
         };
-
         let mut batch = Self::new();
         let mut pos = 8_usize;
         for _ in 0..n {
@@ -436,7 +436,6 @@ impl ColumnarParquetBatch {
             };
             let side = if buf[pos + 3] == 1 { Side::Ask } else { Side::Bid };
             pos += 4;
-
             let seq_id = Self::read_i64_le(&buf, &mut pos) as u64;
             let ts_exch = TimestampNs(Self::read_i64_le(&buf, &mut pos));
             let ts_loc = TimestampNs(Self::read_i64_le(&buf, &mut pos));
@@ -450,7 +449,6 @@ impl ColumnarParquetBatch {
             let ofi_b = Self::read_i32_le(&buf, &mut pos);
             let tfi_b = Self::read_i32_le(&buf, &mut pos);
             let geom_b = Self::read_i32_le(&buf, &mut pos);
-
             let mut vol_5m = ScaledBps(6_500);
             let mut db_t = [PriceTicks(0); DEEP_BOOK_LEVELS];
             let mut db_q = [LotQty(0); DEEP_BOOK_LEVELS];
@@ -465,7 +463,6 @@ impl ColumnarParquetBatch {
                     da_q[lvl] = LotQty(Self::read_i64_le(&buf, &mut pos));
                 }
             }
-
             let row = ColumnarMarketRow {
                 symbol_id: sym_id,
                 event_kind: ev_k,
@@ -544,20 +541,24 @@ impl ParitySyncLedger {
     ) {
         self.record_closed_trade(net_pnl_1e8, fee_1e8);
         let n_bps = consolidated_net_bps.raw();
-        if n_bps > 0 {
-            let locked_70 = (n_bps * 70) / 100;
-            let reserve_30 = n_bps - locked_70;
-            self.vault_locked_profit_bps_x100 =
-                self.vault_locked_profit_bps_x100.saturating_add(locked_70);
-            self.sinking_fund_reserve_bps_x100 = self
-                .sinking_fund_reserve_bps_x100
-                .saturating_add(reserve_30)
-                .min(MAX_SINKING_FUND_SCALED_BPS);
-        } else if n_bps < 0 {
-            self.sinking_fund_reserve_bps_x100 = self
-                .sinking_fund_reserve_bps_x100
-                .saturating_add(n_bps)
-                .max(0);
+        match n_bps.cmp(&0) {
+            Ordering::Greater => {
+                let locked_70 = (n_bps * 70) / 100;
+                let reserve_30 = n_bps - locked_70;
+                self.vault_locked_profit_bps_x100 =
+                    self.vault_locked_profit_bps_x100.saturating_add(locked_70);
+                self.sinking_fund_reserve_bps_x100 = self
+                    .sinking_fund_reserve_bps_x100
+                    .saturating_add(reserve_30)
+                    .min(MAX_SINKING_FUND_SCALED_BPS);
+            }
+            Ordering::Less => {
+                self.sinking_fund_reserve_bps_x100 = self
+                    .sinking_fund_reserve_bps_x100
+                    .saturating_add(n_bps)
+                    .max(0);
+            }
+            Ordering::Equal => {}
         }
     }
 }
@@ -603,7 +604,6 @@ mod tests {
             PriceTicks(8_200),
             LotQty(300),
         );
-
         let mut batch = ColumnarParquetBatch::new();
         assert!(batch.push_row(&tr_row).is_ok());
         assert!(batch.push_row(&l2_row).is_ok());
