@@ -42,3 +42,9 @@
 
 ## Ley IX — Higiene Zero-Alloc, Compilación LTO Fat y Rotación por Drenaje
 1. Cero asignaciones dinámicas en la ruta caliente de `200.0 Hz`, codificación `UTF-8 sin BOM + LF`, `cargo clippy --all-targets -- -D warnings` limpio y despliegue exclusivo en producción mediante drenaje verificado (`DRAIN_MODE.lock` hasta `0` posiciones abiertas).
+
+---
+
+## Adenda Evolutiva OMEGA V4.1 — Desbloqueo Elástico del *Runner* y Coherencia Macro-Elliott
+1. **Desacoplamiento SL vs. Techo Pasivo (`observe_wald_sprt_step`):** La compresión del `Stop-Loss` de servidor permanece 100% irreversible desde `t >= 3 s`, mientras que `defensive_floor_locked` exige excursión adversa real (`< -2.00 bps`) y se desbloquea dinámicamente ante resurgimiento de impulso propio ($\Phi_{\text{own}} \ge +0.35$, excursión $\ge +1.50\text{ bps}$ y fase macro coherente).
+2. **Veto de Contradicción Macro-Elliott (`passes_elliott_macro_coherence_guard`):** Bloquea el armado, pre-vuelo, `Re-Peg` y permanencia en cola (`>= 500 ms`) cuando $\Phi_{\text{macro}} \cdot s_{\text{dir}} \le -0.25$, $H_t \ge 0.55$ e $I_{\text{OI}} \cdot s_{\text{dir}} < 0.10$.
