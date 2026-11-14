@@ -1083,7 +1083,11 @@ impl OnlineAdaptiveGovernor {
         {
             return false;
         }
-        let adaptive_threshold = (0.42
+        let ob_obs = candidate_snap.order_block_observables();
+        if ob_obs.vetoes_into_opposing_wall(side, spec, entry_px, candidate_snap.realized_vol_5m, candidate_snap.factor_tfi.get() * dir_s) { return false; }
+        let ob_res = ob_obs.aligned_confluence_resonance(side, spec, entry_px, candidate_snap.realized_vol_5m);
+        let gp_res = candidate_snap.wave_observables().golden_pocket_resonance(side);
+        let adaptive_threshold = (0.42 - (0.012 * ob_res + 0.014 * ob_res * gp_res)
             + 0.08 * sl_s
             + debt_penalty
             + global_penalty
@@ -1156,6 +1160,9 @@ impl OnlineAdaptiveGovernor {
             return Err("VETO_PREFLIGHT_SNR_COLLAPSE");
         }
         let spec = APPROVED_SPECS[slot_idx];
+        if snap.order_block_observables().vetoes_into_opposing_wall(side, spec, entry_px, snap.realized_vol_5m, tfi * dir_s) {
+            return Err("VETO_PREFLIGHT_OPPOSING_OB_WALL");
+        }
         let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         if !spec.passes_oversized_lot_conviction_guard_with_vol(
             wallet_usdt_1e8,

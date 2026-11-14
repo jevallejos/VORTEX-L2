@@ -20,10 +20,11 @@ use crate::types::{
     now_epoch_ns, BoundedScore, LotQty, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs,
     VortexError,
 };
+use crate::order_block::OrderBlockObservables;
 use crate::wave_elliott::{WaveObservables, WaveRegime};
 
 pub const MAX_ACTIVE_PAIRS: usize = 12;
-pub const VORTEX_SHM_VERSION: u32 = 13;
+pub const VORTEX_SHM_VERSION: u32 = 14;
 const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C33;
 
 #[repr(C)]
@@ -84,6 +85,13 @@ pub struct SymbolLobSnapshot {
     pub wave_oi_impulse: BoundedScore,
     pub wave_liq_imbalance: BoundedScore,
     pub wave_fib_proj_bps: ScaledBps,
+    pub ob_bull_score: BoundedScore,
+    pub ob_bear_score: BoundedScore,
+    pub ob_dist_bull_bps: ScaledBps,
+    pub ob_dist_bear_bps: ScaledBps,
+    pub ob_bull_wall_ticks: PriceTicks,
+    pub ob_bear_wall_ticks: PriceTicks,
+    pub ob_learned_efficacy_pm: i64,
 }
 
 impl Default for SymbolLobSnapshot {
@@ -122,6 +130,13 @@ impl SymbolLobSnapshot {
             wave_oi_impulse: BoundedScore::ZERO,
             wave_liq_imbalance: BoundedScore::ZERO,
             wave_fib_proj_bps: ScaledBps(0),
+            ob_bull_score: BoundedScore::ZERO,
+            ob_bear_score: BoundedScore::ZERO,
+            ob_dist_bull_bps: ScaledBps(0),
+            ob_dist_bear_bps: ScaledBps(0),
+            ob_bull_wall_ticks: PriceTicks(0),
+            ob_bear_wall_ticks: PriceTicks(0),
+            ob_learned_efficacy_pm: 618,
         }
     }
 
@@ -147,6 +162,31 @@ impl SymbolLobSnapshot {
             oi_impulse: self.wave_oi_impulse,
             liq_imbalance: self.wave_liq_imbalance,
             fib_proj_bps: self.wave_fib_proj_bps,
+        }
+    }
+
+    #[inline]
+    pub fn set_order_block_observables(&mut self, obs: OrderBlockObservables) {
+        self.ob_bull_score = obs.bull_ob_score;
+        self.ob_bear_score = obs.bear_ob_score;
+        self.ob_dist_bull_bps = obs.dist_bull_ob_bps;
+        self.ob_dist_bear_bps = obs.dist_bear_ob_bps;
+        self.ob_bull_wall_ticks = obs.bull_wall_ticks;
+        self.ob_bear_wall_ticks = obs.bear_wall_ticks;
+        self.ob_learned_efficacy_pm = obs.learned_efficacy_pm;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn order_block_observables(&self) -> OrderBlockObservables {
+        OrderBlockObservables {
+            bull_ob_score: self.ob_bull_score,
+            bear_ob_score: self.ob_bear_score,
+            dist_bull_ob_bps: self.ob_dist_bull_bps,
+            dist_bear_ob_bps: self.ob_dist_bear_bps,
+            bull_wall_ticks: self.ob_bull_wall_ticks,
+            bear_wall_ticks: self.ob_bear_wall_ticks,
+            learned_efficacy_pm: self.ob_learned_efficacy_pm,
         }
     }
 

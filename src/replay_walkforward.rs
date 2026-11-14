@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use crate::execution_fsm::{
-    check_queue_depletion_velocity_abort, is_chandelier_profit_locked_sl, passes_elliott_macro_coherence_guard, passes_stoikov_repeg_coherence_guard, ClosedTradeKind, ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor,
+    check_queue_depletion_velocity_abort, is_chandelier_profit_locked_sl, passes_elliott_macro_coherence_guard, passes_ob_wall_snap_guard, passes_stoikov_repeg_coherence_guard, ClosedTradeKind, ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor,
     OrderLifecycleState, SlotExecutionEngine,
 };
 use crate::fifo_sim::{
@@ -255,7 +255,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 && q_eroded
                                 && (btc_q_snr < -0.02 || flow_imp < 0.38);
                             let macro_contradiction = elapsed_ns >= 500_000_000
-                                && !passes_elliott_macro_coherence_guard(side, &cur_snap);
+                                && (!passes_elliott_macro_coherence_guard(side, &cur_snap) || !passes_ob_wall_snap_guard(side, &cur_snap));
                             let dq_abort = headwind_erosion
                                 || macro_contradiction
                                 || (elapsed_ns >= 25_000_000
@@ -274,7 +274,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 && elapsed_ns >= 2_500_000_000
                                 && total_chase_ns + 2_500_000_000 < max_chase_ns
                                 && passes_stoikov_repeg_coherence_guard(s_idx, side, &cur_snap, &btc_snap)
-                                && passes_elliott_macro_coherence_guard(side, &cur_snap)
+                                && passes_elliott_macro_coherence_guard(side, &cur_snap) && passes_ob_wall_snap_guard(side, &cur_snap)
                                 && cur_snap.ts_local_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
                             {
                                 let new_l1 = side.select_entry_bbo_price(cur_snap.bids[0].price, cur_snap.asks[0].price);
@@ -536,7 +536,7 @@ pub mod omega_twin {
     use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
     use crate::exec_daemon::compute_exit_sync_schedule;
     use crate::execution_fsm::{
-        is_chandelier_profit_locked_sl, passes_elliott_macro_coherence_guard, passes_stoikov_repeg_coherence_guard, ClosedTradeKind,
+        is_chandelier_profit_locked_sl, passes_elliott_macro_coherence_guard, passes_ob_wall_snap_guard, passes_stoikov_repeg_coherence_guard, ClosedTradeKind,
         ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState,
         SlotExecutionEngine,
     };
@@ -787,7 +787,7 @@ pub mod omega_twin {
                         );
                         let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
                         let macro_contradiction = elapsed_ns >= 500_000_000
-                            && !passes_elliott_macro_coherence_guard(side, &ev.snap);
+                            && (!passes_elliott_macro_coherence_guard(side, &ev.snap) || !passes_ob_wall_snap_guard(side, &ev.snap));
                         if (elapsed_ns >= 25_000_000 && q_verdict.abort_now) || macro_contradiction {
                             self.entry_fifo[s_idx].cancel();
                             self.gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
@@ -801,7 +801,7 @@ pub mod omega_twin {
                         };
                         if !at_l1
                             && elapsed_ns >= 2_500_000_000
-                            && passes_elliott_macro_coherence_guard(side, &ev.snap)
+                            && passes_elliott_macro_coherence_guard(side, &ev.snap) && passes_ob_wall_snap_guard(side, &ev.snap)
                             && passes_stoikov_repeg_coherence_guard(
                                 s_idx, side, &ev.snap, &btc_snap,
                             )

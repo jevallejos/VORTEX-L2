@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA Institutional Low-Latency Execution Core (19-Module Clean-Room Architecture).
+//! VORTEX-OMEGA Institutional Low-Latency Execution Core (20-Module Clean-Room Architecture).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;
@@ -14,6 +14,7 @@ pub mod forensic_parquet;
 pub mod http_ws_transport;
 pub mod kinematic_surface;
 pub mod lob_shm;
+pub mod order_block;
 pub mod replay_walkforward;
 pub mod tap_ring;
 pub mod telemetry_hud;
@@ -38,7 +39,7 @@ mod tests {
 
     #[test]
     fn test_phase4_constitutional_3_cli_gates_end_to_end() {
-        assert_eq!(VORTEX_SHM_VERSION, 13);
+        assert_eq!(VORTEX_SHM_VERSION, 14);
 
         // Gate 1: Ingestor SHM v13 + PAR1 Ring Self-Test (12 institutional slots)
         let tap_gate = run_isolated_tap_self_test(false);

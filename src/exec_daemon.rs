@@ -21,7 +21,7 @@ use crate::exec_gateway_handlers::{
     run_oos_520_certification_suite, ExecRuntimeState,
 };
 use crate::execution_fsm::{
-    passes_elliott_macro_coherence_guard, passes_stoikov_repeg_coherence_guard,
+    passes_elliott_macro_coherence_guard, passes_order_block_wall_guard, passes_stoikov_repeg_coherence_guard,
     CanonicalExitQuote, ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState,
     ServerSlDecision, SlotExecutionEngine,
 };
@@ -364,7 +364,7 @@ pub fn step_12_slot_daemon_tick(
                     && rt.cur_q_ahead[s_idx].0 * 100 <= rt.init_q_ahead[s_idx].0 * 65
                     && (btc_q_snr < -0.02 || flow_imp < 0.38);
                 let macro_contradiction = resting_elapsed_ns >= 500_000_000
-                    && !passes_elliott_macro_coherence_guard(side, &snap);
+                    && (!passes_elliott_macro_coherence_guard(side, &snap) || !passes_order_block_wall_guard(s_idx, side, &snap));
                 let dq_abort = (resting_elapsed_ns >= 25_000_000 && at_l1 && q_shield.abort_now)
                     || headwind_erosion
                     || macro_contradiction
@@ -399,7 +399,7 @@ pub fn step_12_slot_daemon_tick(
                     && total_chase_ns + 2_500_000_000 < max_chase_ns
                     && now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
                     && passes_stoikov_repeg_coherence_guard(s_idx, side, &snap, &btc_snap)
-                    && passes_elliott_macro_coherence_guard(side, &snap)
+                    && passes_elliott_macro_coherence_guard(side, &snap) && passes_order_block_wall_guard(s_idx, side, &snap)
                 {
                     let new_l1 = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
                     let moved_away = match side {
@@ -744,7 +744,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     );
     let gateway = BybitAsyncGateway::spawn_if_enabled(live_capital);
     println!(
-        "{}\u{1f7e2} [VORTEX-OMEGA V4.3 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
+        "{}\u{1f7e2} [VORTEX-OMEGA V4.4 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
         ANSI_GREEN,
         ANSI_RESET
     );

@@ -16,6 +16,22 @@ use crate::wave_elliott::{WaveObservables, WaveRegime};
 /// OMEGA V4.1 Law II & VI: Vetoes entries contradicting persistent Elliott macro phase (#45 & #58).
 #[inline]
 #[must_use]
+pub fn passes_ob_wall_snap_guard(side: Side, snap: &SymbolLobSnapshot) -> bool {
+    let spec = crate::types::spec_from_symbol_id(snap.symbol_id).unwrap_or(APPROVED_SPECS[0]);
+    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 { PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)) } else { snap.mark_price };
+    !snap.order_block_observables().vetoes_into_opposing_wall(side, spec, mid_px, snap.realized_vol_5m, snap.factor_tfi.get() * side.sign_f64())
+}
+
+#[inline]
+#[must_use]
+pub fn passes_order_block_wall_guard(slot_idx: usize, side: Side, snap: &SymbolLobSnapshot) -> bool {
+    let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 { PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)) } else { snap.mark_price };
+    !snap.order_block_observables().vetoes_into_opposing_wall(side, spec, mid_px, snap.realized_vol_5m, snap.factor_tfi.get() * side.sign_f64())
+}
+
+#[inline]
+#[must_use]
 pub fn passes_elliott_macro_coherence_guard(side: Side, snap: &SymbolLobSnapshot) -> bool {
     let w = snap.wave_observables();
     let dir_s = side.sign_f64();
@@ -623,7 +639,7 @@ impl SlotExecutionEngine {
         let SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps } = verdict else {
             return Ok(self.state);
         };
-        if !passes_elliott_macro_coherence_guard(side, snap) {
+        if !passes_elliott_macro_coherence_guard(side, snap) || !passes_order_block_wall_guard(self.slot_idx, side, snap) {
             return Ok(self.state);
         }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
@@ -653,7 +669,7 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PlacingEntryMaker { side, entry_price: armed_px, .. } = self.state else {
             return Err(VortexError::InvalidPriceOrTickSpec);
         };
-        if !passes_elliott_macro_coherence_guard(side, snap) {
+        if !passes_elliott_macro_coherence_guard(side, snap) || !passes_order_block_wall_guard(self.slot_idx, side, snap) {
             return Err(VortexError::InvalidPriceOrTickSpec);
         }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
@@ -2112,5 +2128,37 @@ mod tests {
         assert_eq!(loaded, MAX_ACTIVE_PAIRS);
         let (dr_bps, ex_bps) = g2.price_drift_and_extension_scaled_bps(1, &eth5);
         assert!(dr_bps != 0 && ex_bps != 0);
+    }
+
+    #[test]
+    fn test_omega_v44_ob_wall_veto_gp_confluence_and_front_run_tp() {
+        let mut eng = SlotExecutionEngine::new(3);
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+        snap.realized_vol_5m = ScaledBps(6_200);
+        snap.ts_local_ns = TimestampNs(2_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(7_502), qty: LotQty(400) };
+        snap.asks[0] = BookLevel { price: PriceTicks(7_503), qty: LotQty(320) };
+        snap.mark_price = PriceTicks(7_503);
+        snap.last_trade_price = PriceTicks(7_503);
+        snap.factor_ofi = BoundedScore::new_clamped(-0.55);
+        snap.factor_tfi = BoundedScore::new_clamped(-0.60);
+        snap.set_order_block_observables(crate::order_block::OrderBlockObservables {
+            bull_ob_score: BoundedScore::new_clamped(0.82), bear_ob_score: BoundedScore::new_clamped(0.86),
+            dist_bull_ob_bps: ScaledBps(399), dist_bear_ob_bps: ScaledBps(3_200),
+            bull_wall_ticks: PriceTicks(7_500), bear_wall_ticks: PriceTicks(7_527), learned_efficacy_pm: 680,
+        });
+        let v_short = SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, target_excursion_scaled_bps: ScaledBps(700) };
+        assert!(eng.try_arm_maker_entry(&snap, v_short, LotQty(22)).is_ok());
+        assert_eq!(eng.state, OrderLifecycleState::Idle);
+        snap.factor_ofi = BoundedScore::new_clamped(0.65);
+        snap.factor_tfi = BoundedScore::new_clamped(0.72);
+        snap.set_wave_observables(WaveObservables { regime: WaveRegime::ImpulseWave3, climax_active: false, hurst: WaveObservables::encode_hurst(0.64), macro_phase: BoundedScore::new_clamped(0.95), oi_impulse: BoundedScore::new_clamped(0.25), liq_imbalance: BoundedScore::ZERO, fib_proj_bps: ScaledBps(4_500) });
+        assert_eq!(compute_wave_dynamic_t1_permille(500, Side::Bid, &snap, false), 350);
+        let v_long = SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, target_excursion_scaled_bps: ScaledBps(900) };
+        assert!(eng.try_arm_maker_entry(&snap, v_long, LotQty(1)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(2_500_000_000)).is_ok());
+        snap.ts_local_ns = TimestampNs(8_000_000_000);
+        assert!(eng.compute_canonical_exit_quote(&snap).is_some_and(|q| q.target_price == PriceTicks(7_525)));
     }
 }

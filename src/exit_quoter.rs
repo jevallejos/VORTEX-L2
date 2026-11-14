@@ -263,13 +263,16 @@ pub fn compute_wave_dynamic_t1_permille(
 
     let delta = if matches!(w_obs.regime, WaveRegime::ImpulseWave3) && signed_phase > 0.15 {
         let gp_res = w_obs.golden_pocket_resonance(side);
+        let sp = crate::types::spec_from_symbol_id(snap.symbol_id).unwrap_or(APPROVED_SPECS[0]);
+        let m_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 { PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)) } else { snap.mark_price };
+        let ob_res = snap.order_block_observables().aligned_confluence_resonance(side, sp, m_px, snap.realized_vol_5m);
         let conv = (0.50 + 0.28 * h_excess + 0.22 * squeeze_fuel + 0.18 * gp_res).min(1.0);
         let gp_runner_boost = if gp_res >= 0.85 {
             (32.0 * gp_res * gp_res).round() as i64
         } else {
             0
         };
-        -((PHI_CONJ_DELTA_PM * conv).round() as i64) - gp_runner_boost
+        -((PHI_CONJ_DELTA_PM * conv).round() as i64) - gp_runner_boost - ((24.0 * ob_res * (0.50 + 0.50 * gp_res)).round() as i64)
     } else if matches!(w_obs.regime, WaveRegime::ImpulseWave5) && signed_phase > 0.15 {
         (PHI_CONJ_DELTA_PM * (0.75 - 0.25 * squeeze_fuel)).round() as i64
     } else if matches!(
@@ -1116,7 +1119,9 @@ pub fn compute_canonical_exit_quote_omega(
     let combined_best = pick_more_ambitious_tp(ctx.side, with_fib, sentinel_px);
     let fib_or_shadow_extended =
         (fib_px.0 > 0 || sentinel_px.0 > 0) && combined_best != pre_fib_best;
-    let target_price = enforce_maker_bbo_bound(ctx.side, combined_best, snap);
+    let spec = APPROVED_SPECS[ctx.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let ob_tp = snap.order_block_observables().front_run_opposing_wall_tp(ctx.side, spec, ctx.avg_price_ticks, combined_best);
+    let target_price = enforce_maker_bbo_bound(ctx.side, pick_more_ambitious_tp(ctx.side, min_win_px, ob_tp), snap);
     let (vac_level, sub_reason) = if fib_or_shadow_extended {
         (lvdbs_vac_level.max(3), ExitSubReason::FibonacciImpulseSurf)
     } else if lvdbs_vac_level >= 2 {

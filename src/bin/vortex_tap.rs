@@ -16,6 +16,8 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use vortex_rs::alpha_3factor::OrthogonalFactorState;
 #[cfg(target_os = "linux")]
+use vortex_rs::order_block::CausalOrderBlockEngine;
+#[cfg(target_os = "linux")]
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
 #[cfg(target_os = "linux")]
 use vortex_rs::lob_shm::{
@@ -100,25 +102,23 @@ fn fetch_bybit_public_json(query_path: &str) -> Option<serde_json::Value> {
 #[cfg(target_os = "linux")]
 fn warm_start_elliott_wave_states(
     wave_states: &mut [vortex_rs::wave_elliott::CausalElliottWaveState; MAX_ACTIVE_PAIRS],
+    ob_states: &mut [CausalOrderBlockEngine; MAX_ACTIVE_PAIRS],
     active_snaps: &mut [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
 ) {
     for s in 0..MAX_ACTIVE_PAIRS {
         let spec = APPROVED_SPECS[s];
         let sym = spec.symbol_id.name();
-        let p5 = format!("/v5/market/kline?category=linear&symbol={}&interval=5&limit=120", sym);
-        let p1 = format!("/v5/market/kline?category=linear&symbol={}&interval=1&limit=90", sym);
-        let po = format!(
-            "/v5/market/open-interest?category=linear&symbol={}&intervalTime=5min&limit=60",
-            sym
-        );
+        let p5 = format!("/v5/market/kline?category=linear&symbol={}&interval=5&limit=300", sym);
+        let p1 = format!("/v5/market/kline?category=linear&symbol={}&interval=1&limit=240", sym);
+        let po = format!("/v5/market/open-interest?category=linear&symbol={}&intervalTime=5min&limit=200", sym);
         let k5 = fetch_bybit_public_json(&p5);
         let k1 = fetch_bybit_public_json(&p1);
         let oi = fetch_bybit_public_json(&po);
-        if wave_states[s]
-            .warm_start_from_bybit_bundle(spec, k5.as_ref(), k1.as_ref(), oi.as_ref())
-            > 0
-        {
+        if wave_states[s].warm_start_from_bybit_bundle(spec, k5.as_ref(), k1.as_ref(), oi.as_ref()) > 0 {
             active_snaps[s].set_wave_observables(wave_states[s].observables());
+        }
+        if ob_states[s].warm_start_from_bybit_bundle(spec, k5.as_ref(), k1.as_ref(), oi.as_ref()) > 0 {
+            active_snaps[s].set_order_block_observables(ob_states[s].observables());
         }
     }
 }
@@ -128,6 +128,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
     let mut factor_states = [OrthogonalFactorState::new(); MAX_ACTIVE_PAIRS];
     let mut wave_states =
         [vortex_rs::wave_elliott::CausalElliottWaveState::new(); MAX_ACTIVE_PAIRS];
+    let mut ob_states = [CausalOrderBlockEngine::new(); MAX_ACTIVE_PAIRS];
     let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let mut has_live_mark_px = [false; MAX_ACTIVE_PAIRS];
     let mut has_book_snapshot = [false; MAX_ACTIVE_PAIRS];
@@ -137,6 +138,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
         for s in 0..MAX_ACTIVE_PAIRS {
             factor_states[s].reset();
             wave_states[s].reset();
+            ob_states[s].reset();
             active_snaps[s] = SymbolLobSnapshot::new_empty();
             active_snaps[s].symbol_id = APPROVED_SPECS[s].symbol_id;
             active_snaps[s].is_eligible = true;
@@ -144,7 +146,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
             has_live_mark_px[s] = false;
             has_book_snapshot[s] = false;
         }
-        warm_start_elliott_wave_states(&mut wave_states, &mut active_snaps);
+        warm_start_elliott_wave_states(&mut wave_states, &mut ob_states, &mut active_snaps);
         if let Ok((mut socket, _)) = tungstenite::connect(BYBIT_PUBLIC_LINEAR_WS) {
             configure_ws_tcp_stream(&mut socket);
             let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 4);
@@ -258,6 +260,8 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
                     let w_obs =
                         wave_states[slot_idx].observe_price_tick(spec, mid_l1, local_ns.0, snap.realized_vol_5m);
                     snap.set_wave_observables(w_obs);
+                    let ob_q = ob_states[slot_idx].observe_mid_quote(spec, mid_l1);
+                    snap.set_order_block_observables(ob_q);
                     factor_states[slot_idx].on_l2_book_update(snap);
                     if let Ok(slot_ref) = arena.slot(slot_idx) {
                         slot_ref.write_snapshot(snap);
@@ -285,6 +289,8 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
                                 snap.ts_exchange_ns = exch_ns;
                                 snap.ts_local_ns = local_ns;
                                 factor_states[slot_idx].on_trade_print(side, qty, snap);
+                                let ob_t = ob_states[slot_idx].observe_live_tick(spec, px, qty, local_ns.0);
+                                snap.set_order_block_observables(ob_t);
                                 if !has_book_snapshot[slot_idx] || snap.bbo_and_spread_ticks().is_none() {
                                     continue;
                                 }
@@ -343,6 +349,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
                         })
                     });
                     if let Some(Ok(oi_f)) = oi_opt.map(|s| s.trim().parse::<f64>()) {
+                        ob_states[slot_idx].observe_open_interest(oi_f);
                         let w_obs = wave_states[slot_idx].observe_open_interest(spec, oi_f, local_ns.0);
                         snap.set_wave_observables(w_obs);
                     }
