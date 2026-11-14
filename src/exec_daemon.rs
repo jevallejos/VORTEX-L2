@@ -670,7 +670,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     );
     let gateway = BybitAsyncGateway::spawn_if_enabled(live_capital);
     println!(
-        "{}\u{1f7e2} [VORTEX-OMEGA V4.1 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
+        "{}\u{1f7e2} [VORTEX-OMEGA V4.2 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
         ANSI_GREEN,
         ANSI_RESET
     );

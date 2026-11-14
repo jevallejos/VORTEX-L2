@@ -1,4 +1,4 @@
-# CONSTITUCION TECNICA DE VORTEX-OMEGA (V4.1)
+# CONSTITUCION TECNICA DE VORTEX-OMEGA (V4.2)
 
 **Arquitectura:** 19 Modulos Rust Zero-Alloc + 3 Binarios LTO Fat (`vortex_tap`, `vortex_replay`, `vortex_exec`)  
 **Memoria Compartida:** `VORTEX_SHM_VERSION = 13` (`/dev/shm/vortex_lob.mmap`, SeqLock Tear-Free)  
@@ -48,3 +48,7 @@
 ## Adenda Evolutiva OMEGA V4.1 - Desbloqueo Elastico del *Runner* y Coherencia Macro-Elliott
 1. **Desacoplamiento SL vs. Techo Pasivo (`observe_wald_sprt_step`):** La compresion del `Stop-Loss` de servidor permanece 100% irreversible desde `t >= 3 s`, mientras que `defensive_floor_locked` exige excursion adversa real (`< -2.00 bps` con flujo `< 0.15`) y se desbloquea dinamicamente antes de `180 s` ante resurgimiento de impulso propio ($\Phi_{\text{own}} \ge +0.35$, excursion $\ge +1.50\text{ bps}$, sin climax y fase macro coherente).
 2. **Veto de Contradiccion Macro-Elliott (`passes_elliott_macro_coherence_guard`):** Bloquea el armado, pre-vuelo, `Re-Peg` y permanencia en cola (`>= 500 ms`) cuando $\Phi_{\text{macro}} \cdot s_{\text{dir}} \le -0.25$, $H_t \ge 0.55$ e $I_{\text{OI}} \cdot s_{\text{dir}} < 0.10$, o frente a ondas `ImpulseWave3/5` opuestas con proyeccion Fibonacci $\le -50\text{ bps}$ y $H_t \ge 0.50$.
+
+## Adenda Evolutiva OMEGA V4.2 - Kernel Continuo Golden Pocket Estricto (`0.618-0.650`)
+1. **Resonancia Dilatada por Tick (`compute_golden_pocket_resonance`):** Centra el nucleo plano en `[0.618, 0.650]` con dilatacion discreta `max(0.015983, 0.55 / w1)` para garantizar `0%` de reticulas muertas en los 12 contratos sin modificar `VORTEX_SHM_VERSION = 13`.
+2. **Acoplamiento en 4 Vectores:** Cuando `G_gp >= 0.85` en `ImpulseWave3`, expande la proyeccion Fibonacci `k3`, profundiza `snr_threshold_delta` hasta `-0.038`, extiende la paciencia defensiva a `1,250 permille` y habilita la particion `35% T1 / 65% Runner` (`350 permille`).

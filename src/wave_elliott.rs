@@ -13,6 +13,31 @@ const PHI: f64 = 1.618_033_988_749_895;
 const PHI_SQ: f64 = 2.618_033_988_749_895;
 const INV_PHI: f64 = 0.618_033_988_749_895;
 const LIQ_FLOOR_USDT: f64 = 500.0;
+const GP_STRICT_HI: f64 = 0.650;
+const GP_CENTER: f64 = f64::midpoint(INV_PHI, GP_STRICT_HI);
+const GP_HALF_WIDTH: f64 = 0.5 * (GP_STRICT_HI - INV_PHI);
+const GP_SIGMA_OUTER: f64 = 0.115;
+
+/// Tick-dilated C^1 Golden Pocket [0.618, 0.650] resonance kernel in [0.0, 1.0].
+#[inline]
+#[must_use]
+pub fn compute_golden_pocket_resonance(w1_ticks: i64, w2_ticks: i64) -> f64 {
+    if w1_ticks <= 0 || w2_ticks <= 0 || w2_ticks >= w1_ticks {
+        return 0.0;
+    }
+    let r2 = (w2_ticks as f64) / (w1_ticks as f64);
+    if !(0.236..0.990).contains(&r2) {
+        return 0.0;
+    }
+    let delta_core = GP_HALF_WIDTH.max(0.55 / (w1_ticks as f64));
+    let dist = ((r2 - GP_CENTER).abs() - delta_core).max(0.0);
+    if dist <= 0.0 {
+        1.0
+    } else {
+        let z = dist / GP_SIGMA_OUTER;
+        (-0.5 * z * z).exp()
+    }
+}
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -85,6 +110,21 @@ impl WaveObservables {
     #[must_use]
     pub fn encode_hurst(h: f64) -> BoundedScore {
         BoundedScore::new_clamped((h.clamp(0.25, 0.85) - 0.50) / 0.35)
+    }
+
+    /// Decodes strict Golden Pocket [0.618, 0.650] resonance from SHM v13 macro_phase.
+    #[inline]
+    #[must_use]
+    pub fn golden_pocket_resonance(self, side: Side) -> f64 {
+        if !matches!(self.regime, WaveRegime::ImpulseWave3) {
+            return 0.0;
+        }
+        let signed_phase = self.macro_phase.get() * side.sign_f64();
+        if signed_phase <= 0.68 {
+            0.0
+        } else {
+            ((signed_phase - 0.68) / 0.27).clamp(0.0, 1.0)
+        }
     }
 }
 
@@ -520,15 +560,15 @@ impl CausalElliottWaveState {
                     phase = 0.90 * sf;
                 } else {
                     regime = WaveRegime::ImpulseWave3;
+                    let gp_res = compute_golden_pocket_resonance(w1, w2);
                     let h_boost = ((hurst_val - 0.54) / 0.14).clamp(0.0, 1.0);
-                    let blend = (0.55 * h_boost + 0.45 * fuel).clamp(0.0, 1.0);
+                    let blend = (0.45 * h_boost + 0.35 * fuel + 0.20 * gp_res).clamp(0.0, 1.0);
                     let k3 = PHI + (PHI_SQ - PHI) * blend;
                     let p_fib3 = p2 + s * ((k3 * (w1 as f64)).round() as i64).max(1);
                     if (p_fib3 - px) * s > 0 {
                         fib_proj_bps = ((p_fib3 - px).saturating_mul(1_000_000)) / px.max(1);
                     }
-                    let golden_pocket = (0.382..=0.786).contains(&r2);
-                    phase = (if golden_pocket { 0.85 } else { 0.70 }) * sf;
+                    phase = (0.68 + 0.27 * gp_res) * sf;
                 }
             } else {
                 let last_s = f64::from(self.zig_dir);
@@ -751,11 +791,25 @@ impl CausalElliottWaveState {
             }
             WaveRegime::ImpulseWave3 => {
                 if signed_phase > 0.15 {
-                    let h_bonus = ((obs.hurst_exponent() - 0.52) * 0.08).clamp(0.0, 0.015);
+                    let h_val = obs.hurst_exponent();
+                    let h_bonus = ((h_val - 0.52) * 0.08).clamp(0.0, 0.015);
+                    let gp_res = obs.golden_pocket_resonance(side);
+                    let sniper_gp = gp_res >= 0.85 && h_val >= 0.54;
+                    let gp_snr_bonus = if h_val >= 0.52 { 0.010 * gp_res } else { 0.0 };
+                    let def_mult = if sniper_gp {
+                        1_180 + (70.0 * gp_res).round() as i64
+                    } else {
+                        1_180
+                    };
+                    let t1_delta = if sniper_gp {
+                        -60 - (25.0 * gp_res).round() as i64
+                    } else {
+                        -60
+                    };
                     Ok(WaveEntryModulation {
-                        snr_threshold_delta: (-0.015 - h_bonus).clamp(-0.030, -0.010),
-                        def_horizon_permille_mult: 1_180,
-                        tranche1_permille_delta: -60,
+                        snr_threshold_delta: (-0.015 - h_bonus - gp_snr_bonus).clamp(-0.038, -0.010),
+                        def_horizon_permille_mult: def_mult,
+                        tranche1_permille_delta: t1_delta,
                         fib_target_bps: ScaledBps(aligned_fib),
                     })
                 } else if signed_phase < -0.15 && btc_signed_snr < 0.20 {
@@ -941,5 +995,55 @@ mod tests {
         });
         let obs_long = st_long.observe_bybit_liquidation_json(avax, &long_liq, 2_000_000_000);
         assert!(obs_long.is_some_and(|o| o.liq_imbalance.get() < -0.50));
+    }
+
+    #[test]
+    fn test_omega_v42_strict_golden_pocket_0618_0650_and_zero_dead_lattices() {
+        // 1. High-tick resolution (BTC w1 = 4_000 ticks): exact [0.618, 0.650] discrimination
+        let g_exact = compute_golden_pocket_resonance(4_000, 2_536); // r2 = 0.634
+        let g_half = compute_golden_pocket_resonance(4_000, 2_000);  // r2 = 0.500
+        let g_shallow = compute_golden_pocket_resonance(4_000, 1_200); // r2 = 0.300
+        assert!((g_exact - 1.0).abs() < 1e-12);
+        assert!(g_half > 0.50 && g_half < 0.70);
+        assert!(g_shallow < 0.05);
+
+        // 2. Coarse-tick lattice invariance (WIF/ORDI/NEAR w1 in 3..=200): 0% dead lattices
+        for w1 in 3..=200_i64 {
+            let mut best = 0.0_f64;
+            for w2 in 1..w1 {
+                best = best.max(compute_golden_pocket_resonance(w1, w2));
+            }
+            assert!((best - 1.0).abs() < 1e-12);
+        }
+
+        // 3. Downstream Wave-3 entry & Fibonacci boost on strict 0.618-0.650 vs shallow pullback
+        let btc = APPROVED_SPECS[0];
+        let vol = ScaledBps(5_000);
+        let mut st_gp = CausalElliottWaveState::new();
+        for &(px, step) in &[(650_000_i64, 1_i64), (657_800, 2), (652_855, 3), (653_800, 4)] {
+            let _ = st_gp.observe_price_tick(btc, PriceTicks(px), step * 1_000_000_000, vol);
+        }
+        let mut st_sh = CausalElliottWaveState::new();
+        for &(px, step) in &[(650_000_i64, 1_i64), (657_800, 2), (655_460, 3), (656_405, 4)] {
+            let _ = st_sh.observe_price_tick(btc, PriceTicks(px), step * 1_000_000_000, vol);
+        }
+        let mut obs_gp = st_gp.observables();
+        let mut obs_sh = st_sh.observables();
+        assert!(obs_gp.golden_pocket_resonance(Side::Bid) > 0.98);
+        assert!(obs_sh.golden_pocket_resonance(Side::Bid) < 0.10);
+        assert!(obs_gp.fib_proj_bps.raw() > obs_sh.fib_proj_bps.raw());
+
+        obs_gp.hurst = WaveObservables::encode_hurst(0.62);
+        obs_sh.hurst = WaveObservables::encode_hurst(0.62);
+        let m_gp = CausalElliottWaveState::evaluate_wave_entry_modulation(obs_gp, Side::Bid, 0.50);
+        let m_sh = CausalElliottWaveState::evaluate_wave_entry_modulation(obs_sh, Side::Bid, 0.50);
+        assert!(m_gp.is_ok_and(|g| {
+            m_sh.is_ok_and(|s| {
+                g.def_horizon_permille_mult == 1_250
+                    && s.def_horizon_permille_mult == 1_180
+                    && g.snr_threshold_delta < s.snr_threshold_delta
+                    && g.tranche1_permille_delta <= -85
+            })
+        }));
     }
 }

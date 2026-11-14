@@ -262,8 +262,14 @@ pub fn compute_wave_dynamic_t1_permille(
     let h_excess = ((hurst - 0.52) / 0.20).max(0.0);
 
     let delta = if matches!(w_obs.regime, WaveRegime::ImpulseWave3) && signed_phase > 0.15 {
-        let conv = (0.55 + 0.30 * h_excess + 0.25 * squeeze_fuel).min(1.0);
-        -(PHI_CONJ_DELTA_PM * conv).round() as i64
+        let gp_res = w_obs.golden_pocket_resonance(side);
+        let conv = (0.50 + 0.28 * h_excess + 0.22 * squeeze_fuel + 0.18 * gp_res).min(1.0);
+        let gp_runner_boost = if gp_res >= 0.85 {
+            (32.0 * gp_res * gp_res).round() as i64
+        } else {
+            0
+        };
+        -((PHI_CONJ_DELTA_PM * conv).round() as i64) - gp_runner_boost
     } else if matches!(w_obs.regime, WaveRegime::ImpulseWave5) && signed_phase > 0.15 {
         (PHI_CONJ_DELTA_PM * (0.75 - 0.25 * squeeze_fuel)).round() as i64
     } else if matches!(
