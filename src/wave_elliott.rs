@@ -914,4 +914,32 @@ mod tests {
             assert!((0.25..=0.85).contains(&st.observables().hurst_exponent()));
         }
     }
+
+    #[test]
+    fn test_bybit_all_liquidation_uppercase_s_vs_lowercase_symbol_key() {
+        let avax = APPROVED_SPECS[3];
+        let mut st_short = CausalElliottWaveState::new();
+        let _ = st_short.observe_price_tick(avax, PriceTicks(8_200), 1_000_000_000, ScaledBps(5_000));
+        let short_liq = serde_json::json!({
+            "T": 1_700_000_002_000_i64,
+            "s": "AVAXUSDT",
+            "S": "Sell",
+            "v": "250.0",
+            "p": "8.210"
+        });
+        let obs_short = st_short.observe_bybit_liquidation_json(avax, &short_liq, 2_000_000_000);
+        assert!(obs_short.is_some_and(|o| o.liq_imbalance.get() > 0.50));
+
+        let mut st_long = CausalElliottWaveState::new();
+        let _ = st_long.observe_price_tick(avax, PriceTicks(8_200), 1_000_000_000, ScaledBps(5_000));
+        let long_liq = serde_json::json!({
+            "T": 1_700_000_002_000_i64,
+            "s": "AVAXUSDT",
+            "S": "Buy",
+            "v": "250.0",
+            "p": "8.190"
+        });
+        let obs_long = st_long.observe_bybit_liquidation_json(avax, &long_liq, 2_000_000_000);
+        assert!(obs_long.is_some_and(|o| o.liq_imbalance.get() < -0.50));
+    }
 }

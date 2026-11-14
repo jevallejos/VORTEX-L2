@@ -240,7 +240,7 @@ EOF
 # 4. VORTEX-TAP & VORTEX-EXEC Systemd Services
 sudo tee /etc/systemd/system/vortex-tap.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L3 Bybit UTA V5 12-Pair L2 + Trade + Ticker Seqlock Daemon (SHM v13)
+Description=VORTEX-OMEGA V4.1 Bybit UTA V5 12-Pair L2 + Liquidation Seqlock Daemon (SHM v13)
 After=network-online.target
 Wants=network-online.target
 
@@ -262,7 +262,7 @@ EOF
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L3 200Hz Autonomous 12-Slot Execution Daemon (Async TLS/WS + LVDBS)
+Description=VORTEX-OMEGA V4.1 200Hz Autonomous 12-Slot Execution Daemon (SHM v13)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -296,7 +296,7 @@ case "${1:-live}" in
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --live
         echo "=== [2. BYBIT V5 LIVE ORDERS & QUEUE TELEMETRY] ==="
         journalctl -u vortex-exec.service -n 35 --no-pager \
-            | grep -E "VORTEX-L3|BYBIT V5|FILL|CLOSE|ADOPT|REHYDRATE|DRAIN" || true
+            | grep -E "VORTEX-OMEGA|VORTEX-L3|BYBIT V5|FILL|CLOSE|ADOPT|REHYDRATE|DRAIN" || true
         echo "=== [3. CLOSED TRADES LEDGER & EXECUTIVE DASHBOARD] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --trades
         echo "=== [4. WALK-FORWARD PAR1 REPLAY & A/B/A+B ECONOMIC LAB] ==="

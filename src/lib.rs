@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA Institutional Low-Latency Execution Core (18-Module Clean-Room Architecture).
+//! VORTEX-OMEGA Institutional Low-Latency Execution Core (19-Module Clean-Room Architecture).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;

@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use crate::execution_fsm::{
-    check_queue_depletion_velocity_abort, ClosedTradeKind, ExitOrderRole, OnlineAdaptiveGovernor,
+    check_queue_depletion_velocity_abort, is_chandelier_profit_locked_sl, passes_elliott_macro_coherence_guard, passes_stoikov_repeg_coherence_guard, ClosedTradeKind, ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor,
     OrderLifecycleState, SlotExecutionEngine,
 };
 use crate::fifo_sim::{
@@ -254,7 +254,10 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 && elapsed_ns >= 2_200_000_000
                                 && q_eroded
                                 && (btc_q_snr < -0.02 || flow_imp < 0.38);
+                            let macro_contradiction = elapsed_ns >= 500_000_000
+                                && !passes_elliott_macro_coherence_guard(side, &cur_snap);
                             let dq_abort = headwind_erosion
+                                || macro_contradiction
                                 || (elapsed_ns >= 25_000_000
                                     && at_l1
                                     && check_queue_depletion_velocity_abort(
@@ -270,6 +273,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             } else if !at_l1
                                 && elapsed_ns >= 2_500_000_000
                                 && total_chase_ns + 2_500_000_000 < max_chase_ns
+                                && passes_stoikov_repeg_coherence_guard(s_idx, side, &cur_snap, &btc_snap)
+                                && passes_elliott_macro_coherence_guard(side, &cur_snap)
                                 && cur_snap.ts_local_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
                             {
                                 let new_l1 = side.select_entry_bbo_price(cur_snap.bids[0].price, cur_snap.asks[0].price);
@@ -301,6 +306,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     sl_trigger_price, ..
                 } => {
                     engines[s_idx].sync_governor_dynamics(&gov);
+                    engines[s_idx].observe_open_flow_kinematics(&cur_snap);
+                    let _ = engines[s_idx].observe_wald_sprt_step(&cur_snap, &btc_snap);
                     let ref_px = if cur_snap.last_trade_price.0 > 0 {
                         cur_snap.last_trade_price
                     } else {
@@ -332,15 +339,26 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     engines[s_idx].last_closed_mae_bps =
                         ((worst_adverse_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_d;
 
+                    if engines[s_idx].last_eff_sl_ticks.0 <= 0 {
+                        engines[s_idx].last_eff_sl_ticks = sl_trigger_price;
+                    }
+                    let eff_sl_px = engines[s_idx].last_eff_sl_ticks;
                     let sl_hit = match side {
-                        Side::Bid => cur_snap.mark_price.0 > 0 && cur_snap.mark_price.0 <= sl_trigger_price.0,
-                        Side::Ask => cur_snap.mark_price.0 > 0 && cur_snap.mark_price.0 >= sl_trigger_price.0,
+                        Side::Bid => cur_snap.mark_price.0 > 0 && cur_snap.mark_price.0 <= eff_sl_px.0,
+                        Side::Ask => cur_snap.mark_price.0 > 0 && cur_snap.mark_price.0 >= eff_sl_px.0,
                     };
                     let mut closed_opt = None;
                     if sl_hit {
+                        let is_chand = engines[s_idx].chandelier_profit_sl_armed
+                            || is_chandelier_profit_locked_sl(side, avg_price_ticks, eff_sl_px);
+                        engines[s_idx].last_exit_sub_reason = if is_chand {
+                            ExitSubReason::ChandelierProfitLockSl
+                        } else {
+                            ExitSubReason::WaldBaseStopLoss
+                        };
                         let sl_slip_px = match side {
-                            Side::Bid => PriceTicks((sl_trigger_price.0 - 1).max(1)),
-                            Side::Ask => PriceTicks(sl_trigger_price.0.saturating_add(1)),
+                            Side::Bid => PriceTicks((eff_sl_px.0 - 1).max(1)),
+                            Side::Ask => PriceTicks(eff_sl_px.0.saturating_add(1)),
                         };
                         exit_fifo[s_idx].reset();
                         closed_opt = engines[s_idx].finalize_open_position_close(
@@ -370,7 +388,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                         rep.cum_net_bps_x100 = rep.cum_net_bps_x100.saturating_add(net_r);
                         gov.observe_closed_trade_at_entry(
                             s_idx, summary.side, summary.entry_price, summary.net_scaled_bps,
-                            summary.is_maker_exit, cur_snap.ts_local_ns,
+                            summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100, cur_snap.ts_local_ns,
                         );
                         if verbose {
                             let net_f = (net_r as f64) / 100.0;
@@ -390,6 +408,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     }
                     if let Some(quote) = engines[s_idx].compute_canonical_exit_quote(&cur_snap) {
                         engines[s_idx].latch_defensive_floor_if_needed(quote.defensive_lock_active);
+                        let _ = engines[s_idx].maybe_ratchet_chandelier_or_wald_sl(&cur_snap, &btc_snap);
                         let (rest_tp, rest_q) = exit_fifo[s_idx].resting_price_and_qty();
                         let tp_diff = (quote.target_price.0 - rest_tp.0).abs();
                         let moving_closer = match side {
@@ -517,7 +536,7 @@ pub mod omega_twin {
     use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
     use crate::exec_daemon::compute_exit_sync_schedule;
     use crate::execution_fsm::{
-        is_chandelier_profit_locked_sl, passes_stoikov_repeg_coherence_guard, ClosedTradeKind,
+        is_chandelier_profit_locked_sl, passes_elliott_macro_coherence_guard, passes_stoikov_repeg_coherence_guard, ClosedTradeKind,
         ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState,
         SlotExecutionEngine,
     };
@@ -767,7 +786,9 @@ pub mod omega_twin {
                             &btc_snap,
                         );
                         let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
-                        if elapsed_ns >= 25_000_000 && q_verdict.abort_now {
+                        let macro_contradiction = elapsed_ns >= 500_000_000
+                            && !passes_elliott_macro_coherence_guard(side, &ev.snap);
+                        if (elapsed_ns >= 25_000_000 && q_verdict.abort_now) || macro_contradiction {
                             self.entry_fifo[s_idx].cancel();
                             self.gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
                             self.engines[s_idx].state = OrderLifecycleState::Idle;
@@ -780,6 +801,7 @@ pub mod omega_twin {
                         };
                         if !at_l1
                             && elapsed_ns >= 2_500_000_000
+                            && passes_elliott_macro_coherence_guard(side, &ev.snap)
                             && passes_stoikov_repeg_coherence_guard(
                                 s_idx, side, &ev.snap, &btc_snap,
                             )

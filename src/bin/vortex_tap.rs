@@ -306,18 +306,31 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
                     let spec = APPROVED_SPECS[slot_idx];
                     let snap = &mut active_snaps[slot_idx];
                     if let Some(data_v) = val.get("data") {
-                        let items: Vec<&serde_json::Value> = if let Some(arr) = data_v.as_array() {
-                            arr.iter().collect()
-                        } else {
-                            vec![data_v]
-                        };
-                        for liq in items {
-                            let s_str = liq.get("s").or_else(|| liq.get("side")).and_then(|v| v.as_str()).unwrap_or("Buy");
-                            let q_str = liq.get("v").or_else(|| liq.get("size")).and_then(|v| v.as_str()).unwrap_or("0");
-                            let l_side = if s_str == "Sell" { Side::Ask } else { Side::Bid };
-                            let l_qty = spec.parse_lot_qty(q_str);
-                            let w_obs = wave_states[slot_idx].observe_liquidation_print(spec, l_side, l_qty, local_ns.0);
+                        let mut updated = false;
+                        if let Some(arr) = data_v.as_array() {
+                            for liq in arr {
+                                if let Some(w_obs) = wave_states[slot_idx]
+                                    .observe_bybit_liquidation_json(spec, liq, local_ns.0)
+                                {
+                                    snap.set_wave_observables(w_obs);
+                                    updated = true;
+                                }
+                            }
+                        } else if let Some(w_obs) = wave_states[slot_idx]
+                            .observe_bybit_liquidation_json(spec, data_v, local_ns.0)
+                        {
                             snap.set_wave_observables(w_obs);
+                            updated = true;
+                        }
+                        if updated
+                            && has_book_snapshot[slot_idx]
+                            && snap.bbo_and_spread_ticks().is_some()
+                        {
+                            snap.ts_exchange_ns = exch_ns;
+                            snap.ts_local_ns = local_ns;
+                            if let Ok(slot_ref) = arena.slot(slot_idx) {
+                                slot_ref.write_snapshot(snap);
+                            }
                         }
                     }
                 } else if let Some(sym_name) = topic.strip_prefix("tickers.") {

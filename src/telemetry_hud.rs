@@ -553,8 +553,6 @@ pub fn dispatch_closed_trade_logs(
     let scar_line = gov.to_scar_snapshot_json(ts_ns).to_string();
     let is_red_loss = net_bps < -0.50;
     if is_red_loss {
-        let _ = fs::create_dir_all("data/vault");
-        let _ = fs::write(HALT_LOCK_PATH, &vault_line);
         *halt_locked = true;
     }
     let task = VaultPersistTask::AppendClosedTrade {
