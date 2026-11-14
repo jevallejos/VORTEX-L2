@@ -502,6 +502,866 @@ pub fn run_replay_cli_gate() -> ExitCode {
     }
 }
 
+// === VORTEX-OMEGA CHAT 6 REPLAY PROD ===
+pub mod omega_twin {
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::manual_clamp,
+        clippy::needless_range_loop,
+        clippy::similar_names,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
+
+    use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
+    use crate::exec_daemon::compute_exit_sync_schedule;
+    use crate::execution_fsm::{
+        is_chandelier_profit_locked_sl, passes_stoikov_repeg_coherence_guard, ClosedTradeKind,
+        ExitOrderRole, ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState,
+        SlotExecutionEngine,
+    };
+    use crate::fifo_sim::{
+        run_200k_fifo_benchmark, run_quadruple_omega_ablation_suite, OmegaConservativeFifoOrder,
+        OmegaFifoLifecycle,
+    };
+    use crate::forensic_parquet::{ColumnarMarketRow, MarketEventKind, ParitySyncLedger};
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
+    use crate::telemetry_hud::DEFAULT_WALLET_EQUITY_1E8;
+    use crate::types::{
+        print_auto_aligned_box, BoundedScore, LotQty, PortfolioBetaGuard, PriceTicks, ScaledBps,
+        Side, TimestampNs, ANSI_GREEN, ANSI_RESET, ANSI_SKY_BLUE, ANSI_YELLOW, APPROVED_SPECS,
+    };
+    use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+    #[derive(Copy, Clone, Debug)]
+    pub struct TwinReplayEvent {
+        pub slot_idx: usize,
+        pub kind: MarketEventKind,
+        pub aggressor_side: Side,
+        pub trade_price: PriceTicks,
+        pub trade_lots: LotQty,
+        pub snap: SymbolLobSnapshot,
+    }
+
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct OmegaTwinWalkForwardReport {
+        pub par1_rows_verified: u64,
+        pub closed_trades: u64,
+        pub maker_closes: u64,
+        pub chandelier_closes: u64,
+        pub shadow_crest_snaps: u64,
+        pub fibonacci_surfs: u64,
+        pub hawkes_queue_aborts: u64,
+        pub post_only_rejects: u64,
+        pub cum_net_bps_x100: i64,
+        pub cum_net_pnl_1e8: i64,
+        pub parity_sync_drift_1e8: i64,
+    }
+
+    /// 1:1 Digital Twin Walk-Forward Engine matching `step_12_slot_daemon_tick` with 25ms RTT FIFO.
+    #[derive(Debug)]
+    pub struct OmegaDigitalTwinEngine {
+        pub engines: [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+        pub gov: OnlineAdaptiveGovernor,
+        pub ledger: ParitySyncLedger,
+        pub entry_fifo: [OmegaConservativeFifoOrder; MAX_ACTIVE_PAIRS],
+        pub exit_fifo: [OmegaConservativeFifoOrder; MAX_ACTIVE_PAIRS],
+        pub cached_snaps: [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+        pub report: OmegaTwinWalkForwardReport,
+        sum_trade_pnl_1e8: i64,
+    }
+
+    impl Default for OmegaDigitalTwinEngine {
+        #[inline]
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl OmegaDigitalTwinEngine {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                engines: SlotExecutionEngine::new_12_slot_array(),
+                gov: OnlineAdaptiveGovernor::new(),
+                ledger: ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8),
+                entry_fifo: [OmegaConservativeFifoOrder::new(); MAX_ACTIVE_PAIRS],
+                exit_fifo: [OmegaConservativeFifoOrder::new(); MAX_ACTIVE_PAIRS],
+                cached_snaps: [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS],
+                report: OmegaTwinWalkForwardReport::default(),
+                sum_trade_pnl_1e8: 0,
+            }
+        }
+
+        pub fn ingest_event(&mut self, ev: &TwinReplayEvent) {
+            let s_idx = ev.slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+            let _par1_row = ColumnarMarketRow::from_lob_snapshot(
+                &ev.snap,
+                ev.kind,
+                ev.aggressor_side,
+                ev.trade_price,
+                ev.trade_lots,
+            );
+            self.report.par1_rows_verified = self.report.par1_rows_verified.saturating_add(1);
+
+            self.cached_snaps[s_idx] = ev.snap;
+            self.gov.observe_market_price(s_idx, &ev.snap);
+            let btc_snap = if self.cached_snaps[0].bids[0].price.0 > 0 {
+                self.cached_snaps[0]
+            } else {
+                ev.snap
+            };
+            let now_ns = ev.snap.ts_local_ns;
+            let spec = APPROVED_SPECS[s_idx];
+
+            // 1. Advance 25ms RTT FIFO queues on L2 update or Trade print
+            let mut entry_fill_opt = None;
+            let mut exit_fill_opt = None;
+            let mut opp_tape_lots = LotQty(0);
+
+            match ev.kind {
+                MarketEventKind::L2BookSnapshot => {
+                    self.entry_fifo[s_idx].on_lob_snapshot(&ev.snap);
+                    self.exit_fifo[s_idx].on_lob_snapshot(&ev.snap);
+                }
+                MarketEventKind::PublicTradePrint => {
+                    if let OmegaFifoLifecycle::RestingInFifoQueue { side, limit_price, .. } =
+                        self.entry_fifo[s_idx].state
+                    {
+                        let hits = match side {
+                            Side::Bid => ev.aggressor_side == Side::Ask && ev.trade_price.0 <= limit_price.0,
+                            Side::Ask => ev.aggressor_side == Side::Bid && ev.trade_price.0 >= limit_price.0,
+                        };
+                        if hits {
+                            opp_tape_lots = ev.trade_lots;
+                        }
+                    }
+                    entry_fill_opt = self.entry_fifo[s_idx].on_trade_print(
+                        ev.aggressor_side,
+                        ev.trade_price,
+                        ev.trade_lots,
+                        now_ns.0,
+                    );
+                    exit_fill_opt = self.exit_fifo[s_idx].on_trade_print(
+                        ev.aggressor_side,
+                        ev.trade_price,
+                        ev.trade_lots,
+                        now_ns.0,
+                    );
+                }
+            }
+
+            // 2. Step per-slot FSM under exact 1:1 production rules
+            match self.engines[s_idx].state {
+                OrderLifecycleState::Idle => {
+                    let mut beta_guard = PortfolioBetaGuard::new();
+                    for eng in &self.engines {
+                        if let Some(act_s) = eng.active_side() {
+                            beta_guard.observe_active_side(act_s);
+                        }
+                    }
+                    let probe_side = if OrthogonalFactorState::snr_composite_score(&ev.snap) >= 0.0 {
+                        Side::Bid
+                    } else {
+                        Side::Ask
+                    };
+                    let (probe_edge, _, _) = self.gov.slot_direction_diagnostics(s_idx, probe_side);
+                    let verdict = OrthogonalFactorState::evaluate_entry_signal_elastic(
+                        spec,
+                        &ev.snap,
+                        &btc_snap,
+                        ScaledBps(self.engines[s_idx].learned_mfe_bps),
+                        ScaledBps(probe_edge),
+                    );
+                    if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
+                        let eq_1e8 = self.ledger.current_equity_1e8();
+                        if beta_guard.can_admit_side(side)
+                            && self.gov.authorizes_adaptive_entry_with_wallet(
+                                s_idx, side, eq_1e8, &ev.snap, &btc_snap,
+                            )
+                        {
+                            let lots = self.gov.compute_slot_entry_lots(s_idx, side, eq_1e8, &ev.snap);
+                            self.engines[s_idx].sync_governor_for_side(&self.gov, side);
+                            let _ = self.engines[s_idx].try_arm_maker_entry(&ev.snap, verdict, lots);
+                        }
+                    }
+                }
+                OrderLifecycleState::PlacingEntryMaker { side, qty, submitted_ts, .. } => {
+                    self.engines[s_idx].sync_governor_dynamics(&self.gov);
+                    let wait_ns =
+                        self.engines[s_idx].elastic_preflight_window_ns(ev.snap.realized_vol_5m);
+                    if now_ns.0.saturating_sub(submitted_ts.0) >= wait_ns {
+                        let eq_1e8 = self.ledger.current_equity_1e8();
+                        if self
+                            .gov
+                            .confirm_preflight_kinematics_non_choking(
+                                s_idx, side, eq_1e8, &ev.snap, &btc_snap,
+                            )
+                            .is_ok()
+                        {
+                            if let Ok((synced_px, _)) =
+                                self.engines[s_idx].sync_preflight_l1_entry(&ev.snap, 8)
+                            {
+                                self.entry_fifo[s_idx]
+                                    .submit_post_only(side, synced_px, qty, now_ns.0);
+                                let _ = self.engines[s_idx].on_entry_order_resting(now_ns);
+                            } else {
+                                self.engines[s_idx].state = OrderLifecycleState::Idle;
+                            }
+                        } else {
+                            self.engines[s_idx].state = OrderLifecycleState::Idle;
+                        }
+                    }
+                }
+                OrderLifecycleState::RestingEntryQueue {
+                    side, entry_price, qty, resting_since_ts, ..
+                } => {
+                    if let Some((fill_px, fill_lots)) = entry_fill_opt {
+                        self.entry_fifo[s_idx].cancel();
+                        self.gov.clear_abort_streak(s_idx, side);
+                        self.engines[s_idx].sync_governor_for_side(&self.gov, side);
+                        let _ = self.engines[s_idx].on_maker_entry_filled_verified(
+                            now_ns,
+                            Some(side),
+                            Some(fill_px),
+                            Some(fill_lots),
+                        );
+                        if let Some(q0) = self.engines[s_idx].compute_canonical_exit_quote(&ev.snap)
+                        {
+                            self.exit_fifo[s_idx].submit_post_only(
+                                side.opposite(),
+                                q0.target_price,
+                                q0.order_lots,
+                                now_ns.0,
+                            );
+                            if let OrderLifecycleState::PositionOpenMakerExit {
+                                active_exit_role: ref mut ax_r,
+                                active_exit_price: ref mut ax_p,
+                                active_exit_lots: ref mut ax_l,
+                                resting_exit_price: ref mut rx_p,
+                                ..
+                            } = self.engines[s_idx].state
+                            {
+                                *ax_r = q0.role;
+                                *ax_p = q0.target_price;
+                                *ax_l = q0.order_lots;
+                                *rx_p = q0.target_price;
+                            }
+                        }
+                        return;
+                    }
+
+                    if let OmegaFifoLifecycle::RestingInFifoQueue {
+                        init_queue_ahead,
+                        queue_ahead_lots,
+                        ..
+                    } = self.entry_fifo[s_idx].state
+                    {
+                        let q_verdict = self.engines[s_idx].evaluate_resting_queue_shield(
+                            side,
+                            init_queue_ahead,
+                            queue_ahead_lots,
+                            opp_tape_lots,
+                            &ev.snap,
+                            &btc_snap,
+                        );
+                        let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
+                        if elapsed_ns >= 25_000_000 && q_verdict.abort_now {
+                            self.entry_fifo[s_idx].cancel();
+                            self.gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
+                            self.engines[s_idx].state = OrderLifecycleState::Idle;
+                            self.report.hawkes_queue_aborts += 1;
+                            return;
+                        }
+                        let at_l1 = match side {
+                            Side::Bid => ev.snap.bids[0].price == entry_price,
+                            Side::Ask => ev.snap.asks[0].price == entry_price,
+                        };
+                        if !at_l1
+                            && elapsed_ns >= 2_500_000_000
+                            && passes_stoikov_repeg_coherence_guard(
+                                s_idx, side, &ev.snap, &btc_snap,
+                            )
+                        {
+                            let new_l1 = side.select_entry_bbo_price(
+                                ev.snap.bids[0].price,
+                                ev.snap.asks[0].price,
+                            );
+                            if let Ok(repeg_sl) =
+                                self.engines[s_idx].compute_repeg_sl_trigger(&ev.snap, new_l1)
+                            {
+                                self.engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);
+                                self.entry_fifo[s_idx]
+                                    .submit_post_only(side, new_l1, qty, now_ns.0);
+                            }
+                        }
+                    }
+                }
+                OrderLifecycleState::PositionOpenMakerExit {
+                    side,
+                    avg_price_ticks,
+                    mut peak_favorable_price,
+                    mut worst_adverse_price,
+                    resting_exit_price,
+                    sl_trigger_price,
+                    ..
+                } => {
+                    self.engines[s_idx].sync_governor_dynamics(&self.gov);
+                    self.engines[s_idx].observe_open_flow_kinematics(&ev.snap);
+                    let _ = self.engines[s_idx].observe_wald_sprt_step(&ev.snap, &btc_snap);
+
+                    let ref_px = if ev.snap.last_trade_price.0 > 0 {
+                        ev.snap.last_trade_price
+                    } else {
+                        ev.snap.mark_price
+                    };
+                    match side {
+                        Side::Bid => {
+                            if ref_px.0 > peak_favorable_price.0 {
+                                peak_favorable_price = ref_px;
+                            }
+                            if ref_px.0 > 0 && ref_px.0 < worst_adverse_price.0 {
+                                worst_adverse_price = ref_px;
+                            }
+                        }
+                        Side::Ask => {
+                            if ref_px.0 > 0 && ref_px.0 < peak_favorable_price.0 {
+                                peak_favorable_price = ref_px;
+                            }
+                            if ref_px.0 > worst_adverse_price.0 {
+                                worst_adverse_price = ref_px;
+                            }
+                        }
+                    }
+                    if let OrderLifecycleState::PositionOpenMakerExit {
+                        peak_favorable_price: ref mut pk,
+                        worst_adverse_price: ref mut wr,
+                        ..
+                    } = self.engines[s_idx].state
+                    {
+                        *pk = peak_favorable_price;
+                        *wr = worst_adverse_price;
+                    }
+                    let d_sign = side.sign_i64();
+                    let denom = avg_price_ticks.0.max(1);
+                    self.engines[s_idx].last_closed_mfe_bps = ((peak_favorable_price.0
+                        - avg_price_ticks.0)
+                        * d_sign)
+                        .saturating_mul(1_000_000)
+                        / denom;
+                    self.engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0
+                        - avg_price_ticks.0)
+                        * d_sign)
+                        .saturating_mul(1_000_000)
+                        / denom;
+                    self.engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
+                    self.engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
+
+                    if self.engines[s_idx].last_eff_sl_ticks.0 <= 0 {
+                        self.engines[s_idx].last_eff_sl_ticks = sl_trigger_price;
+                    }
+                    let eff_sl = self.engines[s_idx].last_eff_sl_ticks;
+                    let sl_crossed = match side {
+                        Side::Bid => ev.snap.mark_price.0 > 0 && ev.snap.mark_price.0 <= eff_sl.0,
+                        Side::Ask => ev.snap.mark_price.0 > 0 && ev.snap.mark_price.0 >= eff_sl.0,
+                    };
+                    if sl_crossed {
+                        self.exit_fifo[s_idx].cancel();
+                        let is_chand = self.engines[s_idx].chandelier_profit_sl_armed
+                            || is_chandelier_profit_locked_sl(side, avg_price_ticks, eff_sl);
+                        self.engines[s_idx].last_exit_sub_reason = if is_chand {
+                            self.report.chandelier_closes += 1;
+                            ExitSubReason::ChandelierProfitLockSl
+                        } else {
+                            ExitSubReason::WaldBaseStopLoss
+                        };
+                        if let Some(summary) = self.engines[s_idx].finalize_open_position_close(
+                            ClosedTradeKind::ServerMarkPriceStopLoss,
+                            eff_sl,
+                            now_ns,
+                            &mut self.ledger,
+                        ) {
+                            let non_pun = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
+                            self.gov.observe_closed_trade_at_entry(
+                                s_idx,
+                                summary.side,
+                                summary.entry_price,
+                                summary.net_scaled_bps,
+                                non_pun,
+                                now_ns,
+                            );
+                            self.record_summary(&summary);
+                        }
+                        return;
+                    }
+
+                    if let Some((fill_px, _)) = exit_fill_opt {
+                        self.exit_fifo[s_idx].cancel();
+                        let cur_role = match self.engines[s_idx].state {
+                            OrderLifecycleState::PositionOpenMakerExit { active_exit_role, .. } => {
+                                active_exit_role
+                            }
+                            _ => ExitOrderRole::StandardMakerExit100,
+                        };
+                        if matches!(cur_role, ExitOrderRole::Tranche1Harvest50)
+                            && self.engines[s_idx].record_tranche1_harvest(fill_px)
+                        {
+                            if let Some(q2) =
+                                self.engines[s_idx].compute_canonical_exit_quote(&ev.snap)
+                            {
+                                self.exit_fifo[s_idx].submit_post_only(
+                                    side.opposite(),
+                                    q2.target_price,
+                                    q2.order_lots,
+                                    now_ns.0,
+                                );
+                                if let OrderLifecycleState::PositionOpenMakerExit {
+                                    active_exit_role: ref mut ax_r,
+                                    active_exit_price: ref mut ax_p,
+                                    active_exit_lots: ref mut ax_l,
+                                    resting_exit_price: ref mut rx_p,
+                                    ..
+                                } = self.engines[s_idx].state
+                                {
+                                    *ax_r = q2.role;
+                                    *ax_p = q2.target_price;
+                                    *ax_l = q2.order_lots;
+                                    *rx_p = q2.target_price;
+                                }
+                                self.engines[s_idx].next_peg_allowed_ts_ns =
+                                    now_ns.0 + 1_350_000_000;
+                            }
+                            return;
+                        }
+
+                        if matches!(
+                            self.engines[s_idx].last_exit_sub_reason,
+                            ExitSubReason::ShadowRunnerCrestHarvest
+                        ) {
+                            self.report.shadow_crest_snaps += 1;
+                        } else if matches!(
+                            self.engines[s_idx].last_exit_sub_reason,
+                            ExitSubReason::FibonacciImpulseSurf
+                        ) {
+                            self.report.fibonacci_surfs += 1;
+                        }
+                        if let Some(summary) = self.engines[s_idx].finalize_open_position_close(
+                            ClosedTradeKind::MakerPassiveUnwind,
+                            fill_px,
+                            now_ns,
+                            &mut self.ledger,
+                        ) {
+                            self.gov.observe_closed_trade_at_entry(
+                                s_idx,
+                                summary.side,
+                                summary.entry_price,
+                                summary.net_scaled_bps,
+                                true,
+                                now_ns,
+                            );
+                            self.record_summary(&summary);
+                        }
+                        return;
+                    }
+
+                    let Some(quote) = self.engines[s_idx].compute_canonical_exit_quote(&ev.snap)
+                    else {
+                        return;
+                    };
+                    self.engines[s_idx].last_closed_wald_pct =
+                        self.engines[s_idx].last_closed_wald_pct.max(quote.wald_pct);
+                    self.engines[s_idx].latch_defensive_floor_if_needed(quote.defensive_lock_active);
+                    let _ =
+                        self.engines[s_idx].maybe_ratchet_chandelier_or_wald_sl(&ev.snap, &btc_snap);
+                    self.engines[s_idx].last_exit_sub_reason = quote.sub_reason;
+
+                    let (preempt, delay_ns) =
+                        compute_exit_sync_schedule(&quote, resting_exit_price, avg_price_ticks);
+                    let need_repeg = resting_exit_price != quote.target_price
+                        && (preempt || now_ns.0 >= self.engines[s_idx].next_peg_allowed_ts_ns);
+                    if need_repeg {
+                        self.exit_fifo[s_idx].submit_post_only(
+                            side.opposite(),
+                            quote.target_price,
+                            quote.order_lots,
+                            now_ns.0,
+                        );
+                        self.engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + delay_ns;
+                        if let OrderLifecycleState::PositionOpenMakerExit {
+                            active_exit_role: ref mut ax_r,
+                            active_exit_price: ref mut ax_p,
+                            active_exit_lots: ref mut ax_l,
+                            resting_exit_price: ref mut rx_p,
+                            ..
+                        } = self.engines[s_idx].state
+                        {
+                            *ax_r = quote.role;
+                            *ax_p = quote.target_price;
+                            *ax_l = quote.order_lots;
+                            *rx_p = quote.target_price;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn record_summary(&mut self, s: &crate::execution_fsm::ClosedTradeSummary) {
+            self.report.closed_trades += 1;
+            if s.is_maker_exit {
+                self.report.maker_closes += 1;
+            }
+            self.report.cum_net_bps_x100 += s.net_scaled_bps.raw();
+            self.report.cum_net_pnl_1e8 += s.net_pnl_1e8;
+            self.sum_trade_pnl_1e8 += s.net_pnl_1e8;
+            self.report.parity_sync_drift_1e8 =
+                (self.ledger.cumulative_net_pnl_1e8 - self.sum_trade_pnl_1e8).abs();
+        }
+
+        #[must_use]
+        pub fn finalize_report(&mut self) -> OmegaTwinWalkForwardReport {
+            let mut rej = 0_u64;
+            for s in 0..MAX_ACTIVE_PAIRS {
+                rej += self.entry_fifo[s].post_only_rejects + self.exit_fifo[s].post_only_rejects;
+            }
+            self.report.post_only_rejects = rej;
+            self.report.parity_sync_drift_1e8 =
+                (self.ledger.cumulative_net_pnl_1e8 - self.sum_trade_pnl_1e8).abs();
+            self.report
+        }
+    }
+
+    fn base_snap(slot_idx: usize, px: i64, b_q: i64, a_q: i64, ts_ns: i64) -> SymbolLobSnapshot {
+        let mut s = SymbolLobSnapshot::new_empty();
+        s.symbol_id = APPROVED_SPECS[slot_idx].symbol_id;
+        s.is_eligible = true;
+        s.sequence_id = (ts_ns.unsigned_abs() / 1_000_000) + 1;
+        s.ts_exchange_ns = TimestampNs(ts_ns);
+        s.ts_local_ns = TimestampNs(ts_ns);
+        s.realized_vol_5m = ScaledBps(6_500);
+        s.bids[0] = BookLevel { price: PriceTicks(px), qty: LotQty(b_q) };
+        s.asks[0] = BookLevel { price: PriceTicks(px + 1), qty: LotQty(a_q) };
+        s.refresh_deep_l1_l5_totals();
+        s.mark_price = PriceTicks(px);
+        s.last_trade_price = PriceTicks(px);
+        s.factor_ofi = BoundedScore::new_clamped(0.76);
+        s.factor_tfi = BoundedScore::new_clamped(0.80);
+        s.factor_geom = BoundedScore::new_clamped(0.48);
+        s
+    }
+
+    /// Runs 4-episode 25ms-FIFO 1:1 Digital Twin Lab (Wave3+Fib, Hawkes Abort, BTC Shadow-Runner, Chandelier).
+    #[must_use]
+    pub fn run_omega_digital_twin_walk_forward_lab() -> OmegaTwinWalkForwardReport {
+        let mut twin = OmegaDigitalTwinEngine::new();
+        // Anchor BTC leader at 14:30 UTC institutional liquidity peak
+        let t0 = 1_700_058_600_000_000_000_i64;
+        let btc_base = base_snap(0, 759_000, 450, 320, t0);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 0,
+            kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid,
+            trade_price: PriceTicks(759_000),
+            trade_lots: LotQty(1),
+            snap: btc_base,
+        });
+
+        // Episode 1 (Slot 3 AVAXUSDT): 25ms preflight -> FIFO fill -> Wave3 ~38% T1 -> Fib +36 bps T2
+        let mut avax = base_snap(3, 8_200, 120, 180, t0 + 10_000_000);
+        avax.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.66),
+            macro_phase: BoundedScore::new_clamped(0.85),
+            oi_impulse: BoundedScore::new_clamped(0.45),
+            liq_imbalance: BoundedScore::new_clamped(0.60),
+            fib_proj_bps: ScaledBps(3_000),
+        });
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_200), trade_lots: LotQty(1), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 45_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_200), trade_lots: LotQty(1), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 80_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_200), trade_lots: LotQty(1), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 110_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::PublicTradePrint,
+            aggressor_side: Side::Ask, trade_price: PriceTicks(8_200), trade_lots: LotQty(150), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 160_000_000);
+        avax.bids[0] = BookLevel { price: PriceTicks(8_204), qty: LotQty(380) };
+        avax.asks[0] = BookLevel { price: PriceTicks(8_205), qty: LotQty(80) };
+        avax.mark_price = PriceTicks(8_205);
+        avax.last_trade_price = PriceTicks(8_205);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_205), trade_lots: LotQty(1), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 200_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::PublicTradePrint,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_205), trade_lots: LotQty(120), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 1_200_000_000);
+        avax.bids[0] = BookLevel { price: PriceTicks(8_229), qty: LotQty(390) };
+        avax.asks[0] = BookLevel { price: PriceTicks(8_230), qty: LotQty(70) };
+        avax.mark_price = PriceTicks(8_230);
+        avax.last_trade_price = PriceTicks(8_230);
+        avax.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.66),
+            macro_phase: BoundedScore::new_clamped(0.88),
+            oi_impulse: BoundedScore::new_clamped(0.40),
+            liq_imbalance: BoundedScore::new_clamped(0.55),
+            fib_proj_bps: ScaledBps(4),
+        });
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_230), trade_lots: LotQty(1), snap: avax,
+        });
+        avax.ts_local_ns = TimestampNs(t0 + 1_260_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 3, kind: MarketEventKind::PublicTradePrint,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_230), trade_lots: LotQty(110), snap: avax,
+        });
+
+        // Episode 2 (Slot 9 LINKUSDT): Hidden Toxic L1 Sweep aborted by Hawkes + Stoikov BEFORE fill
+        let t2 = t0 + 10_000_000_000;
+        let mut link = base_snap(9, 10_720, 500, 320, t2);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 9, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(10_720), trade_lots: LotQty(1), snap: link,
+        });
+        link.ts_local_ns = TimestampNs(t2 + 35_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 9, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(10_720), trade_lots: LotQty(1), snap: link,
+        });
+        link.ts_local_ns = TimestampNs(t2 + 70_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 9, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(10_720), trade_lots: LotQty(1), snap: link,
+        });
+        for k in 1..=5_i64 {
+            link.ts_local_ns = TimestampNs(t2 + 70_000_000 + k * 20_000_000);
+            link.bids[0] = BookLevel { price: PriceTicks(10_720), qty: LotQty(500 - k * 75) };
+            link.asks[0] = BookLevel { price: PriceTicks(10_721), qty: LotQty(410) };
+            link.deep_bid_lots_l1_l5 = LotQty(360);
+            link.deep_ask_lots_l1_l5 = LotQty(1_300);
+            link.factor_ofi = BoundedScore::new_clamped(0.14);
+            link.factor_tfi = BoundedScore::new_clamped(0.10);
+            twin.ingest_event(&TwinReplayEvent {
+                slot_idx: 9, kind: MarketEventKind::PublicTradePrint,
+                aggressor_side: Side::Ask, trade_price: PriceTicks(10_720), trade_lots: LotQty(75), snap: link,
+            });
+        }
+
+        // Episode 3 (Slot 1 ETHUSDT 1-Lot): Shadow-Runner Sentinel float + Crest Snap-In via 25ms FIFO
+        let t3 = t0 + 25_000_000_000;
+        let mut eth = base_snap(1, 223_700, 100, 180, t3);
+        eth.set_wave_observables(WaveObservables {
+            regime: WaveRegime::NeutralWarmup,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.60),
+            macro_phase: BoundedScore::ZERO,
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 1, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(223_700), trade_lots: LotQty(1), snap: eth,
+        });
+        eth.ts_local_ns = TimestampNs(t3 + 35_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 1, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(223_700), trade_lots: LotQty(1), snap: eth,
+        });
+        eth.ts_local_ns = TimestampNs(t3 + 70_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 1, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(223_700), trade_lots: LotQty(1), snap: eth,
+        });
+        eth.ts_local_ns = TimestampNs(t3 + 95_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 1, kind: MarketEventKind::PublicTradePrint,
+            aggressor_side: Side::Ask, trade_price: PriceTicks(223_700), trade_lots: LotQty(130), snap: eth,
+        });
+        for k in 1..=8_i64 {
+            let px = 223_850 + k * 115;
+            eth.ts_local_ns = TimestampNs(t3 + 95_000_000 + k * 50_000_000);
+            eth.bids[0] = BookLevel { price: PriceTicks(px - 1), qty: LotQty(360) };
+            eth.asks[0] = BookLevel { price: PriceTicks(px), qty: LotQty(180) };
+            eth.mark_price = PriceTicks(px);
+            eth.last_trade_price = PriceTicks(px);
+            eth.factor_ofi = BoundedScore::new_clamped(0.62 + 0.03 * (k as f64));
+            eth.factor_tfi = BoundedScore::new_clamped(0.66 + 0.03 * (k as f64));
+            twin.ingest_event(&TwinReplayEvent {
+                slot_idx: 1, kind: MarketEventKind::L2BookSnapshot,
+                aggressor_side: Side::Bid, trade_price: PriceTicks(px), trade_lots: LotQty(1), snap: eth,
+            });
+        }
+        // Crest deceleration at 224_770 (+47.8 bps): preempts peg to 224_770 -> rests -> fills
+        for m in 1..=3_i64 {
+            eth.ts_local_ns = TimestampNs(t3 + 500_000_000 + m * 50_000_000);
+            eth.bids[0] = BookLevel { price: PriceTicks(224_769), qty: LotQty(240) };
+            eth.asks[0] = BookLevel { price: PriceTicks(224_770), qty: LotQty(60) };
+            eth.mark_price = PriceTicks(224_770);
+            eth.last_trade_price = PriceTicks(224_770);
+            eth.factor_ofi = BoundedScore::new_clamped(0.04);
+            eth.factor_tfi = BoundedScore::new_clamped(0.03);
+            eth.factor_geom = BoundedScore::ZERO;
+            twin.ingest_event(&TwinReplayEvent {
+                slot_idx: 1, kind: MarketEventKind::L2BookSnapshot,
+                aggressor_side: Side::Bid, trade_price: PriceTicks(224_770), trade_lots: LotQty(1), snap: eth,
+            });
+        }
+        eth.ts_local_ns = TimestampNs(t3 + 700_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 1, kind: MarketEventKind::PublicTradePrint,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(224_770), trade_lots: LotQty(95), snap: eth,
+        });
+
+        // Episode 4 (Slot 5 SUIUSDT): Wave-5 +58 bps arms Chandelier SL -> Flash reversal banks green
+        let t4 = t0 + 40_000_000_000;
+        let mut sui = base_snap(5, 8_510, 110, 180, t4);
+        sui.realized_vol_5m = ScaledBps(5_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_510), trade_lots: LotQty(1), snap: sui,
+        });
+        sui.ts_local_ns = TimestampNs(t4 + 35_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_510), trade_lots: LotQty(1), snap: sui,
+        });
+        sui.ts_local_ns = TimestampNs(t4 + 70_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_510), trade_lots: LotQty(1), snap: sui,
+        });
+        sui.ts_local_ns = TimestampNs(t4 + 95_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::PublicTradePrint,
+            aggressor_side: Side::Ask, trade_price: PriceTicks(8_510), trade_lots: LotQty(140), snap: sui,
+        });
+        sui.ts_local_ns = TimestampNs(t4 + 130_000_000);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_510), trade_lots: LotQty(1), snap: sui,
+        });
+        sui.ts_local_ns = TimestampNs(t4 + 3_000_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_559), qty: LotQty(360) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_560), qty: LotQty(180) };
+        sui.mark_price = PriceTicks(8_560);
+        sui.last_trade_price = PriceTicks(8_560);
+        sui.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave5,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.60),
+            macro_phase: BoundedScore::new_clamped(0.70),
+            oi_impulse: BoundedScore::new_clamped(0.20),
+            liq_imbalance: BoundedScore::new_clamped(0.20),
+            fib_proj_bps: ScaledBps(2_600),
+        });
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(8_560), trade_lots: LotQty(1), snap: sui,
+        });
+        let chand_px = twin.engines[5].last_eff_sl_ticks;
+        sui.ts_local_ns = TimestampNs(t4 + 4_000_000_000);
+        sui.mark_price = PriceTicks(chand_px.0 - 1);
+        sui.last_trade_price = PriceTicks(chand_px.0 - 1);
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 5, kind: MarketEventKind::L2BookSnapshot,
+            aggressor_side: Side::Bid, trade_price: PriceTicks(chand_px.0 - 1), trade_lots: LotQty(1), snap: sui,
+        });
+
+        twin.finalize_report()
+    }
+
+    /// Executes and prints the institutional Gate 2 (`vortex_replay`) 4-Arm + Digital Twin report.
+    #[must_use]
+    pub fn run_and_print_omega_chat6_twin_certification() -> bool {
+        let (elapsed_us, fills, rejects) = run_200k_fifo_benchmark();
+        let ev_per_sec = (200_000_u128 * 1_000_000) / elapsed_us.max(1);
+        let ab = run_quadruple_omega_ablation_suite();
+        let twin = run_omega_digital_twin_walk_forward_lab();
+
+        let sec_title = vec![format!(
+            "{}[VORTEX-REPLAY OMEGA V4.0] 4-ARM PARETO ABLATION & 1:1 DIGITAL TWIN GATE{}",
+            ANSI_SKY_BLUE, ANSI_RESET
+        )];
+        let sec_fifo = vec![format!(
+            "  {}200k FIFO Queue Sim{}: {} ev/s | Passive Fills: {} | PostOnly Rejects: {}",
+            ANSI_GREEN, ANSI_RESET, ev_per_sec, fills, rejects
+        )];
+        let sec_arms = vec![
+            format!(
+                "  MODEL A   (Baseline Fixed L1)      : {:>+8.2} bps net",
+                (ab.arm_a_baseline_net_bps_x100 as f64) / 100.0
+            ),
+            format!(
+                "  MODEL B   (Elastic Multi-Tranche)  : {:>+8.2} bps net",
+                (ab.arm_b_multitranche_net_bps_x100 as f64) / 100.0
+            ),
+            format!(
+                "  MODEL A+B (VORTEX-L3 LVDBS Surf)   : {:>+8.2} bps net",
+                (ab.arm_ab_vortex_l3_net_bps_x100 as f64) / 100.0
+            ),
+            format!(
+                "  {}MODEL OMEGA (Shadow+Fib+Chand+Wald): {:>+8.2} bps net [PARETO DOMINANT]{}",
+                ANSI_YELLOW,
+                (ab.arm_omega_full_net_bps_x100 as f64) / 100.0,
+                ANSI_RESET
+            ),
+            format!(
+                "  Adversarial 24-Ep Tape             : L3 {:>+8.2} bps ({} loss) vs OMEGA {:>+8.2} bps ({} loss | Hwk:{} Chd:{} Wld:{})",
+                (ab.stress_l3_unshielded.cum_net_bps_x100 as f64) / 100.0,
+                ab.stress_l3_unshielded.losses,
+                (ab.stress_omega_shielded.cum_net_bps_x100 as f64) / 100.0,
+                ab.stress_omega_shielded.losses,
+                ab.stress_omega_shielded.hawkes_aborts,
+                ab.stress_omega_shielded.chandelier_saves,
+                ab.stress_omega_shielded.wald_compressions
+            ),
+        ];
+        let sec_twin = vec![format!(
+            "  {}1:1 Digital Twin (25ms RTT FIFO){}  : Trades:{} | Net:{:+.2} bps | HwkAbort:{} | Rej:{} | Drift:{}",
+            ANSI_GREEN,
+            ANSI_RESET,
+            twin.closed_trades,
+            (twin.cum_net_bps_x100 as f64) / 100.0,
+            twin.hawkes_queue_aborts,
+            twin.post_only_rejects,
+            twin.parity_sync_drift_1e8
+        )];
+        print_auto_aligned_box(&[sec_title, sec_fifo, sec_arms, sec_twin]);
+
+        ev_per_sec >= 100_000
+            && fills == 1_000
+            && rejects == 0
+            && ab.pareto_strictly_dominant
+            && twin.closed_trades == 3
+            && twin.hawkes_queue_aborts == 1
+            && twin.post_only_rejects == 0
+            && twin.parity_sync_drift_1e8 == 0
+            && twin.cum_net_bps_x100 >= 7_000
+    }
+}
+
+pub use omega_twin::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +1447,28 @@ mod tests {
         assert_eq!(rep.wins, 1);
         assert_eq!(rep.losses, 0);
         assert!(rep.cum_net_bps_x100 >= 1_200);
+    }
+}
+
+// === VORTEX-OMEGA CHAT 6 REPLAY TESTS ===
+#[cfg(test)]
+mod omega_chat6_replay_tests {
+    use super::*;
+
+    #[test]
+    fn test_omega_digital_twin_1to1_hawkes_wald_shadow_and_chandelier() {
+        let rep = run_omega_digital_twin_walk_forward_lab();
+        assert!(rep.par1_rows_verified >= 25);
+        assert_eq!(rep.closed_trades, 3);
+        assert_eq!(rep.maker_closes, 2);
+        assert_eq!(rep.chandelier_closes, 1);
+        assert_eq!(rep.shadow_crest_snaps, 1);
+        assert_eq!(rep.fibonacci_surfs, 1);
+        assert_eq!(rep.hawkes_queue_aborts, 1);
+        assert_eq!(rep.post_only_rejects, 0);
+        assert_eq!(rep.parity_sync_drift_1e8, 0);
+        assert!(rep.cum_net_bps_x100 >= 7_000);
+        assert!(rep.cum_net_pnl_1e8 > 0);
+        assert!(run_and_print_omega_chat6_twin_certification());
     }
 }

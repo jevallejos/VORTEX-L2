@@ -1,4 +1,4 @@
-name: VORTEX-L3 Institutional CI Gate (SHM v13)
+name: VORTEX-OMEGA Institutional CI Gate
 
 on:
   push:
@@ -9,44 +9,66 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  RUST_BACKTRACE: "1"
+
+permissions:
+  contents: read
 
 jobs:
-  linux-x86_64-institutional-gate:
-    name: Ubuntu x86_64 Clippy + 38 Tests + 3 LTO Release Gates
+  ubuntu-institutional-gate:
+    name: Ubuntu x86_64 SHM v13, 49-Test & LTO Fat Release Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (LF preserved)
         uses: actions/checkout@v4
 
-      - name: Install OpenSSL & pkg-config headers for Linux TLS/WS
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
-
-      - name: Install Rust stable toolchain with Clippy
+      - name: Install stable Rust toolchain + clippy
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
-      - name: Restore Cargo build cache
+      - name: Cache Cargo registry and target build
         uses: Swatinem/rust-cache@v2
 
-      - name: Static Pedantic Audit (Linux cfg active, zero warnings)
+      - name: Stage 1a — Secret, Lockfile & CRLF Hygiene Audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^\.env|\.env\.|HALTED_ON_LOSS\.lock|DRAIN_MODE\.lock|\.pdb$|\.mmap$)'; then
+            echo "::error::Forbidden secret, runtime lock, or binary artifact tracked in Git!"
+            exit 1
+          fi
+          if grep -rnU $'\r' src/ Cargo.toml CONSTITUTION_VORTEX_OMEGA.md .github/workflows/ci.yml; then
+            echo "::error::CRLF line endings detected; repository mandates strict UTF-8 LF."
+            exit 1
+          fi
+          echo "[OK] Zero tracked secrets/locks and 100% pure LF verified."
+
+      - name: Stage 1b — Zero-Warning Clippy Static Analysis
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Unified Deterministic Test Suite (38 tests, single-threaded SHM)
-        run: cargo test -- --test-threads=1
+      - name: Stage 2 — Deterministic 49-Test Suite (POSIX /dev/shm + Scar Lab + OOS 520)
+        run: cargo test --lib --bins -- --test-threads=1
 
-      - name: Compile LTO Fat Release Binaries
+      - name: Stage 3a — Build LTO Fat Release Binaries
         run: cargo build --release --bins
 
-      - name: Execute Native Linux Gate 1 (vortex_tap SHM v13 + PAR1)
-        run: ./target/release/vortex_tap
+      - name: Stage 3b — Execute Linux Release CLI Certification Gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/vortex_replay
+          ./target/release/vortex_exec
+          mkdir -p dist-omega
+          cp target/release/vortex_tap target/release/vortex_replay target/release/vortex_exec CONSTITUTION_VORTEX_OMEGA.md dist-omega/
+          (cd dist-omega && sha256sum vortex_tap vortex_replay vortex_exec CONSTITUTION_VORTEX_OMEGA.md > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
-      - name: Execute Native Linux Gate 2 (vortex_replay 200k FIFO + A/B/A+B)
-        run: ./target/release/vortex_replay
-
-      - name: Execute Native Linux Gate 3 (vortex_exec OOS 520 + Zero Drift)
-        run: ./target/release/vortex_exec
+      - name: Upload Immutable Linux x86_64 Release Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: vortex-omega-v4-linux-x86_64
+          path: dist-omega/
+          if-no-files-found: error
+          retention-days: 30

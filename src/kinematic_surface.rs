@@ -397,6 +397,273 @@ pub fn audit_unified_63_losses_and_2160_manifold() -> (usize, usize) {
     (mitigated_all, manifold_blocked)
 }
 
+// === VORTEX-OMEGA CHAT 5 KINEMATIC PROD ===
+const HAWKES_PHI: f64 = 1.618_033_988_749_895;
+const HAWKES_INV_PHI: f64 = 0.618_033_988_749_895;
+const HAWKES_BETA_DECAY_PER_S: f64 = 2.0;
+const WALD_MU_MID: f64 = 0.140_983_005_625_052_5;
+const WALD_SPRT_GAIN: f64 = 0.963_932_022_500_210_3;
+
+/// O(1) Markovian Hawkes self-exciting opposing Taker queue depletion tracker.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct HawkesQueueTracker {
+    pub excitation: f64,
+    pub last_update_ts_ns: i64,
+}
+
+impl HawkesQueueTracker {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            excitation: 0.0,
+            last_update_ts_ns: 0,
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.excitation = 0.0;
+        self.last_update_ts_ns = 0;
+    }
+}
+
+/// Verdict emitted by the Moallemi-Yuan v2.0 + Stoikov Micro-Price queue survival shield.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct QueueShieldVerdict {
+    pub abort_now: bool,
+    pub stoikov_skew: f64,
+    pub adverse_micro_ticks: f64,
+    pub hawkes_lambda_ratio: f64,
+    pub moallemi_toxicity: f64,
+}
+
+/// Continuous Abraham Wald SPRT v2.0 sequential stopping & Server-SL compression state.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct WaldSprtState {
+    pub log_likelihood: f64,
+    pub last_step_ts_ns: i64,
+    pub contraction_pct: i64,
+    pub exhaustion_unwind_active: bool,
+}
+
+impl WaldSprtState {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            log_likelihood: 0.0,
+            last_step_ts_ns: 0,
+            contraction_pct: 0,
+            exhaustion_unwind_active: false,
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Delegates to `OrthogonalFactorState::stoikov_microprice_and_skew` for L1 + L1..L5 skew.
+#[inline]
+#[must_use]
+pub fn compute_stoikov_microprice_skew(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+) -> (f64, f64) {
+    crate::alpha_3factor::OrthogonalFactorState::stoikov_microprice_and_skew(side, snap)
+}
+
+/// Evaluates Moallemi-Yuan queue toxicity, Hawkes opposing Taker bursts & Stoikov divergence.
+#[must_use]
+pub fn evaluate_moallemi_stoikov_queue_shield(
+    tracker: &mut HawkesQueueTracker,
+    side: crate::types::Side,
+    init_q_ahead: crate::types::LotQty,
+    cur_q_ahead: crate::types::LotQty,
+    opp_tape_delta_lots: crate::types::LotQty,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+    slot_idx: usize,
+) -> QueueShieldVerdict {
+    let now_ns = snap.ts_local_ns.0;
+    if tracker.last_update_ts_ns > 0 && now_ns > tracker.last_update_ts_ns {
+        let dt_s = ((now_ns - tracker.last_update_ts_ns) as f64 * 1e-9).clamp(0.0, 10.0);
+        tracker.excitation *= (-HAWKES_BETA_DECAY_PER_S * dt_s).exp();
+    }
+    if now_ns > 0 {
+        tracker.last_update_ts_ns = now_ns;
+    }
+
+    let init_den = (init_q_ahead.0.max(1)) as f64;
+    if opp_tape_delta_lots.0 > 0 {
+        let tape_frac = (opp_tape_delta_lots.0 as f64) / init_den;
+        tracker.excitation = (tracker.excitation + HAWKES_PHI * tape_frac).clamp(0.0, 8.0);
+    }
+    let hawkes_lambda_ratio = 1.0 + tracker.excitation;
+    let q_ratio = ((cur_q_ahead.0.max(0) as f64) / init_den).clamp(0.0, 1.0);
+    let (stoikov_skew, adverse_micro_ticks) = compute_stoikov_microprice_skew(side, snap);
+
+    let dir_s = side.sign_f64();
+    let own_flow = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+    let btc_drag = if slot_idx > 0 {
+        let beta = crate::alpha_3factor::OrthogonalFactorState::epps_btc_lead_lag_beta(
+            slot_idx,
+            snap,
+            btc_leader_snap,
+        );
+        let btc_snr =
+            crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(btc_leader_snap)
+                * dir_s;
+        (-beta * btc_snr - 0.15).max(0.0) * 0.25
+    } else {
+        0.0
+    };
+
+    let moallemi_toxicity = 0.45 * tracker.excitation * (0.25 / q_ratio.max(0.12))
+        + 0.55 * (-stoikov_skew).max(0.0)
+        + btc_drag
+        - 0.50 * own_flow.max(0.0);
+
+    let crit_tail_sweep =
+        init_q_ahead.0 > 0 && q_ratio < 0.15 && tracker.excitation >= HAWKES_INV_PHI;
+    let stoikov_collapse = (stoikov_skew <= -0.68 && own_flow < 0.15)
+        || (adverse_micro_ticks >= 0.75 && own_flow < 0.20);
+    let abort_now = crit_tail_sweep
+        || stoikov_collapse
+        || moallemi_toxicity >= HAWKES_INV_PHI
+        || check_queue_depletion_velocity_abort(side, init_q_ahead, cur_q_ahead, snap);
+
+    QueueShieldVerdict {
+        abort_now,
+        stoikov_skew,
+        adverse_micro_ticks,
+        hawkes_lambda_ratio,
+        moallemi_toxicity,
+    }
+}
+
+/// Blocks trend-chasing `Re-Peg` when Stoikov micro-price or BTC leader diverges against entry.
+#[inline]
+#[must_use]
+pub fn passes_stoikov_repeg_coherence_guard(
+    slot_idx: usize,
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+) -> bool {
+    let (m_skew, adv_ticks) = compute_stoikov_microprice_skew(side, snap);
+    if m_skew < -0.10 || adv_ticks >= 0.50 {
+        return false;
+    }
+    if snap.wave_observables().climax_active {
+        return false;
+    }
+    if slot_idx > 0 {
+        let beta = crate::alpha_3factor::OrthogonalFactorState::epps_btc_lead_lag_beta(
+            slot_idx,
+            snap,
+            btc_leader_snap,
+        );
+        let btc_aligned =
+            crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(btc_leader_snap)
+                * side.sign_f64();
+        if beta * btc_aligned < -0.05 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Computes exact Abraham Wald `(A_hold, B_unwind)` log-likelihood boundaries from `p_taker_pct`.
+#[inline]
+#[must_use]
+pub fn wald_sprt_boundaries(p_taker_pct: i64) -> (f64, f64) {
+    let alpha = ((p_taker_pct as f64) * 0.01).clamp(0.01, 0.25);
+    let beta = (2.0 * alpha).min(0.45);
+    let a_hold = ((1.0 - beta) / alpha).ln();
+    let b_unwind = (beta / (1.0 - alpha)).ln();
+    (a_hold, b_unwind)
+}
+
+/// Advances continuous Abraham Wald SPRT v2.0 log-likelihood `Lambda_t` with BTC Lead-Lag.
+pub fn step_wald_sprt_v2(
+    state: &mut WaldSprtState,
+    slot_idx: usize,
+    side: crate::types::Side,
+    p_taker_pct: i64,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+) -> WaldSprtState {
+    let (a_hold, b_unwind) = wald_sprt_boundaries(p_taker_pct);
+    let now_ns = snap.ts_local_ns.0;
+    if state.last_step_ts_ns <= 0 || now_ns <= state.last_step_ts_ns {
+        if now_ns > 0 {
+            state.last_step_ts_ns = now_ns;
+        }
+        return *state;
+    }
+    let dt_s = ((now_ns - state.last_step_ts_ns) as f64 * 1e-9).clamp(0.001, 2.0);
+    state.last_step_ts_ns = now_ns;
+
+    let dir_s = side.sign_f64();
+    let phi_self = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+    let (m_skew, _) = compute_stoikov_microprice_skew(side, snap);
+    let beta_btc = crate::alpha_3factor::OrthogonalFactorState::epps_btc_lead_lag_beta(
+        slot_idx,
+        snap,
+        btc_leader_snap,
+    );
+    let btc_aligned =
+        crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
+
+    let y_evidence = if slot_idx == 0 {
+        0.70 * phi_self + 0.30 * m_skew
+    } else {
+        0.50 * phi_self + 0.20 * m_skew + 0.30 * beta_btc * btc_aligned
+    };
+
+    state.log_likelihood = (state.log_likelihood
+        + WALD_SPRT_GAIN * (y_evidence - WALD_MU_MID) * dt_s)
+        .clamp(1.5 * b_unwind, a_hold);
+
+    if state.log_likelihood <= b_unwind {
+        let excess_ratio = ((b_unwind - state.log_likelihood) / b_unwind.abs().max(1e-6)).max(0.0);
+        let btc_drag = if slot_idx > 0 {
+            (-beta_btc * btc_aligned - 0.20).max(0.0)
+        } else {
+            0.0
+        };
+        let gamma = (18.0 + 22.0 * excess_ratio + 12.0 * btc_drag).round() as i64;
+        state.contraction_pct = gamma.clamp(15, 48);
+        state.exhaustion_unwind_active = true;
+    } else {
+        state.contraction_pct = 0;
+        state.exhaustion_unwind_active = false;
+    }
+    *state
+}
+
+/// Computes `(contracted_sl_scaled_bps, gamma_pct)` compressing left-tail SL severity by up to 48%.
+#[inline]
+#[must_use]
+pub fn compute_wald_v2_contracted_sl_bps(
+    realized_vol_5m: crate::types::ScaledBps,
+    wald_state: &WaldSprtState,
+) -> (i64, i64) {
+    let base_sl_bps =
+        crate::types::PairSpec::elastic_server_sl_distance_bps(realized_vol_5m).raw();
+    if !wald_state.exhaustion_unwind_active || wald_state.contraction_pct <= 0 {
+        return (base_sl_bps, 0);
+    }
+    let gamma = wald_state.contraction_pct.clamp(15, 48);
+    let fee_rt = crate::types::ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+    let floor_sl = fee_rt * 9;
+    let contracted = ((base_sl_bps * (100 - gamma)) / 100).max(floor_sl);
+    (contracted, gamma)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +720,107 @@ mod tests {
             Side::Bid, eq_vol, edge, 33, 220, 150, 0.22, 0.47
         )
         .is_err());
+    }
+}
+
+// === VORTEX-OMEGA CHAT 5 KINEMATIC TESTS ===
+#[cfg(test)]
+mod omega_chat5_kinematic_tests {
+    use super::*;
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
+    use crate::types::{
+        BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, APPROVED_SPECS,
+    };
+
+    #[test]
+    fn test_hawkes_moallemi_anti_pickoff_repeg_guard_and_wald_sprt_v2() {
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.realized_vol_5m = ScaledBps(6_000);
+        btc.bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(400) };
+        btc.asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(300) };
+        btc.factor_ofi = BoundedScore::new_clamped(0.60);
+        btc.factor_tfi = BoundedScore::new_clamped(0.65);
+        btc.factor_geom = BoundedScore::new_clamped(0.30);
+
+        let mut avax = SymbolLobSnapshot::new_empty();
+        avax.symbol_id = APPROVED_SPECS[3].symbol_id;
+        avax.realized_vol_5m = ScaledBps(8_800);
+
+        // 1. Hidden institutional sweep (lagging OFI +0.14 / TFI +0.10 where v1 was blind):
+        // Hawkes + Stoikov catches the 20ms Taker burst at step 5 (lam >= 2.0x, 125 lots left)
+        let mut tox_trk = HawkesQueueTracker::new();
+        let mut cur_q = 500_i64;
+        let mut ts = 1_000_000_000_i64;
+        let mut aborted_step = 0_usize;
+        for step in 1..=6_usize {
+            ts += 20_000_000;
+            cur_q -= 75;
+            avax.ts_local_ns = TimestampNs(ts);
+            avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(cur_q.max(20)) };
+            avax.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(380) };
+            avax.deep_bid_lots_l1_l5 = LotQty(400);
+            avax.deep_ask_lots_l1_l5 = LotQty(1_200);
+            avax.factor_ofi = BoundedScore::new_clamped(0.14);
+            avax.factor_tfi = BoundedScore::new_clamped(0.10);
+            let v = evaluate_moallemi_stoikov_queue_shield(
+                &mut tox_trk, Side::Bid, LotQty(500), LotQty(cur_q), LotQty(75), &avax, &btc, 3,
+            );
+            if v.abort_now {
+                aborted_step = step;
+                assert!(v.hawkes_lambda_ratio >= 2.0);
+                break;
+            }
+        }
+        assert_eq!(aborted_step, 5);
+        assert!(!passes_stoikov_repeg_coherence_guard(3, Side::Bid, &avax, &btc));
+
+        // 2. Benign 3.0s passive queue advance down to 50 lots NEVER false-aborts (Zero Self-Choke)
+        let mut calm_trk = HawkesQueueTracker::new();
+        let mut calm_q = 500_i64;
+        let mut calm_ts = 5_000_000_000_i64;
+        for _ in 1..=10_usize {
+            calm_ts += 300_000_000;
+            calm_q -= 45;
+            avax.ts_local_ns = TimestampNs(calm_ts);
+            avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(350) };
+            avax.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(180) };
+            avax.deep_bid_lots_l1_l5 = LotQty(1_200);
+            avax.deep_ask_lots_l1_l5 = LotQty(650);
+            avax.factor_ofi = BoundedScore::new_clamped(0.55);
+            avax.factor_tfi = BoundedScore::new_clamped(0.62);
+            let v_ok = evaluate_moallemi_stoikov_queue_shield(
+                &mut calm_trk, Side::Bid, LotQty(500), LotQty(calm_q), LotQty(25), &avax, &btc, 3,
+            );
+            assert!(!v_ok.abort_now);
+        }
+        assert!(passes_stoikov_repeg_coherence_guard(3, Side::Bid, &avax, &btc));
+
+        // 3. Wald SPRT v2.0 + BTC dump triggers exhaustion unwind in <= 3.5s & compresses SL >= 30%
+        let mut wald = WaldSprtState::new();
+        btc.factor_ofi = BoundedScore::new_clamped(-0.75);
+        btc.factor_tfi = BoundedScore::new_clamped(-0.80);
+        btc.factor_geom = BoundedScore::new_clamped(-0.55);
+        avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(60) };
+        avax.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(420) };
+        avax.deep_bid_lots_l1_l5 = LotQty(200);
+        avax.deep_ask_lots_l1_l5 = LotQty(1_300);
+        avax.factor_ofi = BoundedScore::new_clamped(-0.60);
+        avax.factor_tfi = BoundedScore::new_clamped(-0.65);
+
+        let mut w_ts = 10_000_000_000_i64;
+        avax.ts_local_ns = TimestampNs(w_ts);
+        let _ = step_wald_sprt_v2(&mut wald, 3, Side::Bid, 5, &avax, &btc);
+        for _ in 0..35 {
+            w_ts += 100_000_000;
+            avax.ts_local_ns = TimestampNs(w_ts);
+            let _ = step_wald_sprt_v2(&mut wald, 3, Side::Bid, 5, &avax, &btc);
+        }
+        assert!(wald.exhaustion_unwind_active);
+        assert!(wald.contraction_pct >= 32);
+        let base_sl = PairSpec::elastic_server_sl_distance_bps(ScaledBps(6_500)).raw();
+        let (comp_sl, gamma) = compute_wald_v2_contracted_sl_bps(ScaledBps(6_500), &wald);
+        assert!(gamma >= 32);
+        assert!(comp_sl * 100 <= base_sl * 70);
     }
 }

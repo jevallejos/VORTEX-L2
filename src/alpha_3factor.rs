@@ -744,6 +744,66 @@ impl OrthogonalFactorState {
     }
 }
 
+// === VORTEX-OMEGA CHAT 5 ALPHA PROD ===
+const CHAT5_PHI: f64 = 1.618_033_988_749_895;
+const CHAT5_INV_PHI: f64 = 0.618_033_988_749_895;
+const CHAT5_INV_PHI_SQ: f64 = 0.381_966_011_250_105;
+
+impl OrthogonalFactorState {
+    /// Computes Golden-Ratio composite Stoikov skew in `[-1, +1]` and adverse micro-price drift in ticks.
+    #[inline]
+    #[must_use]
+    pub fn stoikov_microprice_and_skew(
+        side: crate::types::Side,
+        snap: &crate::lob_shm::SymbolLobSnapshot,
+    ) -> (f64, f64) {
+        let b0 = snap.bids[0];
+        let a0 = snap.asks[0];
+        if b0.price.0 <= 0 || a0.price.0 <= b0.price.0 || (b0.qty.0 <= 0 && a0.qty.0 <= 0) {
+            return (0.0, 0.0);
+        }
+        let dir_s = side.sign_f64();
+        let spread_ticks = (a0.price.0 - b0.price.0) as f64;
+        let b_l1 = b0.qty.0.max(0);
+        let a_l1 = a0.qty.0.max(0);
+        let tot_l1 = (b_l1.saturating_add(a_l1)).max(1) as f64;
+        let i_bbo = dir_s * ((b_l1 - a_l1) as f64) / tot_l1;
+
+        let eff_db = if snap.deep_bid_lots_l1_l5.0 > 0 {
+            snap.deep_bid_lots_l1_l5.0
+        } else {
+            b_l1
+        };
+        let eff_da = if snap.deep_ask_lots_l1_l5.0 > 0 {
+            snap.deep_ask_lots_l1_l5.0
+        } else {
+            a_l1
+        };
+        let tot_deep = (eff_db.saturating_add(eff_da)).max(1) as f64;
+        let i_deep = dir_s * ((eff_db - eff_da) as f64) / tot_deep;
+
+        let m_skew = (CHAT5_INV_PHI * i_bbo + CHAT5_INV_PHI_SQ * i_deep).clamp(-1.0, 1.0);
+        let adverse_micro_ticks = 0.5 * spread_ticks * (-m_skew).max(0.0);
+        (m_skew, adverse_micro_ticks)
+    }
+
+    /// Computes live Epps-aware `BTCUSDT` cross-asset propagation beta in `[0.75, PHI]` (`0.0` on Slot 0).
+    #[inline]
+    #[must_use]
+    pub fn epps_btc_lead_lag_beta(
+        slot_idx: usize,
+        snap: &crate::lob_shm::SymbolLobSnapshot,
+        btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+    ) -> f64 {
+        if slot_idx == 0 {
+            return 0.0;
+        }
+        let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(1_200) as f64;
+        let own_vol = snap.realized_vol_5m.raw().max(1_200) as f64;
+        (own_vol / btc_vol).clamp(0.75, CHAT5_PHI)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
@@ -1016,5 +1076,47 @@ mod tests {
                 PriceTicks(758_529),
             );
         assert_eq!(px_ask, PriceTicks(758_529));
+    }
+}
+
+// === VORTEX-OMEGA CHAT 5 ALPHA TESTS ===
+#[cfg(test)]
+mod omega_chat5_alpha_tests {
+    use super::*;
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
+    use crate::types::{LotQty, PriceTicks, ScaledBps, Side, APPROVED_SPECS};
+
+    #[test]
+    fn test_stoikov_microprice_skew_and_epps_btc_lead_lag_beta() {
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.realized_vol_5m = ScaledBps(6_000);
+
+        let mut avax = SymbolLobSnapshot::new_empty();
+        avax.symbol_id = APPROVED_SPECS[3].symbol_id;
+        avax.realized_vol_5m = ScaledBps(8_800);
+        avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(40) };
+        avax.asks[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(460) };
+        avax.deep_bid_lots_l1_l5 = LotQty(120);
+        avax.deep_ask_lots_l1_l5 = LotQty(1_380);
+
+        let (sk_adv, ticks_adv) =
+            OrthogonalFactorState::stoikov_microprice_and_skew(Side::Bid, &avax);
+        assert!(sk_adv <= -0.80);
+        assert!(ticks_adv >= 0.80);
+
+        avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(420) };
+        avax.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(120) };
+        avax.deep_bid_lots_l1_l5 = LotQty(1_500);
+        avax.deep_ask_lots_l1_l5 = LotQty(450);
+        let (sk_fav, ticks_fav) =
+            OrthogonalFactorState::stoikov_microprice_and_skew(Side::Bid, &avax);
+        assert!(sk_fav >= 0.50);
+        assert!(ticks_fav.abs() < 1e-9);
+
+        let beta_btc0 = OrthogonalFactorState::epps_btc_lead_lag_beta(0, &btc, &btc);
+        let beta_avax = OrthogonalFactorState::epps_btc_lead_lag_beta(3, &avax, &btc);
+        assert!(beta_btc0.abs() < 1e-9);
+        assert!((1.40..=1.55).contains(&beta_avax));
     }
 }

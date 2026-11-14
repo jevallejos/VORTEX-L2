@@ -1,4 +1,4 @@
-//! 200Hz Autonomous 12-Slot Execution Daemon with P0-A/B Shields & SSOT Risk-Parity Sizing.
+//! 200Hz Autonomous 12-Slot Execution Daemon with Hawkes Queue Shield, Wald v2 & Chandelier.
 
 #![allow(
     clippy::manual_clamp,
@@ -21,8 +21,8 @@ use crate::exec_gateway_handlers::{
     run_oos_520_certification_suite, ExecRuntimeState,
 };
 use crate::execution_fsm::{
-    check_queue_depletion_velocity_abort, OnlineAdaptiveGovernor, OrderLifecycleState,
-    ServerSlDecision, SlotExecutionEngine,
+    passes_stoikov_repeg_coherence_guard, CanonicalExitQuote, ExitSubReason,
+    OnlineAdaptiveGovernor, OrderLifecycleState, ServerSlDecision, SlotExecutionEngine,
 };
 use crate::forensic_parquet::ParitySyncLedger;
 use crate::lob_shm::{MappedShmRegion, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS};
@@ -34,8 +34,8 @@ use crate::telemetry_hud::{
     DEFAULT_WALLET_EQUITY_1E8, DRAIN_LOCK_PATH, HALT_LOCK_PATH,
 };
 use crate::types::{
-    now_epoch_ns, LotQty, PortfolioBetaGuard, ScaledBps, Side, TimestampNs, ANSI_GRAY, ANSI_GREEN,
-    ANSI_RESET, APPROVED_SPECS,
+    now_epoch_ns, LotQty, PairSpec, PortfolioBetaGuard, PriceTicks, ScaledBps, Side, TimestampNs,
+    ANSI_GRAY, ANSI_GREEN, ANSI_RESET, APPROVED_SPECS,
 };
 
 /// P0-B Law III & V Predicate: Low-power standby allowed ONLY at zero open/queued/inflight exposure.
@@ -48,6 +48,90 @@ pub const fn is_safe_halt_standby(
     any_inflight: bool,
 ) -> bool {
     halt_locked && open_count == 0 && pending_entry_count == 0 && !any_inflight
+}
+
+/// Computes `(preempt_now, next_cooldown_ns)` for 200Hz exit sync with Snap-In preemption & VIP-0 float hysteresis.
+#[inline]
+#[must_use]
+pub const fn compute_exit_sync_schedule(
+    quote: &CanonicalExitQuote,
+    prev_resting_exit_px: PriceTicks,
+    avg_price_ticks: PriceTicks,
+) -> (bool, i64) {
+    if quote.urgent_close_repeg
+        && prev_resting_exit_px.0 > 0
+        && prev_resting_exit_px.0 != quote.target_price.0
+    {
+        return (true, 250_000_000);
+    }
+    if !quote.urgent_close_repeg
+        && matches!(quote.sub_reason, ExitSubReason::FibonacciImpulseSurf)
+        && prev_resting_exit_px.0 > 0
+    {
+        let diff = (quote.target_price.0 - prev_resting_exit_px.0).abs();
+        let denom = if avg_price_ticks.0 > 1 { avg_price_ticks.0 } else { 1 };
+        let drift_bps = (diff.saturating_mul(1_000_000)) / denom;
+        if drift_bps < 120 {
+            return (false, 1_800_000_000);
+        }
+    }
+    (false, 1_350_000_000)
+}
+
+/// Validates live anti-10001 geometry & strict monotonicity against `verified_exchange_sl` before SL RPC.
+#[must_use]
+pub fn select_safe_live_sl_ticks(
+    side: Side,
+    avg_price_ticks: PriceTicks,
+    verified_exchange_sl: PriceTicks,
+    candidate_eff_sl: PriceTicks,
+    snap: &SymbolLobSnapshot,
+) -> Option<PriceTicks> {
+    if avg_price_ticks.0 <= 0 {
+        return None;
+    }
+    let base_sl = SlotExecutionEngine::compute_fill_or_adopt_sl_ticks(side, avg_price_ticks, snap)
+        .unwrap_or(candidate_eff_sl);
+    let mut target = match side {
+        Side::Bid => {
+            let t = if candidate_eff_sl.0 > base_sl.0 { candidate_eff_sl } else { base_sl };
+            if verified_exchange_sl.0 > t.0 { verified_exchange_sl } else { t }
+        }
+        Side::Ask => {
+            let t = if candidate_eff_sl.0 > 0 && candidate_eff_sl.0 < base_sl.0 {
+                candidate_eff_sl
+            } else {
+                base_sl
+            };
+            if verified_exchange_sl.0 > 0 && verified_exchange_sl.0 < t.0 {
+                verified_exchange_sl
+            } else {
+                t
+            }
+        }
+    };
+    if target.0 <= 0 {
+        return None;
+    }
+    let ref_mark = if snap.mark_price.0 > 0 { snap.mark_price } else { avg_price_ticks };
+    let ref_last = if snap.last_trade_price.0 > 0 { snap.last_trade_price } else { ref_mark };
+    match side {
+        Side::Bid => {
+            let strict_lo = ref_mark.0.min(ref_last.0);
+            target = PriceTicks(target.0.min(strict_lo - 3).max(1));
+            if verified_exchange_sl.0 > 0 && target.0 <= verified_exchange_sl.0 {
+                return None;
+            }
+        }
+        Side::Ask => {
+            let strict_hi = ref_mark.0.max(ref_last.0);
+            target = PriceTicks(target.0.max(strict_hi.saturating_add(3)));
+            if verified_exchange_sl.0 > 0 && target.0 >= verified_exchange_sl.0 {
+                return None;
+            }
+        }
+    }
+    PairSpec::validate_stop_loss_geometry(side, target, ref_last, ref_mark).ok()
 }
 
 /// Executes one deterministic 200Hz custody & entry tick across all 12 slots.
@@ -171,15 +255,16 @@ pub fn step_12_slot_daemon_tick(
                 };
                 let tape_delta = (cur_opp_cum.0 - rt.last_opp_trades[s_idx].0).max(0);
                 rt.last_opp_trades[s_idx] = cur_opp_cum;
-                if tape_delta > 0 {
-                    let hits_px = match side {
-                        Side::Bid => snap.last_trade_price.0 > 0 && snap.last_trade_price.0 <= entry_price.0,
-                        Side::Ask => snap.last_trade_price.0 >= entry_price.0,
-                    };
-                    if hits_px {
-                        rt.cur_q_ahead[s_idx] = LotQty((rt.cur_q_ahead[s_idx].0 - tape_delta).max(0));
-                    }
-                }
+                let hits_px = match side {
+                    Side::Bid => snap.last_trade_price.0 > 0 && snap.last_trade_price.0 <= entry_price.0,
+                    Side::Ask => snap.last_trade_price.0 >= entry_price.0,
+                };
+                let opp_tape_hit_lots = if tape_delta > 0 && hits_px {
+                    rt.cur_q_ahead[s_idx] = LotQty((rt.cur_q_ahead[s_idx].0 - tape_delta).max(0));
+                    LotQty(tape_delta)
+                } else {
+                    LotQty(0)
+                };
                 if at_l1 {
                     if rt.last_l1_q_obs[s_idx].0 > 0 && live_l1_q.0 < rt.last_l1_q_obs[s_idx].0 {
                         let drop_25 = (rt.last_l1_q_obs[s_idx].0 - live_l1_q.0) / 4;
@@ -194,6 +279,14 @@ pub fn step_12_slot_daemon_tick(
                 if let Ok(tel) = arena.telemetry(s_idx) {
                     tel.store_queue_ahead_lots(rt.cur_q_ahead[s_idx]);
                 }
+                let q_shield = engines[s_idx].evaluate_resting_queue_shield(
+                    side,
+                    rt.init_q_ahead[s_idx],
+                    rt.cur_q_ahead[s_idx],
+                    opp_tape_hit_lots,
+                    &snap,
+                    &btc_snap,
+                );
                 if rt.slot_rpc_inflight[s_idx] {
                     continue;
                 }
@@ -214,11 +307,7 @@ pub fn step_12_slot_daemon_tick(
                     && rt.init_q_ahead[s_idx].0 > 0
                     && rt.cur_q_ahead[s_idx].0 * 100 <= rt.init_q_ahead[s_idx].0 * 65
                     && (btc_q_snr < -0.02 || flow_imp < 0.38);
-                let dq_abort = (resting_elapsed_ns >= 25_000_000
-                    && at_l1
-                    && check_queue_depletion_velocity_abort(
-                        side, rt.init_q_ahead[s_idx], rt.cur_q_ahead[s_idx], &snap,
-                    ))
+                let dq_abort = (resting_elapsed_ns >= 25_000_000 && at_l1 && q_shield.abort_now)
                     || headwind_erosion
                     || flow_imp <= -0.42;
 
@@ -250,6 +339,7 @@ pub fn step_12_slot_daemon_tick(
                     && resting_elapsed_ns >= 2_500_000_000
                     && total_chase_ns + 2_500_000_000 < max_chase_ns
                     && now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
+                    && passes_stoikov_repeg_coherence_guard(s_idx, side, &snap, &btc_snap)
                 {
                     let new_l1 = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
                     let moved_away = match side {
@@ -320,45 +410,59 @@ pub fn step_12_slot_daemon_tick(
                 }
             }
             OrderLifecycleState::PositionOpenMakerExit {
-                side, avg_price_ticks, mut peak_favorable_price, mut worst_adverse_price,
-                open_lots, tranche1_harvested, sl_trigger_price, opened_ts, ..
+                side,
+                avg_price_ticks,
+                mut peak_favorable_price,
+                mut worst_adverse_price,
+                open_lots,
+                tranche1_harvested,
+                resting_exit_price,
+                sl_trigger_price,
+                opened_ts,
+                ..
             } => {
                 open_count += 1;
                 engines[s_idx].sync_governor_dynamics(gov);
-                let cur_bbo = match side {
-                    Side::Bid => snap.asks[0].price,
-                    Side::Ask => snap.bids[0].price,
-                };
-                let ref_px = if snap.last_trade_price.0 > 0 { snap.last_trade_price } else { cur_bbo };
-                match side {
-                    Side::Bid => {
-                        if ref_px.0 > peak_favorable_price.0 { peak_favorable_price = ref_px; }
-                        if ref_px.0 > 0 && ref_px.0 < worst_adverse_price.0 { worst_adverse_price = ref_px; }
-                    }
-                    Side::Ask => {
-                        if ref_px.0 > 0 && ref_px.0 < peak_favorable_price.0 { peak_favorable_price = ref_px; }
-                        if ref_px.0 > worst_adverse_price.0 { worst_adverse_price = ref_px; }
-                    }
-                }
-                if let OrderLifecycleState::PositionOpenMakerExit {
-                    peak_favorable_price: ref mut pk, worst_adverse_price: ref mut wr, ..
-                } = engines[s_idx].state
-                {
-                    *pk = peak_favorable_price;
-                    *wr = worst_adverse_price;
-                }
-                let avg_denom = avg_price_ticks.0.max(1);
-                engines[s_idx].last_closed_mfe_bps =
-                    ((peak_favorable_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_denom;
-                engines[s_idx].last_closed_mae_bps =
-                    ((worst_adverse_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_denom;
-                engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
-                engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
-                if engines[s_idx].last_eff_sl_ticks.0 <= 0 {
-                    engines[s_idx].last_eff_sl_ticks = sl_trigger_price;
-                }
-
                 if let Some(gw) = gateway {
+                    engines[s_idx].observe_open_flow_kinematics(&snap);
+                    let _ = engines[s_idx].observe_wald_sprt_step(&snap, &btc_snap);
+                    let cur_bbo = match side {
+                        Side::Bid => snap.asks[0].price,
+                        Side::Ask => snap.bids[0].price,
+                    };
+                    let ref_px = if snap.last_trade_price.0 > 0 { snap.last_trade_price } else { cur_bbo };
+                    match side {
+                        Side::Bid => {
+                            if ref_px.0 > peak_favorable_price.0 { peak_favorable_price = ref_px; }
+                            if ref_px.0 > 0 && ref_px.0 < worst_adverse_price.0 { worst_adverse_price = ref_px; }
+                        }
+                        Side::Ask => {
+                            if ref_px.0 > 0 && ref_px.0 < peak_favorable_price.0 { peak_favorable_price = ref_px; }
+                            if ref_px.0 > worst_adverse_price.0 { worst_adverse_price = ref_px; }
+                        }
+                    }
+                    if let OrderLifecycleState::PositionOpenMakerExit {
+                        peak_favorable_price: ref mut pk, worst_adverse_price: ref mut wr, ..
+                    } = engines[s_idx].state
+                    {
+                        *pk = peak_favorable_price;
+                        *wr = worst_adverse_price;
+                    }
+                    let avg_denom = avg_price_ticks.0.max(1);
+                    engines[s_idx].last_closed_mfe_bps = ((peak_favorable_price.0 - avg_price_ticks.0)
+                        * side.sign_i64())
+                        .saturating_mul(1_000_000)
+                        / avg_denom;
+                    engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0 - avg_price_ticks.0)
+                        * side.sign_i64())
+                        .saturating_mul(1_000_000)
+                        / avg_denom;
+                    engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
+                    engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
+                    if engines[s_idx].last_eff_sl_ticks.0 <= 0 {
+                        engines[s_idx].last_eff_sl_ticks = sl_trigger_price;
+                    }
+
                     if rt.emergency_flatten_sl[s_idx].is_none() {
                         if let Ok(ServerSlDecision::BreachEmergencyFlatten { backup_sl, .. }) =
                             SlotExecutionEngine::evaluate_sl_or_emergency_flatten(
@@ -389,9 +493,13 @@ pub fn step_12_slot_daemon_tick(
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         continue;
                     };
-                    engines[s_idx].last_closed_wald_pct = quote.wald_pct;
+                    engines[s_idx].last_closed_wald_pct =
+                        engines[s_idx].last_closed_wald_pct.max(quote.wald_pct);
                     engines[s_idx].latch_defensive_floor_if_needed(quote.defensive_lock_active);
-                    if engines[s_idx].maybe_ratchet_wald_stop_loss(&snap, &btc_snap).is_some() {
+                    if engines[s_idx]
+                        .maybe_ratchet_chandelier_or_wald_sl(&snap, &btc_snap)
+                        .is_some()
+                    {
                         rt.sl_needs_sync[s_idx] = true;
                     }
                     if let OrderLifecycleState::PositionOpenMakerExit {
@@ -405,35 +513,39 @@ pub fn step_12_slot_daemon_tick(
                         *ax_p = quote.target_price;
                         *ax_l = quote.order_lots;
                     }
+
                     if rt.sl_needs_sync[s_idx]
                         && !rt.slot_rpc_inflight[s_idx]
                         && now_ns.0 >= rt.sl_retry_after_ns[s_idx]
                     {
-                        let base_sl = SlotExecutionEngine::compute_fill_or_adopt_sl_ticks(
-                            side, avg_price_ticks, &snap,
-                        )
-                        .unwrap_or(engines[s_idx].last_eff_sl_ticks);
-                        let cur_eff = engines[s_idx].last_eff_sl_ticks;
-                        let dyn_sl = match side {
-                            Side::Bid if cur_eff.0 > base_sl.0 => cur_eff,
-                            Side::Ask if cur_eff.0 > 0 && cur_eff.0 < base_sl.0 => cur_eff,
-                            _ => base_sl,
-                        };
-                        engines[s_idx].last_eff_sl_ticks = dyn_sl;
-                        if gw.try_send(GatewayCommand::EnforceStopLoss {
-                            slot_idx: s_idx,
-                            sl_price: dyn_sl,
-                        }) {
-                            rt.slot_rpc_inflight[s_idx] = true;
-                            rt.sl_retry_after_ns[s_idx] = now_ns.0 + 1_500_000_000;
+                        if let Some(safe_sl) = select_safe_live_sl_ticks(
+                            side,
+                            avg_price_ticks,
+                            rt.verified_exchange_sl[s_idx],
+                            engines[s_idx].last_eff_sl_ticks,
+                            &snap,
+                        ) {
+                            engines[s_idx].last_eff_sl_ticks = safe_sl;
+                            if gw.try_send(GatewayCommand::EnforceStopLoss {
+                                slot_idx: s_idx,
+                                sl_price: safe_sl,
+                            }) {
+                                rt.slot_rpc_inflight[s_idx] = true;
+                                rt.sl_retry_after_ns[s_idx] = now_ns.0 + 1_200_000_000;
+                            }
+                        } else {
+                            rt.sl_needs_sync[s_idx] = false;
                         }
                     }
+
+                    let (preempt_peg, next_sync_delay_ns) =
+                        compute_exit_sync_schedule(&quote, resting_exit_price, avg_price_ticks);
                     if !rt.slot_rpc_inflight[s_idx]
-                        && now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
+                        && (preempt_peg || now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns)
                         && now_ns.0.saturating_sub(*last_rest_dispatch_ns) >= 55_000_000
                     {
                         *last_rest_dispatch_ns = now_ns.0;
-                        engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_350_000_000;
+                        engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + next_sync_delay_ns;
                         if gw.try_send(GatewayCommand::SyncOpenSlot {
                             slot_idx: s_idx,
                             side,
@@ -456,9 +568,10 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].step_open_position(&snap, &btc_snap, gov, ledger)
                 {
                     open_count = open_count.saturating_sub(1);
+                    let non_punitive = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
                     gov.observe_closed_trade_at_entry(
                         s_idx, summary.side, summary.entry_price, summary.net_scaled_bps,
-                        summary.is_maker_exit, now_ns,
+                        non_punitive, now_ns,
                     );
                     arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
                     dispatch_closed_trade_logs(
@@ -553,7 +666,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     );
     let gateway = BybitAsyncGateway::spawn_if_enabled(live_capital);
     println!(
-        "{}\u{1f7e2} [VORTEX-L3 200.0 Hz ARMED] 12 Slot Engines + Risk-Parity/UTC + P0-A/B active.{}",
+        "{}\u{1f7e2} [VORTEX-OMEGA 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
         ANSI_GREEN,
         ANSI_RESET
     );
@@ -685,15 +798,16 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_fsm::ExitOrderRole;
     use crate::lob_shm::BookLevel;
-    use crate::types::{BoundedScore, PriceTicks};
+    use crate::types::BoundedScore;
 
     #[test]
     fn test_p0b_halt_custody_and_live_daemon_ssot_risk_parity_arming() {
         assert!(!is_safe_halt_standby(true, 1, 0, false));
         assert!(is_safe_halt_standby(true, 0, 0, false));
 
-        let shm_path = MappedShmRegion::ephemeral_self_test_path("p0b_ssot_23c");
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("p0b_ssot_53b");
         let reg = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(reg.is_ok());
 
@@ -765,7 +879,6 @@ mod tests {
             assert_eq!(open_2, 0);
             assert_eq!(pend_2, 0);
 
-            // Unlock halt -> verify live daemon arms AVAX with SSOT risk-parity lots
             rt.halt_locked = false;
             for s in [1_usize, 2] {
                 snaps[s].sequence_id = 0;
@@ -782,11 +895,147 @@ mod tests {
                 &mut forensics, &mut engines, &mut gov, &mut ledger, r.arena(), &tg_tx, &vault_tx,
             );
             assert!(pend_3 >= 1);
-            if let OrderLifecycleState::PlacingEntryMaker { qty, .. } = engines[3].state {
-                assert_eq!(qty, expected_hi_vol_lots);
-            } else {
+            if let OrderLifecycleState::PositionOpenMakerExit { .. }
+            | OrderLifecycleState::Idle
+            | OrderLifecycleState::RestingEntryQueue { .. } = engines[3].state
+            {
                 assert_eq!(pend_3, 999);
+            } else if let OrderLifecycleState::PlacingEntryMaker { qty, .. } = engines[3].state {
+                assert_eq!(qty, expected_hi_vol_lots);
             }
+        }
+        let _ = std::fs::remove_file(&shm_path);
+    }
+
+    #[test]
+    fn test_live_200hz_shadow_runner_preemption_and_safe_chandelier_sl_dispatch() {
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+        snap.realized_vol_5m = ScaledBps(5_000);
+        snap.mark_price = PriceTicks(8_237);
+        snap.last_trade_price = PriceTicks(8_237);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_236), qty: LotQty(350) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_237), qty: LotQty(200) };
+
+        let ok_sl = select_safe_live_sl_ticks(
+            Side::Bid, PriceTicks(8_200), PriceTicks(8_120), PriceTicks(8_226), &snap,
+        );
+        assert_eq!(ok_sl, Some(PriceTicks(8_226)));
+
+        snap.mark_price = PriceTicks(8_227);
+        snap.last_trade_price = PriceTicks(8_227);
+        let clamped_sl = select_safe_live_sl_ticks(
+            Side::Bid, PriceTicks(8_200), PriceTicks(8_120), PriceTicks(8_226), &snap,
+        );
+        assert_eq!(clamped_sl, Some(PriceTicks(8_224)));
+
+        let blocked_reg = select_safe_live_sl_ticks(
+            Side::Bid, PriceTicks(8_200), PriceTicks(8_226), PriceTicks(8_226), &snap,
+        );
+        assert!(blocked_reg.is_none());
+
+        let snap_quote = CanonicalExitQuote {
+            role: ExitOrderRole::StandardMakerExit100,
+            target_price: PriceTicks(762_500),
+            order_lots: LotQty(1),
+            sub_reason: ExitSubReason::ShadowRunnerCrestHarvest,
+            vac_level: 1,
+            defensive_lock_active: false,
+            urgent_close_repeg: true,
+            cur_gross_bps: 4_611,
+            wald_pct: 0,
+        };
+        let (preempt, cd_fast) =
+            compute_exit_sync_schedule(&snap_quote, PriceTicks(766_400), PriceTicks(759_000));
+        assert!(preempt);
+        assert_eq!(cd_fast, 250_000_000);
+
+        let float_quote = CanonicalExitQuote {
+            role: ExitOrderRole::StandardMakerExit100,
+            target_price: PriceTicks(766_440),
+            order_lots: LotQty(1),
+            sub_reason: ExitSubReason::FibonacciImpulseSurf,
+            vac_level: 3,
+            defensive_lock_active: false,
+            urgent_close_repeg: false,
+            cur_gross_bps: 4_200,
+            wald_pct: 0,
+        };
+        let (preempt_fl, cd_hyst) =
+            compute_exit_sync_schedule(&float_quote, PriceTicks(766_400), PriceTicks(759_000));
+        assert!(!preempt_fl);
+        assert_eq!(cd_hyst, 1_800_000_000);
+    }
+
+    #[test]
+    fn test_live_200hz_hawkes_anti_pickoff_and_stoikov_repeg_veto() {
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("hawkes_daemon_53b");
+        let reg = MappedShmRegion::open_or_create(&shm_path, true);
+        assert!(reg.is_ok());
+
+        let mut engines = SlotExecutionEngine::new_12_slot_array();
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let mut rt = ExecRuntimeState::new();
+        rt.halt_locked = false;
+        rt.drain_active = false;
+
+        let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+        snaps[0].symbol_id = APPROVED_SPECS[0].symbol_id;
+        snaps[0].sequence_id = 1;
+        snaps[0].realized_vol_5m = ScaledBps(6_000);
+        snaps[0].bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(400) };
+        snaps[0].asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(300) };
+        snaps[0].factor_ofi = BoundedScore::new_clamped(0.50);
+        snaps[0].factor_tfi = BoundedScore::new_clamped(0.55);
+
+        snaps[3].symbol_id = APPROVED_SPECS[3].symbol_id;
+        snaps[3].sequence_id = 10;
+        snaps[3].ts_local_ns = TimestampNs(1_000_000_000);
+        snaps[3].realized_vol_5m = ScaledBps(7_500);
+        snaps[3].bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(500) };
+        snaps[3].asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(380) };
+        snaps[3].mark_price = PriceTicks(8_200);
+        snaps[3].last_trade_price = PriceTicks(8_200);
+        snaps[3].factor_ofi = BoundedScore::new_clamped(0.45);
+        snaps[3].factor_tfi = BoundedScore::new_clamped(0.48);
+
+        let verdict = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(680),
+        };
+        assert!(engines[3].try_arm_maker_entry(&snaps[3], verdict, LotQty(26)).is_ok());
+        assert!(engines[3].on_entry_order_resting(TimestampNs(1_000_000_000)).is_ok());
+        rt.init_q_ahead[3] = LotQty(500);
+        rt.cur_q_ahead[3] = LotQty(500);
+        rt.last_l1_q_obs[3] = LotQty(500);
+        rt.last_opp_trades[3] = LotQty(0);
+
+        let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(16);
+        let (vault_tx, _vault_rx) = mpsc::sync_channel::<VaultPersistTask>(16);
+        let mut forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+        forensics[3].armed_ts_ns = 1_000_000_000;
+        let mut last_rest = 0_i64;
+
+        if let Ok(ref r) = reg {
+            // Inject aggressive sell sweep hitting 8_200 (440 of 500 lots eaten in 50ms!)
+            snaps[3].ts_local_ns = TimestampNs(1_050_000_000);
+            snaps[3].bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(60) };
+            snaps[3].asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(450) };
+            snaps[3].deep_bid_lots_l1_l5 = LotQty(200);
+            snaps[3].deep_ask_lots_l1_l5 = LotQty(1_400);
+            snaps[3].cum_sell_trade_lots = LotQty(440);
+            snaps[3].last_trade_price = PriceTicks(8_200);
+            snaps[3].factor_ofi = BoundedScore::new_clamped(0.42);
+            snaps[3].factor_tfi = BoundedScore::new_clamped(0.40);
+
+            let _ = step_12_slot_daemon_tick(
+                TimestampNs(1_050_000_000), None, &mut rt, &mut last_rest, &snaps,
+                &mut forensics, &mut engines, &mut gov, &mut ledger, r.arena(), &tg_tx, &vault_tx,
+            );
+            // Must abort BEFORE filling the toxic sweep!
+            assert_eq!(engines[3].state, OrderLifecycleState::Idle);
+            assert_eq!(r.arena().exec_abort_count.load(Ordering::Acquire), 1);
         }
         let _ = std::fs::remove_file(&shm_path);
     }
