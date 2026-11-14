@@ -645,7 +645,6 @@ pub fn step_12_slot_daemon_tick(
     (open_count, pending_entry_count)
 }
 
-#[must_use]
 pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> ExitCode {
     let tg_tx = spawn_bounded_telegram_notifier();
     let vault_tx = spawn_bounded_vault_persister();
@@ -745,7 +744,6 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     }
 }
 
-#[must_use]
 pub fn run_exec_cli_entrypoint() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let is_live_hud = args.iter().any(|a| a == "--live");

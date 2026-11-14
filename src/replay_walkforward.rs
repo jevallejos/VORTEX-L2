@@ -462,7 +462,6 @@ fn fmt_ablation_row(label: &str, m: &AblationMetrics, fee_drag_pct: f64) -> Stri
     )
 }
 
-#[must_use]
 pub fn run_replay_cli_gate() -> ExitCode {
     let (elapsed_us, fills, rejects) = run_200k_fifo_benchmark();
     let ev_per_sec = (200_000_u128 * 1_000_000) / elapsed_us.max(1);
