@@ -1,41 +1,42 @@
-//! Causal C1 Elliott Impulse/Correction Wave Physics, Hurst VR & Bybit OI/Kline Lab.
+//! Causal 6-Pivot Elliott Wave v2.0 Automaton, Signed Liquidations & Fibonacci Projections.
 
-use core::f64::consts::{FRAC_1_SQRT_2, LN_10};
+#![allow(
+    clippy::manual_clamp,
+    clippy::manual_range_contains,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
 
-use crate::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side};
+use crate::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs};
 
-const HORIZON_30S_NS: i64 = 30_000_000_000;
-const HORIZON_5M_NS: i64 = 300_000_000_000;
-const MAD_TO_SIGMA: f64 = 1.253_314_14;
-const PARKINSON_TO_SIGMA: f64 = 0.600_561_20;
-const TWO_LN_10: f64 = 2.0 * LN_10;
-const EWMA_DIFF_STD_5M_15M: f64 = FRAC_1_SQRT_2;
-const EWMA_DIFF_STD_15M_60M: f64 = 2.012_461_18;
+const PHI: f64 = 1.618_033_988_749_895;
+const PHI_SQ: f64 = 2.618_033_988_749_895;
+const INV_PHI: f64 = 0.618_033_988_749_895;
+const LIQ_FLOOR_USDT: f64 = 500.0;
 
-/// Exhaustive continuous-state Elliott wave regime classification (zero repainting).
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum WaveRegimeKind {
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WaveRegime {
     #[default]
-    NeutralEquilibrium = 0,
-    MotiveImpulseBull = 1,
-    MotiveImpulseBear = 2,
-    CorrectivePullbackInBull = 3,
-    CorrectiveBounceInBear = 4,
-    TerminalExhaustionClimax = 5,
+    NeutralWarmup = 0,
+    ImpulseWave3 = 1,
+    CorrectiveWave4 = 2,
+    ImpulseWave5 = 3,
+    CorrectiveAbc = 4,
+    ClimaxExhaustion = 5,
 }
 
-impl WaveRegimeKind {
+impl WaveRegime {
     #[inline]
     #[must_use]
     pub const fn from_code(code: u8) -> Self {
         match code {
-            1 => Self::MotiveImpulseBull,
-            2 => Self::MotiveImpulseBear,
-            3 => Self::CorrectivePullbackInBull,
-            4 => Self::CorrectiveBounceInBear,
-            5 => Self::TerminalExhaustionClimax,
-            _ => Self::NeutralEquilibrium,
+            1 => Self::ImpulseWave3,
+            2 => Self::CorrectiveWave4,
+            3 => Self::ImpulseWave5,
+            4 => Self::CorrectiveAbc,
+            5 => Self::ClimaxExhaustion,
+            _ => Self::NeutralWarmup,
         }
     }
 
@@ -43,96 +44,126 @@ impl WaveRegimeKind {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::NeutralEquilibrium => "NEUTRAL_EQUILIBRIUM",
-            Self::MotiveImpulseBull => "IMPULSE_BULL_W135",
-            Self::MotiveImpulseBear => "IMPULSE_BEAR_W135",
-            Self::CorrectivePullbackInBull => "CORR_PULLBACK_W24",
-            Self::CorrectiveBounceInBear => "CORR_BOUNCE_WB24",
-            Self::TerminalExhaustionClimax => "CLIMAX_EXHAUST_W5C",
+            Self::NeutralWarmup => "NeutralWarmup",
+            Self::ImpulseWave3 => "ImpulseWave3",
+            Self::CorrectiveWave4 => "CorrectiveWave4",
+            Self::ImpulseWave5 => "ImpulseWave5",
+            Self::CorrectiveAbc => "CorrectiveAbc",
+            Self::ClimaxExhaustion => "ClimaxExhaustion",
         }
     }
 }
 
-/// Dimensionless wave observables in [-1, +1] / [0, +1] with exact 0.0 neutral priors.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct WaveObservables {
-    pub regime: WaveRegimeKind,
-    pub hurst_score: BoundedScore,
-    pub oi_impulse: BoundedScore,
-    pub macro_phase: BoundedScore,
-    pub retracement_ratio: BoundedScore,
-    pub climax_intensity: BoundedScore,
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WavePivot {
+    pub kind_sign: i8,
+    pub price_ticks: PriceTicks,
+    pub ts_ns: TimestampNs,
 }
 
-impl Default for WaveObservables {
-    #[inline]
-    fn default() -> Self {
-        Self::neutral()
-    }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct WaveObservables {
+    pub regime: WaveRegime,
+    pub climax_active: bool,
+    pub hurst: BoundedScore,
+    pub macro_phase: BoundedScore,
+    pub oi_impulse: BoundedScore,
+    pub liq_imbalance: BoundedScore,
+    pub fib_proj_bps: ScaledBps,
 }
 
 impl WaveObservables {
     #[inline]
     #[must_use]
-    pub const fn neutral() -> Self {
-        Self {
-            regime: WaveRegimeKind::NeutralEquilibrium,
-            hurst_score: BoundedScore::ZERO,
-            oi_impulse: BoundedScore::ZERO,
-            macro_phase: BoundedScore::ZERO,
-            retracement_ratio: BoundedScore::ZERO,
-            climax_intensity: BoundedScore::ZERO,
-        }
+    pub fn hurst_exponent(self) -> f64 {
+        (0.50 + 0.35 * self.hurst.get()).clamp(0.25, 0.85)
     }
 
-    /// Reconstructs local Hurst exponent H_t in [0.20, 0.85] from centered BoundedScore.
     #[inline]
     #[must_use]
-    pub fn hurst_exponent(self) -> f64 {
-        (0.50 + 0.50 * self.hurst_score.get()).clamp(0.20, 0.85)
+    pub fn encode_hurst(h: f64) -> BoundedScore {
+        BoundedScore::new_clamped((h.clamp(0.25, 0.85) - 0.50) / 0.35)
     }
 }
 
-/// Entry conviction & Tranche-1 harvest modulation derived from causal wave physics.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct WaveModulationVerdict {
+pub struct WaveEntryModulation {
     pub snr_threshold_delta: f64,
-    pub tranche1_permille_delta: i64,
     pub def_horizon_permille_mult: i64,
+    pub tranche1_permille_delta: i64,
+    pub fib_target_bps: ScaledBps,
 }
 
-/// Zero-allocation O(1) state-space estimator for causal Elliott wave physics.
+impl Default for WaveEntryModulation {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            snr_threshold_delta: 0.0,
+            def_horizon_permille_mult: 1_000,
+            tranche1_permille_delta: 0,
+            fib_target_bps: ScaledBps(0),
+        }
+    }
+}
+
+/// Parses Bybit V5 `allLiquidation` JSON item using uppercase `"S"` / `"side"`.
+/// `"Sell"` (Short liquidated => Forced Market Buy) -> `Side::Bid` (+1).
+/// `"Buy"`  (Long liquidated  => Forced Market Sell) -> `Side::Ask` (-1).
+#[must_use]
+pub fn parse_bybit_all_liquidation_event(
+    spec: PairSpec,
+    item: &serde_json::Value,
+) -> Option<(Side, LotQty, PriceTicks)> {
+    let raw_pos_side = item
+        .get("S")
+        .or_else(|| item.get("side"))
+        .and_then(|v| v.as_str())?;
+    let forced_book_side = match raw_pos_side {
+        "Sell" => Side::Bid,
+        "Buy" => Side::Ask,
+        _ => return None,
+    };
+    let q_str = item
+        .get("v")
+        .or_else(|| item.get("size"))
+        .and_then(|v| v.as_str())?;
+    let qty = spec.parse_lot_qty(q_str);
+    if qty.0 <= 0 {
+        return None;
+    }
+    let px = item
+        .get("p")
+        .or_else(|| item.get("price"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| spec.parse_price_ticks(s).ok())
+        .unwrap_or(PriceTicks(0));
+    Some((forced_book_side, qty, px))
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct CausalElliottWaveState {
-    initialized: bool,
-    last_price_ts_ns: i64,
-    last_price_ticks: PriceTicks,
-    last_vol_5m: ScaledBps,
-    px_ewma_30s: f64,
-    px_ewma_5m: f64,
-    px_ewma_15m: f64,
-    px_ewma_1h: f64,
-    swing_high_px: f64,
-    swing_low_px: f64,
-    var30_anchor_px: i64,
-    var30_low_px: i64,
-    var30_high_px: i64,
-    var30_start_ts_ns: i64,
-    ewma_var_30s_bps2: f64,
-    var300_anchor_px: i64,
-    var300_low_px: i64,
-    var300_high_px: i64,
-    var300_start_ts_ns: i64,
-    ewma_var_300s_bps2: f64,
-    oi_initialized: bool,
+    pivots: [WavePivot; 6],
+    pivot_len: u8,
+    zig_dir: i8,
+    anchor_px: PriceTicks,
+    anchor_ts: TimestampNs,
+    last_mid_px: PriceTicks,
+    last_var_sample_px: PriceTicks,
+    last_var_sample_ts_ns: i64,
+    ring_ret4_bps: [f64; 4],
+    ring_idx: u8,
+    ewma_var1_bps2: f64,
+    ewma_var4_bps2: f64,
+    ewma_oi_fast: f64,
+    ewma_oi_slow: f64,
     last_oi_ts_ns: i64,
-    oi_ewma_fast: f64,
-    oi_ewma_slow: f64,
-    oi_diff_mad: f64,
+    ewma_liq_signed_usdt: f64,
+    ewma_liq_abs_fast_usdt: f64,
+    ewma_liq_abs_slow_usdt: f64,
     last_liq_ts_ns: i64,
-    liq_buy_lots_ewma: f64,
-    liq_sell_lots_ewma: f64,
-    last_obs: WaveObservables,
+    cached_obs: WaveObservables,
 }
 
 impl Default for CausalElliottWaveState {
@@ -142,41 +173,43 @@ impl Default for CausalElliottWaveState {
     }
 }
 
-#[allow(clippy::manual_clamp, clippy::needless_range_loop, clippy::too_many_arguments)]
 impl CausalElliottWaveState {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            initialized: false,
-            last_price_ts_ns: 0,
-            last_price_ticks: PriceTicks(0),
-            last_vol_5m: ScaledBps(0),
-            px_ewma_30s: 0.0,
-            px_ewma_5m: 0.0,
-            px_ewma_15m: 0.0,
-            px_ewma_1h: 0.0,
-            swing_high_px: 0.0,
-            swing_low_px: 0.0,
-            var30_anchor_px: 0,
-            var30_low_px: 0,
-            var30_high_px: 0,
-            var30_start_ts_ns: 0,
-            ewma_var_30s_bps2: 400.0,
-            var300_anchor_px: 0,
-            var300_low_px: 0,
-            var300_high_px: 0,
-            var300_start_ts_ns: 0,
-            ewma_var_300s_bps2: 4_000.0,
-            oi_initialized: false,
+            pivots: [WavePivot {
+                kind_sign: 0,
+                price_ticks: PriceTicks(0),
+                ts_ns: TimestampNs(0),
+            }; 6],
+            pivot_len: 0,
+            zig_dir: 0,
+            anchor_px: PriceTicks(0),
+            anchor_ts: TimestampNs(0),
+            last_mid_px: PriceTicks(0),
+            last_var_sample_px: PriceTicks(0),
+            last_var_sample_ts_ns: 0,
+            ring_ret4_bps: [0.0; 4],
+            ring_idx: 0,
+            ewma_var1_bps2: 400.0,
+            ewma_var4_bps2: 1_600.0,
+            ewma_oi_fast: 0.0,
+            ewma_oi_slow: 0.0,
             last_oi_ts_ns: 0,
-            oi_ewma_fast: 0.0,
-            oi_ewma_slow: 0.0,
-            oi_diff_mad: 1.0,
+            ewma_liq_signed_usdt: 0.0,
+            ewma_liq_abs_fast_usdt: 0.0,
+            ewma_liq_abs_slow_usdt: LIQ_FLOOR_USDT,
             last_liq_ts_ns: 0,
-            liq_buy_lots_ewma: 0.0,
-            liq_sell_lots_ewma: 0.0,
-            last_obs: WaveObservables::neutral(),
+            cached_obs: WaveObservables {
+                regime: WaveRegime::NeutralWarmup,
+                climax_active: false,
+                hurst: BoundedScore::ZERO,
+                macro_phase: BoundedScore::ZERO,
+                oi_impulse: BoundedScore::ZERO,
+                liq_imbalance: BoundedScore::ZERO,
+                fib_proj_bps: ScaledBps(0),
+            },
         }
     }
 
@@ -188,679 +221,602 @@ impl CausalElliottWaveState {
     #[inline]
     #[must_use]
     pub const fn observables(&self) -> WaveObservables {
-        self.last_obs
+        self.cached_obs
     }
 
     #[inline]
-    fn parkinson_window_var_bps2(
-        anchor_px: i64,
-        low_px: i64,
-        high_px: i64,
-        cur_px: i64,
-        dt_ns: i64,
-        ref_horizon_ns: i64,
-    ) -> f64 {
-        let a = anchor_px.max(1) as f64;
-        let lo = low_px.min(anchor_px).min(cur_px);
-        let hi = high_px.max(anchor_px).max(cur_px);
-        let net_bps = (((cur_px - anchor_px).abs() as f64) * 10_000.0) / a;
-        let hl_bps = (((hi - lo).max(0) as f64) * 10_000.0) / a;
-        let dt_s = ((dt_ns.max(1_000_000_000) as f64) * 1e-9).max(1.0);
-        let ref_s = (ref_horizon_ns as f64) * 1e-9;
-        let s_net = net_bps * MAD_TO_SIGMA;
-        let s_hl = hl_bps * PARKINSON_TO_SIGMA;
-        let best_sigma = s_net.max(s_hl);
-        (best_sigma * best_sigma * (ref_s / dt_s)).clamp(0.01, 250_000.0)
+    #[must_use]
+    pub const fn pivot_count(&self) -> usize {
+        self.pivot_len as usize
     }
 
-    fn init_seed(&mut self, spec: PairSpec, obs_px: PriceTicks, ts_ns: i64) {
-        let px_f = obs_px.0 as f64;
-        let b3x_bps = (spec
-            .required_3x_barrier_bps(obs_px)
+    #[inline]
+    fn reversal_threshold_bps(spec: PairSpec, mid_px: PriceTicks, vol_5m: ScaledBps) -> i64 {
+        let b3x = spec
+            .required_3x_barrier_bps(mid_px)
             .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
-            .raw() as f64)
-            / 100.0;
-        let seed_var_300 = (b3x_bps * 2.5) * (b3x_bps * 2.5);
-        self.initialized = true;
-        self.last_price_ts_ns = ts_ns;
-        self.last_price_ticks = obs_px;
-        self.px_ewma_30s = px_f;
-        self.px_ewma_5m = px_f;
-        self.px_ewma_15m = px_f;
-        self.px_ewma_1h = px_f;
-        self.swing_high_px = px_f;
-        self.swing_low_px = px_f;
-        self.var30_anchor_px = obs_px.0;
-        self.var30_low_px = obs_px.0;
-        self.var30_high_px = obs_px.0;
-        self.var30_start_ts_ns = ts_ns;
-        self.ewma_var_30s_bps2 = (seed_var_300 / 10.0).max(0.25);
-        self.var300_anchor_px = obs_px.0;
-        self.var300_low_px = obs_px.0;
-        self.var300_high_px = obs_px.0;
-        self.var300_start_ts_ns = ts_ns;
-        self.ewma_var_300s_bps2 = seed_var_300.max(2.5);
+            .raw()
+            .max(900);
+        let base_v = vol_5m.raw().max(b3x) as f64;
+        let raw = (INV_PHI * base_v).round() as i64;
+        raw.clamp(b3x, b3x.saturating_mul(8))
     }
 
-    /// Steps causal multi-scale wave state on a live L2 mid-price tick at monotonic ts_ns.
+    #[inline]
+    fn push_pivot(&mut self, pivot: WavePivot) {
+        let len = self.pivot_len as usize;
+        if len < 6 {
+            self.pivots[len] = pivot;
+            self.pivot_len += 1;
+        } else {
+            for i in 0..5 {
+                self.pivots[i] = self.pivots[i + 1];
+            }
+            self.pivots[5] = pivot;
+        }
+    }
+
+    fn step_zigzag(&mut self, spec: PairSpec, px: PriceTicks, ts_ns: i64, vol_5m: ScaledBps) {
+        if px.0 <= 0 {
+            return;
+        }
+        let ts = TimestampNs(ts_ns);
+        let rev_bps = Self::reversal_threshold_bps(spec, px, vol_5m);
+        if self.zig_dir == 0 {
+            if self.anchor_px.0 <= 0 {
+                self.anchor_px = px;
+                self.anchor_ts = ts;
+                return;
+            }
+            let move_bps =
+                ((px.0 - self.anchor_px.0).saturating_mul(1_000_000)) / self.anchor_px.0.max(1);
+            if move_bps >= rev_bps {
+                self.push_pivot(WavePivot {
+                    kind_sign: -1,
+                    price_ticks: self.anchor_px,
+                    ts_ns: self.anchor_ts,
+                });
+                self.push_pivot(WavePivot {
+                    kind_sign: 1,
+                    price_ticks: px,
+                    ts_ns: ts,
+                });
+                self.zig_dir = 1;
+            } else if move_bps <= -rev_bps {
+                self.push_pivot(WavePivot {
+                    kind_sign: 1,
+                    price_ticks: self.anchor_px,
+                    ts_ns: self.anchor_ts,
+                });
+                self.push_pivot(WavePivot {
+                    kind_sign: -1,
+                    price_ticks: px,
+                    ts_ns: ts,
+                });
+                self.zig_dir = -1;
+            }
+            return;
+        }
+        let last_idx = (self.pivot_len as usize).saturating_sub(1);
+        let last_px = self.pivots[last_idx].price_ticks;
+        if self.zig_dir > 0 {
+            if px.0 >= last_px.0 {
+                self.pivots[last_idx].price_ticks = px;
+                self.pivots[last_idx].ts_ns = ts;
+            } else {
+                let drop_bps = ((last_px.0 - px.0).saturating_mul(1_000_000)) / last_px.0.max(1);
+                if drop_bps >= rev_bps {
+                    self.push_pivot(WavePivot {
+                        kind_sign: -1,
+                        price_ticks: px,
+                        ts_ns: ts,
+                    });
+                    self.zig_dir = -1;
+                }
+            }
+        } else if px.0 <= last_px.0 {
+            self.pivots[last_idx].price_ticks = px;
+            self.pivots[last_idx].ts_ns = ts;
+        } else {
+            let rise_bps = ((px.0 - last_px.0).saturating_mul(1_000_000)) / last_px.0.max(1);
+            if rise_bps >= rev_bps {
+                self.push_pivot(WavePivot {
+                    kind_sign: 1,
+                    price_ticks: px,
+                    ts_ns: ts,
+                });
+                self.zig_dir = 1;
+            }
+        }
+    }
+
+    fn update_hurst_vr(&mut self, px: PriceTicks, ts_ns: i64) -> f64 {
+        if self.last_var_sample_px.0 <= 0 {
+            self.last_var_sample_px = px;
+            self.last_var_sample_ts_ns = ts_ns;
+            return self.cached_obs.hurst_exponent();
+        }
+        let dt_ns = ts_ns.saturating_sub(self.last_var_sample_ts_ns);
+        if ts_ns > 0 && self.last_var_sample_ts_ns > 0 && dt_ns < 500_000_000 {
+            return self.cached_obs.hurst_exponent();
+        }
+        let prev = self.last_var_sample_px.0.max(1) as f64;
+        let ret_bps = (((px.0 - self.last_var_sample_px.0) as f64) * 10_000.0) / prev;
+        self.last_var_sample_px = px;
+        self.last_var_sample_ts_ns = ts_ns;
+        if ret_bps.abs() < 1e-6 {
+            return self.cached_obs.hurst_exponent();
+        }
+        let idx = (self.ring_idx as usize) & 3;
+        self.ring_ret4_bps[idx] = ret_bps;
+        self.ring_idx = self.ring_idx.wrapping_add(1);
+        let sum4 = self.ring_ret4_bps[0]
+            + self.ring_ret4_bps[1]
+            + self.ring_ret4_bps[2]
+            + self.ring_ret4_bps[3];
+        let sq1 = (ret_bps * ret_bps).clamp(0.01, 250_000.0);
+        let sq4 = (sum4 * sum4).clamp(0.04, 1_000_000.0);
+        self.ewma_var1_bps2 = 0.92 * self.ewma_var1_bps2 + 0.08 * sq1;
+        self.ewma_var4_bps2 = 0.92 * self.ewma_var4_bps2 + 0.08 * sq4;
+        let vr4 = (self.ewma_var4_bps2 / (4.0 * self.ewma_var1_bps2).max(0.04)).clamp(0.35, 2.65);
+        (0.50 + vr4.ln() / (2.0 * 4.0_f64.ln())).clamp(0.25, 0.85)
+    }
+
+    fn decay_liquidation_state(&mut self, ts_ns: i64) {
+        if self.last_liq_ts_ns <= 0 || ts_ns <= self.last_liq_ts_ns {
+            if self.last_liq_ts_ns <= 0 && ts_ns > 0 {
+                self.last_liq_ts_ns = ts_ns;
+            }
+            return;
+        }
+        let dt_s = ((ts_ns - self.last_liq_ts_ns) as f64 * 1e-9).clamp(0.0, 600.0);
+        self.last_liq_ts_ns = ts_ns;
+        let d_fast = (-dt_s / 15.0).exp();
+        let d_slow = (-dt_s / 300.0).exp();
+        self.ewma_liq_signed_usdt *= d_fast;
+        self.ewma_liq_abs_fast_usdt *= d_fast;
+        self.ewma_liq_abs_slow_usdt =
+            (self.ewma_liq_abs_slow_usdt * d_slow).max(LIQ_FLOOR_USDT);
+    }
+
+    #[inline]
+    fn liq_imbalance_and_z(&self) -> (f64, f64) {
+        let denom = (self.ewma_liq_abs_fast_usdt + LIQ_FLOOR_USDT).max(1.0);
+        let i_liq = (self.ewma_liq_signed_usdt / denom).clamp(-1.0, 1.0);
+        let z_liq = self.ewma_liq_abs_fast_usdt / self.ewma_liq_abs_slow_usdt.max(LIQ_FLOOR_USDT);
+        (i_liq, z_liq)
+    }
+
+    fn recompute_observables(&mut self, hurst_val: f64) -> WaveObservables {
+        let px = self.last_mid_px.0;
+        let (i_liq, z_liq) = self.liq_imbalance_and_z();
+        let i_oi = self.cached_obs.oi_impulse.get();
+        let len = self.pivot_len as usize;
+
+        if px <= 0 || len < 3 {
+            let obs = WaveObservables {
+                regime: WaveRegime::NeutralWarmup,
+                climax_active: false,
+                hurst: WaveObservables::encode_hurst(hurst_val),
+                macro_phase: BoundedScore::ZERO,
+                oi_impulse: self.cached_obs.oi_impulse,
+                liq_imbalance: BoundedScore::new_clamped(i_liq),
+                fib_proj_bps: ScaledBps(0),
+            };
+            self.cached_obs = obs;
+            return obs;
+        }
+
+        let mut regime = WaveRegime::CorrectiveAbc;
+        let mut phase = 0.0_f64;
+        let mut fib_proj_bps = 0_i64;
+        let mut climax_active = false;
+        let mut matched_higher_order = false;
+
+        if len == 6 {
+            let p0 = self.pivots[0].price_ticks.0;
+            let p1 = self.pivots[1].price_ticks.0;
+            let p2 = self.pivots[2].price_ticks.0;
+            let p3 = self.pivots[3].price_ticks.0;
+            let p4 = self.pivots[4].price_ticks.0;
+            let s = i64::from(-self.pivots[0].kind_sign);
+            let sf = s as f64;
+            let w1 = (p1 - p0) * s;
+            let w2 = (p1 - p2) * s;
+            let w3 = (p3 - p2) * s;
+            let w4 = (p3 - p4) * s;
+            let e1_ok = (p2 - p0) * s > 0 && w1 > 0 && w2 > 0 && (w2 as f64) < 0.99 * (w1 as f64);
+            let e2_w3_valid = w3 >= w1;
+            let e3_non_overlap = (p4 - p1) * s > 0
+                && w3 > 0
+                && w4 > 0
+                && (w4 as f64) <= (INV_PHI + 0.06) * (w3 as f64);
+
+            if e1_ok && e3_non_overlap && (px - p4) * s > 0 {
+                let w5_cur = (px - p4) * s;
+                let e2_ok = e2_w3_valid || w5_cur < w3;
+                if e2_ok {
+                    matched_higher_order = true;
+                    let fuel = (0.60 * (sf * i_liq).max(0.0) * (0.45 * z_liq).tanh()
+                        + 0.40 * i_oi.max(0.0))
+                        .clamp(0.0, 1.0);
+                    let blowoff = z_liq >= 3.5 && (sf * i_liq) >= 0.55 && i_oi <= -0.12;
+                    if blowoff {
+                        regime = WaveRegime::ClimaxExhaustion;
+                        climax_active = true;
+                        phase = 0.92 * sf;
+                        fib_proj_bps = 0;
+                    } else {
+                        regime = WaveRegime::ImpulseWave5;
+                        let k5 = 1.0 + (PHI - 1.0) * (1.25 * fuel - 0.25).clamp(0.0, 1.0);
+                        let base_amp = (w1 as f64).max(INV_PHI * ((p3 - p0).abs() as f64));
+                        let raw_w5 = (k5 * base_amp).round() as i64;
+                        let cap_w5 = if e2_w3_valid { raw_w5 } else { raw_w5.min(w3 - 1) };
+                        let p_fib5 = p4 + s * cap_w5.max(1);
+                        let rem_ticks = (p_fib5 - px) * s;
+                        if rem_ticks > 0 {
+                            fib_proj_bps = ((p_fib5 - px).saturating_mul(1_000_000)) / px.max(1);
+                        }
+                        phase = 0.68 * sf;
+                    }
+                }
+            } else if e1_ok && !e3_non_overlap {
+                matched_higher_order = true;
+                regime = WaveRegime::CorrectiveAbc;
+                phase = -0.45 * sf;
+            }
+        }
+
+        if !matched_higher_order && len >= 5 {
+            let b = len - 5;
+            let p0 = self.pivots[b].price_ticks.0;
+            let p1 = self.pivots[b + 1].price_ticks.0;
+            let p2 = self.pivots[b + 2].price_ticks.0;
+            let p3 = self.pivots[b + 3].price_ticks.0;
+            let s = i64::from(-self.pivots[b].kind_sign);
+            let sf = s as f64;
+            let w1 = (p1 - p0) * s;
+            let w2 = (p1 - p2) * s;
+            let w3 = (p3 - p2) * s;
+            let w4_cur = (p3 - px) * s;
+            if (p2 - p0) * s > 0
+                && w1 > 0
+                && w2 > 0
+                && w3 >= w1
+                && w4_cur > 0
+                && (px - p1) * s > 0
+                && (w4_cur as f64) <= (INV_PHI + 0.06) * (w3 as f64)
+            {
+                matched_higher_order = true;
+                regime = WaveRegime::CorrectiveWave4;
+                phase = 0.25 * sf;
+            }
+        }
+
+        if !matched_higher_order && len >= 3 {
+            let b = if len >= 4 && self.pivots[len - 1].kind_sign != self.pivots[len - 4].kind_sign
+            {
+                len - 4
+            } else {
+                len - 3
+            };
+            let p0 = self.pivots[b].price_ticks.0;
+            let p1 = self.pivots[b + 1].price_ticks.0;
+            let p2 = self.pivots[b + 2].price_ticks.0;
+            let s = i64::from(-self.pivots[b].kind_sign);
+            let sf = s as f64;
+            let w1 = (p1 - p0) * s;
+            let w2 = (p1 - p2) * s;
+            let r2 = if w1 > 0 { (w2 as f64) / (w1 as f64) } else { 0.0 };
+            let e1_ok = (p2 - p0) * s > 0 && (0.236..0.990).contains(&r2);
+            if e1_ok && (px - p2) * s > 0 {
+                let fuel = (0.60 * (sf * i_liq).max(0.0) * (0.45 * z_liq).tanh()
+                    + 0.40 * i_oi.max(0.0))
+                    .clamp(0.0, 1.0);
+                let blowoff = z_liq >= 4.2 && (sf * i_liq) >= 0.65 && i_oi <= -0.18;
+                if blowoff {
+                    regime = WaveRegime::ClimaxExhaustion;
+                    climax_active = true;
+                    phase = 0.90 * sf;
+                } else {
+                    regime = WaveRegime::ImpulseWave3;
+                    let h_boost = ((hurst_val - 0.54) / 0.14).clamp(0.0, 1.0);
+                    let blend = (0.55 * h_boost + 0.45 * fuel).clamp(0.0, 1.0);
+                    let k3 = PHI + (PHI_SQ - PHI) * blend;
+                    let p_fib3 = p2 + s * ((k3 * (w1 as f64)).round() as i64).max(1);
+                    if (p_fib3 - px) * s > 0 {
+                        fib_proj_bps = ((p_fib3 - px).saturating_mul(1_000_000)) / px.max(1);
+                    }
+                    let golden_pocket = (0.382..=0.786).contains(&r2);
+                    phase = (if golden_pocket { 0.85 } else { 0.70 }) * sf;
+                }
+            } else {
+                let last_s = f64::from(self.zig_dir);
+                phase = 0.30 * last_s;
+            }
+        }
+
+        let obs = WaveObservables {
+            regime,
+            climax_active,
+            hurst: WaveObservables::encode_hurst(hurst_val),
+            macro_phase: BoundedScore::new_clamped(phase),
+            oi_impulse: self.cached_obs.oi_impulse,
+            liq_imbalance: BoundedScore::new_clamped(i_liq),
+            fib_proj_bps: ScaledBps(fib_proj_bps),
+        };
+        self.cached_obs = obs;
+        obs
+    }
+
     pub fn observe_price_tick(
         &mut self,
         spec: PairSpec,
-        obs_px: PriceTicks,
+        mid_px: PriceTicks,
         ts_ns: i64,
         realized_vol_5m: ScaledBps,
     ) -> WaveObservables {
-        if obs_px.0 <= 0 || ts_ns <= 0 {
-            return self.last_obs;
+        if mid_px.0 <= 0 {
+            return self.cached_obs;
         }
-        self.last_price_ticks = obs_px;
-        self.last_vol_5m = realized_vol_5m;
-        if !self.initialized {
-            self.init_seed(spec, obs_px, ts_ns);
-            return self.last_obs;
-        }
-        let px_f = obs_px.0 as f64;
-        if obs_px.0 < self.var30_low_px {
-            self.var30_low_px = obs_px.0;
-        }
-        if obs_px.0 > self.var30_high_px {
-            self.var30_high_px = obs_px.0;
-        }
-        if obs_px.0 < self.var300_low_px {
-            self.var300_low_px = obs_px.0;
-        }
-        if obs_px.0 > self.var300_high_px {
-            self.var300_high_px = obs_px.0;
-        }
-
-        if ts_ns > self.last_price_ts_ns {
-            let dt_ns = ts_ns - self.last_price_ts_ns;
-            self.last_price_ts_ns = ts_ns;
-            let dt_s = ((dt_ns as f64) * 1e-9).clamp(1e-4, 3_600.0);
-            self.px_ewma_30s += (1.0 - (-dt_s / 30.0).exp()) * (px_f - self.px_ewma_30s);
-            self.px_ewma_5m += (1.0 - (-dt_s / 300.0).exp()) * (px_f - self.px_ewma_5m);
-            self.px_ewma_15m += (1.0 - (-dt_s / 900.0).exp()) * (px_f - self.px_ewma_15m);
-            self.px_ewma_1h += (1.0 - (-dt_s / 3_600.0).exp()) * (px_f - self.px_ewma_1h);
-
-            let a_env = 1.0 - (-dt_s / 3_600.0).exp();
-            self.swing_high_px = if px_f >= self.swing_high_px {
-                px_f
-            } else {
-                (self.swing_high_px + a_env * (self.px_ewma_1h - self.swing_high_px))
-                    .max(px_f)
-            };
-            self.swing_low_px = if px_f <= self.swing_low_px {
-                px_f
-            } else {
-                (self.swing_low_px + a_env * (self.px_ewma_1h - self.swing_low_px))
-                    .min(px_f)
-            };
-        }
-
-        let dt30 = ts_ns.saturating_sub(self.var30_start_ts_ns);
-        if dt30 >= HORIZON_30S_NS {
-            let v30 = Self::parkinson_window_var_bps2(
-                self.var30_anchor_px,
-                self.var30_low_px,
-                self.var30_high_px,
-                obs_px.0,
-                dt30,
-                HORIZON_30S_NS,
-            );
-            let a_v30 = (1.0 - (-(dt30 as f64 * 1e-9) / 180.0).exp()).clamp(0.05, 0.50);
-            self.ewma_var_30s_bps2 += a_v30 * (v30 - self.ewma_var_30s_bps2);
-            self.var30_anchor_px = obs_px.0;
-            self.var30_low_px = obs_px.0;
-            self.var30_high_px = obs_px.0;
-            self.var30_start_ts_ns = ts_ns;
-        }
-
-        let dt300 = ts_ns.saturating_sub(self.var300_start_ts_ns);
-        if dt300 >= HORIZON_5M_NS {
-            let v300 = Self::parkinson_window_var_bps2(
-                self.var300_anchor_px,
-                self.var300_low_px,
-                self.var300_high_px,
-                obs_px.0,
-                dt300,
-                HORIZON_5M_NS,
-            );
-            let a_v300 = (1.0 - (-(dt300 as f64 * 1e-9) / 900.0).exp()).clamp(0.08, 0.55);
-            self.ewma_var_300s_bps2 += a_v300 * (v300 - self.ewma_var_300s_bps2);
-            self.var300_anchor_px = obs_px.0;
-            self.var300_low_px = obs_px.0;
-            self.var300_high_px = obs_px.0;
-            self.var300_start_ts_ns = ts_ns;
-        }
-
-        self.recompute_observables(spec, obs_px, ts_ns, realized_vol_5m)
+        self.last_mid_px = mid_px;
+        self.decay_liquidation_state(ts_ns);
+        let h_val = self.update_hurst_vr(mid_px, ts_ns);
+        self.step_zigzag(spec, mid_px, ts_ns, realized_vol_5m);
+        self.recompute_observables(h_val)
     }
 
-    /// Integrates a closed OHLC candle over its exact bar_secs without intra-bar bias.
-    pub fn observe_ohlc_candle(
-        &mut self,
-        spec: PairSpec,
-        start_ts_ms: i64,
-        o_t: PriceTicks,
-        h_t: PriceTicks,
-        l_t: PriceTicks,
-        c_t: PriceTicks,
-        bar_secs: i64,
-    ) -> WaveObservables {
-        let dur_ns = bar_secs.max(1) * 1_000_000_000;
-        let end_ns = start_ts_ms.saturating_mul(1_000_000).saturating_add(dur_ns);
-        if c_t.0 <= 0 || end_ns <= 0 {
-            return self.last_obs;
-        }
-        if !self.initialized {
-            self.init_seed(spec, o_t, end_ns - dur_ns);
-            self.swing_high_px = h_t.0 as f64;
-            self.swing_low_px = l_t.0 as f64;
-        }
-        if end_ns <= self.last_price_ts_ns {
-            return self.last_obs;
-        }
-        self.last_price_ts_ns = end_ns;
-        self.last_price_ticks = c_t;
-        let c_f = c_t.0 as f64;
-        let h_f = h_t.0 as f64;
-        let l_f = l_t.0 as f64;
-        let dt_s = (bar_secs.max(1)) as f64;
-
-        self.px_ewma_30s += (1.0 - (-dt_s / 30.0).exp()) * (c_f - self.px_ewma_30s);
-        self.px_ewma_5m += (1.0 - (-dt_s / 300.0).exp()) * (c_f - self.px_ewma_5m);
-        self.px_ewma_15m += (1.0 - (-dt_s / 900.0).exp()) * (c_f - self.px_ewma_15m);
-        self.px_ewma_1h += (1.0 - (-dt_s / 3_600.0).exp()) * (c_f - self.px_ewma_1h);
-
-        let a_env = 1.0 - (-dt_s / 3_600.0).exp();
-        self.swing_high_px = (self.swing_high_px
-            + a_env * (self.px_ewma_1h - self.swing_high_px))
-            .max(h_f);
-        self.swing_low_px = (self.swing_low_px
-            + a_env * (self.px_ewma_1h - self.swing_low_px))
-            .min(l_f);
-
-        if bar_secs <= 90 {
-            let v30 = Self::parkinson_window_var_bps2(
-                o_t.0,
-                l_t.0,
-                h_t.0,
-                c_t.0,
-                dur_ns,
-                HORIZON_30S_NS,
-            );
-            let a_v30 = (1.0 - (-dt_s / 180.0).exp()).clamp(0.05, 0.50);
-            self.ewma_var_30s_bps2 += a_v30 * (v30 - self.ewma_var_30s_bps2);
-        }
-        self.var30_anchor_px = c_t.0;
-        self.var30_low_px = c_t.0;
-        self.var30_high_px = c_t.0;
-        self.var30_start_ts_ns = end_ns;
-
-        if l_t.0 < self.var300_low_px {
-            self.var300_low_px = l_t.0;
-        }
-        if h_t.0 > self.var300_high_px {
-            self.var300_high_px = h_t.0;
-        }
-        let dt300 = end_ns.saturating_sub(self.var300_start_ts_ns);
-        if dt300 >= HORIZON_5M_NS {
-            let v300 = Self::parkinson_window_var_bps2(
-                self.var300_anchor_px,
-                self.var300_low_px,
-                self.var300_high_px,
-                c_t.0,
-                dt300,
-                HORIZON_5M_NS,
-            );
-            let a_v300 = (1.0 - (-(dt300 as f64 * 1e-9) / 900.0).exp()).clamp(0.08, 0.55);
-            self.ewma_var_300s_bps2 += a_v300 * (v300 - self.ewma_var_300s_bps2);
-            if bar_secs > 90 {
-                self.ewma_var_30s_bps2 = (self.ewma_var_300s_bps2 / 10.0).max(0.25);
-            }
-            self.var300_anchor_px = c_t.0;
-            self.var300_low_px = c_t.0;
-            self.var300_high_px = c_t.0;
-            self.var300_start_ts_ns = end_ns;
-        }
-
-        let est_vol = ScaledBps((self.ewma_var_300s_bps2.sqrt() * 100.0).round() as i64);
-        self.last_vol_5m = est_vol;
-        self.recompute_observables(spec, c_t, end_ns, est_vol)
-    }
-
-    /// Updates unilateral Open Interest state and refreshes wave observables if initialized.
     pub fn observe_open_interest(
         &mut self,
-        spec: PairSpec,
-        open_interest_contracts: f64,
+        _spec: PairSpec,
+        open_interest: f64,
         ts_ns: i64,
     ) -> WaveObservables {
-        if !open_interest_contracts.is_finite()
-            || open_interest_contracts <= 0.0
-            || ts_ns <= 0
-        {
-            return self.last_obs;
+        if !open_interest.is_finite() || open_interest <= 0.0 {
+            return self.cached_obs;
         }
-        if !self.oi_initialized {
-            self.oi_initialized = true;
+        if self.ewma_oi_fast <= 0.0 || self.ewma_oi_slow <= 0.0 {
+            self.ewma_oi_fast = open_interest;
+            self.ewma_oi_slow = open_interest;
             self.last_oi_ts_ns = ts_ns;
-            self.oi_ewma_fast = open_interest_contracts;
-            self.oi_ewma_slow = open_interest_contracts;
-            self.oi_diff_mad = (open_interest_contracts * 1e-3).max(1e-6);
-            return self.last_obs;
+            return self.cached_obs;
         }
-        if ts_ns <= self.last_oi_ts_ns {
-            return self.last_obs;
-        }
-        let dt_s = ((ts_ns - self.last_oi_ts_ns) as f64 * 1e-9).clamp(0.1, 1_800.0);
+        let dt_s = if ts_ns > self.last_oi_ts_ns && self.last_oi_ts_ns > 0 {
+            ((ts_ns - self.last_oi_ts_ns) as f64 * 1e-9).clamp(1.0, 300.0)
+        } else {
+            5.0
+        };
         self.last_oi_ts_ns = ts_ns;
-        let a_fast = 1.0 - (-dt_s / 60.0).exp();
-        let a_slow = 1.0 - (-dt_s / 300.0).exp();
-        self.oi_ewma_fast += a_fast * (open_interest_contracts - self.oi_ewma_fast);
-        self.oi_ewma_slow += a_slow * (open_interest_contracts - self.oi_ewma_slow);
-        let abs_diff = (self.oi_ewma_fast - self.oi_ewma_slow).abs();
-        let a_mad = 1.0 - (-dt_s / 600.0).exp();
-        let floor_mad = (self.oi_ewma_slow * 5e-4).max(1e-6);
-        self.oi_diff_mad =
-            (self.oi_diff_mad + a_mad * (abs_diff - self.oi_diff_mad)).max(floor_mad);
-
-        if self.initialized && self.last_price_ticks.0 > 0 {
-            let eff_ts = ts_ns.max(self.last_price_ts_ns);
-            return self.recompute_observables(
-                spec,
-                self.last_price_ticks,
-                eff_ts,
-                self.last_vol_5m,
-            );
-        }
-        self.last_obs
+        let a_f = (1.0 - (-dt_s / 30.0).exp()).clamp(0.02, 1.0);
+        let a_s = (1.0 - (-dt_s / 300.0).exp()).clamp(0.005, 1.0);
+        self.ewma_oi_fast += a_f * (open_interest - self.ewma_oi_fast);
+        self.ewma_oi_slow += a_s * (open_interest - self.ewma_oi_slow);
+        let rel_oi = (self.ewma_oi_fast - self.ewma_oi_slow) / self.ewma_oi_slow.max(1e-6);
+        self.cached_obs.oi_impulse = BoundedScore::new_clamped(rel_oi * 120.0);
+        let h_val = self.cached_obs.hurst_exponent();
+        self.recompute_observables(h_val)
     }
 
-    /// Updates Hawkes forced-liquidation intensity from Bybit allLiquidation.{sym} WS.
+    pub fn observe_liquidation_with_price(
+        &mut self,
+        spec: PairSpec,
+        forced_book_side: Side,
+        qty: LotQty,
+        liq_price: PriceTicks,
+        ts_ns: i64,
+    ) -> WaveObservables {
+        if qty.0 <= 0 {
+            return self.cached_obs;
+        }
+        self.decay_liquidation_state(ts_ns);
+        let ref_px = if liq_price.0 > 0 {
+            liq_price
+        } else if self.last_mid_px.0 > 0 {
+            self.last_mid_px
+        } else {
+            PriceTicks(1_000)
+        };
+        let notional_usdt = (spec.lot_notional_1e8(qty, ref_px) as f64) * 1e-8;
+        let signed_usdt = notional_usdt * forced_book_side.sign_f64();
+        self.ewma_liq_signed_usdt += signed_usdt;
+        self.ewma_liq_abs_fast_usdt += notional_usdt;
+        self.ewma_liq_abs_slow_usdt =
+            0.96 * self.ewma_liq_abs_slow_usdt + 0.04 * notional_usdt.max(LIQ_FLOOR_USDT);
+        let h_val = self.cached_obs.hurst_exponent();
+        self.recompute_observables(h_val)
+    }
+
+    #[inline]
     pub fn observe_liquidation_print(
         &mut self,
         spec: PairSpec,
-        side: Side,
+        forced_book_side: Side,
         qty: LotQty,
         ts_ns: i64,
     ) -> WaveObservables {
-        if qty.0 <= 0 || ts_ns <= 0 {
-            return self.last_obs;
-        }
-        if self.last_liq_ts_ns > 0 && ts_ns > self.last_liq_ts_ns {
-            let dt_s = ((ts_ns - self.last_liq_ts_ns) as f64 * 1e-9).clamp(0.0, 600.0);
-            let decay = (-dt_s / 45.0).exp();
-            self.liq_buy_lots_ewma *= decay;
-            self.liq_sell_lots_ewma *= decay;
-        }
-        if ts_ns > self.last_liq_ts_ns {
-            self.last_liq_ts_ns = ts_ns;
-        }
-        let q = qty.0 as f64;
-        match side {
-            Side::Bid => self.liq_buy_lots_ewma += q,
-            Side::Ask => self.liq_sell_lots_ewma += q,
-        }
-        if self.initialized && self.last_price_ticks.0 > 0 {
-            let eff_ts = ts_ns.max(self.last_price_ts_ns);
-            return self.recompute_observables(
-                spec,
-                self.last_price_ticks,
-                eff_ts,
-                self.last_vol_5m,
-            );
-        }
-        self.last_obs
+        self.observe_liquidation_with_price(spec, forced_book_side, qty, self.last_mid_px, ts_ns)
     }
 
-    fn recompute_observables(
+    pub fn observe_bybit_liquidation_json(
         &mut self,
         spec: PairSpec,
-        obs_px: PriceTicks,
+        item: &serde_json::Value,
         ts_ns: i64,
-        realized_vol_5m: ScaledBps,
-    ) -> WaveObservables {
-        let px_f = (obs_px.0.max(1)) as f64;
-        let b3x_sc = spec
-            .required_3x_barrier_bps(obs_px)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
-        let b3x_bps = (b3x_sc.raw() as f64) / 100.0;
-        let obs_vol_bps = (realized_vol_5m.raw() as f64) / 100.0;
-        let park_sigma_5m = self.ewma_var_300s_bps2.sqrt();
-        let sigma_5m_bps = if self.ewma_var_300s_bps2 > (b3x_bps * b3x_bps) {
-            park_sigma_5m.max(b3x_bps)
-        } else {
-            obs_vol_bps.max(park_sigma_5m).max(b3x_bps).max(4.0)
-        };
-
-        let tau_tick_bps = (spec
-            .tick_to_price_scaled_bps(obs_px)
-            .unwrap_or(ScaledBps(50))
-            .raw() as f64)
-            / 100.0;
-        let bounce_var = 2.0 * tau_tick_bps * tau_tick_bps;
-        let min_v30 = (0.5 * tau_tick_bps * tau_tick_bps).max(0.04);
-        let clean_v30 = (self.ewma_var_30s_bps2 - bounce_var).max(min_v30);
-        let clean_v300 = (self.ewma_var_300s_bps2 - bounce_var).max(min_v30 * 2.0);
-        let vr_10 = (clean_v300 / (10.0 * clean_v30)).clamp(0.05, 25.0);
-        let hurst_h = (0.50 + vr_10.ln() / TWO_LN_10).clamp(0.20, 0.85);
-        let hurst_score = BoundedScore::new_clamped(2.0 * (hurst_h - 0.50));
-
-        let d_fast_bps =
-            ((px_f - self.px_ewma_30s) / self.px_ewma_30s.max(1.0)) * 10_000.0;
-        let d_sub_bps =
-            ((px_f - self.px_ewma_5m) / self.px_ewma_5m.max(1.0)) * 10_000.0;
-        let d_int_bps = ((self.px_ewma_5m - self.px_ewma_15m)
-            / self.px_ewma_15m.max(1.0))
-            * 10_000.0;
-        let d_par_bps = ((self.px_ewma_15m - self.px_ewma_1h)
-            / self.px_ewma_1h.max(1.0))
-            * 10_000.0;
-
-        let z_fast = d_fast_bps / (0.35 * sigma_5m_bps).max(1.0);
-        let z_sub = d_sub_bps / (EWMA_DIFF_STD_5M_15M * sigma_5m_bps);
-        let z_int = d_int_bps / (EWMA_DIFF_STD_5M_15M * sigma_5m_bps);
-        let z_par = d_par_bps / (EWMA_DIFF_STD_15M_60M * sigma_5m_bps);
-        let omega_macro = (0.55 * z_par + 0.45 * z_int).tanh();
-        let macro_phase = BoundedScore::new_clamped(omega_macro);
-
-        let oi_val = if self.oi_initialized && self.oi_ewma_slow > 0.0 {
-            let rel_oi =
-                (self.oi_ewma_fast - self.oi_ewma_slow) / self.oi_diff_mad.max(1e-6);
-            let f_oi = rel_oi.tanh();
-            let phi_oi = if f_oi >= 0.0 { f_oi } else { 0.50 * f_oi };
-            let v_px = (0.65 * z_fast + 0.35 * z_sub).tanh();
-            (v_px * phi_oi).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        let oi_impulse = BoundedScore::new_clamped(oi_val);
-
-        let min_span = (px_f * sigma_5m_bps * 1e-4).max(2.0);
-        let span = (self.swing_high_px - self.swing_low_px).max(min_span);
-        let ret_raw = if omega_macro >= 0.0 {
-            (self.swing_high_px - px_f) / span
-        } else {
-            (px_f - self.swing_low_px) / span
-        };
-        let retracement_ratio = BoundedScore::new_clamped(ret_raw.clamp(0.0, 1.0));
-
-        let liq_decay = if self.last_liq_ts_ns > 0 && ts_ns > self.last_liq_ts_ns {
-            (-((ts_ns - self.last_liq_ts_ns) as f64 * 1e-9) / 45.0).exp()
-        } else {
-            1.0
-        };
-        let q_scale = spec.characteristic_lot_scale(obs_px).max(1.0);
-        let tot_liq =
-            (self.liq_buy_lots_ewma + self.liq_sell_lots_ewma) * liq_decay / (8.0 * q_scale);
-        let ext_mag = (z_int.abs() + 0.5 * z_sub.abs() - 1.80).max(0.0) / 1.80;
-        let oi_div = if omega_macro * oi_val < -0.05 { 0.25 } else { 0.0 };
-        let climax_raw = (0.55 * tot_liq.tanh() + 0.45 * ext_mag + oi_div).clamp(0.0, 1.0);
-        let climax_intensity = BoundedScore::new_clamped(climax_raw);
-
-        let regime = if climax_raw >= 0.58
-            && omega_macro.abs() >= 0.38
-            && retracement_ratio.get() <= 0.08
-        {
-            WaveRegimeKind::TerminalExhaustionClimax
-        } else if omega_macro >= 0.22 {
-            if (z_fast < -0.20 || z_sub < -0.15) && retracement_ratio.get() >= 0.16 {
-                WaveRegimeKind::CorrectivePullbackInBull
-            } else if hurst_h >= 0.48 {
-                WaveRegimeKind::MotiveImpulseBull
-            } else {
-                WaveRegimeKind::NeutralEquilibrium
-            }
-        } else if omega_macro <= -0.22 {
-            if (z_fast > 0.20 || z_sub > 0.15) && retracement_ratio.get() >= 0.16 {
-                WaveRegimeKind::CorrectiveBounceInBear
-            } else if hurst_h >= 0.48 {
-                WaveRegimeKind::MotiveImpulseBear
-            } else {
-                WaveRegimeKind::NeutralEquilibrium
-            }
-        } else {
-            WaveRegimeKind::NeutralEquilibrium
-        };
-
-        let out = WaveObservables {
-            regime,
-            hurst_score,
-            oi_impulse,
-            macro_phase,
-            retracement_ratio,
-            climax_intensity,
-        };
-        self.last_obs = out;
-        out
+    ) -> Option<WaveObservables> {
+        let (forced_side, qty, px) = parse_bybit_all_liquidation_event(spec, item)?;
+        Some(self.observe_liquidation_with_price(spec, forced_side, qty, px, ts_ns))
     }
 
-    /// Parses Bybit V5 /v5/market/kline list into ascending (ts_ms, O, H, L, C) rows.
-    #[must_use]
-    pub fn parse_bybit_kline_rows(
-        spec: PairSpec,
-        kline_payload: &serde_json::Value,
-    ) -> Vec<(i64, PriceTicks, PriceTicks, PriceTicks, PriceTicks)> {
-        let Some(list) = kline_payload
+    fn ingest_kline_bundle(&mut self, spec: PairSpec, kline_json: &serde_json::Value) -> usize {
+        let Some(rows) = kline_json
             .get("result")
             .and_then(|r| r.get("list"))
             .and_then(|l| l.as_array())
         else {
-            return Vec::new();
+            return 0;
         };
-        let mut rows = Vec::with_capacity(list.len());
-        for item in list {
-            let Some(arr) = item.as_array() else { continue };
+        let mut count = 0_usize;
+        for row in rows.iter().rev() {
+            let Some(arr) = row.as_array() else { continue };
             if arr.len() < 5 {
                 continue;
             }
             let ts_ms = arr[0]
                 .as_str()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .or_else(|| arr[0].as_i64())
+                .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
-            let Some(o_s) = arr[1].as_str() else { continue };
-            let Some(h_s) = arr[2].as_str() else { continue };
-            let Some(l_s) = arr[3].as_str() else { continue };
-            let Some(c_s) = arr[4].as_str() else { continue };
-            let (Ok(o_t), Ok(h_t), Ok(l_t), Ok(c_t)) = (
-                spec.parse_price_ticks(o_s),
-                spec.parse_price_ticks(h_s),
-                spec.parse_price_ticks(l_s),
-                spec.parse_price_ticks(c_s),
-            ) else {
-                continue;
-            };
-            if ts_ms > 0 && c_t.0 > 0 {
-                rows.push((ts_ms, o_t, h_t, l_t, c_t));
+            let hi_opt = arr[2].as_str().and_then(|s| spec.parse_price_ticks(s).ok());
+            let lo_opt = arr[3].as_str().and_then(|s| spec.parse_price_ticks(s).ok());
+            let cl_opt = arr[4].as_str().and_then(|s| spec.parse_price_ticks(s).ok());
+            if let (Some(hi), Some(lo), Some(cl)) = (hi_opt, lo_opt, cl_opt) {
+                let vol_est = ScaledBps(
+                    (((hi.0 - lo.0).abs().saturating_mul(1_000_000)) / cl.0.max(1)).max(2_500),
+                );
+                let ts_ns = ts_ms.saturating_mul(1_000_000);
+                let _ = self.observe_price_tick(spec, cl, ts_ns, vol_est);
+                count += 1;
             }
         }
-        rows.sort_by_key(|r| r.0);
-        rows
+        count
     }
 
-    /// Chronologically merges 5m history (< first 1m bar), 1m detail & 5m Open Interest.
     pub fn warm_start_from_bybit_bundle(
         &mut self,
         spec: PairSpec,
-        kline5m: Option<&serde_json::Value>,
-        kline1m: Option<&serde_json::Value>,
-        oi5m: Option<&serde_json::Value>,
+        kline_5m: Option<&serde_json::Value>,
+        kline_1m: Option<&serde_json::Value>,
+        oi_5m: Option<&serde_json::Value>,
     ) -> usize {
-        let rows_1m = kline1m
-            .map(|k| Self::parse_bybit_kline_rows(spec, k))
-            .unwrap_or_default();
-        let first_1m_ms = rows_1m.first().map_or(i64::MAX, |r| r.0);
-        let rows_5m = kline5m
-            .map(|k| Self::parse_bybit_kline_rows(spec, k))
-            .unwrap_or_default();
-
-        let mut oi_pts: Vec<(i64, f64)> = Vec::new();
-        if let Some(oi_json) = oi5m {
-            if let Some(list) = oi_json
+        let mut total = 0_usize;
+        if let Some(k5) = kline_5m {
+            total += self.ingest_kline_bundle(spec, k5);
+        }
+        if let Some(k1) = kline_1m {
+            total += self.ingest_kline_bundle(spec, k1);
+        }
+        if let Some(oi_val) = oi_5m {
+            if let Some(rows) = oi_val
                 .get("result")
                 .and_then(|r| r.get("list"))
                 .and_then(|l| l.as_array())
             {
-                for item in list {
-                    let ts_ms = item
-                        .get("timestamp")
-                        .and_then(|v| {
-                            v.as_str()
-                                .and_then(|s| s.trim().parse::<i64>().ok())
-                                .or_else(|| v.as_i64())
-                        })
-                        .unwrap_or(0);
-                    let oi_v = item
+                for item in rows.iter().rev() {
+                    let oi_f = item
                         .get("openInterest")
                         .and_then(|v| v.as_str())
-                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .and_then(|s| s.parse::<f64>().ok())
                         .unwrap_or(0.0);
-                    if ts_ms > 0 && oi_v > 0.0 {
-                        oi_pts.push((ts_ms, oi_v));
+                    let ts_ms = item
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    if oi_f > 0.0 {
+                        let _ = self.observe_open_interest(
+                            spec,
+                            oi_f,
+                            ts_ms.saturating_mul(1_000_000),
+                        );
                     }
                 }
             }
         }
-        oi_pts.sort_by_key(|p| p.0);
-        let mut oi_idx = 0_usize;
-        let mut total_bars = 0_usize;
-
-        for &(ts_ms, o_t, h_t, l_t, c_t) in &rows_5m {
-            if ts_ms >= first_1m_ms {
-                break;
-            }
-            while oi_idx < oi_pts.len() && oi_pts[oi_idx].0 <= ts_ms + 300_000 {
-                let (ots, oval) = oi_pts[oi_idx];
-                let _ = self.observe_open_interest(spec, oval, ots * 1_000_000);
-                oi_idx += 1;
-            }
-            let _ = self.observe_ohlc_candle(spec, ts_ms, o_t, h_t, l_t, c_t, 300);
-            total_bars += 1;
-        }
-
-        for &(ts_ms, o_t, h_t, l_t, c_t) in &rows_1m {
-            while oi_idx < oi_pts.len() && oi_pts[oi_idx].0 <= ts_ms + 60_000 {
-                let (ots, oval) = oi_pts[oi_idx];
-                let _ = self.observe_open_interest(spec, oval, ots * 1_000_000);
-                oi_idx += 1;
-            }
-            let _ = self.observe_ohlc_candle(spec, ts_ms, o_t, h_t, l_t, c_t, 60);
-            total_bars += 1;
-        }
-
-        while oi_idx < oi_pts.len() {
-            let (ots, oval) = oi_pts[oi_idx];
-            let _ = self.observe_open_interest(spec, oval, ots * 1_000_000);
-            oi_idx += 1;
-        }
-        total_bars
+        total
     }
 
-    /// Evaluates continuous C1 wave entry modulation & counter-trend/climax vetoes.
     pub fn evaluate_wave_entry_modulation(
         obs: WaveObservables,
-        candidate_side: Side,
-        btc_leader_snr_signed: f64,
-    ) -> Result<WaveModulationVerdict, &'static str> {
-        let dir_s = candidate_side.sign_f64();
-        let signed_macro = obs.macro_phase.get() * dir_s;
-        let signed_oi = obs.oi_impulse.get() * dir_s;
-        let x_h = obs.hurst_score.get();
-        let ret = obs.retracement_ratio.get();
-        let climax = obs.climax_intensity.get();
-
-        let is_corrective_counter = matches!(
-            (candidate_side, obs.regime),
-            (Side::Bid, WaveRegimeKind::CorrectiveBounceInBear)
-                | (Side::Ask, WaveRegimeKind::CorrectivePullbackInBull)
-        );
-        let hurst_h = obs.hurst_exponent();
-        if (signed_macro < -0.32 || is_corrective_counter)
-            && signed_macro < -0.18
-            && signed_oi < 0.18
-            && btc_leader_snr_signed < 0.28
-        {
-            return Err("VETO_COUNTER_TREND_CORRECTIVE_WAVE");
+        side: Side,
+        btc_signed_snr: f64,
+    ) -> Result<WaveEntryModulation, &'static str> {
+        let dir_s = side.sign_f64();
+        let signed_phase = obs.macro_phase.get() * dir_s;
+        if obs.climax_active && signed_phase > 0.0 {
+            return Err("VETO_WAVE5_LIQ_CLIMAX_EXHAUSTION");
         }
-        let req_chop_h = (0.48 + 0.35 * signed_macro).clamp(0.36, 0.48);
-        let opp_excess = (-signed_macro - 0.12).max(0.0);
-        let chop_depth = (0.48 - hurst_h).max(0.0);
-        let req_btc_override =
-            (0.25 + 0.65 * opp_excess + 0.80 * chop_depth).clamp(0.25, 0.52);
-        let req_oi_override = (0.22 + 0.50 * opp_excess).clamp(0.22, 0.42);
-        if signed_macro < -0.12
-            && (hurst_h < req_chop_h || hurst_h < 0.46)
-            && signed_oi < req_oi_override
-            && btc_leader_snr_signed < req_btc_override
-        {
-            return Err("VETO_COUNTER_TREND_SUBDIFFUSIVE_CHOP");
+        let aligned_fib = obs.fib_proj_bps.raw().saturating_mul(side.sign_i64()).max(0);
+        match obs.regime {
+            WaveRegime::NeutralWarmup => Ok(WaveEntryModulation::default()),
+            WaveRegime::ClimaxExhaustion => {
+                if signed_phase > 0.0 {
+                    Err("VETO_WAVE5_LIQ_CLIMAX_EXHAUSTION")
+                } else {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: -0.010,
+                        def_horizon_permille_mult: 850,
+                        tranche1_permille_delta: 60,
+                        fib_target_bps: ScaledBps(0),
+                    })
+                }
+            }
+            WaveRegime::ImpulseWave3 => {
+                if signed_phase > 0.15 {
+                    let h_bonus = ((obs.hurst_exponent() - 0.52) * 0.08).clamp(0.0, 0.015);
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: (-0.015 - h_bonus).clamp(-0.030, -0.010),
+                        def_horizon_permille_mult: 1_180,
+                        tranche1_permille_delta: -60,
+                        fib_target_bps: ScaledBps(aligned_fib),
+                    })
+                } else if signed_phase < -0.15 && btc_signed_snr < 0.20 {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: 0.045,
+                        def_horizon_permille_mult: 820,
+                        tranche1_permille_delta: 90,
+                        fib_target_bps: ScaledBps(0),
+                    })
+                } else {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: 0.010,
+                        def_horizon_permille_mult: 1_000,
+                        tranche1_permille_delta: 0,
+                        fib_target_bps: ScaledBps(aligned_fib),
+                    })
+                }
+            }
+            WaveRegime::ImpulseWave5 => {
+                if signed_phase > 0.15 {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: -0.008,
+                        def_horizon_permille_mult: 1_050,
+                        tranche1_permille_delta: 40,
+                        fib_target_bps: ScaledBps(aligned_fib),
+                    })
+                } else if signed_phase < -0.15 {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: 0.025,
+                        def_horizon_permille_mult: 860,
+                        tranche1_permille_delta: 80,
+                        fib_target_bps: ScaledBps(0),
+                    })
+                } else {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: 0.0,
+                        def_horizon_permille_mult: 1_000,
+                        tranche1_permille_delta: 20,
+                        fib_target_bps: ScaledBps(aligned_fib),
+                    })
+                }
+            }
+            WaveRegime::CorrectiveWave4 => Ok(WaveEntryModulation {
+                snr_threshold_delta: if signed_phase >= 0.0 { 0.005 } else { 0.020 },
+                def_horizon_permille_mult: 900,
+                tranche1_permille_delta: 50,
+                fib_target_bps: ScaledBps(0),
+            }),
+            WaveRegime::CorrectiveAbc => {
+                if signed_phase < -0.35 && btc_signed_snr < 0.15 {
+                    Err("VETO_WAVE_ABC_STRUCTURAL_HEADWIND")
+                } else {
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: if signed_phase < 0.0 { 0.025 } else { 0.0 },
+                        def_horizon_permille_mult: 880,
+                        tranche1_permille_delta: 60,
+                        fib_target_bps: ScaledBps(0),
+                    })
+                }
+            }
         }
-        if matches!(obs.regime, WaveRegimeKind::TerminalExhaustionClimax)
-            && signed_macro > 0.35
-            && ret <= 0.08
-            && climax >= 0.58
-        {
-            return Err("VETO_ELLIOTT_WAVE5_CLIMAX_EXHAUSTION");
-        }
-
-        let mut snr_delta = 0.0_f64;
-        if signed_macro < -0.15 {
-            snr_delta += (((-signed_macro - 0.15) / 0.25) * 0.07).clamp(0.0, 0.08);
-        } else if signed_macro >= 0.22 && (0.30..=0.70).contains(&ret) && x_h >= -0.05 {
-            snr_delta -= 0.025;
-        } else if signed_macro >= 0.30 && x_h >= 0.10 && signed_oi >= 0.05 {
-            snr_delta -= 0.020;
-        }
-        if x_h < -0.12 {
-            snr_delta += ((-x_h - 0.12) * 0.10).clamp(0.0, 0.04);
-        }
-
-        let t1_shift = -(90.0 * x_h.clamp(-0.50, 0.60)
-            + 50.0 * signed_oi.clamp(-0.50, 0.60))
-        .round() as i64;
-        let def_mult = if signed_macro >= 0.25 && x_h >= 0.08 {
-            (1_000.0 + 250.0 * x_h.min(0.60)).round() as i64
-        } else if signed_macro <= -0.20 {
-            800
-        } else {
-            1_000
-        };
-
-        Ok(WaveModulationVerdict {
-            snr_threshold_delta: snr_delta.clamp(-0.03, 0.09),
-            tranche1_permille_delta: t1_shift.clamp(-110, 110),
-            def_horizon_permille_mult: def_mult.clamp(750, 1_250),
-        })
-    }
-}
-
-/// Computes absolute Pearson correlation |r| in [0.0, 1.0] to verify orthogonality (< 0.25).
-#[must_use]
-pub fn pearson_abs_correlation(xs: &[f64], ys: &[f64]) -> f64 {
-    let n = xs.len().min(ys.len());
-    if n < 3 {
-        return 0.0;
-    }
-    let nf = n as f64;
-    let mx = xs.iter().take(n).sum::<f64>() / nf;
-    let my = ys.iter().take(n).sum::<f64>() / nf;
-    let mut cov = 0.0_f64;
-    let mut vx = 0.0_f64;
-    let mut vy = 0.0_f64;
-    for i in 0..n {
-        let dx = xs[i] - mx;
-        let dy = ys[i] - my;
-        cov += dx * dy;
-        vx += dx * dx;
-        vy += dy * dy;
-    }
-    let denom = (vx * vy).sqrt();
-    if denom <= 1e-12 {
-        0.0
-    } else {
-        (cov / denom).abs().clamp(0.0, 1.0)
     }
 }
 
@@ -871,214 +827,91 @@ mod tests {
 
     #[test]
     fn test_elliott_impulse_vs_corrective_bounce_symmetry_and_climax() {
-        let tao_spec = APPROVED_SPECS[4];
-        let mut bear_st = CausalElliottWaveState::new();
-        let mut ts = 1_700_000_000_000_000_000_i64;
-        let mut px = 22_200_i64;
-        for step in 0..120_i64 {
-            ts += 60_000_000_000;
-            px -= 6;
-            let _ = bear_st.observe_price_tick(
-                tao_spec,
-                PriceTicks(px),
-                ts,
-                ScaledBps(5_500),
-            );
-            let _ = bear_st.observe_open_interest(
-                tao_spec,
-                100_000.0 + (step as f64) * 180.0,
-                ts,
-            );
+        let avax = APPROVED_SPECS[3];
+        let mut bull = CausalElliottWaveState::new();
+        let vol = ScaledBps(5_000);
+        for &(px, step) in &[(10_000_i64, 1_i64), (10_100, 2), (10_038, 3), (10_080, 4)] {
+            let _ = bull.observe_price_tick(avax, PriceTicks(px), step * 1_000_000_000, vol);
         }
-        let bear_imp = bear_st.observables();
-        assert!(bear_imp.macro_phase.get() < -0.45);
-        assert!(bear_imp.hurst_exponent() > 0.55);
-        assert!(bear_imp.oi_impulse.get() < -0.20);
-        assert_eq!(bear_imp.regime, WaveRegimeKind::MotiveImpulseBear);
+        let obs_w3 = bull.observables();
+        assert_eq!(obs_w3.regime, WaveRegime::ImpulseWave3);
+        assert!(obs_w3.fib_proj_bps.raw() > 800);
+        let mod_w3 = CausalElliottWaveState::evaluate_wave_entry_modulation(obs_w3, Side::Bid, 0.4);
+        assert!(mod_w3.is_ok_and(|m| m.def_horizon_permille_mult == 1_180 && m.tranche1_permille_delta == -60));
+
+        let mut bear = CausalElliottWaveState::new();
+        for &(px, step) in &[(10_000_i64, 1_i64), (9_900, 2), (9_962, 3), (9_920, 4)] {
+            let _ = bear.observe_price_tick(avax, PriceTicks(px), step * 1_000_000_000, vol);
+        }
+        assert_eq!(bear.observables().regime, WaveRegime::ImpulseWave3);
+        assert!(bear.observables().fib_proj_bps.raw() < -800);
+
+        let _ = bull.observe_price_tick(avax, PriceTicks(10_200), 5_000_000_000, vol);
+        let _ = bull.observe_price_tick(avax, PriceTicks(10_090), 6_000_000_000, vol);
+        let _ = bull.observe_price_tick(avax, PriceTicks(10_150), 7_000_000_000, vol);
+        assert_eq!(bull.observables().regime, WaveRegime::CorrectiveAbc);
+
+        let mut w5 = CausalElliottWaveState::new();
+        for &(px, st) in &[
+            (10_000_i64, 1_i64),
+            (10_100, 2),
+            (10_038, 3),
+            (10_210, 4),
+            (10_145, 5),
+            (10_220, 6),
+        ] {
+            let _ = w5.observe_price_tick(avax, PriceTicks(px), st * 2_000_000_000, vol);
+        }
+        assert_eq!(w5.observables().regime, WaveRegime::ImpulseWave5);
+        let _ = w5.observe_open_interest(avax, 1_000_000.0, 12_000_000_000);
+        let _ = w5.observe_open_interest(avax, 970_000.0, 14_000_000_000);
+        let liq_short_json = serde_json::json!({
+            "s": "AVAXUSDT",
+            "S": "Sell",
+            "v": "500.0",
+            "p": "10.220"
+        });
+        assert_eq!(
+            parse_bybit_all_liquidation_event(avax, &liq_short_json),
+            Some((Side::Bid, LotQty(5_000), PriceTicks(10_220)))
+        );
+        let climax_obs = w5.observe_bybit_liquidation_json(avax, &liq_short_json, 15_000_000_000);
+        assert!(climax_obs.is_some_and(|o| o.regime == WaveRegime::ClimaxExhaustion && o.climax_active));
         assert!(CausalElliottWaveState::evaluate_wave_entry_modulation(
-            bear_imp, Side::Ask, -0.45,
-        )
-        .is_ok());
-
-        for step in 0..6_i64 {
-            ts += 30_000_000_000;
-            px += 4;
-            let _ = bear_st.observe_price_tick(
-                tao_spec,
-                PriceTicks(px),
-                ts,
-                ScaledBps(5_500),
-            );
-            let _ = bear_st.observe_open_interest(
-                tao_spec,
-                121_500.0 - (step as f64) * 320.0,
-                ts,
-            );
-        }
-        let hollow_bounce = bear_st.observables();
-        assert!(hollow_bounce.oi_impulse.get() <= 0.0);
-        assert_eq!(
-            CausalElliottWaveState::evaluate_wave_entry_modulation(
-                hollow_bounce,
-                Side::Bid,
-                -0.10,
-            ),
-            Err("VETO_COUNTER_TREND_CORRECTIVE_WAVE")
-        );
-
-        let mut bull_st = CausalElliottWaveState::new();
-        let mut ts_b = 1_700_000_000_000_000_000_i64;
-        let mut px_b = 20_760_i64;
-        for step in 0..120_i64 {
-            ts_b += 60_000_000_000;
-            px_b += 6;
-            let _ = bull_st.observe_price_tick(
-                tao_spec,
-                PriceTicks(px_b),
-                ts_b,
-                ScaledBps(5_500),
-            );
-            let _ = bull_st.observe_open_interest(
-                tao_spec,
-                100_000.0 + (step as f64) * 180.0,
-                ts_b,
-            );
-        }
-        let bull_imp = bull_st.observables();
-        assert_eq!(bull_imp.regime, WaveRegimeKind::MotiveImpulseBull);
-        let mod_bull = CausalElliottWaveState::evaluate_wave_entry_modulation(
-            bull_imp, Side::Bid, 0.45,
-        );
-        let mod_bear = CausalElliottWaveState::evaluate_wave_entry_modulation(
-            bear_imp, Side::Ask, -0.45,
-        );
-        assert!(mod_bull.is_ok() && mod_bear.is_ok());
-        if let (Ok(mb), Ok(ma)) = (mod_bull, mod_bear) {
-            assert!((mb.tranche1_permille_delta - ma.tranche1_permille_delta).abs() <= 2);
-            assert!(mb.tranche1_permille_delta < 0);
-        }
-
-        let _ = bull_st.observe_liquidation_print(
-            tao_spec,
+            w5.observables(),
             Side::Bid,
-            LotQty(4_000),
-            ts_b + 1_000_000_000,
-        );
-        let climax_obs = bull_st.observe_price_tick(
-            tao_spec,
-            PriceTicks(px_b + 85),
-            ts_b + 2_000_000_000,
-            ScaledBps(5_500),
-        );
-        assert_eq!(climax_obs.regime, WaveRegimeKind::TerminalExhaustionClimax);
-        assert_eq!(
-            CausalElliottWaveState::evaluate_wave_entry_modulation(
-                climax_obs, Side::Bid, 0.50,
-            ),
-            Err("VETO_ELLIOTT_WAVE5_CLIMAX_EXHAUSTION")
-        );
+            0.50,
+        )
+        .is_err());
     }
 
     #[test]
     fn test_bybit_v5_live_or_cached_12pair_elliott_statistical_validation() {
-        let sample_kline = serde_json::json!({
-            "retCode": 0,
+        let k5 = serde_json::json!({
             "result": {
                 "list": [
-                    ["1700000900000", "8.4800", "8.4900", "8.4500", "8.4550", "1000", "8460"],
-                    ["1700000600000", "8.5100", "8.5150", "8.4750", "8.4800", "1200", "10180"],
-                    ["1700000300000", "8.5400", "8.5450", "8.5050", "8.5100", "1100", "9360"],
-                    ["1700000000000", "8.5700", "8.5800", "8.5350", "8.5400", "900", "7690"]
+                    ["1700001200000", "8.300", "8.340", "8.290", "8.330"],
+                    ["1700000900000", "8.240", "8.260", "8.230", "8.245"],
+                    ["1700000600000", "8.290", "8.305", "8.235", "8.240"],
+                    ["1700000300000", "8.200", "8.300", "8.195", "8.295"],
+                    ["1700000000000", "8.200", "8.210", "8.190", "8.200"]
                 ]
             }
         });
-        let sample_oi = serde_json::json!({
-            "retCode": 0,
+        let oi = serde_json::json!({
             "result": {
                 "list": [
-                    {"openInterest": "2650000", "timestamp": "1700000900000"},
-                    {"openInterest": "2610000", "timestamp": "1700000600000"},
-                    {"openInterest": "2580000", "timestamp": "1700000300000"},
-                    {"openInterest": "2550000", "timestamp": "1700000000000"}
+                    {"openInterest": "1050000", "timestamp": "1700001200000"},
+                    {"openInterest": "1000000", "timestamp": "1700000000000"}
                 ]
             }
         });
-        let mut st = CausalElliottWaveState::new();
-        assert_eq!(
-            st.warm_start_from_bybit_bundle(
-                APPROVED_SPECS[3],
-                Some(&sample_kline),
-                None,
-                Some(&sample_oi),
-            ),
-            4
-        );
-        assert!(st.observables().macro_phase.get() < 0.0);
-
-        let mut macro_series = Vec::with_capacity(120);
-        let mut fast_osc_series = Vec::with_capacity(120);
-        for k in 0..120_usize {
-            let kf = k as f64;
-            macro_series.push((kf / 40.0).tanh());
-            fast_osc_series.push((kf * 1.7).sin());
-        }
-        assert!(pearson_abs_correlation(&macro_series, &fast_osc_series) < 0.25);
-
-        let live_cache = std::env::temp_dir().join("vortex_bybit_elliott_live.json");
-        if let Ok(raw_txt) = std::fs::read_to_string(&live_cache) {
-            if let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw_txt) {
-                println!(
-                    "\n=== [BYBIT V5 UNBIASED 12-PAIR ELLIOTT WAVE & OI LAB] ==="
-                );
-                println!(
-                    concat!(
-                        "SLOT | SYMBOL     | REGIME               | ",
-                        "HURST | MACRO | OI_IMP | RET_FIB | BID_GATE | ASK_GATE"
-                    )
-                );
-                let mut analyzed = 0_usize;
-                for (idx, spec) in APPROVED_SPECS.iter().enumerate() {
-                    let sym = spec.symbol_id.name();
-                    let Some(entry) = root.get(sym) else { continue };
-                    let mut live_w = CausalElliottWaveState::new();
-                    let _ = live_w.warm_start_from_bybit_bundle(
-                        *spec,
-                        entry.get("kline5m"),
-                        entry.get("kline1m"),
-                        entry.get("oi5m"),
-                    );
-                    let obs = live_w.observables();
-                    let bid_g = match CausalElliottWaveState::evaluate_wave_entry_modulation(
-                        obs, Side::Bid, 0.0,
-                    ) {
-                        Ok(m) => format!("OK(dT1={:+})", m.tranche1_permille_delta),
-                        Err(_) => "VETO_CORR".to_string(),
-                    };
-                    let ask_g = match CausalElliottWaveState::evaluate_wave_entry_modulation(
-                        obs, Side::Ask, 0.0,
-                    ) {
-                        Ok(m) => format!("OK(dT1={:+})", m.tranche1_permille_delta),
-                        Err(_) => "VETO_CORR".to_string(),
-                    };
-                    println!(
-                        concat!(
-                            "  {:2} | {:<10} | {:<20} | {:>5.3} | ",
-                            "{:>+5.2} | {:>+6.2} | {:>7.3} | {:<11} | {}"
-                        ),
-                        idx,
-                        sym,
-                        obs.regime.label(),
-                        obs.hurst_exponent(),
-                        obs.macro_phase.get(),
-                        obs.oi_impulse.get(),
-                        obs.retracement_ratio.get(),
-                        bid_g,
-                        ask_g
-                    );
-                    analyzed += 1;
-                }
-                assert!(analyzed >= 1);
-            }
+        for spec in &APPROVED_SPECS {
+            let mut st = CausalElliottWaveState::new();
+            let bars = st.warm_start_from_bybit_bundle(*spec, Some(&k5), None, Some(&oi));
+            assert_eq!(bars, 5);
+            assert!(st.observables().oi_impulse.get() > 0.0);
+            assert!((0.25..=0.85).contains(&st.observables().hurst_exponent()));
         }
     }
 }
