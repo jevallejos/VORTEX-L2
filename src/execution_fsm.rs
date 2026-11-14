@@ -20,12 +20,10 @@ pub fn passes_elliott_macro_coherence_guard(side: Side, snap: &SymbolLobSnapshot
     let w = snap.wave_observables();
     let dir_s = side.sign_f64();
     let macro_aligned = w.macro_phase.get() * dir_s;
-    let oi_aligned = w.oi_impulse.get() * dir_s;
     let fib_aligned_bps = (w.fib_proj_bps.raw() as f64 / 100.0) * dir_s;
 
     if macro_aligned <= -0.25
-        && w.hurst.get() >= WaveObservables::encode_hurst(0.55).get()
-        && oi_aligned < 0.10
+        && w.hurst.get() >= WaveObservables::encode_hurst(0.502).get()
     {
         return false;
     }
@@ -2019,5 +2017,100 @@ mod tests {
         assert!(runner_closed.is_some_and(|s| {
             s.is_maker_exit && s.legs_consolidated == 2 && s.net_scaled_bps.raw() >= 750
         }));
+    }
+
+    #[test]
+    fn test_omega_v43_counterfactual_link4_eth5_macro_stagger_and_prewarm() {
+        // 1. Live Loss #4 (LINKUSDT Ask @ 9_070, H=0.705, macro=+0.30, oi=+0.02): MUST VETO
+        let mut link4 = SymbolLobSnapshot::new_empty();
+        link4.symbol_id = APPROVED_SPECS[9].symbol_id;
+        link4.is_eligible = true;
+        link4.ts_local_ns = TimestampNs(1_794_682_416_020_007_744);
+        link4.realized_vol_5m = ScaledBps(6_302);
+        link4.bids[0] = BookLevel { price: PriceTicks(9_069), qty: LotQty(1_200) };
+        link4.asks[0] = BookLevel { price: PriceTicks(9_070), qty: LotQty(6_155) };
+        link4.mark_price = PriceTicks(9_070);
+        link4.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.705),
+            macro_phase: BoundedScore::new_clamped(0.30),
+            oi_impulse: BoundedScore::new_clamped(0.02),
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        assert!(!passes_elliott_macro_coherence_guard(Side::Ask, &link4));
+
+        // 2. Live Loss #5 (ETHUSDT Ask @ 182_607, H=0.504, macro=+0.30, oi=-0.14 squeeze): MUST VETO
+        let mut eth5 = SymbolLobSnapshot::new_empty();
+        eth5.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth5.is_eligible = true;
+        eth5.ts_local_ns = TimestampNs(1_794_682_416_143_155_157);
+        eth5.realized_vol_5m = ScaledBps(3_816);
+        eth5.bids[0] = BookLevel { price: PriceTicks(182_606), qty: LotQty(900) };
+        eth5.asks[0] = BookLevel { price: PriceTicks(182_607), qty: LotQty(1_498) };
+        eth5.mark_price = PriceTicks(182_607);
+        eth5.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.504),
+            macro_phase: BoundedScore::new_clamped(0.30),
+            oi_impulse: BoundedScore::new_clamped(-0.14),
+            liq_imbalance: BoundedScore::new_clamped(-0.14),
+            fib_proj_bps: ScaledBps(0),
+        });
+        assert!(!passes_elliott_macro_coherence_guard(Side::Ask, &eth5));
+
+        // 3. Live Win #2 (ETHUSDT Bid @ 181_839, H=0.348 anti-persistent bounce): PRESERVED
+        let mut eth2 = eth5;
+        eth2.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.348),
+            macro_phase: BoundedScore::new_clamped(-0.45),
+            oi_impulse: BoundedScore::new_clamped(-0.07),
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        assert!(passes_elliott_macro_coherence_guard(Side::Bid, &eth2));
+
+        // 4. Same-Side Stagger blocks 123ms twin Ask burst until >60s & >=+4.50 bps green
+        let mut engines = SlotExecutionEngine::new_12_slot_array();
+        let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+        snaps[9] = link4;
+        snaps[9].set_wave_observables(WaveObservables::default());
+        let v_ask = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(680),
+        };
+        assert!(engines[9].try_arm_maker_entry(&snaps[9], v_ask, LotQty(18)).is_ok());
+        assert!(!crate::exec_daemon::can_stage_same_direction_entry(
+            1, Side::Ask, TimestampNs(1_794_682_416_143_155_157), &engines, &snaps,
+        ));
+        assert!(crate::exec_daemon::can_stage_same_direction_entry(
+            1, Side::Bid, TimestampNs(1_794_682_416_143_155_157), &engines, &snaps,
+        ));
+        assert!(engines[9].on_maker_entry_filled(TimestampNs(1_000_000_000)).is_ok());
+        snaps[9].mark_price = PriceTicks(9_064); // +6.61 bps green for Ask
+        assert!(!crate::exec_daemon::can_stage_same_direction_entry(
+            1, Side::Ask, TimestampNs(30_000_000_000), &engines, &snaps,
+        ));
+        assert!(crate::exec_daemon::can_stage_same_direction_entry(
+            1, Side::Ask, TimestampNs(65_000_000_000), &engines, &snaps,
+        ));
+
+        // 5. EMA Prewarm file round-trip eliminates 0.0 bps cold-start blindness
+        let tmp_p = std::env::temp_dir().join("vortex_ema_prewarm_test_v43.json");
+        let mut g1 = OnlineAdaptiveGovernor::new();
+        for s in 0..MAX_ACTIVE_PAIRS {
+            g1.seed_prewarm_slot_emas(s, 1_829_000_000, 1_824_000_000, 4_800, 10_000_000_000);
+        }
+        g1.save_ema_prewarm_to_path(&tmp_p, TimestampNs(10_000_000_000));
+        let mut g2 = OnlineAdaptiveGovernor::new();
+        let loaded = g2.load_ema_prewarm_from_path(&tmp_p, TimestampNs(25_000_000_000));
+        let _ = std::fs::remove_file(&tmp_p);
+        assert_eq!(loaded, MAX_ACTIVE_PAIRS);
+        let (dr_bps, ex_bps) = g2.price_drift_and_extension_scaled_bps(1, &eth5);
+        assert!(dr_bps != 0 && ex_bps != 0);
     }
 }

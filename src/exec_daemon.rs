@@ -135,6 +135,61 @@ pub fn select_safe_live_sl_ticks(
     PairSpec::validate_stop_loss_geometry(side, target, ref_last, ref_mark).ok()
 }
 
+/// OMEGA V4.3 Anti-Burst Directional Stagger: blocks concurrent same-side entries unless
+/// every existing same-side slot has survived >= 60s and holds >= +4.50 bps gross cushion.
+#[must_use]
+pub fn can_stage_same_direction_entry(
+    candidate_slot: usize,
+    side: Side,
+    now_ns: TimestampNs,
+    engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+) -> bool {
+    for (s_idx, eng) in engines.iter().enumerate() {
+        if s_idx == candidate_slot {
+            continue;
+        }
+        match eng.state {
+            OrderLifecycleState::Idle => {}
+            OrderLifecycleState::PlacingEntryMaker { side: s, .. }
+            | OrderLifecycleState::RestingEntryQueue { side: s, .. } => {
+                if s == side {
+                    return false;
+                }
+            }
+            OrderLifecycleState::PositionOpenMakerExit {
+                side: s,
+                avg_price_ticks,
+                opened_ts,
+                ..
+            } => {
+                if s == side {
+                    if now_ns.0.saturating_sub(opened_ts.0) < 60_000_000_000 {
+                        return false;
+                    }
+                    let snap = &cached_snaps[s_idx];
+                    let ref_px = if snap.mark_price.0 > 0 {
+                        snap.mark_price.0
+                    } else {
+                        match s {
+                            Side::Bid => snap.bids[0].price.0,
+                            Side::Ask => snap.asks[0].price.0,
+                        }
+                    };
+                    let denom = avg_price_ticks.0.max(1);
+                    let cur_gross_bps = ((ref_px - avg_price_ticks.0) * s.sign_i64())
+                        .saturating_mul(1_000_000)
+                        / denom;
+                    if cur_gross_bps < 450 && !eng.chandelier_profit_sl_armed {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Executes one deterministic 200Hz custody & entry tick across all 12 slots.
 pub fn step_12_slot_daemon_tick(
     now_ns: TimestampNs,
@@ -603,7 +658,7 @@ pub fn step_12_slot_daemon_tick(
     if !block_new_entries && beta_guard.total_active() < 6 {
         let mut armed_this_tick = 0_usize;
         for s_idx in 0..MAX_ACTIVE_PAIRS {
-            if beta_guard.total_active() >= 6 || armed_this_tick >= 2 {
+            if beta_guard.total_active() >= 6 || armed_this_tick >= 1 {
                 break;
             }
             if !matches!(engines[s_idx].state, OrderLifecycleState::Idle)
@@ -627,7 +682,9 @@ pub fn step_12_slot_daemon_tick(
                 ScaledBps(probe_edge),
             );
             if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
-                if !beta_guard.can_admit_side(side) {
+                if !beta_guard.can_admit_side(side)
+                    || !can_stage_same_direction_entry(s_idx, side, now_ns, engines, cached_snaps)
+                {
                     continue;
                 }
                 if gov.authorizes_adaptive_entry_with_wallet(
@@ -665,12 +722,29 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     let mut lock_poll_ticks = 0_u32;
 
     rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
+    let boot_ns = now_epoch_ns();
+    let prewarmed_slots = gov.load_ema_prewarm_file(boot_ns);
+    if live_capital {
+        let warmup_ns = if prewarmed_slots >= MAX_ACTIVE_PAIRS {
+            15_000_000_000_i64
+        } else {
+            75_000_000_000_i64
+        };
+        gov.set_entry_warmup_until_ns(boot_ns.0.saturating_add(warmup_ns));
+        println!(
+            "{}\u{1f7e2} [EMA PREWARM V4.3] Hydrated {}/12 slots | Live L2 stabilize: {}s{}",
+            ANSI_GREEN,
+            prewarmed_slots,
+            warmup_ns / 1_000_000_000,
+            ANSI_RESET
+        );
+    }
     bootstrap_live_adopt_if_enabled(
         live_capital, arena, &gov, &mut rt, &mut entry_forensics, &mut engines,
     );
     let gateway = BybitAsyncGateway::spawn_if_enabled(live_capital);
     println!(
-        "{}\u{1f7e2} [VORTEX-OMEGA V4.2 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
+        "{}\u{1f7e2} [VORTEX-OMEGA V4.3 200.0 Hz ARMED] Hawkes Shield + Wald v2 + Shadow-Runner + Chandelier SL.{}",
         ANSI_GREEN,
         ANSI_RESET
     );
@@ -705,6 +779,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         }
         if now_ns.0.saturating_sub(last_wallet_sync_ns) >= 30_000_000_000 {
             last_wallet_sync_ns = now_ns.0;
+            gov.save_ema_prewarm_file(now_ns);
             if let Some(ref gw) = gateway {
                 let _ = gw.try_send(GatewayCommand::SyncWallet);
             }

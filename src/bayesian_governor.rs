@@ -23,6 +23,8 @@ use crate::types::{
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const INIT_RETURN_VAR_BPS2: i64 = 40_000;
 const MIN_VALID_UTC_EPOCH_NS: i64 = 1_577_836_800_000_000_000;
+pub const EMA_PREWARM_PATH: &str = "data/vault/vortex_ema_prewarm.json";
+const MAX_EMA_PREWARM_AGE_NS: i64 = 900_000_000_000;
 
 /// 12x2 Online Bayesian Governor with Lyapunov Crest Shield, Welford Var & UTC Cadence.
 #[derive(Clone, Debug)]
@@ -47,6 +49,7 @@ pub struct OnlineAdaptiveGovernor {
     abort_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     abort_anchor_px_1e4: [[i64; 2]; MAX_ACTIVE_PAIRS],
     abort_last_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    entry_warmup_until_ns: i64,
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -82,6 +85,7 @@ impl OnlineAdaptiveGovernor {
             abort_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             abort_anchor_px_1e4: [[i64::MIN; 2]; MAX_ACTIVE_PAIRS],
             abort_last_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
+            entry_warmup_until_ns: 0,
         }
     }
 
@@ -268,6 +272,105 @@ impl OnlineAdaptiveGovernor {
             0
         };
         (tau_ns.saturating_mul(2 * fee_rt + edge_pos)) / fee_rt
+    }
+
+    #[inline]
+    pub fn set_entry_warmup_until_ns(&mut self, until_ns: i64) {
+        self.entry_warmup_until_ns = until_ns;
+    }
+
+    #[inline]
+    pub fn seed_prewarm_slot_emas(
+        &mut self,
+        slot_idx: usize,
+        fast_px_1e4: i64,
+        slow_px_1e4: i64,
+        eq_vol_bps: i64,
+        ts_ns: i64,
+    ) {
+        if slot_idx >= MAX_ACTIVE_PAIRS || fast_px_1e4 <= 0 || slow_px_1e4 <= 0 {
+            return;
+        }
+        let min_floor = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 2;
+        self.ewma_fast_px_1e4[slot_idx] = fast_px_1e4;
+        self.ewma_slow_px_1e4[slot_idx] = slow_px_1e4;
+        if eq_vol_bps > 0 {
+            self.eq_vol_5m_bps[slot_idx] = eq_vol_bps.clamp(min_floor, 24_000);
+        }
+        if ts_ns > 0 {
+            self.last_price_sample_ts_ns[slot_idx] = ts_ns;
+        }
+    }
+
+    pub fn save_ema_prewarm_to_path(&self, path: &std::path::Path, now_ns: TimestampNs) {
+        if self.ewma_fast_px_1e4.iter().all(|&v| v <= 0) {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let payload = serde_json::json!({
+            "event": "EMA_PREWARM_V43",
+            "ts_ns": now_ns.0,
+            "ewma_fast_px_1e4": self.ewma_fast_px_1e4,
+            "ewma_slow_px_1e4": self.ewma_slow_px_1e4,
+            "eq_vol_5m_bps": self.eq_vol_5m_bps,
+        });
+        if let Ok(txt) = serde_json::to_string(&payload) {
+            let _ = std::fs::write(path, txt);
+        }
+    }
+
+    #[inline]
+    pub fn save_ema_prewarm_file(&self, now_ns: TimestampNs) {
+        self.save_ema_prewarm_to_path(std::path::Path::new(EMA_PREWARM_PATH), now_ns);
+    }
+
+    #[must_use]
+    pub fn load_ema_prewarm_from_path(
+        &mut self,
+        path: &std::path::Path,
+        now_ns: TimestampNs,
+    ) -> usize {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return 0;
+        };
+        let file_ts = val.get("ts_ns").and_then(|v| v.as_i64()).unwrap_or(0);
+        if file_ts <= 0
+            || (now_ns.0 > file_ts && now_ns.0.saturating_sub(file_ts) > MAX_EMA_PREWARM_AGE_NS)
+        {
+            return 0;
+        }
+        let Some(f_arr) = val.get("ewma_fast_px_1e4").and_then(|v| v.as_array()) else {
+            return 0;
+        };
+        let Some(s_arr) = val.get("ewma_slow_px_1e4").and_then(|v| v.as_array()) else {
+            return 0;
+        };
+        let eq_opt = val.get("eq_vol_5m_bps").and_then(|v| v.as_array());
+        let mut loaded = 0_usize;
+        for (idx, (fv, sv)) in f_arr.iter().zip(s_arr.iter()).take(MAX_ACTIVE_PAIRS).enumerate() {
+            let f_px = fv.as_i64().unwrap_or(0);
+            let s_px = sv.as_i64().unwrap_or(0);
+            let eq_v = eq_opt
+                .and_then(|a| a.get(idx))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if f_px > 0 && s_px > 0 {
+                self.seed_prewarm_slot_emas(idx, f_px, s_px, eq_v, file_ts);
+                loaded += 1;
+            }
+        }
+        loaded
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn load_ema_prewarm_file(&mut self, now_ns: TimestampNs) -> usize {
+        self.load_ema_prewarm_from_path(std::path::Path::new(EMA_PREWARM_PATH), now_ns)
     }
 
     #[inline]
@@ -842,6 +945,12 @@ impl OnlineAdaptiveGovernor {
         if slot_idx >= MAX_ACTIVE_PAIRS {
             return false;
         }
+        if self.entry_warmup_until_ns > 0
+            && candidate_snap.ts_local_ns.0 > 0
+            && candidate_snap.ts_local_ns.0 < self.entry_warmup_until_ns
+        {
+            return false;
+        }
         let has_bbo = candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0;
         let entry_px = if has_bbo {
             side.select_entry_bbo_price(candidate_snap.bids[0].price, candidate_snap.asks[0].price)
@@ -933,6 +1042,12 @@ impl OnlineAdaptiveGovernor {
             (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
         let req_scar_tfi = if in_local_scar { 0.45 } else { 0.38 };
         if in_scar && candidate_snap.factor_tfi.get().abs() < req_scar_tfi {
+            return false;
+        }
+        if self.sl_streak[slot_idx][d] >= 1
+            && self.ewma_net_bps_x100[slot_idx][d] <= -800
+            && cand_comp < 0.72
+        {
             return false;
         }
 

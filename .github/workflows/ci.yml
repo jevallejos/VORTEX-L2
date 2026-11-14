@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   ubuntu-institutional-gate:
-    name: Ubuntu x86_64 SHM v13, 52-Test & LTO Fat Release Gate
+    name: Ubuntu x86_64 SHM v13, 53-Test & LTO Fat Release Gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -49,7 +49,7 @@ jobs:
       - name: Stage 1b - Zero-Warning Clippy Static Analysis
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Stage 2 - Deterministic 52-Test Suite (POSIX /dev/shm + Scar Lab + OOS 520 + V4.1)
+      - name: Stage 2 - Deterministic 53-Test Suite (POSIX /dev/shm + Scar Lab + OOS 520 + V4.1)
         run: cargo test --lib --bins -- --test-threads=1
 
       - name: Stage 3a - Build LTO Fat Release Binaries

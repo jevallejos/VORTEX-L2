@@ -1,4 +1,4 @@
-# CONSTITUCION TECNICA DE VORTEX-OMEGA (V4.2)
+# CONSTITUCION TECNICA DE VORTEX-OMEGA (V4.3)
 
 **Arquitectura:** 19 Modulos Rust Zero-Alloc + 3 Binarios LTO Fat (`vortex_tap`, `vortex_replay`, `vortex_exec`)  
 **Memoria Compartida:** `VORTEX_SHM_VERSION = 13` (`/dev/shm/vortex_lob.mmap`, SeqLock Tear-Free)  
@@ -52,3 +52,8 @@
 ## Adenda Evolutiva OMEGA V4.2 - Kernel Continuo Golden Pocket Estricto (`0.618-0.650`)
 1. **Resonancia Dilatada por Tick (`compute_golden_pocket_resonance`):** Centra el nucleo plano en `[0.618, 0.650]` con dilatacion discreta `max(0.015983, 0.55 / w1)` para garantizar `0%` de reticulas muertas en los 12 contratos sin modificar `VORTEX_SHM_VERSION = 13`.
 2. **Acoplamiento en 4 Vectores:** Cuando `G_gp >= 0.85` en `ImpulseWave3`, expande la proyeccion Fibonacci `k3`, profundiza `snr_threshold_delta` hasta `-0.038`, extiende la paciencia defensiva a `1,250 permille` y habilita la particion `35% T1 / 65% Runner` (`350 permille`).
+
+## Adenda Evolutiva OMEGA V4.3 - Precalentamiento Persistente EMA, Anti-Rafaga y Signo `OI`
+1. **Precalentamiento Cinematico Persistente (`vortex_ema_prewarm.json`):** Hidrata `ewma_fast_px_1e4` (`20 s`), `ewma_slow_px_1e4` (`300 s`) y `eq_vol_5m_bps` al iniciar `vortex-exec` y guarda puntos de control cada `30 s`, erradicando entradas ciegas con `drift_bps == 0.0`.
+2. **Serializacion Anti-Rafaga Direccional (`can_stage_same_direction_entry`):** Prohibe abrir un segundo carril en la misma direccion mientras otro carril del mismo lado este en cola o lleve `< 60 s` y `< +4.50 bps` brutos en verde.
+3. **Invarianza Escalar de `oi_impulse` (`passes_elliott_macro_coherence_guard`):** Veta entradas contra fase macro opuesta (`<= -0.25`) desde `H >= 0.502` sin invertir el signo de `oi_impulse` en cortos.
