@@ -200,8 +200,9 @@ impl OrderBlockObservables {
         fees: FeeSchedule,
     ) -> PriceTicks {
         let tau_bps = spec.tick_to_price_scaled_bps(avg_entry).unwrap_or(ScaledBps(100)).raw().max(1);
-        let mkr_abs = fees.maker_fee_bps.raw().abs().max(50);
-        let pad_ticks = (mkr_abs / tau_bps).clamp(2, 12);
+        let pos_mkr = fees.maker_fee_bps.raw().max(0);
+        let cap_ticks = ((12_i64.saturating_mul(pos_mkr.saturating_add(40))) / 240).clamp(2, 14);
+        let pad_ticks = (pos_mkr / tau_bps).clamp(2, cap_ticks);
         let min_sc = INV_PHI * 0.80;
         match open_side {
             Side::Bid => {
