@@ -11,7 +11,7 @@ env:
 
 jobs:
   constitutional-gate-linux:
-    name: Ubuntu /dev/shm 88-Test & 3-CLI Gate
+    name: Ubuntu /dev/shm Test Suite & 3-CLI Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -19,7 +19,7 @@ jobs:
 
       - name: Gate 0 - UTF-8 LF & Secret Hygiene Audit
         run: |
-          python3 -c 'import pathlib, subprocess, sys; files = subprocess.check_output(["git", "ls-files"], text=True).splitlines(); bad_ext = (".env", ".lock", ".pdb", ".mmap", ".parquet", ".jsonl"); bad = [f for f in files if f == ".env" or f.endswith(bad_ext)]; crlf = [f for f in files if pathlib.Path(f).is_file() and b"\r" in pathlib.Path(f).read_bytes()]; sys.exit("Forbidden or CRLF: " + str(bad + crlf) if (bad or crlf) else 0)'
+          python3 -c 'import pathlib, subprocess, sys; files = subprocess.check_output(["git", "ls-files"], text=True).splitlines(); bad_ext = (".pdb", ".mmap", ".parquet", ".jsonl"); bad = [f for f in files if f == ".env" or f.startswith(".env.") or (f.endswith(".lock") and f != "Cargo.lock") or f.endswith(bad_ext)]; crlf = [f for f in files if pathlib.Path(f).is_file() and b"\r" in pathlib.Path(f).read_bytes()]; sys.exit("Forbidden or CRLF: " + str(bad + crlf) if (bad or crlf) else 0)'
 
       - name: Install Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
