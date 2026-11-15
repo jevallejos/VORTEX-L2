@@ -21,7 +21,7 @@ install -m 0755 target/release/vortex_exec /home/ubuntu/vortex-rs/bin/vortex_exe
 
 sudo tee /etc/systemd/system/vortex-tap.service > /dev/null <<UNIT_TAP
 [Unit]
-Description=VORTEX-OMEGA V4.5 Bybit UTA V5 12-Pair L2 + PAR2 + OB+- Daemon (SHM v15)
+Description=VORTEX-OMEGA V4.6 Bybit UTA V5 12-Pair L2 + PAR2 + OB+- Daemon (SHM v15)
 After=network-online.target
 Wants=network-online.target
 
@@ -43,7 +43,7 @@ UNIT_TAP
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<UNIT_EXEC
 [Unit]
-Description=VORTEX-OMEGA V4.5 200Hz Autonomous 12-Slot Execution Daemon (SHM v15)
+Description=VORTEX-OMEGA V4.6 200Hz Autonomous 12-Slot Execution Daemon (SHM v15)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -65,4 +65,4 @@ WantedBy=multi-user.target
 UNIT_EXEC
 
 sudo systemctl daemon-reload
-echo "[OK] VORTEX-OMEGA V4.5 (SHM v15 + PAR2) instalado en /home/ubuntu/vortex-rs/bin."
+echo "[OK] VORTEX-OMEGA V4.6 (SHM v15 + PAR2) instalado en /home/ubuntu/vortex-rs/bin."

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VORTEX-OMEGA V4.4 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer."""
+"""VORTEX-OMEGA V4.6 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer."""
 
 import json
 import math
@@ -39,7 +39,7 @@ def decimal_to_ticks(val_str: str, tick_size_1e8: int) -> int:
 
 def fetch_1m_klines(symbol: str, limit: int = 90) -> list:
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/4.4"})
+    req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/4.6"})
     with urllib.request.urlopen(req, timeout=5) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     rows = data.get("result", {}).get("list", [])

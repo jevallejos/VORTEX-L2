@@ -1,16 +1,36 @@
-//! Orthogonal 3-Factor Alpha, Elastic Parkinson Diffusion & L2/L3 Vacuum Surf (LVDBS).
+//! Orthogonal 3-Factor Alpha, Anti-Spoof GEOM Weights, Dynamic 3x Barrier, Epps 5s & LVDBS (V4.6).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::manual_clamp,
+    clippy::needless_range_loop,
+    clippy::suboptimal_flops,
+    clippy::too_many_arguments
+)]
 
+use crate::fee_cadence_beta::FeeSchedule;
 use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
 use crate::types::{
-    spec_from_symbol_id, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side,
+    spec_from_symbol_id, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs,
 };
 
 pub const OFI_DEPTH: usize = 5;
 pub const GEOM_DEPTH: usize = 10;
+
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const BASE_VOL_WIN_NS: i64 = VOL_5M_HORIZON_NS / 60;
 const GAUSSIAN_MAD_TO_SIGMA: f64 = 1.253_314_14;
 const PARKINSON_HL_TO_SIGMA: f64 = 0.600_561_20;
+const V45_PHI: f64 = 1.618_033_988_749_895;
+const V45_INV_PHI: f64 = 0.618_033_988_749_895;
+const V45_INV_PHI_SQ: f64 = 0.381_966_011_250_105;
+const V45_EPPS_BUCKET_NS: i64 = 5_000_000_000;
+const V45_EPPS_TAU_SECS: f64 = 120.0;
+const V45_EPPS_PRIOR_VAR_BPS2: f64 = 25.0;
+const V45_FAST_RATE_TAU_SECS: f64 = 2.0;
+const V45_EQ_RATE_TAU_SECS: f64 = 60.0;
+const V45_SPOOF_TAU_SECS: f64 = 15.0;
+const V45_SEED_RATE_HZ: f64 = 10.0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SignalVerdict {
@@ -41,6 +61,7 @@ pub struct OrthogonalFactorState {
     ofi_neg_slow: f64,
     tfi_buy_accum: f64,
     tfi_sell_accum: f64,
+    spoof_density_ewma: f64,
     last_ofi: BoundedScore,
     last_tfi: BoundedScore,
     last_geom: BoundedScore,
@@ -53,7 +74,6 @@ impl Default for OrthogonalFactorState {
     }
 }
 
-#[allow(clippy::needless_range_loop, clippy::manual_clamp)]
 impl OrthogonalFactorState {
     #[inline]
     #[must_use]
@@ -76,6 +96,7 @@ impl OrthogonalFactorState {
             ofi_neg_slow: 1.0,
             tfi_buy_accum: 1.0,
             tfi_sell_accum: 1.0,
+            spoof_density_ewma: 0.0,
             last_ofi: BoundedScore::ZERO,
             last_tfi: BoundedScore::ZERO,
             last_geom: BoundedScore::ZERO,
@@ -83,11 +104,16 @@ impl OrthogonalFactorState {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn spoofing_density(&self) -> f64 {
+        self.spoof_density_ewma
+    }
+
+    #[inline]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 
-    /// Resets L2 book delta state on snapshot reload while preserving TFI & Vol memory.
     #[inline]
     pub fn reset_l2_book_only(&mut self) {
         self.initialized = false;
@@ -104,7 +130,6 @@ impl OrthogonalFactorState {
         self.last_geom = BoundedScore::ZERO;
     }
 
-    /// Computes contract-normalized neutral seed and silence floor in LotQty units.
     #[inline]
     #[must_use]
     pub fn flow_prior_bounds(snap: &SymbolLobSnapshot) -> (f64, f64) {
@@ -112,17 +137,13 @@ impl OrthogonalFactorState {
             PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
         } else if snap.mark_price.0 > 0 {
             snap.mark_price
-        } else if snap.last_trade_price.0 > 0 {
-            snap.last_trade_price
         } else {
-            PriceTicks(0)
+            snap.last_trade_price
         };
         match spec_from_symbol_id(snap.symbol_id) {
             Some(spec) if ref_px.0 > 0 => {
                 let q_scale = spec.characteristic_lot_scale(ref_px);
-                let init_lots = q_scale.clamp(1.0, 250.0);
-                let floor_lots = (0.25 * q_scale).clamp(0.25, 125.0);
-                (init_lots, floor_lots)
+                (q_scale.clamp(1.0, 250.0), (0.25 * q_scale).clamp(0.25, 125.0))
             }
             _ => (1.0, 0.25),
         }
@@ -133,11 +154,8 @@ impl OrthogonalFactorState {
         if ts_ns <= 0 {
             return;
         }
-        if self.last_tfi_ts_ns <= 0 {
-            self.last_tfi_ts_ns = ts_ns;
-            return;
-        }
-        if ts_ns <= self.last_tfi_ts_ns {
+        if self.last_tfi_ts_ns <= 0 || ts_ns <= self.last_tfi_ts_ns {
+            if self.last_tfi_ts_ns <= 0 { self.last_tfi_ts_ns = ts_ns; }
             return;
         }
         let dt_s = ((ts_ns - self.last_tfi_ts_ns) as f64 * 1e-9).clamp(0.0, 30.0);
@@ -150,8 +168,7 @@ impl OrthogonalFactorState {
     #[inline]
     #[must_use]
     fn compute_book_geometry(snap: &SymbolLobSnapshot) -> BoundedScore {
-        let mut bid_mass = 0.0_f64;
-        let mut ask_mass = 0.0_f64;
+        let (mut bid_mass, mut ask_mass) = (0.0_f64, 0.0_f64);
         for i in 0..GEOM_DEPTH {
             let decay = 1.0 / ((i + 1) as f64);
             if snap.bids[i].price.0 > 0 && snap.bids[i].qty.0 > 0 {
@@ -161,20 +178,15 @@ impl OrthogonalFactorState {
                 ask_mass += (snap.asks[i].qty.0 as f64) * decay;
             }
         }
-        let spread_ticks = if snap.asks[0].price.0 > snap.bids[0].price.0
-            && snap.bids[0].price.0 > 0
-        {
+        let spread_ticks = if snap.asks[0].price.0 > snap.bids[0].price.0 && snap.bids[0].price.0 > 0 {
             (snap.asks[0].price.0 - snap.bids[0].price.0) as f64
         } else {
             1.0
         };
-        let spread_penalty = 1.0 / spread_ticks.sqrt().max(1.0);
-        let geom_raw =
-            ((bid_mass - ask_mass) / (bid_mass + ask_mass + 1e-6)) * spread_penalty;
+        let geom_raw = ((bid_mass - ask_mass) / (bid_mass + ask_mass + 1e-6)) / spread_ticks.sqrt().max(1.0);
         BoundedScore::new_clamped(geom_raw)
     }
 
-    /// Continuous Parkinson High-Low + Net MAD 5m volatility with asymmetric Kalman-EWMA.
     #[inline]
     #[must_use]
     pub fn update_realized_vol_5m_parkinson(
@@ -187,62 +199,33 @@ impl OrthogonalFactorState {
     ) -> ScaledBps {
         let a_px = anchor_px.0.max(1);
         let eff_cur = if cur_px.0 > 0 { cur_px.0 } else { a_px };
-        let eff_lo = if low_px.0 > 0 {
-            low_px.0.min(a_px).min(eff_cur)
-        } else {
-            a_px.min(eff_cur)
-        };
+        let eff_lo = if low_px.0 > 0 { low_px.0.min(a_px).min(eff_cur) } else { a_px.min(eff_cur) };
         let eff_hi = high_px.0.max(a_px).max(eff_cur);
-        let net_dp = (eff_cur - a_px).abs();
-        let hl_span = (eff_hi - eff_lo).max(0);
-
-        let net_bps = ((net_dp.saturating_mul(1_000_000)) as f64) / (a_px as f64);
-        let hl_bps = ((hl_span.saturating_mul(1_000_000)) as f64) / (a_px as f64);
+        let net_bps = (((eff_cur - a_px).abs().saturating_mul(1_000_000)) as f64) / (a_px as f64);
+        let hl_bps = (((eff_hi - eff_lo).max(0).saturating_mul(1_000_000)) as f64) / (a_px as f64);
         let horizon_s = (VOL_5M_HORIZON_NS as f64) * 1e-9;
         let dt_s = ((dt_ns.max(500_000_000) as f64) * 1e-9).clamp(0.5, horizon_s);
         let root_t = (horizon_s / dt_s).sqrt();
-
-        let inst_net = net_bps * GAUSSIAN_MAD_TO_SIGMA * root_t;
-        let inst_hl = hl_bps * PARKINSON_HL_TO_SIGMA * root_t;
-        let inst_v = inst_net.max(inst_hl).clamp(0.0, 24_000.0);
-
+        let inst_v = (net_bps * GAUSSIAN_MAD_TO_SIGMA * root_t)
+            .max(hl_bps * PARKINSON_HL_TO_SIGMA * root_t)
+            .clamp(0.0, 24_000.0);
         let prev_f = (prev_vol.raw().max(0) as f64).clamp(0.0, 24_000.0);
-        let tau_s = if inst_v > prev_f {
-            horizon_s / 12.0
-        } else {
-            horizon_s / 4.0
-        };
+        let tau_s = if inst_v > prev_f { horizon_s / 12.0 } else { horizon_s / 4.0 };
         let alpha = (1.0 - (-dt_s / tau_s).exp()).clamp(0.01, 1.0);
-        let next_v = (prev_f + alpha * (inst_v - prev_f)).round() as i64;
-        ScaledBps(next_v.clamp(0, 24_000))
+        ScaledBps(((prev_f + alpha * (inst_v - prev_f)).round() as i64).clamp(0, 24_000))
     }
 
-    /// Unbiased continuous-time 5m diffusion volatility wrapper (delegates to Parkinson SSOT).
     #[inline]
     #[must_use]
-    pub fn update_realized_vol_5m(
-        prev_vol: ScaledBps,
-        anchor_px: PriceTicks,
-        cur_px: PriceTicks,
-        dt_ns: i64,
-    ) -> ScaledBps {
-        let lo = PriceTicks(anchor_px.0.min(cur_px.0));
-        let hi = PriceTicks(anchor_px.0.max(cur_px.0));
-        Self::update_realized_vol_5m_parkinson(prev_vol, anchor_px, lo, hi, cur_px, dt_ns)
+    pub fn update_realized_vol_5m(prev_vol: ScaledBps, anchor_px: PriceTicks, cur_px: PriceTicks, dt_ns: i64) -> ScaledBps {
+        Self::update_realized_vol_5m_parkinson(
+            prev_vol, anchor_px, PriceTicks(anchor_px.0.min(cur_px.0)), PriceTicks(anchor_px.0.max(cur_px.0)), cur_px, dt_ns,
+        )
     }
 
-    /// Tracks O(1) intrawindow [low, high] & steps realized_vol_5m over an elastic window.
     #[inline]
-    pub fn observe_mid_and_step_elastic_vol(
-        &mut self,
-        spec: PairSpec,
-        obs_px: PriceTicks,
-        ts_ns: i64,
-        current_vol: ScaledBps,
-    ) -> ScaledBps {
-        if obs_px.0 <= 0 || ts_ns <= 0 {
-            return current_vol;
-        }
+    pub fn observe_mid_and_step_elastic_vol(&mut self, spec: PairSpec, obs_px: PriceTicks, ts_ns: i64, current_vol: ScaledBps) -> ScaledBps {
+        if obs_px.0 <= 0 || ts_ns <= 0 { return current_vol; }
         if self.vol_anchor_px.0 <= 0 || self.vol_window_start_ts_ns <= 0 {
             self.vol_anchor_px = obs_px;
             self.vol_low_px = obs_px;
@@ -250,44 +233,20 @@ impl OrthogonalFactorState {
             self.vol_window_start_ts_ns = ts_ns;
             return current_vol;
         }
-        if obs_px.0 < self.vol_low_px.0 {
-            self.vol_low_px = obs_px;
-        }
-        if obs_px.0 > self.vol_high_px.0 {
-            self.vol_high_px = obs_px;
-        }
+        if obs_px.0 < self.vol_low_px.0 { self.vol_low_px = obs_px; }
+        if obs_px.0 > self.vol_high_px.0 { self.vol_high_px = obs_px; }
         let dt_ns = ts_ns.saturating_sub(self.vol_window_start_ts_ns);
         let min_win_ns = (BASE_VOL_WIN_NS * 3) / 10;
-        if dt_ns < min_win_ns {
-            return current_vol;
-        }
-        let b3x = spec
-            .required_3x_barrier_bps(self.vol_anchor_px)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
-            .raw()
-            .max(1);
-        let eq_ref = b3x.saturating_mul(4);
-        let denom_v = current_vol.raw().max(b3x);
-        let raw_win_ns =
-            ((BASE_VOL_WIN_NS as i128 * eq_ref as i128) / (denom_v as i128)) as i64;
-        let max_win_ns = BASE_VOL_WIN_NS * 2;
-        let elastic_win_ns = raw_win_ns.clamp(min_win_ns, max_win_ns);
-        if dt_ns < elastic_win_ns {
-            return current_vol;
-        }
-        let updated_vol = Self::update_realized_vol_5m_parkinson(
-            current_vol,
-            self.vol_anchor_px,
-            self.vol_low_px,
-            self.vol_high_px,
-            obs_px,
-            dt_ns,
-        );
+        if dt_ns < min_win_ns { return current_vol; }
+        let b3x = spec.required_3x_barrier_bps(self.vol_anchor_px).unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS).raw().max(1);
+        let raw_win_ns = ((BASE_VOL_WIN_NS as i128 * (b3x.saturating_mul(4) as i128)) / (current_vol.raw().max(b3x) as i128)) as i64;
+        if dt_ns < raw_win_ns.clamp(min_win_ns, BASE_VOL_WIN_NS * 2) { return current_vol; }
+        let updated = Self::update_realized_vol_5m_parkinson(current_vol, self.vol_anchor_px, self.vol_low_px, self.vol_high_px, obs_px, dt_ns);
         self.vol_anchor_px = obs_px;
         self.vol_low_px = obs_px;
         self.vol_high_px = obs_px;
         self.vol_window_start_ts_ns = ts_ns;
-        updated_vol
+        updated
     }
 
     pub fn on_l2_book_update(&mut self, snap: &mut SymbolLobSnapshot) {
@@ -298,12 +257,9 @@ impl OrthogonalFactorState {
                 self.prev_bids[i] = snap.bids[i];
                 self.prev_asks[i] = snap.asks[i];
             }
-            self.ofi_pos_fast = init_lots;
-            self.ofi_neg_fast = init_lots;
-            self.ofi_pos_med = init_lots;
-            self.ofi_neg_med = init_lots;
-            self.ofi_pos_slow = init_lots;
-            self.ofi_neg_slow = init_lots;
+            self.ofi_pos_fast = init_lots; self.ofi_neg_fast = init_lots;
+            self.ofi_pos_med = init_lots; self.ofi_neg_med = init_lots;
+            self.ofi_pos_slow = init_lots; self.ofi_neg_slow = init_lots;
             self.last_l2_ts_ns = snap.ts_local_ns.0;
             if self.last_tfi_ts_ns <= 0 {
                 self.last_tfi_ts_ns = snap.ts_local_ns.0;
@@ -311,9 +267,7 @@ impl OrthogonalFactorState {
                 self.tfi_sell_accum = init_lots;
             } else {
                 self.decay_tfi_to_clock(snap.ts_local_ns.0, floor_lots);
-                let tfi_val = (self.tfi_buy_accum - self.tfi_sell_accum)
-                    / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6);
-                self.last_tfi = BoundedScore::new_clamped(tfi_val);
+                self.last_tfi = BoundedScore::new_clamped((self.tfi_buy_accum - self.tfi_sell_accum) / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6));
             }
             self.last_ofi = BoundedScore::ZERO;
             self.last_geom = Self::compute_book_geometry(snap);
@@ -323,148 +277,88 @@ impl OrthogonalFactorState {
             self.initialized = true;
             return;
         }
-
         let weights: [f64; OFI_DEPTH] = [1.0, 0.70, 0.45, 0.25, 0.12];
-        let mut prev_worst_bid = 0_i64;
-        let mut cur_worst_bid = 0_i64;
-        let mut prev_worst_ask = 0_i64;
-        let mut cur_worst_ask = 0_i64;
+        let (mut prev_wb, mut cur_wb, mut prev_wa, mut cur_wa) = (0_i64, 0_i64, 0_i64, 0_i64);
         for i in 0..OFI_DEPTH {
             let pb = self.prev_bids[i].price.0;
-            if pb > 0 && (prev_worst_bid == 0 || pb < prev_worst_bid) {
-                prev_worst_bid = pb;
-            }
+            if pb > 0 && (prev_wb == 0 || pb < prev_wb) { prev_wb = pb; }
             let cb = snap.bids[i].price.0;
-            if cb > 0 && (cur_worst_bid == 0 || cb < cur_worst_bid) {
-                cur_worst_bid = cb;
-            }
-            let pa = self.prev_asks[i].price.0;
-            if pa > prev_worst_ask {
-                prev_worst_ask = pa;
-            }
-            let ca = snap.asks[i].price.0;
-            if ca > cur_worst_ask {
-                cur_worst_ask = ca;
-            }
+            if cb > 0 && (cur_wb == 0 || cb < cur_wb) { cur_wb = cb; }
+            if self.prev_asks[i].price.0 > prev_wa { prev_wa = self.prev_asks[i].price.0; }
+            if snap.asks[i].price.0 > cur_wa { cur_wa = snap.asks[i].price.0; }
         }
-
         let mut b_flow = 0.0_f64;
         for i in 0..OFI_DEPTH {
             let cur_b = snap.bids[i];
-            if cur_b.price.0 <= 0 {
-                continue;
-            }
-            let mut matched_prev = None;
+            if cur_b.price.0 <= 0 { continue; }
+            let mut matched = None;
             for j in 0..OFI_DEPTH {
-                if self.prev_bids[j].price.0 == cur_b.price.0 {
-                    matched_prev = Some(self.prev_bids[j].qty.0);
-                    break;
-                }
+                if self.prev_bids[j].price.0 == cur_b.price.0 { matched = Some(self.prev_bids[j].qty.0); break; }
             }
-            if let Some(pq) = matched_prev {
-                b_flow += weights[i] * ((cur_b.qty.0 - pq) as f64);
-            } else if prev_worst_bid == 0 || cur_b.price.0 > prev_worst_bid {
-                b_flow += weights[i] * (cur_b.qty.0 as f64);
-            }
+            if let Some(pq) = matched { b_flow += weights[i] * ((cur_b.qty.0 - pq) as f64); }
+            else if prev_wb == 0 || cur_b.price.0 > prev_wb { b_flow += weights[i] * (cur_b.qty.0 as f64); }
         }
         for j in 0..OFI_DEPTH {
             let prv_b = self.prev_bids[j];
-            if prv_b.price.0 <= 0 {
-                continue;
-            }
-            let mut still_present = false;
-            for i in 0..OFI_DEPTH {
-                if snap.bids[i].price.0 == prv_b.price.0 {
-                    still_present = true;
-                    break;
-                }
-            }
-            if !still_present && (cur_worst_bid == 0 || prv_b.price.0 >= cur_worst_bid) {
-                b_flow -= weights[j] * (prv_b.qty.0 as f64);
-            }
+            if prv_b.price.0 <= 0 { continue; }
+            let mut present = false;
+            for i in 0..OFI_DEPTH { if snap.bids[i].price.0 == prv_b.price.0 { present = true; break; } }
+            if !present && (cur_wb == 0 || prv_b.price.0 >= cur_wb) { b_flow -= weights[j] * (prv_b.qty.0 as f64); }
         }
-
         let mut a_flow = 0.0_f64;
         for i in 0..OFI_DEPTH {
             let cur_a = snap.asks[i];
-            if cur_a.price.0 <= 0 {
-                continue;
-            }
-            let mut matched_prev = None;
+            if cur_a.price.0 <= 0 { continue; }
+            let mut matched = None;
             for j in 0..OFI_DEPTH {
-                if self.prev_asks[j].price.0 == cur_a.price.0 {
-                    matched_prev = Some(self.prev_asks[j].qty.0);
-                    break;
-                }
+                if self.prev_asks[j].price.0 == cur_a.price.0 { matched = Some(self.prev_asks[j].qty.0); break; }
             }
-            if let Some(pq) = matched_prev {
-                a_flow += weights[i] * ((cur_a.qty.0 - pq) as f64);
-            } else if prev_worst_ask == 0 || cur_a.price.0 < prev_worst_ask {
-                a_flow += weights[i] * (cur_a.qty.0 as f64);
-            }
+            if let Some(pq) = matched { a_flow += weights[i] * ((cur_a.qty.0 - pq) as f64); }
+            else if prev_wa == 0 || cur_a.price.0 < prev_wa { a_flow += weights[i] * (cur_a.qty.0 as f64); }
         }
         for j in 0..OFI_DEPTH {
             let prv_a = self.prev_asks[j];
-            if prv_a.price.0 <= 0 {
-                continue;
-            }
-            let mut still_present = false;
-            for i in 0..OFI_DEPTH {
-                if snap.asks[i].price.0 == prv_a.price.0 {
-                    still_present = true;
-                    break;
-                }
-            }
-            if !still_present && (cur_worst_ask == 0 || prv_a.price.0 <= cur_worst_ask) {
-                a_flow -= weights[j] * (prv_a.qty.0 as f64);
-            }
+            if prv_a.price.0 <= 0 { continue; }
+            let mut present = false;
+            for i in 0..OFI_DEPTH { if snap.asks[i].price.0 == prv_a.price.0 { present = true; break; } }
+            if !present && (cur_wa == 0 || prv_a.price.0 <= cur_wa) { a_flow -= weights[j] * (prv_a.qty.0 as f64); }
         }
-
         for i in 0..OFI_DEPTH {
             self.prev_bids[i] = snap.bids[i];
             self.prev_asks[i] = snap.asks[i];
         }
-
         let ts_now = snap.ts_local_ns.0;
         let dt_s = if ts_now > 0 && self.last_l2_ts_ns > 0 && ts_now > self.last_l2_ts_ns {
             ((ts_now - self.last_l2_ts_ns) as f64 * 1e-9).clamp(0.0, 30.0)
-        } else {
-            0.0
-        };
-        if ts_now > self.last_l2_ts_ns {
-            self.last_l2_ts_ns = ts_now;
-        }
-        let a_fast = (-dt_s / 0.50).exp();
-        let a_med = (-dt_s / 3.00).exp();
-        let a_slow = (-dt_s / 15.00).exp();
-
+        } else { 0.0 };
+        if ts_now > self.last_l2_ts_ns { self.last_l2_ts_ns = ts_now; }
+        let (a_fast, a_med, a_slow) = ((-dt_s / 0.50).exp(), (-dt_s / 3.00).exp(), (-dt_s / 15.00).exp());
         let raw_ofi = b_flow - a_flow;
-        let pos = raw_ofi.max(0.0);
-        let neg = (-raw_ofi).max(0.0);
-
+        let (pos, neg) = (raw_ofi.max(0.0), (-raw_ofi).max(0.0));
         self.ofi_pos_fast = (self.ofi_pos_fast * a_fast).max(floor_lots) + pos;
         self.ofi_neg_fast = (self.ofi_neg_fast * a_fast).max(floor_lots) + neg;
         self.ofi_pos_med = (self.ofi_pos_med * a_med).max(floor_lots) + pos;
         self.ofi_neg_med = (self.ofi_neg_med * a_med).max(floor_lots) + neg;
         self.ofi_pos_slow = (self.ofi_pos_slow * a_slow).max(floor_lots) + pos;
         self.ofi_neg_slow = (self.ofi_neg_slow * a_slow).max(floor_lots) + neg;
-
-        let f_score = (self.ofi_pos_fast - self.ofi_neg_fast)
-            / (self.ofi_pos_fast + self.ofi_neg_fast + 1e-6);
-        let m_score = (self.ofi_pos_med - self.ofi_neg_med)
-            / (self.ofi_pos_med + self.ofi_neg_med + 1e-6);
-        let s_score = (self.ofi_pos_slow - self.ofi_neg_slow)
-            / (self.ofi_pos_slow + self.ofi_neg_slow + 1e-6);
-
-        let blended_ofi = 0.50 * f_score + 0.32 * m_score + 0.18 * s_score;
-        self.last_ofi = BoundedScore::new_clamped(blended_ofi);
-
+        let f_sc = (self.ofi_pos_fast - self.ofi_neg_fast) / (self.ofi_pos_fast + self.ofi_neg_fast + 1e-6);
+        let m_sc = (self.ofi_pos_med - self.ofi_neg_med) / (self.ofi_pos_med + self.ofi_neg_med + 1e-6);
+        let s_sc = (self.ofi_pos_slow - self.ofi_neg_slow) / (self.ofi_pos_slow + self.ofi_neg_slow + 1e-6);
+        self.last_ofi = BoundedScore::new_clamped(0.50 * f_sc + 0.32 * m_sc + 0.18 * s_sc);
         self.decay_tfi_to_clock(ts_now, floor_lots);
-        let tfi_val = (self.tfi_buy_accum - self.tfi_sell_accum)
-            / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6);
-        self.last_tfi = BoundedScore::new_clamped(tfi_val);
+        self.last_tfi = BoundedScore::new_clamped((self.tfi_buy_accum - self.tfi_sell_accum) / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6));
         self.last_geom = Self::compute_book_geometry(snap);
-
+        if dt_s > 0.0 {
+            let ofi_f = self.last_ofi.get();
+            let tfi_f = self.last_tfi.get();
+            let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05) || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08) {
+                1.0
+            } else {
+                0.0
+            };
+            let alpha_sp = 1.0 - (-dt_s / V45_SPOOF_TAU_SECS).exp();
+            self.spoof_density_ewma = ((1.0 - alpha_sp) * self.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
+        }
         snap.factor_ofi = self.last_ofi;
         snap.factor_tfi = self.last_tfi;
         snap.factor_geom = self.last_geom;
@@ -477,30 +371,132 @@ impl OrthogonalFactorState {
         match side {
             Side::Bid => {
                 self.tfi_buy_accum += q;
-                snap.cum_buy_trade_lots =
-                    LotQty(snap.cum_buy_trade_lots.0.saturating_add(qty.0));
+                snap.cum_buy_trade_lots = LotQty(snap.cum_buy_trade_lots.0.saturating_add(qty.0));
             }
             Side::Ask => {
                 self.tfi_sell_accum += q;
-                snap.cum_sell_trade_lots =
-                    LotQty(snap.cum_sell_trade_lots.0.saturating_add(qty.0));
+                snap.cum_sell_trade_lots = LotQty(snap.cum_sell_trade_lots.0.saturating_add(qty.0));
             }
         }
-        let tfi_val = (self.tfi_buy_accum - self.tfi_sell_accum)
-            / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6);
-        self.last_tfi = BoundedScore::new_clamped(tfi_val);
+        self.last_tfi = BoundedScore::new_clamped((self.tfi_buy_accum - self.tfi_sell_accum) / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6));
         snap.factor_tfi = self.last_tfi;
     }
 
     #[inline]
     #[must_use]
     pub fn snr_composite_score(snap: &SymbolLobSnapshot) -> f64 {
-        0.45 * snap.factor_ofi.get()
-            + 0.35 * snap.factor_tfi.get()
-            + 0.20 * snap.factor_geom.get()
+        0.45 * snap.factor_ofi.get() + 0.35 * snap.factor_tfi.get() + 0.20 * snap.factor_geom.get()
     }
 
-    /// Fully elastic, self-learned entry signal evaluator preserving LVDBS L2..L4 reach.
+    #[inline]
+    #[must_use]
+    pub fn adaptive_weights_from_spoof_density(spoof_density: f64) -> (f64, f64, f64) {
+        let excess = ((spoof_density.clamp(0.0, 1.0) - 0.15) / 0.55).clamp(0.0, 1.0);
+        let w_geom = 0.20 * (1.0 - V45_INV_PHI * excess);
+        let dw = 0.20 - w_geom;
+        let w_tfi = 0.35 + V45_INV_PHI * dw;
+        let w_ofi = 1.0 - w_tfi - w_geom;
+        (w_ofi, w_tfi, w_geom)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn adaptive_snr_from_snapshot(snap: &SymbolLobSnapshot, spoof_density: f64) -> BoundedScore {
+        let (w_ofi, w_tfi, w_geom) = Self::adaptive_weights_from_spoof_density(spoof_density);
+        BoundedScore::new_clamped(
+            w_ofi * snap.factor_ofi.get() + w_tfi * snap.factor_tfi.get() + w_geom * snap.factor_geom.get(),
+        )
+    }
+
+    /// V4.6 Island 1A: Entry evaluator coupled to anti-spoof GEOM weights, dynamic 3x VIP barrier & signed Epps beta.
+    #[must_use]
+    pub fn evaluate_entry_signal_v46(
+        spec: PairSpec,
+        snap: &SymbolLobSnapshot,
+        leader_btc_snap: &SymbolLobSnapshot,
+        learned_mfe_bps: ScaledBps,
+        learned_dir_edge_bps: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+    ) -> SignalVerdict {
+        let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
+            return SignalVerdict::NeutralNoAction;
+        };
+        let mid_ticks = PriceTicks(i64::midpoint(best_bid.price.0, best_ask.price.0));
+        let Ok(raw_tick_bps) = spec.tick_to_price_scaled_bps(mid_ticks) else {
+            return SignalVerdict::NeutralNoAction;
+        };
+        let b3x_barrier = spec.three_x_friction_barrier_bps_dynamic(mid_ticks, taker_prob_pm, fees);
+        if spread_ticks > 1 {
+            let spread_scaled_bps = (spread_ticks.saturating_mul(1_000_000)) / mid_ticks.0.max(1);
+            let rt_cost = (b3x_barrier.raw() / 3).max(50);
+            let max_elastic_spread_bps = (snap.realized_vol_5m.raw() / 24).clamp(rt_cost / 2, rt_cost);
+            if spread_scaled_bps > max_elastic_spread_bps {
+                return SignalVerdict::NeutralNoAction;
+            }
+        }
+        if snap.realized_vol_5m.raw() < b3x_barrier.raw() {
+            return SignalVerdict::NeutralNoAction;
+        }
+        let p_exc_pm = (taker_prob_pm.clamp(20, 450) - 50).max(0);
+        let tox_div_x10 = 100 + p_exc_pm * 4;
+        let elastic_max_tick = (snap.realized_vol_5m.raw().saturating_mul(10)) / tox_div_x10;
+        if raw_tick_bps.raw() > elastic_max_tick {
+            return SignalVerdict::NeutralNoAction;
+        }
+        let ofi = snap.factor_ofi.get();
+        let tfi = snap.factor_tfi.get();
+        let geom = snap.factor_geom.get();
+        if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08) || (ofi.abs() > 0.55 && tfi.abs() < 0.08) {
+            return SignalVerdict::SpoofingVeto;
+        }
+        let eq_vol_anchor = (b3x_barrier.raw().saturating_mul(4)).max(1) as f64;
+        let nu_sigma = ((snap.realized_vol_5m.raw().max(b3x_barrier.raw()) as f64) / eq_vol_anchor).sqrt().clamp(0.82, 1.25);
+        let edge_relief = ((learned_dir_edge_bps.raw().clamp(0, 450) as f64) / 10_000.0).min(0.04);
+        let elastic_snr_floor = (0.40 * nu_sigma - edge_relief).clamp(0.34, 0.48);
+        let composite = Self::adaptive_snr_from_snapshot(snap, spoof_density).get();
+        if composite.abs() < elastic_snr_floor {
+            return SignalVerdict::NeutralNoAction;
+        }
+        let side = if composite > 0.0 {
+            if ofi <= 0.15 || tfi <= 0.12 || geom < -0.05 { return SignalVerdict::NeutralNoAction; }
+            Side::Bid
+        } else {
+            if ofi >= -0.15 || tfi >= -0.12 || geom > 0.05 { return SignalVerdict::NeutralNoAction; }
+            Side::Ask
+        };
+        let dir_sign = side.sign_f64();
+        let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
+        let beta_c = epps_signed_beta.clamp(-V45_PHI, V45_PHI);
+        let aligned_leader = beta_c * (Self::snr_composite_score(leader_btc_snap) * dir_sign);
+        let beta_sign = if beta_c >= 0.0 { 1.0 } else { -1.0 };
+        let leader_tfi_al = leader_btc_snap.factor_tfi.get() * dir_sign * beta_sign;
+        let lead_lag_adj_bps = if !is_follower || beta_c.abs() < 1e-6 {
+            0
+        } else if aligned_leader >= 0.55 && leader_tfi_al >= 0.55 {
+            let bonus_cap = b3x_barrier.raw() / 9;
+            ((aligned_leader * (bonus_cap as f64)).round() as i64).clamp(0, bonus_cap)
+        } else if aligned_leader <= -0.35 {
+            let drag_cap = b3x_barrier.raw() / 6;
+            -((((-aligned_leader) - 0.35) * (drag_cap as f64)).round() as i64).clamp(0, drag_cap)
+        } else {
+            0
+        };
+        let raw_vol = snap.realized_vol_5m.raw() as f64;
+        let learned_span = learned_mfe_bps.raw().max(0).saturating_add(learned_dir_edge_bps.raw().max(0));
+        let eq_horizon = b3x_barrier.raw().saturating_mul(3).saturating_add(learned_span.saturating_mul(2)) as f64;
+        let eff_vol = if raw_vol < eq_horizon { (raw_vol * eq_horizon).sqrt() } else { raw_vol };
+        let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
+        let expected_excursion = ScaledBps(((composite.abs() * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
+        if expected_excursion.raw() >= b3x_barrier.raw() {
+            SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps: expected_excursion }
+        } else {
+            SignalVerdict::NeutralNoAction
+        }
+    }
+
     #[must_use]
     pub fn evaluate_entry_signal_elastic(
         spec: PairSpec,
@@ -509,98 +505,11 @@ impl OrthogonalFactorState {
         learned_mfe_bps: ScaledBps,
         learned_dir_edge_bps: ScaledBps,
     ) -> SignalVerdict {
-        let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
-            return SignalVerdict::NeutralNoAction;
-        };
-        let mid_ticks = PriceTicks(i64::midpoint(best_bid.price.0, best_ask.price.0));
-        let Ok(b3x_barrier) = spec.required_3x_barrier_bps(mid_ticks) else {
-            return SignalVerdict::NeutralNoAction;
-        };
-        if spread_ticks > 1 {
-            let spread_scaled_bps =
-                (spread_ticks.saturating_mul(1_000_000)) / mid_ticks.0.max(1);
-            let rt_cost = b3x_barrier.raw() / 3;
-            let max_elastic_spread_bps =
-                (snap.realized_vol_5m.raw() / 24).clamp(rt_cost / 2, rt_cost);
-            if spread_scaled_bps > max_elastic_spread_bps {
-                return SignalVerdict::NeutralNoAction;
-            }
-        }
-        if spec.validate_pair_eligibility(mid_ticks, snap.realized_vol_5m).is_err() {
-            return SignalVerdict::NeutralNoAction;
-        }
-
-        let ofi = snap.factor_ofi.get();
-        let tfi = snap.factor_tfi.get();
-        let geom = snap.factor_geom.get();
-        if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08)
-            || (ofi.abs() > 0.55 && tfi.abs() < 0.08)
-        {
-            return SignalVerdict::SpoofingVeto;
-        }
-
-        let eq_vol_anchor = (b3x_barrier.raw().saturating_mul(4)).max(1) as f64;
-        let vol_ratio = (snap.realized_vol_5m.raw().max(b3x_barrier.raw()) as f64)
-            / eq_vol_anchor;
-        let nu_sigma = vol_ratio.sqrt().clamp(0.82, 1.25);
-        let edge_relief =
-            ((learned_dir_edge_bps.raw().clamp(0, 450) as f64) / 10_000.0).min(0.04);
-        let elastic_snr_floor = (0.40 * nu_sigma - edge_relief).clamp(0.34, 0.48);
-
-        let composite = Self::snr_composite_score(snap);
-        if composite.abs() < elastic_snr_floor {
-            return SignalVerdict::NeutralNoAction;
-        }
-
-        let side = if composite > 0.0 {
-            if ofi <= 0.15 || tfi <= 0.12 || geom < -0.05 {
-                return SignalVerdict::NeutralNoAction;
-            }
-            Side::Bid
-        } else {
-            if ofi >= -0.15 || tfi >= -0.12 || geom > 0.05 {
-                return SignalVerdict::NeutralNoAction;
-            }
-            Side::Ask
-        };
-
-        let dir_sign = side.sign_f64();
-        let leader_snr = Self::snr_composite_score(leader_btc_snap) * dir_sign;
-        let leader_tfi = leader_btc_snap.factor_tfi.get() * dir_sign;
-        let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
-        let lead_lag_bonus_bps = if is_follower && leader_snr >= 0.55 && leader_tfi >= 0.60 {
-            let bonus_cap = b3x_barrier.raw() / 9;
-            ((leader_snr * (bonus_cap as f64)).round() as i64).clamp(0, bonus_cap)
-        } else {
-            0
-        };
-
-        let raw_vol = snap.realized_vol_5m.raw() as f64;
-        let learned_span = learned_mfe_bps
-            .raw()
-            .max(0)
-            .saturating_add(learned_dir_edge_bps.raw().max(0));
-        let eq_horizon = b3x_barrier
-            .raw()
-            .saturating_mul(3)
-            .saturating_add(learned_span.saturating_mul(2)) as f64;
-        let eff_vol = if raw_vol < eq_horizon {
-            (raw_vol * eq_horizon).sqrt()
-        } else {
-            raw_vol
-        };
-        let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
-        let base_exc = ((composite.abs() * eff_vol * flow_boost).round() as i64)
-            .saturating_add(lead_lag_bonus_bps);
-        let expected_excursion = ScaledBps(base_exc);
-
-        match spec.passes_3x_friction_barrier(mid_ticks, expected_excursion) {
-            Ok(_) => SignalVerdict::AuthorizeMakerEntry {
-                side,
-                target_excursion_scaled_bps: expected_excursion,
-            },
-            Err(_) => SignalVerdict::NeutralNoAction,
-        }
+        let beta_default = if snap.symbol_id == leader_btc_snap.symbol_id { 0.0 } else { 1.0 };
+        Self::evaluate_entry_signal_v46(
+            spec, snap, leader_btc_snap, learned_mfe_bps, learned_dir_edge_bps,
+            50, FeeSchedule::VIP0_DEFAULT, 0.0, beta_default,
+        )
     }
 
     #[must_use]
@@ -614,62 +523,31 @@ impl OrthogonalFactorState {
         } else {
             snap.mark_price
         };
-        let b3x = spec
-            .required_3x_barrier_bps(mid_px)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
-        let neutral_mfe = ScaledBps((b3x.raw() * 4) / 9);
-        let neutral_edge = ScaledBps(b3x.raw() / 8);
-        Self::evaluate_entry_signal_elastic(
-            spec,
-            snap,
-            leader_btc_snap,
-            neutral_mfe,
-            neutral_edge,
-        )
+        let b3x = spec.required_3x_barrier_bps(mid_px).unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
+        Self::evaluate_entry_signal_elastic(spec, snap, leader_btc_snap, ScaledBps((b3x.raw() * 4) / 9), ScaledBps(b3x.raw() / 8))
     }
 
-    /// Computes continuous L2/L3 Liquidity Vacuum Index V_t with spatial tick-gap dilation.
     #[inline]
     #[must_use]
     pub fn compute_vacuum_index_l2_l3(open_side: Side, snap: &SymbolLobSnapshot) -> f64 {
-        let mut own_q = 0_i64;
-        let mut opp_q = 0_i64;
-        let mut first_opp_px = 0_i64;
-        let mut last_opp_px = 0_i64;
-        let mut opp_populated = 0_usize;
-
+        let (mut own_q, mut opp_q, mut first_px, mut last_px, mut pop) = (0_i64, 0_i64, 0_i64, 0_i64, 0_usize);
         for i in 0..4 {
-            let (own_lvl, opp_lvl) = match open_side {
-                Side::Bid => (snap.bids[i], snap.asks[i]),
-                Side::Ask => (snap.asks[i], snap.bids[i]),
-            };
-            if own_lvl.price.0 > 0 && own_lvl.qty.0 > 0 {
-                own_q = own_q.saturating_add(own_lvl.qty.0);
-            }
-            if opp_lvl.price.0 > 0 && opp_lvl.qty.0 > 0 {
-                opp_q = opp_q.saturating_add(opp_lvl.qty.0);
-                if opp_populated == 0 {
-                    first_opp_px = opp_lvl.price.0;
-                }
-                last_opp_px = opp_lvl.price.0;
-                opp_populated += 1;
+            let (own_l, opp_l) = match open_side { Side::Bid => (snap.bids[i], snap.asks[i]), Side::Ask => (snap.asks[i], snap.bids[i]) };
+            if own_l.price.0 > 0 && own_l.qty.0 > 0 { own_q = own_q.saturating_add(own_l.qty.0); }
+            if opp_l.price.0 > 0 && opp_l.qty.0 > 0 {
+                opp_q = opp_q.saturating_add(opp_l.qty.0);
+                if pop == 0 { first_px = opp_l.price.0; }
+                last_px = opp_l.price.0;
+                pop += 1;
             }
         }
-        let gap_mult = if opp_populated >= 2 {
-            let span_ticks = (last_opp_px - first_opp_px).abs().max(1) as f64;
-            let mean_step = span_ticks / ((opp_populated - 1) as f64);
-            mean_step.sqrt().clamp(1.0, 1.50)
-        } else {
-            1.0
-        };
+        let gap_mult = if pop >= 2 { (((last_px - first_px).abs().max(1) as f64) / ((pop - 1) as f64)).sqrt().clamp(1.0, 1.50) } else { 1.0 };
         let dir_s = open_side.sign_f64();
-        let signed_ofi = (snap.factor_ofi.get() * dir_s).max(0.0);
-        let signed_tfi = (snap.factor_tfi.get() * dir_s).max(0.0);
-        let depth_ratio = (own_q.max(1) as f64) / (opp_q.max(1) as f64);
-        depth_ratio * gap_mult * (1.0 + signed_ofi + 1.25 * signed_tfi)
+        ((own_q.max(1) as f64) / (opp_q.max(1) as f64))
+            * gap_mult
+            * (1.0 + (snap.factor_ofi.get() * dir_s).max(0.0) + 1.25 * (snap.factor_tfi.get() * dir_s).max(0.0))
     }
 
-    /// Selects L1..L4 exit level respecting structural floor & endogenous volatility cap.
     #[inline]
     #[must_use]
     pub fn compute_l2_l3_vacuum_surf_target_with_structural(
@@ -685,12 +563,8 @@ impl OrthogonalFactorState {
             .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
             .raw();
         let vol_raw = snap.realized_vol_5m.raw();
-        let eq_anchor = (b3x_raw.saturating_mul(4)).max(1) as f64;
-        let vol_ratio = (vol_raw.max(b3x_raw) as f64) / eq_anchor;
-        let nu_v = vol_ratio.sqrt().clamp(0.85, 1.15);
-        let dir_s = open_side.sign_f64();
-        let signed_tfi = snap.factor_tfi.get() * dir_s;
-
+        let nu_v = ((vol_raw.max(b3x_raw) as f64) / ((b3x_raw.saturating_mul(4)).max(1) as f64)).sqrt().clamp(0.85, 1.15);
+        let signed_tfi = snap.factor_tfi.get() * open_side.sign_f64();
         let level_idx = if vac_idx >= (2.15 * nu_v) && signed_tfi >= 0.42 {
             3_usize
         } else if vac_idx >= (1.42 * nu_v) && signed_tfi >= 0.18 {
@@ -698,124 +572,65 @@ impl OrthogonalFactorState {
         } else {
             usize::from(vac_idx >= (1.04 * nu_v))
         };
-
         let eff_struct = match open_side {
             Side::Bid => structural_l1_floor_price.0.max(quantum_floor_price.0).max(1),
-            Side::Ask => {
-                if structural_l1_floor_price.0 > 0 {
-                    structural_l1_floor_price.0.min(quantum_floor_price.0).max(1)
-                } else {
-                    quantum_floor_price.0.max(1)
-                }
-            }
+            Side::Ask => if structural_l1_floor_price.0 > 0 { structural_l1_floor_price.0.min(quantum_floor_price.0).max(1) } else { quantum_floor_price.0.max(1) },
         };
-
-        let min_surf_cap = b3x_raw.saturating_mul(3);
-        let max_surf_cap = b3x_raw.saturating_mul(7);
-        let max_surf_bps = vol_raw.clamp(min_surf_cap, max_surf_cap);
-        let anchor_t = eff_struct.max(quantum_floor_price.0).max(1);
-        let max_offset_t = ((anchor_t.saturating_mul(max_surf_bps)) / 1_000_000).max(4);
-
+        let max_surf_bps = vol_raw.clamp(b3x_raw.saturating_mul(3), b3x_raw.saturating_mul(7));
+        let max_offset_t = ((eff_struct.max(quantum_floor_price.0).max(1).saturating_mul(max_surf_bps)) / 1_000_000).max(4);
         let book_px = match open_side {
             Side::Bid => {
                 let p = snap.asks[level_idx].price.0;
-                let fallback = snap.asks[0].price.0.max(eff_struct);
-                let raw_t = if p > 0 { p.max(eff_struct) } else { fallback };
-                let cap_t = eff_struct.saturating_add(max_offset_t);
-                PriceTicks(raw_t.min(cap_t))
+                let raw_t = if p > 0 { p.max(eff_struct) } else { snap.asks[0].price.0.max(eff_struct) };
+                PriceTicks(raw_t.min(eff_struct.saturating_add(max_offset_t)))
             }
             Side::Ask => {
                 let p = snap.bids[level_idx].price.0;
-                let fallback = if snap.bids[0].price.0 > 0 {
-                    snap.bids[0].price.0.min(eff_struct)
-                } else {
-                    eff_struct
-                };
-                let raw_t = if p > 0 {
-                    p.min(eff_struct).max(1)
-                } else {
-                    fallback.max(1)
-                };
-                let floor_cap_t = eff_struct.saturating_sub(max_offset_t).max(1);
-                PriceTicks(raw_t.max(floor_cap_t))
+                let fb = if snap.bids[0].price.0 > 0 { snap.bids[0].price.0.min(eff_struct) } else { eff_struct };
+                let raw_t = if p > 0 { p.min(eff_struct).max(1) } else { fb.max(1) };
+                PriceTicks(raw_t.max(eff_struct.saturating_sub(max_offset_t).max(1)))
             }
         };
         (level_idx + 1, book_px, vac_idx)
     }
-}
 
-// === VORTEX-OMEGA CHAT 5 ALPHA PROD ===
-const CHAT5_PHI: f64 = 1.618_033_988_749_895;
-const CHAT5_INV_PHI: f64 = 0.618_033_988_749_895;
-const CHAT5_INV_PHI_SQ: f64 = 0.381_966_011_250_105;
-
-impl OrthogonalFactorState {
-    /// Computes Golden-Ratio composite Stoikov skew in `[-1, +1]` and adverse micro-price drift in ticks.
     #[inline]
     #[must_use]
-    pub fn stoikov_microprice_and_skew(
-        side: crate::types::Side,
-        snap: &crate::lob_shm::SymbolLobSnapshot,
-    ) -> (f64, f64) {
-        let b0 = snap.bids[0];
-        let a0 = snap.asks[0];
+    pub fn stoikov_microprice_and_skew(side: Side, snap: &SymbolLobSnapshot) -> (f64, f64) {
+        let (b0, a0) = (snap.bids[0], snap.asks[0]);
         if b0.price.0 <= 0 || a0.price.0 <= b0.price.0 || (b0.qty.0 <= 0 && a0.qty.0 <= 0) {
             return (0.0, 0.0);
         }
         let dir_s = side.sign_f64();
         let spread_ticks = (a0.price.0 - b0.price.0) as f64;
-        let b_l1 = b0.qty.0.max(0);
-        let a_l1 = a0.qty.0.max(0);
-        let tot_l1 = (b_l1.saturating_add(a_l1)).max(1) as f64;
-        let i_bbo = dir_s * ((b_l1 - a_l1) as f64) / tot_l1;
-
-        let eff_db = if snap.deep_bid_lots_l1_l5.0 > 0 {
-            snap.deep_bid_lots_l1_l5.0
-        } else {
-            b_l1
-        };
-        let eff_da = if snap.deep_ask_lots_l1_l5.0 > 0 {
-            snap.deep_ask_lots_l1_l5.0
-        } else {
-            a_l1
-        };
-        let tot_deep = (eff_db.saturating_add(eff_da)).max(1) as f64;
-        let i_deep = dir_s * ((eff_db - eff_da) as f64) / tot_deep;
-
-        let m_skew = (CHAT5_INV_PHI * i_bbo + CHAT5_INV_PHI_SQ * i_deep).clamp(-1.0, 1.0);
-        let adverse_micro_ticks = 0.5 * spread_ticks * (-m_skew).max(0.0);
-        (m_skew, adverse_micro_ticks)
+        let (b_l1, a_l1) = (b0.qty.0.max(0), a0.qty.0.max(0));
+        let i_bbo = dir_s * ((b_l1 - a_l1) as f64) / ((b_l1.saturating_add(a_l1)).max(1) as f64);
+        let eff_db = if snap.deep_bid_lots_l1_l5.0 > 0 { snap.deep_bid_lots_l1_l5.0 } else { b_l1 };
+        let eff_da = if snap.deep_ask_lots_l1_l5.0 > 0 { snap.deep_ask_lots_l1_l5.0 } else { a_l1 };
+        let i_deep = dir_s * ((eff_db - eff_da) as f64) / ((eff_db.saturating_add(eff_da)).max(1) as f64);
+        let m_skew = (V45_INV_PHI * i_bbo + V45_INV_PHI_SQ * i_deep).clamp(-1.0, 1.0);
+        (m_skew, 0.5 * spread_ticks * (-m_skew).max(0.0))
     }
 
-    /// Computes live Epps-aware `BTCUSDT` cross-asset propagation beta in `[0.75, PHI]` (`0.0` on Slot 0).
     #[inline]
     #[must_use]
-    pub fn epps_btc_lead_lag_beta(
+    pub fn epps_btc_lead_lag_beta(slot_idx: usize, snap: &SymbolLobSnapshot, btc_leader_snap: &SymbolLobSnapshot) -> f64 {
+        if slot_idx == 0 { return 0.0; }
+        ((snap.realized_vol_5m.raw().max(1_200) as f64) / (btc_leader_snap.realized_vol_5m.raw().max(1_200) as f64)).clamp(0.75, V45_PHI)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn epps_correlated_lead_lag_beta(
         slot_idx: usize,
-        snap: &crate::lob_shm::SymbolLobSnapshot,
-        btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        tracker: &EppsBtcCorrelationTracker,
     ) -> f64 {
-        if slot_idx == 0 {
-            return 0.0;
-        }
-        let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(1_200) as f64;
-        let own_vol = snap.realized_vol_5m.raw().max(1_200) as f64;
-        (own_vol / btc_vol).clamp(0.75, CHAT5_PHI)
+        if slot_idx == 0 { 0.0 } else { tracker.correlated_beta(false, snap.realized_vol_5m, btc_leader_snap.realized_vol_5m) }
     }
 }
 
-// === VORTEX-OMEGA V4.5 ALPHA PROD ===
-const V45_PHI: f64 = 1.618_033_988_749_895;
-const V45_INV_PHI: f64 = 0.618_033_988_749_895;
-const V45_EPPS_BUCKET_NS: i64 = 5_000_000_000;
-const V45_EPPS_TAU_SECS: f64 = 120.0;
-const V45_EPPS_PRIOR_VAR_BPS2: f64 = 25.0;
-const V45_FAST_RATE_TAU_SECS: f64 = 2.0;
-const V45_EQ_RATE_TAU_SECS: f64 = 60.0;
-const V45_SPOOF_TAU_SECS: f64 = 15.0;
-const V45_SEED_RATE_HZ: f64 = 10.0;
-
-/// O(1) Zero-Alloc 5-second Epps-aware correlation & signed beta estimator against `BTCUSDT`.
 #[derive(Copy, Clone, Debug)]
 pub struct EppsBtcCorrelationTracker {
     last_bucket_ts_ns: i64,
@@ -828,70 +643,30 @@ pub struct EppsBtcCorrelationTracker {
 
 impl Default for EppsBtcCorrelationTracker {
     #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::suboptimal_flops
-)]
 impl EppsBtcCorrelationTracker {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            last_bucket_ts_ns: 0,
-            prev_own_mid_ticks: 0,
-            prev_btc_mid_ticks: 0,
-            var_own_bps2: 0.0,
-            var_btc_bps2: 0.0,
-            cov_own_btc_bps2: 0.0,
-        }
+        Self { last_bucket_ts_ns: 0, prev_own_mid_ticks: 0, prev_btc_mid_ticks: 0, var_own_bps2: 0.0, var_btc_bps2: 0.0, cov_own_btc_bps2: 0.0 }
     }
 
     #[inline]
-    pub fn observe_5s_pair(
-        &mut self,
-        ts_ns: crate::types::TimestampNs,
-        is_btc_slot: bool,
-        own_mid: crate::types::PriceTicks,
-        btc_mid: crate::types::PriceTicks,
-    ) {
-        if own_mid.0 <= 0 || btc_mid.0 <= 0 || ts_ns.0 <= 0 {
-            return;
-        }
-        if is_btc_slot {
-            self.last_bucket_ts_ns = ts_ns.0;
-            self.prev_own_mid_ticks = own_mid.0;
-            self.prev_btc_mid_ticks = btc_mid.0;
-            return;
-        }
-        if self.last_bucket_ts_ns <= 0
-            || ts_ns.0 < self.last_bucket_ts_ns
-            || self.prev_own_mid_ticks <= 0
-            || self.prev_btc_mid_ticks <= 0
-        {
+    pub fn observe_5s_pair(&mut self, ts_ns: TimestampNs, is_btc_slot: bool, own_mid: PriceTicks, btc_mid: PriceTicks) {
+        if own_mid.0 <= 0 || btc_mid.0 <= 0 || ts_ns.0 <= 0 { return; }
+        if is_btc_slot || self.last_bucket_ts_ns <= 0 || ts_ns.0 < self.last_bucket_ts_ns || self.prev_own_mid_ticks <= 0 || self.prev_btc_mid_ticks <= 0 {
             self.last_bucket_ts_ns = ts_ns.0;
             self.prev_own_mid_ticks = own_mid.0;
             self.prev_btc_mid_ticks = btc_mid.0;
             return;
         }
         let dt_ns = ts_ns.0 - self.last_bucket_ts_ns;
-        if dt_ns < V45_EPPS_BUCKET_NS {
-            return;
-        }
-        let dt_s = ((dt_ns as f64) * 1e-9).clamp(5.0, 60.0);
-        let alpha = 1.0 - (-dt_s / V45_EPPS_TAU_SECS).exp();
-        let r_own = (((own_mid.0 - self.prev_own_mid_ticks) as f64) * 10_000.0
-            / (self.prev_own_mid_ticks as f64))
-            .clamp(-500.0, 500.0);
-        let r_btc = (((btc_mid.0 - self.prev_btc_mid_ticks) as f64) * 10_000.0
-            / (self.prev_btc_mid_ticks as f64))
-            .clamp(-500.0, 500.0);
-
+        if dt_ns < V45_EPPS_BUCKET_NS { return; }
+        let alpha = 1.0 - (-(((dt_ns as f64) * 1e-9).clamp(5.0, 60.0)) / V45_EPPS_TAU_SECS).exp();
+        let r_own = (((own_mid.0 - self.prev_own_mid_ticks) as f64) * 10_000.0 / (self.prev_own_mid_ticks as f64)).clamp(-500.0, 500.0);
+        let r_btc = (((btc_mid.0 - self.prev_btc_mid_ticks) as f64) * 10_000.0 / (self.prev_btc_mid_ticks as f64)).clamp(-500.0, 500.0);
         self.var_own_bps2 = (1.0 - alpha) * self.var_own_bps2 + alpha * (r_own * r_own);
         self.var_btc_bps2 = (1.0 - alpha) * self.var_btc_bps2 + alpha * (r_btc * r_btc);
         self.cov_own_btc_bps2 = (1.0 - alpha) * self.cov_own_btc_bps2 + alpha * (r_own * r_btc);
@@ -903,47 +678,27 @@ impl EppsBtcCorrelationTracker {
     #[inline]
     #[must_use]
     pub fn correlation(&self, is_btc_slot: bool) -> f64 {
-        if is_btc_slot {
-            return 1.0;
-        }
+        if is_btc_slot { return 1.0; }
         let num = self.cov_own_btc_bps2 + V45_INV_PHI * V45_EPPS_PRIOR_VAR_BPS2;
-        let v_own = (self.var_own_bps2 + V45_EPPS_PRIOR_VAR_BPS2).max(1e-6);
-        let v_btc = (self.var_btc_bps2 + V45_EPPS_PRIOR_VAR_BPS2).max(1e-6);
-        (num / (v_own * v_btc).sqrt()).clamp(-1.0, 1.0)
+        let denom = ((self.var_own_bps2 + V45_EPPS_PRIOR_VAR_BPS2).max(1e-6) * (self.var_btc_bps2 + V45_EPPS_PRIOR_VAR_BPS2).max(1e-6)).sqrt();
+        (num / denom).clamp(-1.0, 1.0)
     }
 
     #[inline]
     #[must_use]
-    pub fn correlated_beta(
-        &self,
-        is_btc_slot: bool,
-        own_vol: crate::types::ScaledBps,
-        btc_vol: crate::types::ScaledBps,
-    ) -> f64 {
-        if is_btc_slot {
-            return 1.0;
+    pub fn correlated_beta(&self, is_btc_slot: bool, own_vol: ScaledBps, btc_vol: ScaledBps) -> f64 {
+        if is_btc_slot { 1.0 } else {
+            (self.correlation(false) * ((own_vol.raw().max(100) as f64) / (btc_vol.raw().max(100) as f64))).clamp(-V45_PHI, V45_PHI)
         }
-        let rho = self.correlation(false);
-        let s_own = own_vol.raw().max(100) as f64;
-        let s_btc = btc_vol.raw().max(100) as f64;
-        (rho * (s_own / s_btc)).clamp(-V45_PHI, V45_PHI)
     }
 
     #[inline]
     #[must_use]
-    pub fn correlated_beta_x1000(
-        &self,
-        is_btc_slot: bool,
-        own_vol: crate::types::ScaledBps,
-        btc_vol: crate::types::ScaledBps,
-    ) -> i64 {
-        (self.correlated_beta(is_btc_slot, own_vol, btc_vol) * 1_000.0)
-            .round()
-            .clamp(-1_618.0, 1_618.0) as i64
+    pub fn correlated_beta_x1000(&self, is_btc_slot: bool, own_vol: ScaledBps, btc_vol: ScaledBps) -> i64 {
+        (self.correlated_beta(is_btc_slot, own_vol, btc_vol) * 1_000.0).round().clamp(-1_618.0, 1_618.0) as i64
     }
 }
 
-/// O(1) Event-Clock time-dilation (`[phi^-1, phi]`) and anti-spoof `GEOM` weight modulator.
 #[derive(Copy, Clone, Debug)]
 pub struct EventClockAlphaModulator {
     last_real_ts_ns: i64,
@@ -957,613 +712,138 @@ pub type Orthogonality3FactorEngine = EventClockAlphaModulator;
 
 impl Default for EventClockAlphaModulator {
     #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::suboptimal_flops
-)]
 impl EventClockAlphaModulator {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            last_real_ts_ns: 0,
-            virtual_clock_ns: 0,
+            last_real_ts_ns: 0, virtual_clock_ns: 0,
             fast_ewma_events: V45_SEED_RATE_HZ * V45_FAST_RATE_TAU_SECS,
             eq_ewma_events: V45_SEED_RATE_HZ * V45_EQ_RATE_TAU_SECS,
             spoof_density_ewma: 0.0,
         }
     }
-
-    #[inline]
-    #[must_use]
-    pub const fn spoofing_density(&self) -> f64 {
-        self.spoof_density_ewma
-    }
-
-    #[inline]
-    #[must_use]
+    #[inline] #[must_use] pub const fn spoofing_density(&self) -> f64 { self.spoof_density_ewma }
+    #[inline] #[must_use]
     pub fn event_clock_dilation(&self) -> f64 {
-        let fast_hz = (self.fast_ewma_events / V45_FAST_RATE_TAU_SECS).max(0.05);
-        let eq_hz = (self.eq_ewma_events / V45_EQ_RATE_TAU_SECS).max(1.0);
-        (fast_hz / eq_hz).sqrt().clamp(V45_INV_PHI, V45_PHI)
+        (((self.fast_ewma_events / V45_FAST_RATE_TAU_SECS).max(0.05)) / ((self.eq_ewma_events / V45_EQ_RATE_TAU_SECS).max(1.0))).sqrt().clamp(V45_INV_PHI, V45_PHI)
     }
-
-    #[inline]
-    #[must_use]
+    #[inline] #[must_use]
     pub fn adaptive_factor_weights(&self) -> (f64, f64, f64) {
         OrthogonalFactorState::adaptive_weights_from_spoof_density(self.spoof_density_ewma)
     }
-
-    /// Updates arrival-rate clock & spoofing EWMA; preserves zero phantom decay when `dt == 0`.
     #[inline]
-    pub fn step_event_clock_and_spoof(
-        &mut self,
-        real_ts_ns: crate::types::TimestampNs,
-        ofi: crate::types::BoundedScore,
-        tfi: crate::types::BoundedScore,
-    ) -> crate::types::TimestampNs {
-        if real_ts_ns.0 <= 0 {
-            return real_ts_ns;
-        }
+    pub fn step_event_clock_and_spoof(&mut self, real_ts_ns: TimestampNs, ofi: BoundedScore, tfi: BoundedScore) -> TimestampNs {
+        if real_ts_ns.0 <= 0 { return real_ts_ns; }
         if self.last_real_ts_ns <= 0 || real_ts_ns.0 < self.last_real_ts_ns {
             self.last_real_ts_ns = real_ts_ns.0;
             self.virtual_clock_ns = real_ts_ns.0;
-            return crate::types::TimestampNs(self.virtual_clock_ns);
+            return TimestampNs(self.virtual_clock_ns);
         }
         let dt_ns = real_ts_ns.0 - self.last_real_ts_ns;
-        if dt_ns == 0 {
-            return crate::types::TimestampNs(self.virtual_clock_ns);
-        }
+        if dt_ns == 0 { return TimestampNs(self.virtual_clock_ns); }
         let dt_s = ((dt_ns as f64) * 1e-9).clamp(1e-6, 30.0);
-        self.fast_ewma_events =
-            self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
-        self.eq_ewma_events =
-            self.eq_ewma_events * (-dt_s / V45_EQ_RATE_TAU_SECS).exp() + 1.0;
-
-        let ofi_f = f64::from(ofi.to_bps_i32()) / 10_000.0;
-        let tfi_f = f64::from(tfi.to_bps_i32()) / 10_000.0;
-        let i_spoof = if ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05 {
-            1.0
-        } else {
-            0.0
-        };
+        self.fast_ewma_events = self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
+        self.eq_ewma_events = self.eq_ewma_events * (-dt_s / V45_EQ_RATE_TAU_SECS).exp() + 1.0;
+        let i_spoof = if ofi.get().abs() >= 0.35 && (ofi.get() * tfi.get()) < -0.05 { 1.0 } else { 0.0 };
         let alpha_sp = 1.0 - (-dt_s / V45_SPOOF_TAU_SECS).exp();
-        self.spoof_density_ewma =
-            ((1.0 - alpha_sp) * self.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
-
-        let kappa = self.event_clock_dilation();
-        let eff_step_ns = (((dt_ns as f64) * kappa).round() as i64).max(1);
-        self.virtual_clock_ns = self.virtual_clock_ns.saturating_add(eff_step_ns);
+        self.spoof_density_ewma = ((1.0 - alpha_sp) * self.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
+        self.virtual_clock_ns = self.virtual_clock_ns.saturating_add((((dt_ns as f64) * self.event_clock_dilation()).round() as i64).max(1));
         self.last_real_ts_ns = real_ts_ns.0;
-        crate::types::TimestampNs(self.virtual_clock_ns)
+        TimestampNs(self.virtual_clock_ns)
     }
-
-    #[inline]
-    #[must_use]
-    pub fn adaptive_composite_snr(
-        &self,
-        ofi: crate::types::BoundedScore,
-        tfi: crate::types::BoundedScore,
-        geom: crate::types::BoundedScore,
-    ) -> crate::types::BoundedScore {
-        let (w_ofi, w_tfi, w_geom) = self.adaptive_factor_weights();
-        let x_ofi = f64::from(ofi.to_bps_i32()) / 10_000.0;
-        let x_tfi = f64::from(tfi.to_bps_i32()) / 10_000.0;
-        let x_geom = f64::from(geom.to_bps_i32()) / 10_000.0;
-        crate::types::BoundedScore::new_clamped(w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom)
-    }
-}
-
-#[allow(clippy::suboptimal_flops)]
-impl OrthogonalFactorState {
-    #[inline]
-    #[must_use]
-    pub fn adaptive_weights_from_spoof_density(spoof_density: f64) -> (f64, f64, f64) {
-        let excess = ((spoof_density.clamp(0.0, 1.0) - 0.15) / 0.55).clamp(0.0, 1.0);
-        let w_geom = 0.20 * (1.0 - V45_INV_PHI * excess);
-        let dw = 0.20 - w_geom;
-        let w_tfi = 0.35 + V45_INV_PHI * dw;
-        let w_ofi = 1.0 - w_tfi - w_geom;
-        (w_ofi, w_tfi, w_geom)
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn adaptive_snr_from_snapshot(
-        snap: &crate::lob_shm::SymbolLobSnapshot,
-        spoof_density: f64,
-    ) -> crate::types::BoundedScore {
-        let (w_ofi, w_tfi, w_geom) = Self::adaptive_weights_from_spoof_density(spoof_density);
-        let x_ofi = f64::from(snap.factor_ofi.to_bps_i32()) / 10_000.0;
-        let x_tfi = f64::from(snap.factor_tfi.to_bps_i32()) / 10_000.0;
-        let x_geom = f64::from(snap.factor_geom.to_bps_i32()) / 10_000.0;
-        crate::types::BoundedScore::new_clamped(w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom)
-    }
-
-    /// Signed Epps-corrected lead-lag propagation beta (`0.0` on Slot 0 `BTCUSDT`, `[-PHI, +PHI]` on alts).
-    #[inline]
-    #[must_use]
-    pub fn epps_correlated_lead_lag_beta(
-        slot_idx: usize,
-        snap: &crate::lob_shm::SymbolLobSnapshot,
-        btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
-        tracker: &EppsBtcCorrelationTracker,
-    ) -> f64 {
-        if slot_idx == 0 {
-            return 0.0;
-        }
-        tracker.correlated_beta(false, snap.realized_vol_5m, btc_leader_snap.realized_vol_5m)
+    #[inline] #[must_use]
+    pub fn adaptive_composite_snr(&self, ofi: BoundedScore, tfi: BoundedScore, geom: BoundedScore) -> BoundedScore {
+        let (w_o, w_t, w_g) = self.adaptive_factor_weights();
+        BoundedScore::new_clamped(w_o * ofi.get() + w_t * tfi.get() + w_g * geom.get())
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
-    use crate::types::{TimestampNs, APPROVED_SPECS};
+    use crate::types::APPROVED_SPECS;
 
     #[test]
-    fn test_lvdbs_vacuum_surf_levels_1_to_4() {
+    fn test_lvdbs_stoikov_parkinson_and_event_clock_invariants() {
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = APPROVED_SPECS[3].symbol_id;
         snap.realized_vol_5m = ScaledBps(7_500);
-        let bid_px = [8_202, 8_201, 8_200, 8_199];
-        let ask_px = [8_203, 8_205, 8_208, 8_211];
-        for i in 0..4 {
-            snap.bids[i] = BookLevel { price: PriceTicks(bid_px[i]), qty: LotQty(300) };
-            snap.asks[i] = BookLevel { price: PriceTicks(ask_px[i]), qty: LotQty(250) };
+        for (i, &(bp, ap)) in [(8_202_i64, 8_203_i64), (8_201, 8_205), (8_200, 8_208), (8_199, 8_211)].iter().enumerate() {
+            snap.bids[i] = BookLevel { price: PriceTicks(bp), qty: LotQty(300) };
+            snap.asks[i] = BookLevel { price: PriceTicks(ap), qty: LotQty(250) };
         }
         snap.factor_ofi = BoundedScore::new_clamped(0.60);
         snap.factor_tfi = BoundedScore::new_clamped(0.72);
-        let (lvl4, px4, vac4) =
-            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
-                Side::Bid,
-                &snap,
-                PriceTicks(8_202),
-                PriceTicks(8_202),
-            );
-        assert_eq!(lvl4, 4);
-        assert_eq!(px4, PriceTicks(8_211));
-        assert!(vac4 >= 2.20);
-
-        snap.asks[0].qty = LotQty(2_200);
-        snap.factor_ofi = BoundedScore::new_clamped(0.10);
-        snap.factor_tfi = BoundedScore::new_clamped(0.08);
-        let (lvl1, px1, vac1) =
-            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
-                Side::Bid,
-                &snap,
-                PriceTicks(8_202),
-                PriceTicks(8_202),
-            );
-        assert_eq!(lvl1, 1);
-        assert_eq!(px1, PriceTicks(8_203));
-        assert!(vac1 < 1.05);
+        let (lvl4, px4, _) = OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(Side::Bid, &snap, PriceTicks(8_202), PriceTicks(8_202));
+        assert_eq!((lvl4, px4), (4, PriceTicks(8_211)));
+        let mut clock = EventClockAlphaModulator::new();
+        let mut ts = 1_794_700_000_000_000_000_i64;
+        for _ in 0..300 { ts += 5_000_000; let _ = clock.step_event_clock_and_spoof(TimestampNs(ts), snap.factor_ofi, snap.factor_tfi); }
+        assert!((clock.event_clock_dilation() - V45_PHI).abs() < 1e-6);
     }
 
     #[test]
-    fn test_price_matched_ofi_clock_decay_and_endogenous_vol_guard() {
+    fn test_v46_island1a_spoof_density_dynamic_3x_vip_fees_and_signed_epps() {
         let mut st = OrthogonalFactorState::new();
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = APPROVED_SPECS[7].symbol_id;
-        snap.realized_vol_5m = ScaledBps(6_500);
+        snap.realized_vol_5m = ScaledBps(2_272);
         snap.ts_local_ns = TimestampNs(1_000_000_000);
         for i in 0..5 {
-            snap.bids[i] = BookLevel {
-                price: PriceTicks(15_700 - (i as i64)),
-                qty: LotQty(5_000),
-            };
-            snap.asks[i] = BookLevel {
-                price: PriceTicks(15_702 + (i as i64)),
-                qty: LotQty(5_000),
-            };
+            snap.bids[i] = BookLevel { price: PriceTicks(15_586 - i as i64), qty: LotQty(400) };
+            snap.asks[i] = BookLevel { price: PriceTicks(15_587 + i as i64), qty: LotQty(400) };
         }
         st.on_l2_book_update(&mut snap);
-        snap.ts_local_ns = TimestampNs(1_100_000_000);
-        snap.apply_level_update(Side::Bid, PriceTicks(15_701), LotQty(1));
-        st.on_l2_book_update(&mut snap);
-        assert!(snap.factor_ofi.get() > 0.05 && snap.factor_ofi.get() < 0.45);
-
-        snap.bids[0] = BookLevel { price: PriceTicks(15_693), qty: LotQty(500) };
-        snap.asks[0] = BookLevel { price: PriceTicks(15_699), qty: LotQty(400) };
-        snap.factor_ofi = BoundedScore::new_clamped(0.80);
-        snap.factor_tfi = BoundedScore::new_clamped(0.85);
-        snap.factor_geom = BoundedScore::new_clamped(0.45);
-        let wide_v = OrthogonalFactorState::evaluate_entry_signal_with_leader(
-            APPROVED_SPECS[7],
-            &snap,
-            &snap,
-        );
-        assert_eq!(wide_v, SignalVerdict::NeutralNoAction);
-
-        snap.realized_vol_5m = ScaledBps(2_272);
-        snap.bids[0] = BookLevel { price: PriceTicks(15_586), qty: LotQty(500) };
-        snap.asks[0] = BookLevel { price: PriceTicks(15_587), qty: LotQty(400) };
-        snap.factor_ofi = BoundedScore::new_clamped(-0.45);
-        snap.factor_tfi = BoundedScore::new_clamped(-0.95);
-        snap.factor_geom = BoundedScore::new_clamped(-0.24);
-        let calm_ok = OrthogonalFactorState::evaluate_entry_signal_elastic(
-            APPROVED_SPECS[7],
-            &snap,
-            &snap,
-            ScaledBps(680),
-            ScaledBps(178),
-        );
-        assert!(matches!(
-            calm_ok,
-            SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. }
-        ));
-
-        let mut v = ScaledBps(6_000);
-        for _ in 0..25 {
-            v = OrthogonalFactorState::update_realized_vol_5m(
-                v,
-                PriceTicks(15_700),
-                PriceTicks(15_700),
-                5_000_000_000,
-            );
+        st.on_trade_print(Side::Ask, LotQty(900), &mut snap);
+        for step in 1..=25_i64 {
+            snap.ts_local_ns = TimestampNs(1_000_000_000 + step * 1_000_000_000);
+            snap.bids[0].qty = LotQty(400 + step * 500);
+            st.on_l2_book_update(&mut snap);
         }
-        let endog_floor = APPROVED_SPECS[7]
-            .endogenous_min_vol_5m_bps(PriceTicks(15_700))
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
-        assert!(v.raw() < endog_floor.raw());
-    }
+        assert!(st.spoofing_density() > 0.65);
+        let (w_o, w_t, w_g) = OrthogonalFactorState::adaptive_weights_from_spoof_density(st.spoofing_density());
+        assert!((w_o + w_t + w_g - 1.0).abs() < 1e-12 && w_g < 0.09);
 
-    #[test]
-    fn test_elastic_parkinson_intrawindow_vol_prevents_roundtrip_zero_collapse() {
-        let link_spec = APPROVED_SPECS[9];
-        let base_px = PriceTicks(10_458);
-        let endog_floor = link_spec
-            .endogenous_min_vol_5m_bps(base_px)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
-
-        let mut st = OrthogonalFactorState::new();
-        let mut vol = ScaledBps(2_400);
-        let mut ts = 1_000_000_000_i64;
-        vol = st.observe_mid_and_step_elastic_vol(link_spec, base_px, ts, vol);
-
-        for _ in 0..20 {
-            ts += 2_000_000_000;
-            vol = st.observe_mid_and_step_elastic_vol(
-                link_spec,
-                PriceTicks(base_px.0 + 3),
-                ts,
-                vol,
-            );
-            ts += 2_000_000_000;
-            vol = st.observe_mid_and_step_elastic_vol(
-                link_spec,
-                PriceTicks(base_px.0 - 3),
-                ts,
-                vol,
-            );
-            ts += 4_000_000_000;
-            vol = st.observe_mid_and_step_elastic_vol(link_spec, base_px, ts, vol);
-        }
-        assert!(vol.raw() > endog_floor.raw() + 400);
-
-        let mut flat_st = OrthogonalFactorState::new();
-        let mut flat_vol = ScaledBps(5_000);
-        let mut flat_ts = 1_000_000_000_i64;
-        for _ in 0..30 {
-            flat_ts += 10_000_000_000;
-            flat_vol = flat_st.observe_mid_and_step_elastic_vol(
-                link_spec,
-                base_px,
-                flat_ts,
-                flat_vol,
-            );
-        }
-        assert!(flat_vol.raw() < endog_floor.raw());
-    }
-
-    #[test]
-    fn test_same_packet_trade_burst_zero_phantom_decay_and_lvdbs_cap() {
-        let mut st = OrthogonalFactorState::new();
-        let mut snap = SymbolLobSnapshot::new_empty();
-        snap.symbol_id = APPROVED_SPECS[5].symbol_id;
-        snap.realized_vol_5m = ScaledBps(6_000);
-        snap.ts_local_ns = TimestampNs(2_000_000_000);
-        st.on_trade_print(Side::Ask, LotQty(100), &mut snap);
-        let sell_before = st.tfi_sell_accum;
-        for _ in 0..50 {
-            st.on_trade_print(Side::Bid, LotQty(10), &mut snap);
-        }
-        assert!((st.tfi_sell_accum - sell_before).abs() < 1e-12);
-        assert!((st.tfi_buy_accum - 501.0).abs() < 1e-9);
-
-        for i in 0..4 {
-            snap.bids[i] = BookLevel {
-                price: PriceTicks(8_500 - i as i64),
-                qty: LotQty(400),
-            };
-        }
-        snap.asks[0] = BookLevel { price: PriceTicks(8_505), qty: LotQty(100) };
-        snap.asks[1] = BookLevel { price: PriceTicks(8_508), qty: LotQty(100) };
-        snap.asks[2] = BookLevel { price: PriceTicks(8_512), qty: LotQty(100) };
-        snap.asks[3] = BookLevel { price: PriceTicks(9_200), qty: LotQty(100) };
-        snap.factor_ofi = BoundedScore::new_clamped(0.70);
-        snap.factor_tfi = BoundedScore::new_clamped(0.80);
-        let (lvl, capped_px, _) =
-            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
-                Side::Bid,
-                &snap,
-                PriceTicks(8_504),
-                PriceTicks(8_504),
-            );
-        assert_eq!(lvl, 4);
-        assert!(capped_px.0 > 8_512 && capped_px.0 < 9_200);
-    }
-
-    #[test]
-    fn test_f11_f04_scale_priors_book_only_reset_and_structural_lvdbs() {
-        let mut st_wif = OrthogonalFactorState::new();
-        let mut wif = SymbolLobSnapshot::new_empty();
-        wif.symbol_id = APPROVED_SPECS[8].symbol_id;
-        wif.ts_local_ns = TimestampNs(1_000_000_000);
-        wif.bids[0] = BookLevel { price: PriceTicks(1_600), qty: LotQty(800) };
-        wif.asks[0] = BookLevel { price: PriceTicks(1_601), qty: LotQty(750) };
-        st_wif.on_l2_book_update(&mut wif);
-        wif.ts_local_ns = TimestampNs(26_000_000_000);
-        st_wif.on_trade_print(Side::Bid, LotQty(1), &mut wif);
-        assert!(wif.factor_tfi.get() < 0.20);
-        st_wif.on_trade_print(Side::Bid, LotQty(120), &mut wif);
-        assert!(wif.factor_tfi.get() > 0.85);
-
-        st_wif.reset_l2_book_only();
-        let preserved_tfi = wif.factor_tfi.get();
-        wif.bids[0] = BookLevel { price: PriceTicks(1_602), qty: LotQty(1_200) };
-        wif.asks[0] = BookLevel { price: PriceTicks(1_603), qty: LotQty(400) };
-        st_wif.on_l2_book_update(&mut wif);
-        assert!((wif.factor_tfi.get() - preserved_tfi).abs() < 1e-6);
-        assert!(wif.factor_geom.get() > 0.25);
-
-        let mut dense = SymbolLobSnapshot::new_empty();
-        let mut gapped = SymbolLobSnapshot::new_empty();
-        for i in 0..4 {
-            dense.bids[i] = BookLevel {
-                price: PriceTicks(8_202 - i as i64),
-                qty: LotQty(250),
-            };
-            dense.asks[i] = BookLevel {
-                price: PriceTicks(8_203 + i as i64),
-                qty: LotQty(250),
-            };
-            gapped.bids[i] = dense.bids[i];
-            gapped.asks[i] = BookLevel {
-                price: PriceTicks(8_203 + (i as i64) * 3),
-                qty: LotQty(250),
-            };
-        }
-        let v_dense = OrthogonalFactorState::compute_vacuum_index_l2_l3(Side::Bid, &dense);
-        let v_gap = OrthogonalFactorState::compute_vacuum_index_l2_l3(Side::Bid, &gapped);
-        assert!(v_gap > v_dense * 1.40);
-
-        let mut btc = SymbolLobSnapshot::new_empty();
+        // VIP rebate vs high Taker toxicity on marginal excursion + inverse Epps beta hedge
+        snap.factor_ofi = BoundedScore::new_clamped(0.26);
+        snap.factor_tfi = BoundedScore::new_clamped(0.25);
+        snap.factor_geom = BoundedScore::new_clamped(0.95);
+        let mut btc = snap;
         btc.symbol_id = APPROVED_SPECS[0].symbol_id;
-        btc.realized_vol_5m = ScaledBps(6_500);
-        for i in 0..4 {
-            btc.bids[i] = BookLevel {
-                price: PriceTicks(759_000 - i as i64),
-                qty: LotQty(100),
-            };
-            btc.asks[i] = BookLevel {
-                price: PriceTicks(759_001 + i as i64),
-                qty: LotQty(100),
-            };
-        }
-        let (_, px_bid, _) =
-            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
-                Side::Bid,
-                &btc,
-                PriceTicks(759_334),
-                PriceTicks(759_471),
-            );
-        assert_eq!(px_bid, PriceTicks(759_471));
-        let (_, px_ask, _) =
-            OrthogonalFactorState::compute_l2_l3_vacuum_surf_target_with_structural(
-                Side::Ask,
-                &btc,
-                PriceTicks(758_666),
-                PriceTicks(758_529),
-            );
-        assert_eq!(px_ask, PriceTicks(758_529));
-    }
-}
-
-// === VORTEX-OMEGA CHAT 5 ALPHA TESTS ===
-#[cfg(test)]
-mod omega_chat5_alpha_tests {
-    use super::*;
-    use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
-    use crate::types::{LotQty, PriceTicks, ScaledBps, Side, APPROVED_SPECS};
-
-    #[test]
-    fn test_stoikov_microprice_skew_and_epps_btc_lead_lag_beta() {
-        let mut btc = SymbolLobSnapshot::new_empty();
-        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
-        btc.realized_vol_5m = ScaledBps(6_000);
-
-        let mut avax = SymbolLobSnapshot::new_empty();
-        avax.symbol_id = APPROVED_SPECS[3].symbol_id;
-        avax.realized_vol_5m = ScaledBps(8_800);
-        avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(40) };
-        avax.asks[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(460) };
-        avax.deep_bid_lots_l1_l5 = LotQty(120);
-        avax.deep_ask_lots_l1_l5 = LotQty(1_380);
-
-        let (sk_adv, ticks_adv) =
-            OrthogonalFactorState::stoikov_microprice_and_skew(Side::Bid, &avax);
-        assert!(sk_adv <= -0.80);
-        assert!(ticks_adv >= 0.80);
-
-        avax.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(420) };
-        avax.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(120) };
-        avax.deep_bid_lots_l1_l5 = LotQty(1_500);
-        avax.deep_ask_lots_l1_l5 = LotQty(450);
-        let (sk_fav, ticks_fav) =
-            OrthogonalFactorState::stoikov_microprice_and_skew(Side::Bid, &avax);
-        assert!(sk_fav >= 0.50);
-        assert!(ticks_fav.abs() < 1e-9);
-
-        let beta_btc0 = OrthogonalFactorState::epps_btc_lead_lag_beta(0, &btc, &btc);
-        let beta_avax = OrthogonalFactorState::epps_btc_lead_lag_beta(3, &avax, &btc);
-        assert!(beta_btc0.abs() < 1e-9);
-        assert!((1.40..=1.55).contains(&beta_avax));
-    }
-}
-
-// === VORTEX-OMEGA V4.5 ALPHA TESTS ===
-#[cfg(test)]
-mod omega_v45_alpha_tests {
-    use super::*;
-    use crate::lob_shm::SymbolLobSnapshot;
-    use crate::types::{BoundedScore, PriceTicks, ScaledBps, TimestampNs};
-
-    #[test]
-    fn test_event_clock_time_dilation_burst_acceleration_and_trough_slowdown() {
-        let mut clock = EventClockAlphaModulator::new();
-        assert!((clock.event_clock_dilation() - 1.0).abs() < 1e-6);
-
-        let mut ts = 1_794_700_000_000_000_000_i64;
-        let ofi_clean = BoundedScore::new_clamped(0.50);
-        let tfi_clean = BoundedScore::new_clamped(0.45);
-        let v0 = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
-        assert_eq!(v0.0, ts);
-
-        // Same-packet burst (dt == 0) must produce zero phantom clock advance
-        let v_same = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
-        assert_eq!(v_same.0, v0.0);
-
-        // 200 Hz high-activity burst over 1.5s -> dilates cleanly up to PHI (1.618x)
-        for _ in 0..300 {
-            ts += 5_000_000;
-            let _ = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
-        }
-        assert!((clock.event_clock_dilation() - V45_PHI).abs() < 1e-6);
-
-        // 1 Hz quiet off-peak trough over 12s -> contracts cleanly down to INV_PHI (0.618x)
-        for _ in 0..12 {
-            ts += 1_000_000_000;
-            let _ = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
-        }
-        assert!((clock.event_clock_dilation() - V45_INV_PHI).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_anti_spoof_geom_attenuation_and_partition_of_unity() {
-        let mut eng = Orthogonality3FactorEngine::new();
-        let (w_o0, w_t0, w_g0) = eng.adaptive_factor_weights();
-        assert!((w_o0 - 0.45).abs() < 1e-9);
-        assert!((w_t0 - 0.35).abs() < 1e-9);
-        assert!((w_g0 - 0.20).abs() < 1e-9);
-
-        // Fake passive L1-L10 wall (GEOM = +0.98, OFI = +0.72) while real tape sells (TFI = -0.48)
-        let ofi_spoof = BoundedScore::new_clamped(0.72);
-        let tfi_real = BoundedScore::new_clamped(-0.48);
-        let geom_wall = BoundedScore::new_clamped(0.98);
-        let snr_clean_weights = eng.adaptive_composite_snr(ofi_spoof, tfi_real, geom_wall);
-
-        let mut ts = 1_794_700_100_000_000_000_i64;
-        for _ in 0..35 {
-            ts += 1_000_000_000;
-            let _ = eng.step_event_clock_and_spoof(TimestampNs(ts), ofi_spoof, tfi_real);
-        }
-        assert!(eng.spoofing_density() > 0.75);
-        let (w_o1, w_t1, w_g1) = eng.adaptive_factor_weights();
-        assert!((w_o1 + w_t1 + w_g1 - 1.0).abs() < 1e-12);
-        assert!(w_g1 < 0.080 && w_t1 > 0.420);
-
-        let snr_attenuated = eng.adaptive_composite_snr(ofi_spoof, tfi_real, geom_wall);
-        assert!(snr_attenuated.to_bps_i32() + 1_100 < snr_clean_weights.to_bps_i32());
-    }
-
-    #[test]
-    fn test_epps_5s_btc_correlation_positive_decoupled_and_inverse_beta() {
-        let mut btc_self = EppsBtcCorrelationTracker::new();
-        btc_self.observe_5s_pair(
-            TimestampNs(10_000_000_000),
-            true,
-            PriceTicks(680_000),
-            PriceTicks(680_000),
-        );
-        assert!((btc_self.correlation(true) - 1.0).abs() < 1e-9);
+        btc.factor_ofi = BoundedScore::new_clamped(-0.75);
+        btc.factor_tfi = BoundedScore::new_clamped(-0.80);
+        btc.factor_geom = BoundedScore::new_clamped(-0.50);
+        // Spoofed GEOM=0.95 blocked when spoof_density=0.85, and toxic taker_prob_pm=350 blocks low vol
         assert_eq!(
-            btc_self.correlated_beta_x1000(true, ScaledBps(6_000), ScaledBps(6_000)),
-            1_000
+            OrthogonalFactorState::evaluate_entry_signal_v46(
+                APPROVED_SPECS[7], &snap, &btc, ScaledBps(680), ScaledBps(150),
+                50, FeeSchedule::VIP0_DEFAULT, 0.85, 1.0,
+            ),
+            SignalVerdict::NeutralNoAction
         );
-
-        let mut pos_trk = EppsBtcCorrelationTracker::new();
-        assert!((pos_trk.correlation(false) - V45_INV_PHI).abs() < 1e-6);
-        let mut ts = 1_794_700_000_000_000_000_i64;
-        pos_trk.observe_5s_pair(
-            TimestampNs(ts),
-            false,
-            PriceTicks(10_000),
-            PriceTicks(680_000),
-        );
-        // Sub-5s asynchronous print ignored by Epps filter
-        pos_trk.observe_5s_pair(
-            TimestampNs(ts + 2_000_000_000),
-            false,
-            PriceTicks(10_050),
-            PriceTicks(679_500),
-        );
-        assert!((pos_trk.correlation(false) - V45_INV_PHI).abs() < 1e-6);
-
-        for step in 1..=32_i64 {
-            ts += 5_000_000_000;
-            let up = (step % 2) == 1;
-            let own_px = if up { 10_015 } else { 10_000 };
-            let btc_px = if up { 680_680 } else { 680_000 };
-            pos_trk.observe_5s_pair(
-                TimestampNs(ts),
-                false,
-                PriceTicks(own_px),
-                PriceTicks(btc_px),
-            );
-        }
-        assert!(pos_trk.correlation(false) > 0.88);
-        assert!(pos_trk.correlated_beta(false, ScaledBps(9_000), ScaledBps(6_000)) > 1.25);
-
+        snap.factor_ofi = BoundedScore::new_clamped(0.52);
+        snap.factor_tfi = BoundedScore::new_clamped(0.58);
+        snap.factor_geom = BoundedScore::new_clamped(0.30);
         let mut inv_trk = EppsBtcCorrelationTracker::new();
-        let mut ts_i = 1_794_705_000_000_000_000_i64;
-        for step in 0..=40_i64 {
-            let up = (step % 2) == 1;
-            let own_px = if up { 9_985 } else { 10_000 };
-            let btc_px = if up { 680_680 } else { 680_000 };
-            inv_trk.observe_5s_pair(
-                TimestampNs(ts_i),
-                false,
-                PriceTicks(own_px),
-                PriceTicks(btc_px),
-            );
-            ts_i += 5_000_000_000;
+        let mut t_e = 10_000_000_000_i64;
+        for k in 0..=36_i64 {
+            let up = (k % 2) == 1;
+            inv_trk.observe_5s_pair(TimestampNs(t_e), false, PriceTicks(if up { 15_560 } else { 15_586 }), PriceTicks(if up { 680_700 } else { 680_000 }));
+            t_e += 5_000_000_000;
         }
-        assert!(inv_trk.correlation(false) < -0.70);
-        assert!(inv_trk.correlated_beta_x1000(false, ScaledBps(9_000), ScaledBps(6_000)) < -950);
-
-        let mut btc_snap = SymbolLobSnapshot::new_empty();
-        btc_snap.realized_vol_5m = ScaledBps(6_000);
-        let mut alt_snap = SymbolLobSnapshot::new_empty();
-        alt_snap.realized_vol_5m = ScaledBps(9_000);
-        assert!(
-            OrthogonalFactorState::epps_correlated_lead_lag_beta(
-                0, &btc_snap, &btc_snap, &inv_trk
-            )
-            .abs()
-                < 1e-9
-        );
-        assert!(
-            OrthogonalFactorState::epps_correlated_lead_lag_beta(
-                2, &alt_snap, &btc_snap, &inv_trk
-            ) < -0.95
-        );
+        let inv_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(7, &snap, &btc, &inv_trk);
+        assert!(inv_beta < -0.50);
+        let vip_rebate = FeeSchedule::from_live_rates_clamped(ScaledBps(-50), ScaledBps(300));
+        assert!(matches!(
+            OrthogonalFactorState::evaluate_entry_signal_v46(
+                APPROVED_SPECS[7], &snap, &btc, ScaledBps(680), ScaledBps(150),
+                35, vip_rebate, 0.0, inv_beta,
+            ),
+            SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+        ));
     }
 }

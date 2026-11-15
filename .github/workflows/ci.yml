@@ -1,79 +1,43 @@
-name: VORTEX-OMEGA V4.5 Institutional Gate (SHM v15 & PAR2)
+name: VORTEX-OMEGA V4.6 Constitutional Gate (SHM v15 & PAR2)
 
 on:
   push:
-    branches:
-      - main
-      - "feat/**"
+    branches: [ "main", "feat/**" ]
   pull_request:
-    branches:
-      - main
+    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: "1"
 
 jobs:
-  constitutional-gate:
-    name: Zero-Warning Pedantic, 85 Tests (/dev/shm) & 3 LTO Binaries
+  constitutional-gate-linux:
+    name: Ubuntu /dev/shm 88-Test & 3-CLI Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust toolchain + clippy
+      - name: Gate 0 - UTF-8 LF & Secret Hygiene Audit
+        run: |
+          python3 -c 'import pathlib, subprocess, sys; files = subprocess.check_output(["git", "ls-files"], text=True).splitlines(); bad_ext = (".env", ".lock", ".pdb", ".mmap", ".parquet", ".jsonl"); bad = [f for f in files if f == ".env" or f.endswith(bad_ext)]; crlf = [f for f in files if pathlib.Path(f).is_file() and b"\r" in pathlib.Path(f).read_bytes()]; sys.exit("Forbidden or CRLF: " + str(bad + crlf) if (bad or crlf) else 0)'
+
+      - name: Install Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
-      - name: Gate 1 - Law IX Hygiene (No CRLF & No Leaked Secrets/Locks)
-        run: |
-          set -euo pipefail
-          if git ls-files | grep -E '(^\.env$|HALTED_ON_LOSS\.lock$|DRAIN_MODE\.lock$|\.pdb$|\.mmap$|\.jsonl$)'; then
-            echo "Forbidden runtime/secret file tracked in Git"
-            exit 1
-          fi
-          python3 - << 'PY'
-          import pathlib, subprocess, sys
-          exts = {".rs", ".toml", ".md", ".py", ".sh", ".yml"}
-          bad = []
-          for p in subprocess.check_output(["git", "ls-files"], text=True).splitlines():
-              path = pathlib.Path(p)
-              if path.suffix in exts and path.exists() and b"\r" in path.read_bytes():
-                  bad.append(p)
-          if bad:
-              print("CRLF detected in:", bad)
-              sys.exit(1)
-          print("UTF-8 LF hygiene verified across tracked files.")
-          PY
-
-      - name: Gate 2 - Clippy Pedantic Zero-Warning Gate
+      - name: Gate 1 - Cargo Clippy Pedantic Zero-Warnings
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Gate 3 - Deterministic Single-Thread Suite on POSIX /dev/shm
+      - name: Gate 2 - Deterministic Suite on Linux /dev/shm
         run: cargo test --lib -- --test-threads=1
 
-      - name: Gate 4 - LTO Fat Release Build & 3 Autonomous CLI Gates
+      - name: Gate 3 - LTO Fat Release Build & 3 Autonomous CLI Gates
         run: |
-          set -euo pipefail
           cargo build --release --bins
           ./target/release/vortex_tap
           mkdir -p /tmp/vortex_empty_par2_gate
           ./target/release/vortex_replay --dir /tmp/vortex_empty_par2_gate
           rmdir /tmp/vortex_empty_par2_gate
           ./target/release/vortex_exec
-          git rev-parse HEAD > target/release/COMMIT_SHA.txt
-          (cd target/release && sha256sum vortex_tap vortex_replay vortex_exec COMMIT_SHA.txt > SHA256SUMS.txt)
-          cat target/release/SHA256SUMS.txt
-
-      - name: Upload Certified Release Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: vortex-omega-v45-linux-x86_64
-          path: |
-            target/release/vortex_tap
-            target/release/vortex_replay
-            target/release/vortex_exec
-            target/release/COMMIT_SHA.txt
-            target/release/SHA256SUMS.txt
+          sha256sum target/release/vortex_tap target/release/vortex_replay target/release/vortex_exec

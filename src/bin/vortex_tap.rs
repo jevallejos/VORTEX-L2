@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.5 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 Lossless + Async VaultIO).
+//! VORTEX-OMEGA V4.6 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 Lossless + Async VaultIO).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -82,7 +82,7 @@ impl TapLiveState {
                     .set_learned_efficacy_permille(ob_plasticity[s].midpoint_efficacy_pm());
             }
             println!(
-                "{}\u{1f7e2} [OB PLASTICITY V4.5 REHYDRATE] Hydrated 12/12 directional [OB+, OB-] slots{}",
+                "{}\u{1f7e2} [OB PLASTICITY V4.6 REHYDRATE] Hydrated 12/12 directional [OB+, OB-] slots{}",
                 ANSI_GREEN, ANSI_RESET
             );
         }
@@ -694,7 +694,7 @@ fn warm_start_elliott_and_order_blocks(state: &mut TapLiveState) {
         }
     }
     println!(
-        "{}\u{1f7e2} [TAP WARM-START V4.5] Hydrated {}/12 slots (Chunked Keep-Alive TLS -> Elliott + [OB+, OB-]){}",
+        "{}\u{1f7e2} [TAP WARM-START V4.6] Hydrated {}/12 slots (Chunked Keep-Alive TLS -> Elliott + [OB+, OB-]){}",
         ANSI_GREEN, hydrated_slots, ANSI_RESET
     );
 }
@@ -775,7 +775,7 @@ fn main() -> ExitCode {
     let dash = "-".repeat(80);
     println!("{sep}");
     println!(
-        "[VORTEX-TAP OMEGA V4.5] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
+        "[VORTEX-TAP OMEGA V4.6] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
         VORTEX_SHM_VERSION,
         shm_path.display()
     );

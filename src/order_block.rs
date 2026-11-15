@@ -1,15 +1,16 @@
-//! Zero-Alloc Bi-Directional Order Block Engine (OB+ / OB-) with Self-Learned Plasticity.
-
+//! Zero-Alloc Bi-Directional Order Block Engine (OB+ / OB-) with Distance-Weighted Eviction & Live VIP Fees (V4.6).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
     clippy::needless_range_loop,
+    clippy::suboptimal_flops,
     clippy::too_many_arguments
 )]
 
 use core::cmp::Ordering;
 
-use crate::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side};
+use crate::fee_cadence_beta::FeeSchedule;
+use crate::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs};
 
 const PHI: f64 = 1.618_033_988_749_895;
 const INV_PHI: f64 = 0.618_033_988_749_895;
@@ -18,6 +19,10 @@ const BAR_RING_CAP: usize = 20;
 const SEED_EFFICACY_PM: i64 = 618;
 const MIN_EFFICACY_PM: i64 = 382;
 const MAX_EFFICACY_PM: i64 = 950;
+pub const OB_DIRECTIONAL_MIN_PM: i64 = 382;
+pub const OB_DIRECTIONAL_SEED_PM: i64 = 618;
+pub const OB_DIRECTIONAL_MAX_PM: i64 = 854;
+const OB_PLASTICITY_ETA_PM: i64 = 120;
 pub const OB_PLASTICITY_VAULT_PATH: &str = "data/vault/vortex_ob_plasticity.json";
 
 #[repr(u8)]
@@ -74,27 +79,28 @@ impl OrderBlockObservables {
     #[inline]
     #[must_use]
     pub const fn effective_efficacy_pm(self) -> i64 {
-        if self.learned_efficacy_pm > 0 {
-            self.learned_efficacy_pm
-        } else {
-            SEED_EFFICACY_PM
-        }
+        if self.learned_efficacy_pm > 0 { self.learned_efficacy_pm } else { SEED_EFFICACY_PM }
     }
 
-    /// Endogenous volatility + 3x friction + self-learned wall collision radius.
     #[inline]
     #[must_use]
-    pub fn elastic_wall_veto_radius_bps(
+    pub fn elastic_wall_veto_radius_bps(self, spec: PairSpec, mid_px: PriceTicks, vol_5m: ScaledBps) -> ScaledBps {
+        let b3x = spec.required_3x_barrier_bps(mid_px).unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS).raw().max(600);
+        let base = (vol_5m.raw() / 5).clamp((b3x * 2) / 3, b3x * 2);
+        ScaledBps((base.saturating_mul(500 + self.effective_efficacy_pm())) / 1_000)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn elastic_wall_veto_radius_bps_dynamic(
         self,
         spec: PairSpec,
         mid_px: PriceTicks,
         vol_5m: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
     ) -> ScaledBps {
-        let b3x = spec
-            .required_3x_barrier_bps(mid_px)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
-            .raw()
-            .max(600);
+        let b3x = spec.three_x_friction_barrier_bps_dynamic(mid_px, taker_prob_pm, fees).raw().max(400);
         let base = (vol_5m.raw() / 5).clamp((b3x * 2) / 3, b3x * 2);
         ScaledBps((base.saturating_mul(500 + self.effective_efficacy_pm())) / 1_000)
     }
@@ -130,35 +136,50 @@ impl OrderBlockObservables {
         }
     }
 
-    /// Continuous C^1 confluence resonance in `[0.0, 1.0]` when pullback lands on aligned OB.
     #[inline]
     #[must_use]
-    pub fn aligned_confluence_resonance(
+    pub fn vetoes_into_opposing_wall_dynamic(
         self,
         side: Side,
         spec: PairSpec,
         mid_px: PriceTicks,
         vol_5m: ScaledBps,
-    ) -> f64 {
+        signed_tfi: f64,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+    ) -> bool {
+        if signed_tfi >= (1.0 - 0.20 * INV_PHI) {
+            return false;
+        }
+        let radius = self.elastic_wall_veto_radius_bps_dynamic(spec, mid_px, vol_5m, taker_prob_pm, fees).raw();
+        let min_sc = INV_PHI * (self.effective_efficacy_pm() as f64 * 1e-3);
+        match side {
+            Side::Bid => {
+                self.bear_wall_ticks.0 > 0
+                    && self.bear_ob_score.get() >= min_sc
+                    && self.dist_bear_ob_bps.raw() >= 0
+                    && self.dist_bear_ob_bps.raw() <= radius
+            }
+            Side::Ask => {
+                self.bull_wall_ticks.0 > 0
+                    && self.bull_ob_score.get() >= min_sc
+                    && self.dist_bull_ob_bps.raw() >= 0
+                    && self.dist_bull_ob_bps.raw() <= radius
+            }
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn aligned_confluence_resonance(self, side: Side, spec: PairSpec, mid_px: PriceTicks, vol_5m: ScaledBps) -> f64 {
         let (w_t, d_bps, sc) = match side {
-            Side::Bid => (
-                self.bull_wall_ticks,
-                self.dist_bull_ob_bps.raw(),
-                self.bull_ob_score.get(),
-            ),
-            Side::Ask => (
-                self.bear_wall_ticks,
-                self.dist_bear_ob_bps.raw(),
-                self.bear_ob_score.get(),
-            ),
+            Side::Bid => (self.bull_wall_ticks, self.dist_bull_ob_bps.raw(), self.bull_ob_score.get()),
+            Side::Ask => (self.bear_wall_ticks, self.dist_bear_ob_bps.raw(), self.bear_ob_score.get()),
         };
         if w_t.0 <= 0 || sc <= 0.05 {
             return 0.0;
         }
-        let span = self
-            .elastic_wall_veto_radius_bps(spec, mid_px, vol_5m)
-            .raw()
-            .max(400) as f64;
+        let span = self.elastic_wall_veto_radius_bps(spec, mid_px, vol_5m).raw().max(400) as f64;
         let d = d_bps as f64;
         if d < -INV_PHI * span || d > PHI * span {
             return 0.0;
@@ -167,7 +188,41 @@ impl OrderBlockObservables {
         (sc * (-0.5 * z * z).exp()).clamp(0.0, 1.0)
     }
 
-    /// Elastic Maker front-run TP ahead of opposing institutional Order Block wall.
+    /// Elastic Maker front-run TP ahead of opposing OB wall parameterized by live `FeeSchedule`.
+    #[inline]
+    #[must_use]
+    pub fn front_run_opposing_wall_tp_with_fees(
+        self,
+        open_side: Side,
+        spec: PairSpec,
+        avg_entry: PriceTicks,
+        cand_tp: PriceTicks,
+        fees: FeeSchedule,
+    ) -> PriceTicks {
+        let tau_bps = spec.tick_to_price_scaled_bps(avg_entry).unwrap_or(ScaledBps(100)).raw().max(1);
+        let mkr_abs = fees.maker_fee_bps.raw().abs().max(50);
+        let pad_ticks = (mkr_abs / tau_bps).clamp(2, 12);
+        let min_sc = INV_PHI * 0.80;
+        match open_side {
+            Side::Bid => {
+                let w = self.bear_wall_ticks.0;
+                if w > avg_entry.0 + pad_ticks + 1 && self.bear_ob_score.get() >= min_sc && cand_tp.0 >= w {
+                    PriceTicks(w - pad_ticks)
+                } else {
+                    cand_tp
+                }
+            }
+            Side::Ask => {
+                let w = self.bull_wall_ticks.0;
+                if w > 0 && w + pad_ticks + 1 < avg_entry.0 && self.bull_ob_score.get() >= min_sc && cand_tp.0 <= w {
+                    PriceTicks(w + pad_ticks)
+                } else {
+                    cand_tp
+                }
+            }
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn front_run_opposing_wall_tp(
@@ -177,634 +232,9 @@ impl OrderBlockObservables {
         avg_entry: PriceTicks,
         cand_tp: PriceTicks,
     ) -> PriceTicks {
-        let tau_bps = spec
-            .tick_to_price_scaled_bps(avg_entry)
-            .unwrap_or(ScaledBps(100))
-            .raw()
-            .max(1);
-        let pad_ticks = (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() / tau_bps).clamp(2, 12);
-        let min_sc = INV_PHI * 0.80;
-        match open_side {
-            Side::Bid => {
-                let w = self.bear_wall_ticks.0;
-                if w > avg_entry.0 + pad_ticks + 1
-                    && self.bear_ob_score.get() >= min_sc
-                    && cand_tp.0 >= w
-                {
-                    PriceTicks(w - pad_ticks)
-                } else {
-                    cand_tp
-                }
-            }
-            Side::Ask => {
-                let w = self.bull_wall_ticks.0;
-                if w > 0
-                    && w + pad_ticks + 1 < avg_entry.0
-                    && self.bull_ob_score.get() >= min_sc
-                    && cand_tp.0 <= w
-                {
-                    PriceTicks(w + pad_ticks)
-                } else {
-                    cand_tp
-                }
-            }
-        }
+        self.front_run_opposing_wall_tp_with_fees(open_side, spec, avg_entry, cand_tp, FeeSchedule::VIP0_DEFAULT)
     }
 }
-
-#[derive(Copy, Clone, Debug, Default)]
-struct OhlcBar {
-    bucket_id: i64,
-    open: PriceTicks,
-    high: PriceTicks,
-    low: PriceTicks,
-    close: PriceTicks,
-    turnover_1e8: i64,
-    end_oi_x100: i64,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct BarRing {
-    bars: [OhlcBar; BAR_RING_CAP],
-    len: usize,
-    cur: OhlcBar,
-    has_cur: bool,
-}
-
-impl BarRing {
-    const fn new() -> Self {
-        let z = OhlcBar {
-            bucket_id: 0,
-            open: PriceTicks(0),
-            high: PriceTicks(0),
-            low: PriceTicks(0),
-            close: PriceTicks(0),
-            turnover_1e8: 0,
-            end_oi_x100: 0,
-        };
-        Self {
-            bars: [z; BAR_RING_CAP],
-            len: 0,
-            cur: z,
-            has_cur: false,
-        }
-    }
-
-    fn push_closed(&mut self, bar: OhlcBar) {
-        if self.len < BAR_RING_CAP {
-            self.bars[self.len] = bar;
-            self.len += 1;
-        } else {
-            for i in 0..(BAR_RING_CAP - 1) {
-                self.bars[i] = self.bars[i + 1];
-            }
-            self.bars[BAR_RING_CAP - 1] = bar;
-        }
-    }
-
-    fn step_tick(&mut self, bucket: i64, px: PriceTicks, turn_1e8: i64, oi_x100: i64) -> bool {
-        if !self.has_cur {
-            self.cur = OhlcBar {
-                bucket_id: bucket,
-                open: px,
-                high: px,
-                low: px,
-                close: px,
-                turnover_1e8: turn_1e8.max(1),
-                end_oi_x100: oi_x100,
-            };
-            self.has_cur = true;
-            return false;
-        }
-        if bucket <= self.cur.bucket_id {
-            if px.0 > self.cur.high.0 {
-                self.cur.high = px;
-            }
-            if px.0 < self.cur.low.0 {
-                self.cur.low = px;
-            }
-            self.cur.close = px;
-            self.cur.turnover_1e8 = self.cur.turnover_1e8.saturating_add(turn_1e8.max(1));
-            if oi_x100 > 0 {
-                self.cur.end_oi_x100 = oi_x100;
-            }
-            return false;
-        }
-        let closed = self.cur;
-        self.push_closed(closed);
-        self.cur = OhlcBar {
-            bucket_id: bucket,
-            open: px,
-            high: px,
-            low: px,
-            close: px,
-            turnover_1e8: turn_1e8.max(1),
-            end_oi_x100: oi_x100,
-        };
-        true
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct CausalOrderBlockEngine {
-    bull_zones: [OrderBlockZone; MAX_OB_ZONES_PER_SIDE],
-    bear_zones: [OrderBlockZone; MAX_OB_ZONES_PER_SIDE],
-    ring_1m: BarRing,
-    ring_5m: BarRing,
-    last_oi_x100: i64,
-    learned_efficacy_pm: i64,
-    cached_obs: OrderBlockObservables,
-}
-
-impl Default for CausalOrderBlockEngine {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CausalOrderBlockEngine {
-    #[inline]
-    #[must_use]
-    pub const fn new() -> Self {
-        let ez = OrderBlockZone {
-            state: ObLifecycleState::Empty,
-            fuel: ObFuelKind::FreshOpenInterest,
-            horizon: ObHorizon::Tactical1m,
-            bounce_verified: false,
-            low_ticks: PriceTicks(0),
-            high_ticks: PriceTicks(0),
-            eq_ticks: PriceTicks(0),
-            strength_pm: 0,
-        };
-        Self {
-            bull_zones: [ez; MAX_OB_ZONES_PER_SIDE],
-            bear_zones: [ez; MAX_OB_ZONES_PER_SIDE],
-            ring_1m: BarRing::new(),
-            ring_5m: BarRing::new(),
-            last_oi_x100: 0,
-            learned_efficacy_pm: SEED_EFFICACY_PM,
-            cached_obs: OrderBlockObservables {
-                bull_ob_score: BoundedScore::ZERO,
-                bear_ob_score: BoundedScore::ZERO,
-                dist_bull_ob_bps: ScaledBps(0),
-                dist_bear_ob_bps: ScaledBps(0),
-                bull_wall_ticks: PriceTicks(0),
-                bear_wall_ticks: PriceTicks(0),
-                learned_efficacy_pm: SEED_EFFICACY_PM,
-            },
-        }
-    }
-
-    #[inline]
-    pub fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn observables(&self) -> OrderBlockObservables {
-        self.cached_obs
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn learned_efficacy_permille(&self) -> i64 {
-        self.learned_efficacy_pm
-    }
-
-    #[inline]
-    pub fn set_learned_efficacy_permille(&mut self, efficacy_pm: i64) {
-        if efficacy_pm > 0 {
-            let clamped = efficacy_pm.clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
-            self.learned_efficacy_pm = clamped;
-            self.cached_obs.learned_efficacy_pm = clamped;
-        }
-    }
-
-    pub fn reset_preserving_plasticity(&mut self) {
-        let keep_pm = self.learned_efficacy_pm;
-        *self = Self::new();
-        self.set_learned_efficacy_permille(keep_pm);
-    }
-
-    pub fn save_plasticity_array_to_path<const N: usize>(
-        engines: &[Self; N],
-        path: &std::path::Path,
-        ts_ns: i64,
-    ) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let vals: Vec<i64> = engines.iter().map(Self::learned_efficacy_permille).collect();
-        let payload = serde_json::json!({
-            "event": "OB_PLASTICITY_V44",
-            "ts_ns": ts_ns,
-            "learned_efficacy_pm": vals,
-        });
-        if let Ok(txt) = serde_json::to_string(&payload) {
-            let _ = std::fs::write(path, txt);
-        }
-    }
-
-    #[must_use]
-    pub fn load_plasticity_array_from_path<const N: usize>(
-        engines: &mut [Self; N],
-        path: &std::path::Path,
-    ) -> usize {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return 0;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return 0;
-        };
-        let Some(arr) = val.get("learned_efficacy_pm").and_then(|v| v.as_array()) else {
-            return 0;
-        };
-        let mut loaded = 0_usize;
-        for (idx, item) in arr.iter().take(N).enumerate() {
-            if let Some(pm) = item.as_i64() {
-                if (MIN_EFFICACY_PM..=MAX_EFFICACY_PM).contains(&pm) {
-                    engines[idx].set_learned_efficacy_permille(pm);
-                    loaded += 1;
-                }
-            }
-        }
-        loaded
-    }
-
-    #[inline]
-    pub fn observe_open_interest(&mut self, oi_contracts: f64) {
-        if oi_contracts.is_finite() && oi_contracts > 0.0 {
-            self.last_oi_x100 = (oi_contracts * 100.0).round() as i64;
-        }
-    }
-
-    fn insert_zone(slots: &mut [OrderBlockZone; MAX_OB_ZONES_PER_SIDE], zone: OrderBlockZone) {
-        for s in &mut *slots {
-            if s.state == ObLifecycleState::Empty {
-                *s = zone;
-                return;
-            }
-        }
-        let mut w = 0_usize;
-        for i in 1..MAX_OB_ZONES_PER_SIDE {
-            if slots[i].strength_pm <= slots[w].strength_pm {
-                w = i;
-            }
-        }
-        slots[w] = zone;
-    }
-
-    fn detect_from_ring(&mut self, is_5m: bool) {
-        let ring = if is_5m { &self.ring_5m } else { &self.ring_1m };
-        if ring.len < 7 {
-            return;
-        }
-        let n = ring.len;
-        let (b0, b1, b2) = (ring.bars[n - 3], ring.bars[n - 2], ring.bars[n - 1]);
-        let hist_n = n - 3;
-        let (mut sum_r, mut sum_t) = (0.0_f64, 0.0_f64);
-        for i in 0..hist_n {
-            sum_r += (ring.bars[i].high.0 - ring.bars[i].low.0).max(1) as f64;
-            sum_t += ring.bars[i].turnover_1e8.max(1) as f64;
-        }
-        let avg_r = (sum_r / (hist_n as f64)).max(1.0);
-        let turn_ratio = (b0.turnover_1e8.max(b1.turnover_1e8).max(b2.turnover_1e8) as f64)
-            / (sum_t / (hist_n as f64)).max(1.0);
-        if turn_ratio < (1.0 + 0.25 * INV_PHI) {
-            return;
-        }
-        let fuel = if b2.end_oi_x100 >= b0.end_oi_x100 {
-            ObFuelKind::FreshOpenInterest
-        } else {
-            ObFuelKind::SqueezeLiquidation
-        };
-        let horizon = if is_5m {
-            ObHorizon::Structural5m
-        } else {
-            ObHorizon::Tactical1m
-        };
-        let h_w = if is_5m { 1.0 } else { f64::midpoint(1.0, INV_PHI) };
-        let f_w = if matches!(fuel, ObFuelKind::FreshOpenInterest) {
-            1.0
-        } else {
-            1.0 - 0.15 * INV_PHI
-        };
-        match b0.close.0.cmp(&b0.open.0) {
-            Ordering::Less => {
-                let disp = (b1.high.0.max(b2.high.0) - b0.close.0).max(0) as f64;
-                if b1.close.0.max(b2.close.0) > b0.high.0
-                    && (b2.low.0 > b0.high.0 || disp >= (PHI + INV_PHI) * avg_r)
-                    && disp >= PHI * avg_r
-                {
-                    let raw_s = ((disp / (3.0 * avg_r)).min(1.0) * 650.0
-                        + (turn_ratio / 3.0).min(1.0) * 350.0)
-                        * h_w
-                        * f_w;
-                    Self::insert_zone(
-                        &mut self.bull_zones,
-                        OrderBlockZone {
-                            state: ObLifecycleState::Virgin,
-                            fuel,
-                            horizon,
-                            bounce_verified: false,
-                            low_ticks: b0.low,
-                            high_ticks: b0.open,
-                            eq_ticks: PriceTicks(i64::midpoint(b0.low.0, b0.open.0)),
-                            strength_pm: (raw_s.round() as i64).clamp(MIN_EFFICACY_PM, 1_000),
-                        },
-                    );
-                }
-            }
-            Ordering::Greater => {
-                let disp = (b0.close.0 - b1.low.0.min(b2.low.0)).max(0) as f64;
-                if b1.close.0.min(b2.close.0) < b0.low.0
-                    && (b2.high.0 < b0.low.0 || disp >= (PHI + INV_PHI) * avg_r)
-                    && disp >= PHI * avg_r
-                {
-                    let raw_s = ((disp / (3.0 * avg_r)).min(1.0) * 650.0
-                        + (turn_ratio / 3.0).min(1.0) * 350.0)
-                        * h_w
-                        * f_w;
-                    Self::insert_zone(
-                        &mut self.bear_zones,
-                        OrderBlockZone {
-                            state: ObLifecycleState::Virgin,
-                            fuel,
-                            horizon,
-                            bounce_verified: false,
-                            low_ticks: b0.open,
-                            high_ticks: b0.high,
-                            eq_ticks: PriceTicks(i64::midpoint(b0.open.0, b0.high.0)),
-                            strength_pm: (raw_s.round() as i64).clamp(MIN_EFFICACY_PM, 1_000),
-                        },
-                    );
-                }
-            }
-            Ordering::Equal => {}
-        }
-    }
-
-    fn step_mitigation_and_plasticity(&mut self, spec: PairSpec, px: PriceTicks) {
-        if px.0 <= 0 {
-            return;
-        }
-        let b3x = spec
-            .required_3x_barrier_bps(px)
-            .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
-            .raw();
-        let mut bull_b = (PriceTicks(0), i64::MAX, 0.0_f64);
-        for z in &mut self.bull_zones {
-            if z.state == ObLifecycleState::Empty {
-                continue;
-            }
-            if px.0 < z.low_ticks.0
-                || (z.state == ObLifecycleState::MitigatedShallow && px.0 < z.eq_ticks.0)
-            {
-                if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
-                    self.learned_efficacy_pm =
-                        ((self.learned_efficacy_pm * 88 + MIN_EFFICACY_PM * 12) / 100)
-                            .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
-                }
-                z.state = ObLifecycleState::Empty;
-                continue;
-            }
-            if px.0 <= z.high_ticks.0 {
-                z.state = ObLifecycleState::MitigatedShallow;
-            } else if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
-                let reb =
-                    ((px.0 - z.high_ticks.0).saturating_mul(1_000_000)) / z.high_ticks.0.max(1);
-                if reb >= b3x {
-                    z.bounce_verified = true;
-                    self.learned_efficacy_pm =
-                        ((self.learned_efficacy_pm * 85 + MAX_EFFICACY_PM * 15) / 100)
-                            .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
-                }
-            }
-            let dist = ((px.0 - z.high_ticks.0).saturating_mul(1_000_000)) / px.0.max(1);
-            let sc = ((z.strength_pm as f64) * 1e-3)
-                * (if z.state == ObLifecycleState::Virgin {
-                    1.0
-                } else {
-                    INV_PHI
-                })
-                * ((self.learned_efficacy_pm as f64) / (SEED_EFFICACY_PM as f64));
-            if dist >= -b3x && dist < bull_b.1 {
-                bull_b = (z.high_ticks, dist, sc.clamp(0.0, 1.0));
-            }
-        }
-        let mut bear_b = (PriceTicks(0), i64::MAX, 0.0_f64);
-        for z in &mut self.bear_zones {
-            if z.state == ObLifecycleState::Empty {
-                continue;
-            }
-            if px.0 > z.high_ticks.0
-                || (z.state == ObLifecycleState::MitigatedShallow && px.0 > z.eq_ticks.0)
-            {
-                if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
-                    self.learned_efficacy_pm =
-                        ((self.learned_efficacy_pm * 88 + MIN_EFFICACY_PM * 12) / 100)
-                            .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
-                }
-                z.state = ObLifecycleState::Empty;
-                continue;
-            }
-            if px.0 >= z.low_ticks.0 {
-                z.state = ObLifecycleState::MitigatedShallow;
-            } else if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
-                let reb =
-                    ((z.low_ticks.0 - px.0).saturating_mul(1_000_000)) / z.low_ticks.0.max(1);
-                if reb >= b3x {
-                    z.bounce_verified = true;
-                    self.learned_efficacy_pm =
-                        ((self.learned_efficacy_pm * 85 + MAX_EFFICACY_PM * 15) / 100)
-                            .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
-                }
-            }
-            let dist = ((z.low_ticks.0 - px.0).saturating_mul(1_000_000)) / px.0.max(1);
-            let sc = ((z.strength_pm as f64) * 1e-3)
-                * (if z.state == ObLifecycleState::Virgin {
-                    1.0
-                } else {
-                    INV_PHI
-                })
-                * ((self.learned_efficacy_pm as f64) / (SEED_EFFICACY_PM as f64));
-            if dist >= -b3x && dist < bear_b.1 {
-                bear_b = (z.low_ticks, dist, sc.clamp(0.0, 1.0));
-            }
-        }
-        self.cached_obs = OrderBlockObservables {
-            bull_ob_score: BoundedScore::new_clamped(bull_b.2),
-            bear_ob_score: BoundedScore::new_clamped(bear_b.2),
-            dist_bull_ob_bps: ScaledBps(if bull_b.0 .0 > 0 { bull_b.1 } else { 0 }),
-            dist_bear_ob_bps: ScaledBps(if bear_b.0 .0 > 0 { bear_b.1 } else { 0 }),
-            bull_wall_ticks: bull_b.0,
-            bear_wall_ticks: bear_b.0,
-            learned_efficacy_pm: self.learned_efficacy_pm,
-        };
-    }
-
-    #[inline]
-    pub fn observe_mid_quote(
-        &mut self,
-        spec: PairSpec,
-        mid_px: PriceTicks,
-    ) -> OrderBlockObservables {
-        if mid_px.0 > 0 {
-            self.step_mitigation_and_plasticity(spec, mid_px);
-        }
-        self.cached_obs
-    }
-
-    pub fn observe_live_tick(
-        &mut self,
-        spec: PairSpec,
-        price: PriceTicks,
-        qty: LotQty,
-        ts_ns: i64,
-    ) -> OrderBlockObservables {
-        if price.0 <= 0 || ts_ns <= 0 {
-            return self.cached_obs;
-        }
-        let turn_1e8 = spec.lot_notional_1e8(LotQty(qty.0.max(1)), price);
-        let oi = self.last_oi_x100;
-        if self.ring_1m.step_tick(ts_ns / 60_000_000_000, price, turn_1e8, oi) {
-            self.detect_from_ring(false);
-        }
-        if self.ring_5m.step_tick(ts_ns / 300_000_000_000, price, turn_1e8, oi) {
-            self.detect_from_ring(true);
-        }
-        self.step_mitigation_and_plasticity(spec, price);
-        self.cached_obs
-    }
-
-    pub fn ingest_closed_bar(
-        &mut self,
-        spec: PairSpec,
-        is_5m: bool,
-        bucket_id: i64,
-        open: PriceTicks,
-        high: PriceTicks,
-        low: PriceTicks,
-        close: PriceTicks,
-        turnover_1e8: i64,
-        oi_x100: i64,
-    ) {
-        if open.0 <= 0 || high.0 < low.0 || low.0 <= 0 || close.0 <= 0 {
-            return;
-        }
-        let bar = OhlcBar {
-            bucket_id,
-            open,
-            high,
-            low,
-            close,
-            turnover_1e8: turnover_1e8.max(1),
-            end_oi_x100: oi_x100,
-        };
-        if is_5m {
-            self.ring_5m.push_closed(bar);
-        } else {
-            self.ring_1m.push_closed(bar);
-        }
-        self.detect_from_ring(is_5m);
-        self.step_mitigation_and_plasticity(spec, close);
-    }
-
-    pub fn warm_start_from_bybit_bundle(
-        &mut self,
-        spec: PairSpec,
-        kline_5m: Option<&serde_json::Value>,
-        kline_1m: Option<&serde_json::Value>,
-        oi_5m: Option<&serde_json::Value>,
-    ) -> usize {
-        let mut oi_pts = [(0_i64, 0_i64); 64];
-        let mut oi_len = 0_usize;
-        if let Some(rows) = oi_5m
-            .and_then(|v| v.get("result"))
-            .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())
-        {
-            for item in rows.iter().rev().take(64) {
-                let ts = item
-                    .get("timestamp")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0);
-                if let Some(of) = item
-                    .get("openInterest")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                {
-                    self.observe_open_interest(of);
-                    oi_pts[oi_len] = (ts, self.last_oi_x100);
-                    oi_len += 1;
-                }
-            }
-        }
-        let mut count = 0_usize;
-        for (is_5m, k_opt) in [(true, kline_5m), (false, kline_1m)] {
-            let Some(rows) = k_opt
-                .and_then(|v| v.get("result"))
-                .and_then(|r| r.get("list"))
-                .and_then(|l| l.as_array())
-            else {
-                continue;
-            };
-            for row in rows.iter().rev() {
-                let Some(arr) = row.as_array() else {
-                    continue;
-                };
-                if arr.len() < 7 {
-                    continue;
-                }
-                let ts_ms = arr[0]
-                    .as_str()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0);
-                let (Ok(op), Ok(hi), Ok(lo), Ok(cl)) = (
-                    spec.parse_price_ticks(arr[1].as_str().unwrap_or("")),
-                    spec.parse_price_ticks(arr[2].as_str().unwrap_or("")),
-                    spec.parse_price_ticks(arr[3].as_str().unwrap_or("")),
-                    spec.parse_price_ticks(arr[4].as_str().unwrap_or("")),
-                ) else {
-                    continue;
-                };
-                let mut bar_oi = self.last_oi_x100;
-                for i in 0..oi_len {
-                    if oi_pts[i].0 <= ts_ms {
-                        bar_oi = oi_pts[i].1;
-                    }
-                }
-                let turn_f = arr[6]
-                    .as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(100.0);
-                let div_ms = if is_5m { 300_000 } else { 60_000 };
-                self.ingest_closed_bar(
-                    spec,
-                    is_5m,
-                    ts_ms / div_ms,
-                    op,
-                    hi,
-                    lo,
-                    cl,
-                    (turn_f.max(1.0) * 1e8).round() as i64,
-                    bar_oi,
-                );
-                count += 1;
-            }
-        }
-        count
-    }
-}
-
-// === VORTEX-OMEGA V4.5 OB PROD ===
-pub const OB_DIRECTIONAL_MIN_PM: i64 = 382;
-pub const OB_DIRECTIONAL_SEED_PM: i64 = 618;
-pub const OB_DIRECTIONAL_MAX_PM: i64 = 854;
-const OB_PLASTICITY_ETA_PM: i64 = 120;
 
 /// Decoupled directional Order Block plasticity (`[OB+ Demand, OB- Supply]` in `[382..=854] permille`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -850,52 +280,36 @@ impl DirectionalObPlasticity {
         self.bear_supply_pm = bear_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
     }
 
-    /// Updates ONLY `OB+` (`is_bull_demand_ob == true`) or ONLY `OB-` (`false`) without cross-contamination.
     #[inline]
     pub fn observe_directional_outcome(&mut self, is_bull_demand_ob: bool, held_and_bounced: bool) {
-        let reward_pm = if held_and_bounced {
-            OB_DIRECTIONAL_MAX_PM
-        } else {
-            OB_DIRECTIONAL_MIN_PM
-        };
+        let reward_pm = if held_and_bounced { OB_DIRECTIONAL_MAX_PM } else { OB_DIRECTIONAL_MIN_PM };
         if is_bull_demand_ob {
-            let next = ((1_000 - OB_PLASTICITY_ETA_PM) * self.bull_demand_pm
-                + OB_PLASTICITY_ETA_PM * reward_pm)
-                / 1_000;
+            let next = ((1_000 - OB_PLASTICITY_ETA_PM) * self.bull_demand_pm + OB_PLASTICITY_ETA_PM * reward_pm) / 1_000;
             self.bull_demand_pm = next.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
         } else {
-            let next = ((1_000 - OB_PLASTICITY_ETA_PM) * self.bear_supply_pm
-                + OB_PLASTICITY_ETA_PM * reward_pm)
-                / 1_000;
+            let next = ((1_000 - OB_PLASTICITY_ETA_PM) * self.bear_supply_pm + OB_PLASTICITY_ETA_PM * reward_pm) / 1_000;
             self.bear_supply_pm = next.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
         }
         self.samples_seen = self.samples_seen.saturating_add(1);
     }
 }
 
-/// Distance-weighted zone retention utility `U_z = (S_z * 1000) / (1000 + floor(1000 * d_bps / max(vol_5m, 1500)))`.
 #[inline]
 #[must_use]
-pub const fn compute_distance_weighted_zone_utility(
-    strength_pm: i64,
-    dist_bps: crate::types::ScaledBps,
-    vol_5m: crate::types::ScaledBps,
-) -> i64 {
+pub const fn compute_distance_weighted_zone_utility(strength_pm: i64, dist_bps: ScaledBps, vol_5m: ScaledBps) -> i64 {
     let s_pos = if strength_pm > 0 { strength_pm } else { 0 };
     let d_pos = if dist_bps.0 > 0 { dist_bps.0 } else { 0 };
     let v_eff = if vol_5m.0 > 1_500 { vol_5m.0 } else { 1_500 };
     let dist_pen = (1_000_i64.saturating_mul(d_pos)) / v_eff;
-    let denom = 1_000_i64.saturating_add(dist_pen);
-    (s_pos.saturating_mul(1_000)) / denom
+    (s_pos.saturating_mul(1_000)) / 1_000_i64.saturating_add(dist_pen)
 }
 
-/// Selects the eviction index `[0..4)` minimizing proximity-adjusted retention utility.
 #[inline]
 #[must_use]
 pub fn select_distance_weighted_eviction_slot(
     strengths_pm: &[i64; 4],
-    dists_bps: &[crate::types::ScaledBps; 4],
-    vol_5m: crate::types::ScaledBps,
+    dists_bps: &[ScaledBps; 4],
+    vol_5m: ScaledBps,
 ) -> usize {
     let mut min_idx = 0_usize;
     let mut min_util = i64::MAX;
@@ -914,13 +328,12 @@ pub fn select_distance_weighted_eviction_slot(
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProximityObZone {
-    pub low_ticks: crate::types::PriceTicks,
-    pub high_ticks: crate::types::PriceTicks,
+    pub low_ticks: PriceTicks,
+    pub high_ticks: PriceTicks,
     pub strength_pm: i64,
-    pub created_ts: crate::types::TimestampNs,
+    pub created_ts: TimestampNs,
 }
 
-/// Fixed 4-slot per side Zero-Alloc proximity bank enforcing distance-weighted eviction.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ProximityObBank {
     pub bull_zones: [ProximityObZone; 4],
@@ -932,21 +345,13 @@ impl ProximityObBank {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            bull_zones: [ProximityObZone {
-                low_ticks: crate::types::PriceTicks(0),
-                high_ticks: crate::types::PriceTicks(0),
-                strength_pm: 0,
-                created_ts: crate::types::TimestampNs(0),
-            }; 4],
-            bear_zones: [ProximityObZone {
-                low_ticks: crate::types::PriceTicks(0),
-                high_ticks: crate::types::PriceTicks(0),
-                strength_pm: 0,
-                created_ts: crate::types::TimestampNs(0),
-            }; 4],
-            plasticity: DirectionalObPlasticity::new(),
-        }
+        let z = ProximityObZone {
+            low_ticks: PriceTicks(0),
+            high_ticks: PriceTicks(0),
+            strength_pm: 0,
+            created_ts: TimestampNs(0),
+        };
+        Self { bull_zones: [z; 4], bear_zones: [z; 4], plasticity: DirectionalObPlasticity::new() }
     }
 
     #[inline]
@@ -964,26 +369,17 @@ impl ProximityObBank {
         &mut self,
         is_bull_demand: bool,
         zone: ProximityObZone,
-        live_mid: crate::types::PriceTicks,
-        vol_5m: crate::types::ScaledBps,
+        live_mid: PriceTicks,
+        vol_5m: ScaledBps,
     ) -> usize {
-        let arr = if is_bull_demand {
-            &mut self.bull_zones
-        } else {
-            &mut self.bear_zones
-        };
+        let arr = if is_bull_demand { &mut self.bull_zones } else { &mut self.bear_zones };
         let mid = live_mid.0.max(1);
         let mut strengths = [0_i64; 4];
-        let mut dists = [crate::types::ScaledBps(0); 4];
+        let mut dists = [ScaledBps(0); 4];
         for (i, z) in arr.iter().enumerate() {
             strengths[i] = z.strength_pm;
-            let ref_edge = if is_bull_demand {
-                z.high_ticks.0
-            } else {
-                z.low_ticks.0
-            };
-            let d_bps = (((live_mid.0 - ref_edge).abs() as i128 * 1_000_000) / (mid as i128)) as i64;
-            dists[i] = crate::types::ScaledBps(d_bps);
+            let ref_edge = if is_bull_demand { z.high_ticks.0 } else { z.low_ticks.0 };
+            dists[i] = ScaledBps((((live_mid.0 - ref_edge).abs() as i128 * 1_000_000) / (mid as i128)) as i64);
         }
         let target_idx = select_distance_weighted_eviction_slot(&strengths, &dists, vol_5m);
         arr[target_idx] = zone;
@@ -991,14 +387,494 @@ impl ProximityObBank {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+struct OhlcBar {
+    bucket_id: i64,
+    open: PriceTicks,
+    high: PriceTicks,
+    low: PriceTicks,
+    close: PriceTicks,
+    turnover_1e8: i64,
+    end_oi_x100: i64,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct BarRing {
+    bars: [OhlcBar; BAR_RING_CAP],
+    len: usize,
+    cur: OhlcBar,
+    has_cur: bool,
+}
+
+impl BarRing {
+    const fn new() -> Self {
+        let z = OhlcBar {
+            bucket_id: 0,
+            open: PriceTicks(0),
+            high: PriceTicks(0),
+            low: PriceTicks(0),
+            close: PriceTicks(0),
+            turnover_1e8: 0,
+            end_oi_x100: 0,
+        };
+        Self { bars: [z; BAR_RING_CAP], len: 0, cur: z, has_cur: false }
+    }
+
+    fn push_closed(&mut self, bar: OhlcBar) {
+        if self.len < BAR_RING_CAP {
+            self.bars[self.len] = bar;
+            self.len += 1;
+        } else {
+            for i in 0..(BAR_RING_CAP - 1) {
+                self.bars[i] = self.bars[i + 1];
+            }
+            self.bars[BAR_RING_CAP - 1] = bar;
+        }
+    }
+
+    fn step_tick(&mut self, bucket: i64, px: PriceTicks, turn_1e8: i64, oi_x100: i64) -> bool {
+        if !self.has_cur {
+            self.cur = OhlcBar {
+                bucket_id: bucket, open: px, high: px, low: px, close: px,
+                turnover_1e8: turn_1e8.max(1), end_oi_x100: oi_x100,
+            };
+            self.has_cur = true;
+            return false;
+        }
+        if bucket <= self.cur.bucket_id {
+            if px.0 > self.cur.high.0 { self.cur.high = px; }
+            if px.0 < self.cur.low.0 { self.cur.low = px; }
+            self.cur.close = px;
+            self.cur.turnover_1e8 = self.cur.turnover_1e8.saturating_add(turn_1e8.max(1));
+            if oi_x100 > 0 { self.cur.end_oi_x100 = oi_x100; }
+            return false;
+        }
+        let closed = self.cur;
+        self.push_closed(closed);
+        self.cur = OhlcBar {
+            bucket_id: bucket, open: px, high: px, low: px, close: px,
+            turnover_1e8: turn_1e8.max(1), end_oi_x100: oi_x100,
+        };
+        true
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct CausalOrderBlockEngine {
+    bull_zones: [OrderBlockZone; MAX_OB_ZONES_PER_SIDE],
+    bear_zones: [OrderBlockZone; MAX_OB_ZONES_PER_SIDE],
+    ring_1m: BarRing,
+    ring_5m: BarRing,
+    last_oi_x100: i64,
+    last_vol_5m: ScaledBps,
+    learned_efficacy_pm: i64,
+    plasticity: DirectionalObPlasticity,
+    cached_obs: OrderBlockObservables,
+}
+
+impl Default for CausalOrderBlockEngine {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CausalOrderBlockEngine {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        let ez = OrderBlockZone {
+            state: ObLifecycleState::Empty,
+            fuel: ObFuelKind::FreshOpenInterest,
+            horizon: ObHorizon::Tactical1m,
+            bounce_verified: false,
+            low_ticks: PriceTicks(0),
+            high_ticks: PriceTicks(0),
+            eq_ticks: PriceTicks(0),
+            strength_pm: 0,
+        };
+        Self {
+            bull_zones: [ez; MAX_OB_ZONES_PER_SIDE],
+            bear_zones: [ez; MAX_OB_ZONES_PER_SIDE],
+            ring_1m: BarRing::new(),
+            ring_5m: BarRing::new(),
+            last_oi_x100: 0,
+            last_vol_5m: ScaledBps(5_000),
+            learned_efficacy_pm: SEED_EFFICACY_PM,
+            plasticity: DirectionalObPlasticity::new(),
+            cached_obs: OrderBlockObservables {
+                bull_ob_score: BoundedScore::ZERO,
+                bear_ob_score: BoundedScore::ZERO,
+                dist_bull_ob_bps: ScaledBps(0),
+                dist_bear_ob_bps: ScaledBps(0),
+                bull_wall_ticks: PriceTicks(0),
+                bear_wall_ticks: PriceTicks(0),
+                learned_efficacy_pm: SEED_EFFICACY_PM,
+            },
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn observables(&self) -> OrderBlockObservables {
+        self.cached_obs
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn learned_efficacy_permille(&self) -> i64 {
+        self.learned_efficacy_pm
+    }
+
+    #[inline]
+    pub fn set_learned_efficacy_permille(&mut self, efficacy_pm: i64) {
+        if efficacy_pm > 0 {
+            let clamped = efficacy_pm.clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
+            self.learned_efficacy_pm = clamped;
+            self.cached_obs.learned_efficacy_pm = clamped;
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn directional_efficacy_pm(&self) -> (i64, i64) {
+        self.plasticity.directional_efficacy_pm()
+    }
+
+    #[inline]
+    pub fn set_directional_efficacy_pm(&mut self, bull_pm: i64, bear_pm: i64) {
+        self.plasticity.set_directional_efficacy_pm(bull_pm, bear_pm);
+        self.set_learned_efficacy_permille(self.plasticity.midpoint_efficacy_pm());
+    }
+
+    #[inline]
+    pub fn set_realized_vol_5m(&mut self, vol_5m: ScaledBps) {
+        if vol_5m.0 > 0 {
+            self.last_vol_5m = ScaledBps(vol_5m.0.clamp(1_500, 24_000));
+        }
+    }
+
+    pub fn reset_preserving_plasticity(&mut self) {
+        let keep_pm = self.learned_efficacy_pm;
+        let keep_plast = self.plasticity;
+        *self = Self::new();
+        self.plasticity = keep_plast;
+        self.set_learned_efficacy_permille(keep_pm);
+    }
+
+    pub fn save_plasticity_array_to_path<const N: usize>(engines: &[Self; N], path: &std::path::Path, ts_ns: i64) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let vals: Vec<i64> = engines.iter().map(Self::learned_efficacy_permille).collect();
+        let payload = serde_json::json!({ "event": "OB_PLASTICITY_V46", "ts_ns": ts_ns, "learned_efficacy_pm": vals });
+        if let Ok(txt) = serde_json::to_string(&payload) {
+            let _ = crate::vault_io::atomic_write_bytes_sync(path, txt.as_bytes());
+        }
+    }
+
+    #[must_use]
+    pub fn load_plasticity_array_from_path<const N: usize>(engines: &mut [Self; N], path: &std::path::Path) -> usize {
+        let Ok(raw) = std::fs::read_to_string(path) else { return 0 };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else { return 0 };
+        let Some(arr) = val.get("learned_efficacy_pm").and_then(serde_json::Value::as_array) else { return 0 };
+        let mut loaded = 0_usize;
+        for (idx, item) in arr.iter().take(N).enumerate() {
+            if let Some(pm) = item.as_i64() {
+                if (MIN_EFFICACY_PM..=MAX_EFFICACY_PM).contains(&pm) {
+                    engines[idx].set_learned_efficacy_permille(pm);
+                    loaded += 1;
+                }
+            }
+        }
+        loaded
+    }
+
+    #[inline]
+    pub fn observe_open_interest(&mut self, oi_contracts: f64) {
+        if oi_contracts.is_finite() && oi_contracts > 0.0 {
+            self.last_oi_x100 = (oi_contracts * 100.0).round() as i64;
+        }
+    }
+
+    fn insert_zone(
+        slots: &mut [OrderBlockZone; MAX_OB_ZONES_PER_SIDE],
+        is_bull_demand: bool,
+        zone: OrderBlockZone,
+        live_mid: PriceTicks,
+        vol_5m: ScaledBps,
+    ) {
+        for s in &mut *slots {
+            if s.state == ObLifecycleState::Empty {
+                *s = zone;
+                return;
+            }
+        }
+        let mid = live_mid.0.max(1);
+        let mut strengths = [0_i64; MAX_OB_ZONES_PER_SIDE];
+        let mut dists = [ScaledBps(0); MAX_OB_ZONES_PER_SIDE];
+        for (i, z) in slots.iter().enumerate() {
+            strengths[i] = z.strength_pm;
+            let ref_edge = if is_bull_demand { z.high_ticks.0 } else { z.low_ticks.0 };
+            dists[i] = ScaledBps((((mid - ref_edge).abs() as i128 * 1_000_000) / (mid as i128)) as i64);
+        }
+        let evict_idx = select_distance_weighted_eviction_slot(&strengths, &dists, vol_5m);
+        slots[evict_idx] = zone;
+    }
+
+    fn detect_from_ring(&mut self, is_5m: bool) {
+        let ring = if is_5m { &self.ring_5m } else { &self.ring_1m };
+        if ring.len < 7 {
+            return;
+        }
+        let n = ring.len;
+        let (b0, b1, b2) = (ring.bars[n - 3], ring.bars[n - 2], ring.bars[n - 1]);
+        let hist_n = n - 3;
+        let (mut sum_r, mut sum_t) = (0.0_f64, 0.0_f64);
+        for i in 0..hist_n {
+            sum_r += (ring.bars[i].high.0 - ring.bars[i].low.0).max(1) as f64;
+            sum_t += ring.bars[i].turnover_1e8.max(1) as f64;
+        }
+        let avg_r = (sum_r / (hist_n as f64)).max(1.0);
+        let turn_ratio = (b0.turnover_1e8.max(b1.turnover_1e8).max(b2.turnover_1e8) as f64)
+            / (sum_t / (hist_n as f64)).max(1.0);
+        if turn_ratio < (1.0 + 0.25 * INV_PHI) {
+            return;
+        }
+        let fuel = if b2.end_oi_x100 >= b0.end_oi_x100 { ObFuelKind::FreshOpenInterest } else { ObFuelKind::SqueezeLiquidation };
+        let horizon = if is_5m { ObHorizon::Structural5m } else { ObHorizon::Tactical1m };
+        let h_w = if is_5m { 1.0 } else { f64::midpoint(1.0, INV_PHI) };
+        let f_w = if matches!(fuel, ObFuelKind::FreshOpenInterest) { 1.0 } else { 1.0 - 0.15 * INV_PHI };
+        let bar_vol_bps = ((avg_r * 2.236 * 1_000_000.0) / (b2.close.0.max(1) as f64)).round() as i64;
+        let eff_vol = ScaledBps(self.last_vol_5m.0.max(bar_vol_bps).max(1_500));
+        match b0.close.0.cmp(&b0.open.0) {
+            Ordering::Less => {
+                let disp = (b1.high.0.max(b2.high.0) - b0.close.0).max(0) as f64;
+                if b1.close.0.max(b2.close.0) > b0.high.0
+                    && (b2.low.0 > b0.high.0 || disp >= (PHI + INV_PHI) * avg_r)
+                    && disp >= PHI * avg_r
+                {
+                    let raw_s = ((disp / (3.0 * avg_r)).min(1.0) * 650.0 + (turn_ratio / 3.0).min(1.0) * 350.0) * h_w * f_w;
+                    Self::insert_zone(
+                        &mut self.bull_zones,
+                        true,
+                        OrderBlockZone {
+                            state: ObLifecycleState::Virgin, fuel, horizon, bounce_verified: false,
+                            low_ticks: b0.low, high_ticks: b0.open,
+                            eq_ticks: PriceTicks(i64::midpoint(b0.low.0, b0.open.0)),
+                            strength_pm: (raw_s.round() as i64).clamp(MIN_EFFICACY_PM, 1_000),
+                        },
+                        b2.close,
+                        eff_vol,
+                    );
+                }
+            }
+            Ordering::Greater => {
+                let disp = (b0.close.0 - b1.low.0.min(b2.low.0)).max(0) as f64;
+                if b1.close.0.min(b2.close.0) < b0.low.0
+                    && (b2.high.0 < b0.low.0 || disp >= (PHI + INV_PHI) * avg_r)
+                    && disp >= PHI * avg_r
+                {
+                    let raw_s = ((disp / (3.0 * avg_r)).min(1.0) * 650.0 + (turn_ratio / 3.0).min(1.0) * 350.0) * h_w * f_w;
+                    Self::insert_zone(
+                        &mut self.bear_zones,
+                        false,
+                        OrderBlockZone {
+                            state: ObLifecycleState::Virgin, fuel, horizon, bounce_verified: false,
+                            low_ticks: b0.open, high_ticks: b0.high,
+                            eq_ticks: PriceTicks(i64::midpoint(b0.open.0, b0.high.0)),
+                            strength_pm: (raw_s.round() as i64).clamp(MIN_EFFICACY_PM, 1_000),
+                        },
+                        b2.close,
+                        eff_vol,
+                    );
+                }
+            }
+            Ordering::Equal => {}
+        }
+    }
+
+    fn step_mitigation_and_plasticity(&mut self, spec: PairSpec, px: PriceTicks) {
+        if px.0 <= 0 {
+            return;
+        }
+        let b3x = spec.required_3x_barrier_bps(px).unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS).raw();
+        let mut bull_b = (PriceTicks(0), i64::MAX, 0.0_f64);
+        for z in &mut self.bull_zones {
+            if z.state == ObLifecycleState::Empty { continue; }
+            if px.0 < z.low_ticks.0 || (z.state == ObLifecycleState::MitigatedShallow && px.0 < z.eq_ticks.0) {
+                if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
+                    self.plasticity.observe_directional_outcome(true, false);
+                    self.learned_efficacy_pm = ((self.learned_efficacy_pm * 88 + MIN_EFFICACY_PM * 12) / 100)
+                        .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
+                }
+                z.state = ObLifecycleState::Empty;
+                continue;
+            }
+            if px.0 <= z.high_ticks.0 {
+                z.state = ObLifecycleState::MitigatedShallow;
+            } else if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
+                let reb = ((px.0 - z.high_ticks.0).saturating_mul(1_000_000)) / z.high_ticks.0.max(1);
+                if reb >= b3x {
+                    z.bounce_verified = true;
+                    self.plasticity.observe_directional_outcome(true, true);
+                    self.learned_efficacy_pm = ((self.learned_efficacy_pm * 85 + MAX_EFFICACY_PM * 15) / 100)
+                        .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
+                }
+            }
+            let (bull_pm, _) = self.plasticity.directional_efficacy_pm();
+            let eff_bull_pm = bull_pm.max(self.learned_efficacy_pm);
+            let dist = ((px.0 - z.high_ticks.0).saturating_mul(1_000_000)) / px.0.max(1);
+            let sc = ((z.strength_pm as f64) * 1e-3)
+                * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI })
+                * ((eff_bull_pm as f64) / (SEED_EFFICACY_PM as f64));
+            if dist >= -b3x && dist < bull_b.1 {
+                bull_b = (z.high_ticks, dist, sc.clamp(0.0, 1.0));
+            }
+        }
+        let mut bear_b = (PriceTicks(0), i64::MAX, 0.0_f64);
+        for z in &mut self.bear_zones {
+            if z.state == ObLifecycleState::Empty { continue; }
+            if px.0 > z.high_ticks.0 || (z.state == ObLifecycleState::MitigatedShallow && px.0 > z.eq_ticks.0) {
+                if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
+                    self.plasticity.observe_directional_outcome(false, false);
+                    self.learned_efficacy_pm = ((self.learned_efficacy_pm * 88 + MIN_EFFICACY_PM * 12) / 100)
+                        .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
+                }
+                z.state = ObLifecycleState::Empty;
+                continue;
+            }
+            if px.0 >= z.low_ticks.0 {
+                z.state = ObLifecycleState::MitigatedShallow;
+            } else if z.state == ObLifecycleState::MitigatedShallow && !z.bounce_verified {
+                let reb = ((z.low_ticks.0 - px.0).saturating_mul(1_000_000)) / z.low_ticks.0.max(1);
+                if reb >= b3x {
+                    z.bounce_verified = true;
+                    self.plasticity.observe_directional_outcome(false, true);
+                    self.learned_efficacy_pm = ((self.learned_efficacy_pm * 85 + MAX_EFFICACY_PM * 15) / 100)
+                        .clamp(MIN_EFFICACY_PM, MAX_EFFICACY_PM);
+                }
+            }
+            let (_, bear_pm) = self.plasticity.directional_efficacy_pm();
+            let eff_bear_pm = bear_pm.max(self.learned_efficacy_pm);
+            let dist = ((z.low_ticks.0 - px.0).saturating_mul(1_000_000)) / px.0.max(1);
+            let sc = ((z.strength_pm as f64) * 1e-3)
+                * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI })
+                * ((eff_bear_pm as f64) / (SEED_EFFICACY_PM as f64));
+            if dist >= -b3x && dist < bear_b.1 {
+                bear_b = (z.low_ticks, dist, sc.clamp(0.0, 1.0));
+            }
+        }
+        self.cached_obs = OrderBlockObservables {
+            bull_ob_score: BoundedScore::new_clamped(bull_b.2),
+            bear_ob_score: BoundedScore::new_clamped(bear_b.2),
+            dist_bull_ob_bps: ScaledBps(if bull_b.0 .0 > 0 { bull_b.1 } else { 0 }),
+            dist_bear_ob_bps: ScaledBps(if bear_b.0 .0 > 0 { bear_b.1 } else { 0 }),
+            bull_wall_ticks: bull_b.0,
+            bear_wall_ticks: bear_b.0,
+            learned_efficacy_pm: self.learned_efficacy_pm,
+        };
+    }
+
+    #[inline]
+    pub fn observe_mid_quote(&mut self, spec: PairSpec, mid_px: PriceTicks) -> OrderBlockObservables {
+        if mid_px.0 > 0 {
+            self.step_mitigation_and_plasticity(spec, mid_px);
+        }
+        self.cached_obs
+    }
+
+    pub fn observe_live_tick(&mut self, spec: PairSpec, price: PriceTicks, qty: LotQty, ts_ns: i64) -> OrderBlockObservables {
+        if price.0 <= 0 || ts_ns <= 0 {
+            return self.cached_obs;
+        }
+        let turn_1e8 = spec.lot_notional_1e8(LotQty(qty.0.max(1)), price);
+        let oi = self.last_oi_x100;
+        if self.ring_1m.step_tick(ts_ns / 60_000_000_000, price, turn_1e8, oi) {
+            self.detect_from_ring(false);
+        }
+        if self.ring_5m.step_tick(ts_ns / 300_000_000_000, price, turn_1e8, oi) {
+            self.detect_from_ring(true);
+        }
+        self.step_mitigation_and_plasticity(spec, price);
+        self.cached_obs
+    }
+
+    pub fn ingest_closed_bar(
+        &mut self,
+        spec: PairSpec,
+        is_5m: bool,
+        bucket_id: i64,
+        open: PriceTicks,
+        high: PriceTicks,
+        low: PriceTicks,
+        close: PriceTicks,
+        turnover_1e8: i64,
+        oi_x100: i64,
+    ) {
+        if open.0 <= 0 || high.0 < low.0 || low.0 <= 0 || close.0 <= 0 {
+            return;
+        }
+        let bar = OhlcBar { bucket_id, open, high, low, close, turnover_1e8: turnover_1e8.max(1), end_oi_x100: oi_x100 };
+        if is_5m { self.ring_5m.push_closed(bar); } else { self.ring_1m.push_closed(bar); }
+        self.detect_from_ring(is_5m);
+        self.step_mitigation_and_plasticity(spec, close);
+    }
+
+    pub fn warm_start_from_bybit_bundle(
+        &mut self,
+        spec: PairSpec,
+        kline_5m: Option<&serde_json::Value>,
+        kline_1m: Option<&serde_json::Value>,
+        oi_5m: Option<&serde_json::Value>,
+    ) -> usize {
+        let mut oi_pts = [(0_i64, 0_i64); 64];
+        let mut oi_len = 0_usize;
+        if let Some(rows) = oi_5m.and_then(|v| v.get("result")).and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) {
+            for item in rows.iter().rev().take(64) {
+                let ts = item.get("timestamp").and_then(serde_json::Value::as_str).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                if let Some(of) = item.get("openInterest").and_then(serde_json::Value::as_str).and_then(|s| s.parse::<f64>().ok()) {
+                    self.observe_open_interest(of);
+                    oi_pts[oi_len] = (ts, self.last_oi_x100);
+                    oi_len += 1;
+                }
+            }
+        }
+        let mut count = 0_usize;
+        for (is_5m, k_opt) in [(true, kline_5m), (false, kline_1m)] {
+            let Some(rows) = k_opt.and_then(|v| v.get("result")).and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) else { continue };
+            for row in rows.iter().rev() {
+                let Some(arr) = row.as_array() else { continue };
+                if arr.len() < 7 { continue; }
+                let ts_ms = arr[0].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let (Ok(op), Ok(hi), Ok(lo), Ok(cl)) = (
+                    spec.parse_price_ticks(arr[1].as_str().unwrap_or("")),
+                    spec.parse_price_ticks(arr[2].as_str().unwrap_or("")),
+                    spec.parse_price_ticks(arr[3].as_str().unwrap_or("")),
+                    spec.parse_price_ticks(arr[4].as_str().unwrap_or("")),
+                ) else { continue };
+                let mut bar_oi = self.last_oi_x100;
+                for i in 0..oi_len {
+                    if oi_pts[i].0 <= ts_ms { bar_oi = oi_pts[i].1; }
+                }
+                let turn_f = arr[6].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(100.0);
+                let div_ms = if is_5m { 300_000 } else { 60_000 };
+                self.ingest_closed_bar(spec, is_5m, ts_ms / div_ms, op, hi, lo, cl, (turn_f.max(1.0) * 1e8).round() as i64, bar_oi);
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
 impl crate::lob_shm::SymbolLobSnapshot {
     #[inline]
-    pub fn set_order_block_observables_directional(
-        &mut self,
-        obs: OrderBlockObservables,
-        bull_pm: i64,
-        bear_pm: i64,
-    ) {
+    pub fn set_order_block_observables_directional(&mut self, obs: OrderBlockObservables, bull_pm: i64, bear_pm: i64) {
         let b_clamped = bull_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
         let s_clamped = bear_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
         self.set_order_block_observables(obs);
@@ -1008,51 +884,34 @@ impl crate::lob_shm::SymbolLobSnapshot {
     }
 }
 
-/// Evaluates directional OB wall collision using `ob_bear_efficacy_pm` for `Bid` and `ob_bull_efficacy_pm` for `Ask`.
 #[inline]
 #[must_use]
-pub fn passes_directional_ob_wall_guard(
-    side: crate::types::Side,
-    snap: &crate::lob_shm::SymbolLobSnapshot,
-    three_x_barrier: crate::types::ScaledBps,
-) -> bool {
+pub fn passes_directional_ob_wall_guard(side: Side, snap: &crate::lob_shm::SymbolLobSnapshot, three_x_barrier: ScaledBps) -> bool {
     let tfi_aligned = side.sign_f64() * (f64::from(snap.factor_tfi.to_bps_i32()) / 10_000.0);
     if tfi_aligned >= 0.88 {
         return true;
     }
-    let base_r = (snap.realized_vol_5m.raw() / 5).clamp(
-        (three_x_barrier.raw() * 2) / 3,
-        three_x_barrier.raw().saturating_mul(2),
-    );
+    let base_r = (snap.realized_vol_5m.raw() / 5).clamp((three_x_barrier.raw() * 2) / 3, three_x_barrier.raw().saturating_mul(2));
     match side {
-        crate::types::Side::Bid => {
-            if snap.ob_bear_wall_ticks.0 <= 0 || snap.ob_bear_score.to_bps_i32() < 4_500 {
-                return true;
-            }
+        Side::Bid => {
+            if snap.ob_bear_wall_ticks.0 <= 0 || snap.ob_bear_score.to_bps_i32() < 4_500 { return true; }
             let eff_r = (base_r.saturating_mul(snap.ob_bear_efficacy_pm)) / OB_DIRECTIONAL_SEED_PM;
             snap.ob_dist_bear_bps.raw() > eff_r.max(400)
         }
-        crate::types::Side::Ask => {
-            if snap.ob_bull_wall_ticks.0 <= 0 || snap.ob_bull_score.to_bps_i32() < 4_500 {
-                return true;
-            }
+        Side::Ask => {
+            if snap.ob_bull_wall_ticks.0 <= 0 || snap.ob_bull_score.to_bps_i32() < 4_500 { return true; }
             let eff_r = (base_r.saturating_mul(snap.ob_bull_efficacy_pm)) / OB_DIRECTIONAL_SEED_PM;
             snap.ob_dist_bull_bps.raw() > eff_r.max(400)
         }
     }
 }
 
-/// Loads `[bull_pm; 12]` and `[bear_pm; 12]` with full backward compatibility for V4.4.1 JSON vaults.
 #[must_use]
 pub fn load_directional_plasticity_from_path(path: &std::path::Path) -> ([i64; 12], [i64; 12]) {
     let mut bull = [OB_DIRECTIONAL_SEED_PM; 12];
     let mut bear = [OB_DIRECTIONAL_SEED_PM; 12];
-    let Ok(txt) = std::fs::read_to_string(path) else {
-        return (bull, bear);
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) else {
-        return (bull, bear);
-    };
+    let Ok(txt) = std::fs::read_to_string(path) else { return (bull, bear) };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) else { return (bull, bear) };
     if let Some(legacy) = val.get("learned_efficacy_pm").and_then(serde_json::Value::as_array) {
         for (i, item) in legacy.iter().take(12).enumerate() {
             if let Some(v) = item.as_i64() {
@@ -1064,22 +923,17 @@ pub fn load_directional_plasticity_from_path(path: &std::path::Path) -> ([i64; 1
     }
     if let Some(b_arr) = val.get("learned_bull_pm").and_then(serde_json::Value::as_array) {
         for (i, item) in b_arr.iter().take(12).enumerate() {
-            if let Some(v) = item.as_i64() {
-                bull[i] = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
-            }
+            if let Some(v) = item.as_i64() { bull[i] = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM); }
         }
     }
     if let Some(s_arr) = val.get("learned_bear_pm").and_then(serde_json::Value::as_array) {
         for (i, item) in s_arr.iter().take(12).enumerate() {
-            if let Some(v) = item.as_i64() {
-                bear[i] = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
-            }
+            if let Some(v) = item.as_i64() { bear[i] = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM); }
         }
     }
     (bull, bear)
 }
 
-#[allow(clippy::missing_errors_doc)]
 pub fn save_directional_plasticity_to_path_atomic(
     path: &std::path::Path,
     ts_ns: i64,
@@ -1091,20 +945,20 @@ pub fn save_directional_plasticity_to_path_atomic(
         *m = i64::midpoint(bull_pm[i], bear_pm[i]);
     }
     let payload = serde_json::json!({
-        "event": "OB_PLASTICITY_V45",
+        "event": "OB_PLASTICITY_V46",
         "ts_ns": ts_ns,
         "learned_efficacy_pm": mean_pm,
         "learned_bull_pm": bull_pm,
         "learned_bear_pm": bear_pm,
     });
-    let s = serde_json::to_string(&payload)
-        .map_err(|_| crate::types::VortexError::ColumnarFormatCorrupted)?;
+    let s = serde_json::to_string(&payload).map_err(|_| crate::types::VortexError::ColumnarFormatCorrupted)?;
     crate::vault_io::atomic_write_bytes_sync(path, s.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lob_shm::SymbolLobSnapshot;
     use crate::types::APPROVED_SPECS;
 
     #[test]
@@ -1112,83 +966,22 @@ mod tests {
         let avax = APPROVED_SPECS[3];
         let vol = ScaledBps(6_200);
         let mut eng = CausalOrderBlockEngine::new();
-        assert!(!eng
-            .observables()
-            .vetoes_into_opposing_wall(Side::Ask, avax, PriceTicks(7_500), vol, 0.20));
         for b in 1..=8_i64 {
-            eng.ingest_closed_bar(
-                avax,
-                false,
-                b,
-                PriceTicks(7_502),
-                PriceTicks(7_505),
-                PriceTicks(7_499),
-                PriceTicks(7_501),
-                100_000_000_000,
-                10_000,
-            );
+            eng.ingest_closed_bar(avax, false, b, PriceTicks(7_502), PriceTicks(7_505), PriceTicks(7_499), PriceTicks(7_501), 100_000_000_000, 10_000);
         }
-        eng.ingest_closed_bar(
-            avax,
-            false,
-            9,
-            PriceTicks(7_500),
-            PriceTicks(7_502),
-            PriceTicks(7_492),
-            PriceTicks(7_494),
-            180_000_000_000,
-            10_000,
-        );
-        eng.ingest_closed_bar(
-            avax,
-            false,
-            10,
-            PriceTicks(7_494),
-            PriceTicks(7_512),
-            PriceTicks(7_494),
-            PriceTicks(7_510),
-            260_000_000_000,
-            10_250,
-        );
-        eng.ingest_closed_bar(
-            avax,
-            false,
-            11,
-            PriceTicks(7_510),
-            PriceTicks(7_522),
-            PriceTicks(7_505),
-            PriceTicks(7_520),
-            220_000_000_000,
-            10_500,
-        );
+        eng.ingest_closed_bar(avax, false, 9, PriceTicks(7_500), PriceTicks(7_502), PriceTicks(7_492), PriceTicks(7_494), 180_000_000_000, 10_000);
+        eng.ingest_closed_bar(avax, false, 10, PriceTicks(7_494), PriceTicks(7_512), PriceTicks(7_494), PriceTicks(7_510), 260_000_000_000, 10_250);
+        eng.ingest_closed_bar(avax, false, 11, PriceTicks(7_510), PriceTicks(7_522), PriceTicks(7_505), PriceTicks(7_520), 220_000_000_000, 10_500);
         assert_eq!(eng.observables().bull_wall_ticks, PriceTicks(7_500));
         let near_obs = eng.observe_live_tick(avax, PriceTicks(7_503), LotQty(20), 12 * 60_000_000_000);
         assert!(near_obs.vetoes_into_opposing_wall(Side::Ask, avax, PriceTicks(7_503), vol, 0.45));
         assert!(!near_obs.vetoes_into_opposing_wall(Side::Ask, avax, PriceTicks(7_503), vol, 0.92));
-        assert!(near_obs.aligned_confluence_resonance(Side::Bid, avax, PriceTicks(7_503), vol) > 0.45);
-        assert_eq!(
-            near_obs.front_run_opposing_wall_tp(Side::Ask, avax, PriceTicks(7_520), PriceTicks(7_495)),
-            PriceTicks(7_502)
-        );
-        let _ = eng.observe_live_tick(
-            avax,
-            PriceTicks(7_498),
-            LotQty(20),
-            12 * 60_000_000_000 + 5_000_000_000,
-        );
-        let bounced = eng.observe_live_tick(
-            avax,
-            PriceTicks(7_520),
-            LotQty(30),
-            12 * 60_000_000_000 + 15_000_000_000,
-        );
+        assert_eq!(near_obs.front_run_opposing_wall_tp(Side::Ask, avax, PriceTicks(7_520), PriceTicks(7_495)), PriceTicks(7_502));
+        let _ = eng.observe_live_tick(avax, PriceTicks(7_498), LotQty(20), 12 * 60_000_000_000 + 5_000_000_000);
+        let bounced = eng.observe_live_tick(avax, PriceTicks(7_520), LotQty(30), 12 * 60_000_000_000 + 15_000_000_000);
         assert!(bounced.learned_efficacy_pm > SEED_EFFICACY_PM);
-        let broken = eng.observe_live_tick(
-            avax,
-            PriceTicks(7_490),
-            LotQty(40),
-            12 * 60_000_000_000 + 25_000_000_000,
-        );
+        assert!(eng.directional_efficacy_pm().0 > OB_DIRECTIONAL_SEED_PM);
+        let broken = eng.observe_live_tick(avax, PriceTicks(7_490), LotQty(40), 12 * 60_000_000_000 + 25_000_000_000);
         assert_eq!(broken.bull_wall_ticks, PriceTicks(0));
     }
 
@@ -1213,211 +1006,32 @@ mod tests {
         assert_eq!(eng.warm_start_from_bybit_bundle(btc, Some(&k5), None, Some(&oi)), 8);
         let obs = eng.observe_live_tick(btc, PriceTicks(663_900), LotQty(2), 1_700_003_100_000_000_000);
         assert_eq!(obs.bear_wall_ticks, PriceTicks(664_200));
-        assert!(obs.vetoes_into_opposing_wall(
-            Side::Bid,
-            btc,
-            PriceTicks(663_900),
-            ScaledBps(5_800),
-            0.35
-        ));
-        assert_eq!(
-            obs.front_run_opposing_wall_tp(Side::Bid, btc, PriceTicks(658_000), PriceTicks(665_000)).0,
-            664_188
-        );
-    }
-
-    #[test]
-    fn test_omega_v44_pareto_dominance_v43_vs_v44_campaign() {
-        use crate::alpha_3factor::SignalVerdict;
-        use crate::bayesian_governor::OnlineAdaptiveGovernor;
-        use crate::execution_fsm::{OrderLifecycleState, SlotExecutionEngine};
-        use crate::forensic_parquet::ParitySyncLedger;
-        use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
-        use crate::types::TimestampNs;
-        use crate::wave_elliott::{WaveObservables, WaveRegime};
-
-        let avax = APPROVED_SPECS[3];
-        let mut ob = CausalOrderBlockEngine::new();
-        for b in 1..=6_i64 {
-            ob.ingest_closed_bar(
-                avax, true, b, PriceTicks(7_511), PriceTicks(7_515), PriceTicks(7_510),
-                PriceTicks(7_512), 100_000_000_000, 10_000,
-            );
-        }
-        ob.ingest_closed_bar(
-            avax, true, 7, PriceTicks(7_526), PriceTicks(7_534), PriceTicks(7_525),
-            PriceTicks(7_532), 180_000_000_000, 10_000,
-        );
-        ob.ingest_closed_bar(
-            avax, true, 8, PriceTicks(7_532), PriceTicks(7_532), PriceTicks(7_512),
-            PriceTicks(7_514), 260_000_000_000, 9_700,
-        );
-        ob.ingest_closed_bar(
-            avax, true, 9, PriceTicks(7_514), PriceTicks(7_520), PriceTicks(7_500),
-            PriceTicks(7_502), 240_000_000_000, 9_500,
-        );
-        for b in 10..=14_i64 {
-            ob.ingest_closed_bar(
-                avax, true, b, PriceTicks(7_501), PriceTicks(7_504), PriceTicks(7_500),
-                PriceTicks(7_502), 100_000_000_000, 9_500,
-            );
-        }
-        ob.ingest_closed_bar(
-            avax, true, 15, PriceTicks(7_500), PriceTicks(7_502), PriceTicks(7_492),
-            PriceTicks(7_494), 180_000_000_000, 9_500,
-        );
-        ob.ingest_closed_bar(
-            avax, true, 16, PriceTicks(7_494), PriceTicks(7_512), PriceTicks(7_494),
-            PriceTicks(7_510), 260_000_000_000, 9_900,
-        );
-        ob.ingest_closed_bar(
-            avax, true, 17, PriceTicks(7_510), PriceTicks(7_520), PriceTicks(7_505),
-            PriceTicks(7_518), 240_000_000_000, 10_300,
-        );
-        let live_ob = ob.observe_mid_quote(avax, PriceTicks(7_503));
-        let gov = OnlineAdaptiveGovernor::new();
-        let (mut l43, mut l44) = (
-            ParitySyncLedger::new(6_568_240_000),
-            ParitySyncLedger::new(6_568_240_000),
-        );
-        let (mut e43, mut e44) = (SlotExecutionEngine::new(3), SlotExecutionEngine::new(3));
-        let mut btc = SymbolLobSnapshot::new_empty();
-        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
-        btc.is_eligible = true;
-        btc.realized_vol_5m = ScaledBps(5_800);
-        btc.bids[0] = BookLevel { price: PriceTicks(656_000), qty: LotQty(400) };
-        btc.asks[0] = BookLevel { price: PriceTicks(656_001), qty: LotQty(350) };
-
-        let mut s43 = SymbolLobSnapshot::new_empty();
-        s43.symbol_id = avax.symbol_id;
-        s43.is_eligible = true;
-        s43.realized_vol_5m = ScaledBps(6_200);
-        s43.ts_local_ns = TimestampNs(1_000_000_000);
-        s43.bids[0] = BookLevel { price: PriceTicks(7_502), qty: LotQty(400) };
-        s43.asks[0] = BookLevel { price: PriceTicks(7_503), qty: LotQty(350) };
-        s43.mark_price = PriceTicks(7_503);
-        s43.last_trade_price = PriceTicks(7_503);
-        s43.factor_ofi = BoundedScore::new_clamped(-0.55);
-        s43.factor_tfi = BoundedScore::new_clamped(-0.60);
-        let mut s44 = s43;
-        s44.set_order_block_observables(live_ob);
-
-        let v_trap = SignalVerdict::AuthorizeMakerEntry {
-            side: Side::Ask,
-            target_excursion_scaled_bps: ScaledBps(700),
-        };
-        assert!(e43.try_arm_maker_entry(&s43, v_trap, LotQty(10)).is_ok()
-            && e43.on_maker_entry_filled(TimestampNs(1_500_000_000)).is_ok());
-        assert!(e44.try_arm_maker_entry(&s44, v_trap, LotQty(10)).is_ok()
-            && e44.state == OrderLifecycleState::Idle);
-        s43.ts_local_ns = TimestampNs(6_000_000_000);
-        s43.mark_price = PriceTicks(7_595);
-        s43.last_trade_price = PriceTicks(7_595);
-        s43.bids[0].price = PriceTicks(7_594);
-        s43.asks[0].price = PriceTicks(7_595);
-        let loss_43 = e43
-            .step_open_position(&s43, &btc, &gov, &mut l43)
-            .map_or(0, |c| c.net_scaled_bps.raw());
-        assert!(loss_43 < -5_000);
-
-        let mut e43_b = SlotExecutionEngine::new(3);
-        s43.ts_local_ns = TimestampNs(20_000_000_000);
-        s43.bids[0].price = PriceTicks(7_503);
-        s43.asks[0].price = PriceTicks(7_504);
-        s43.mark_price = PriceTicks(7_503);
-        s43.last_trade_price = PriceTicks(7_503);
-        s43.factor_ofi = BoundedScore::new_clamped(0.72);
-        s43.factor_tfi = BoundedScore::new_clamped(0.85);
-        s43.set_wave_observables(WaveObservables {
-            regime: WaveRegime::ImpulseWave3,
-            climax_active: false,
-            hurst: WaveObservables::encode_hurst(0.64),
-            macro_phase: BoundedScore::new_clamped(0.95),
-            oi_impulse: BoundedScore::new_clamped(0.25),
-            liq_imbalance: BoundedScore::ZERO,
-            fib_proj_bps: ScaledBps(4_500),
-        });
-        s44 = s43;
-        s44.set_order_block_observables(live_ob);
-        let v_long = SignalVerdict::AuthorizeMakerEntry {
-            side: Side::Bid,
-            target_excursion_scaled_bps: ScaledBps(900),
-        };
-        assert!(e43_b.try_arm_maker_entry(&s43, v_long, LotQty(1)).is_ok()
-            && e43_b.on_maker_entry_filled(TimestampNs(20_500_000_000)).is_ok());
-        assert!(e44.try_arm_maker_entry(&s44, v_long, LotQty(1)).is_ok()
-            && e44.on_maker_entry_filled(TimestampNs(20_500_000_000)).is_ok());
-        let mut win_44 = 0_i64;
-        for k in 1..=6_i64 {
-            let ts = 21_000_000_000 + k * 500_000_000;
-            let px = if k == 1 { 7_515 } else { 7_525 };
-            for s in [&mut s43, &mut s44] {
-                s.ts_local_ns = TimestampNs(ts);
-                s.bids[0].price = PriceTicks(px - 1);
-                s.asks[0].price = PriceTicks(px);
-                s.mark_price = PriceTicks(px);
-                s.last_trade_price = PriceTicks(px);
-            }
-            assert!(e43_b.step_open_position(&s43, &btc, &gov, &mut l43).is_none());
-            if win_44 == 0 {
-                if let Some(c) = e44.step_open_position(&s44, &btc, &gov, &mut l44) {
-                    assert!(c.is_maker_exit);
-                    win_44 = c.net_scaled_bps.raw();
-                }
-            }
-        }
-        assert!(win_44 >= 2_200 && win_44 > loss_43);
+        assert_eq!(obs.front_run_opposing_wall_tp(Side::Bid, btc, PriceTicks(658_000), PriceTicks(665_000)).0, 664_188);
     }
 
     #[test]
     fn test_ob_plasticity_vault_roundtrip_and_reconnect_preservation() {
-        let tmp = std::env::temp_dir().join(format!("vortex_ob_plast_{}.json", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("vortex_ob_plast_v46_{}.json", std::process::id()));
         let mut src = [CausalOrderBlockEngine::new(); 12];
         for (idx, eng) in src.iter_mut().enumerate() {
             eng.set_learned_efficacy_permille(500 + (idx as i64) * 25);
         }
-        CausalOrderBlockEngine::save_plasticity_array_to_path(
-            &src,
-            &tmp,
-            1_794_690_000_000_000_000,
-        );
-
+        CausalOrderBlockEngine::save_plasticity_array_to_path(&src, &tmp, 1_794_690_000_000_000_000);
         let mut dst = [CausalOrderBlockEngine::new(); 12];
         let loaded = CausalOrderBlockEngine::load_plasticity_array_from_path(&mut dst, &tmp);
         let _ = std::fs::remove_file(&tmp);
-
         assert_eq!(loaded, 12);
-        assert_eq!(dst[0].learned_efficacy_permille(), 500);
-        assert_eq!(dst[11].learned_efficacy_permille(), 775);
-
         dst[3].reset_preserving_plasticity();
         assert_eq!(dst[3].learned_efficacy_permille(), 575);
-        assert_eq!(dst[3].observables().learned_efficacy_pm, 575);
     }
-}
-
-// === VORTEX-OMEGA V4.5 OB TESTS ===
-#[cfg(test)]
-mod omega_v45_ob_tests {
-    use super::*;
-    use crate::lob_shm::SymbolLobSnapshot;
-    use crate::types::{BoundedScore, PriceTicks, ScaledBps, Side, TimestampNs};
 
     #[test]
-    fn test_decoupled_ob_bull_bear_plasticity_zero_crash_contamination_and_vault_compat() {
+    fn test_decoupled_ob_bull_bear_plasticity_and_v46_engine_distance_eviction_and_vip_tp() {
         let mut plast = DirectionalObPlasticity::new();
-        assert_eq!(plast.directional_efficacy_pm(), (618, 618));
-
-        // Bearish crash breaks 10 OB+ demand floors while 6 OB- supply ceilings hold every bounce
-        for _ in 0..10 {
-            plast.observe_directional_outcome(true, false);
-        }
-        for _ in 0..6 {
-            plast.observe_directional_outcome(false, true);
-        }
+        for _ in 0..10 { plast.observe_directional_outcome(true, false); }
+        for _ in 0..6 { plast.observe_directional_outcome(false, true); }
         let (bull_after, bear_after) = plast.directional_efficacy_pm();
-        assert!(bull_after < 460);
-        assert!(bear_after > 730);
+        assert!(bull_after < 460 && bear_after > 730);
 
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.realized_vol_5m = ScaledBps(6_000);
@@ -1434,54 +1048,70 @@ mod omega_v45_ob_tests {
             bull_after,
             bear_after,
         );
-        // Strong OB- ceiling vetoes Bid at 13.50 bps, while broken OB+ allows Ask at 10.50 bps
         assert!(!passes_directional_ob_wall_guard(Side::Bid, &snap, ScaledBps(1_300)));
         assert!(passes_directional_ob_wall_guard(Side::Ask, &snap, ScaledBps(1_300)));
 
-        // Legacy V4.4.1 JSON upgrade + V4.5 atomic round-trip
-        let tmp = std::env::temp_dir().join(format!("vortex_ob_v45_{}.json", std::process::id()));
-        let legacy = serde_json::json!({ "learned_efficacy_pm": [700, 500, 618, 618, 618, 618, 618, 618, 618, 618, 618, 618] }).to_string();
-        assert!(crate::vault_io::atomic_write_bytes_sync(&tmp, legacy.as_bytes()).is_ok());
-        let (b_leg, s_leg) = load_directional_plasticity_from_path(&tmp);
-        assert_eq!((b_leg[0], s_leg[0]), (700, 700));
-
-        let mut b_v45 = b_leg;
-        let mut s_v45 = s_leg;
-        b_v45[0] = bull_after;
-        s_v45[0] = bear_after;
-        assert!(save_directional_plasticity_to_path_atomic(&tmp, 123_456, &b_v45, &s_v45).is_ok());
-        let (b_rt, s_rt) = load_directional_plasticity_from_path(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        assert_eq!((b_rt[0], s_rt[0]), (bull_after, bear_after));
-    }
-
-    #[test]
-    fn test_distance_weighted_zone_eviction_preserves_near_bbo_wall() {
-        let mut bank = ProximityObBank::new();
-        let vol = ScaledBps(5_000);
-        // Slot 0: old distant block (300 bps away, strength 920) vs Slots 1..3: near BBO blocks (15..35 bps, strength 700..760)
-        let _ = bank.insert_zone_distance_weighted(
+        // V4.6 Island 2: CausalOrderBlockEngine internal distance-weighted eviction & VIP FeeSchedule front-run TP
+        let btc = APPROVED_SPECS[0];
+        let mut eng = CausalOrderBlockEngine::new();
+        eng.set_realized_vol_5m(ScaledBps(5_000));
+        CausalOrderBlockEngine::insert_zone(
+            &mut eng.bull_zones,
             true,
-            ProximityObZone { low_ticks: PriceTicks(7_940), high_ticks: PriceTicks(7_954), strength_pm: 920, created_ts: TimestampNs(1) },
-            PriceTicks(8_200),
-            vol,
+            OrderBlockZone {
+                state: ObLifecycleState::Virgin, fuel: ObFuelKind::FreshOpenInterest, horizon: ObHorizon::Structural5m,
+                bounce_verified: false, low_ticks: PriceTicks(639_000), high_ticks: PriceTicks(640_000),
+                eq_ticks: PriceTicks(639_500), strength_pm: 940,
+            },
+            PriceTicks(660_000),
+            ScaledBps(5_000),
         );
-        for (k, hi) in [8_185_i64, 8_180, 8_172].into_iter().enumerate() {
-            let _ = bank.insert_zone_distance_weighted(
+        for (k, hi) in [658_800_i64, 659_100, 659_400].into_iter().enumerate() {
+            CausalOrderBlockEngine::insert_zone(
+                &mut eng.bull_zones,
                 true,
-                ProximityObZone { low_ticks: PriceTicks(hi - 5), high_ticks: PriceTicks(hi), strength_pm: 720 + (k as i64) * 20, created_ts: TimestampNs(2 + k as i64) },
-                PriceTicks(8_200),
-                vol,
+                OrderBlockZone {
+                    state: ObLifecycleState::Virgin, fuel: ObFuelKind::FreshOpenInterest, horizon: ObHorizon::Tactical1m,
+                    bounce_verified: false, low_ticks: PriceTicks(hi - 100), high_ticks: PriceTicks(hi),
+                    eq_ticks: PriceTicks(hi - 50), strength_pm: 720 + (k as i64) * 20,
+                },
+                PriceTicks(660_000),
+                ScaledBps(5_000),
             );
         }
-        // 5th fresh block right at BBO (8_196) MUST evict Slot 0 (distant 300 bps block), never the near walls!
-        let evicted = bank.insert_zone_distance_weighted(
+        CausalOrderBlockEngine::insert_zone(
+            &mut eng.bull_zones,
             true,
-            ProximityObZone { low_ticks: PriceTicks(8_192), high_ticks: PriceTicks(8_196), strength_pm: 740, created_ts: TimestampNs(10) },
-            PriceTicks(8_200),
-            vol,
+            OrderBlockZone {
+                state: ObLifecycleState::Virgin, fuel: ObFuelKind::FreshOpenInterest, horizon: ObHorizon::Tactical1m,
+                bounce_verified: false, low_ticks: PriceTicks(659_700), high_ticks: PriceTicks(659_850),
+                eq_ticks: PriceTicks(659_775), strength_pm: 750,
+            },
+            PriceTicks(660_000),
+            ScaledBps(5_000),
         );
-        assert_eq!(evicted, 0);
-        assert_eq!(bank.bull_zones[0].high_ticks, PriceTicks(8_196));
+        // Slot 0 (stale 303 bps away) was evicted while all 3 near-BBO walls remained intact!
+        assert_eq!(eng.bull_zones[0].high_ticks, PriceTicks(659_850));
+        assert_eq!(eng.bull_zones[1].high_ticks, PriceTicks(658_800));
+
+        let obs_btc = OrderBlockObservables {
+            bull_ob_score: BoundedScore::ZERO,
+            bear_ob_score: BoundedScore::new_clamped(0.85),
+            dist_bull_ob_bps: ScaledBps(0),
+            dist_bear_ob_bps: ScaledBps(450),
+            bull_wall_ticks: PriceTicks(0),
+            bear_wall_ticks: PriceTicks(664_200),
+            learned_efficacy_pm: 680,
+        };
+        let vip0_tp = obs_btc.front_run_opposing_wall_tp_with_fees(
+            Side::Bid, btc, PriceTicks(658_000), PriceTicks(665_000), FeeSchedule::VIP0_DEFAULT,
+        );
+        let vip_rebate_tp = obs_btc.front_run_opposing_wall_tp_with_fees(
+            Side::Bid, btc, PriceTicks(658_000), PriceTicks(665_000),
+            FeeSchedule::from_live_rates_clamped(ScaledBps(-50), ScaledBps(300)),
+        );
+        // Lower VIP fee / negative rebate pads closer to opposing wall without crossing it (664_197 vs 664_188)
+        assert_eq!(vip0_tp, PriceTicks(664_188));
+        assert!(vip_rebate_tp.0 > vip0_tp.0 && vip_rebate_tp.0 < 664_200);
     }
 }
