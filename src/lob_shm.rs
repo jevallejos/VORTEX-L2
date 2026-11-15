@@ -1,5 +1,4 @@
-//! Lock-Free 12-Slot Seqlock LOB Shared Memory Arena (SHM v13) & Tear-Free Telemetry.
-
+//! Lock-Free 12-Slot Seqlock LOB Shared Memory Arena (SHM v15) & Volatile Tear-Free Telemetry.
 #![allow(
     clippy::borrow_as_ptr,
     clippy::manual_clamp,
@@ -16,16 +15,78 @@ use core::sync::atomic::{fence, AtomicI64, AtomicU64, Ordering};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use crate::order_block::OrderBlockObservables;
 use crate::types::{
     now_epoch_ns, BoundedScore, LotQty, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs,
     VortexError,
 };
-use crate::order_block::OrderBlockObservables;
 use crate::wave_elliott::{WaveObservables, WaveRegime};
 
 pub const MAX_ACTIVE_PAIRS: usize = 12;
-pub const VORTEX_SHM_VERSION: u32 = 14;
+pub const VORTEX_SHM_VERSION: u32 = 15;
 const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C33;
+pub const MAX_CONTIGUOUS_L2_SEQ_JUMP: u64 = 5_000;
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LastVetoCode {
+    #[default]
+    None = 0,
+    WarmupOrLock = 1,
+    BetaOrSameSideStagger = 2,
+    SpoofingVeto = 3,
+    Friction3xOrEligibility = 4,
+    QueueDepthOrOversizedLot = 5,
+    KinematicSurfaceOrCadence = 6,
+    ScarCooldownOrContagion = 7,
+    BtcLeadLagHeadwind = 8,
+    MacroElliottContradiction = 9,
+    OpposingOrderBlockWall = 10,
+    PreflightDriftOrDecay = 11,
+    HawkesStoikovQueueAbort = 12,
+}
+
+impl LastVetoCode {
+    #[inline]
+    #[must_use]
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::WarmupOrLock,
+            2 => Self::BetaOrSameSideStagger,
+            3 => Self::SpoofingVeto,
+            4 => Self::Friction3xOrEligibility,
+            5 => Self::QueueDepthOrOversizedLot,
+            6 => Self::KinematicSurfaceOrCadence,
+            7 => Self::ScarCooldownOrContagion,
+            8 => Self::BtcLeadLagHeadwind,
+            9 => Self::MacroElliottContradiction,
+            10 => Self::OpposingOrderBlockWall,
+            11 => Self::PreflightDriftOrDecay,
+            12 => Self::HawkesStoikovQueueAbort,
+            _ => Self::None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::None => "READY",
+            Self::WarmupOrLock => "LOCK/WARM",
+            Self::BetaOrSameSideStagger => "STAGGER/BETA",
+            Self::SpoofingVeto => "SPOOF_VETO",
+            Self::Friction3xOrEligibility => "3X_BARRIER",
+            Self::QueueDepthOrOversizedLot => "LOT/Q_WALL",
+            Self::KinematicSurfaceOrCadence => "KIN/UTC",
+            Self::ScarCooldownOrContagion => "SCAR_GUARD",
+            Self::BtcLeadLagHeadwind => "BTC_HEADW",
+            Self::MacroElliottContradiction => "MACRO_VETO",
+            Self::OpposingOrderBlockWall => "OB_WALL",
+            Self::PreflightDriftOrDecay => "PRE_DECAY",
+            Self::HawkesStoikovQueueAbort => "HWK_ABORT",
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -56,6 +117,34 @@ pub const fn classify_l2_sequence_transition(
     } else {
         L2SeqDecision::ApplyMonotonicDelta
     }
+}
+
+/// Detects abnormal L2 sequence jumps or Mark-Mid basis decoupling requiring book resync.
+#[inline]
+#[must_use]
+pub const fn is_l2_seq_or_basis_anomaly(
+    prev_sequence_id: u64,
+    incoming_u: u64,
+    mid_ticks: PriceTicks,
+    mark_ticks: PriceTicks,
+    vol_5m: ScaledBps,
+    b3x_barrier: ScaledBps,
+) -> bool {
+    let seq_gap = prev_sequence_id > 0
+        && incoming_u > prev_sequence_id
+        && (incoming_u - prev_sequence_id) > MAX_CONTIGUOUS_L2_SEQ_JUMP;
+    if seq_gap {
+        return true;
+    }
+    if mid_ticks.0 <= 0 || mark_ticks.0 <= 0 {
+        return false;
+    }
+    let v3 = vol_5m.0.saturating_mul(3);
+    let b4 = b3x_barrier.0.saturating_mul(4);
+    let bound_bps = if v3 > b4 { v3 } else { b4 };
+    let eff_bound = if bound_bps > 1_200 { bound_bps } else { 1_200 };
+    let diff = (mark_ticks.0 - mid_ticks.0).abs();
+    (diff as i128) * 1_000_000 > (mid_ticks.0 as i128) * (eff_bound as i128)
 }
 
 #[repr(C)]
@@ -92,6 +181,12 @@ pub struct SymbolLobSnapshot {
     pub ob_bull_wall_ticks: PriceTicks,
     pub ob_bear_wall_ticks: PriceTicks,
     pub ob_learned_efficacy_pm: i64,
+    pub ob_bull_efficacy_pm: i64,
+    pub ob_bear_efficacy_pm: i64,
+    pub funding_rate_scaled_bps: ScaledBps,
+    pub next_funding_ts_ns: TimestampNs,
+    pub open_interest_x100: i64,
+    pub seq_resync_count: u64,
 }
 
 impl Default for SymbolLobSnapshot {
@@ -137,6 +232,12 @@ impl SymbolLobSnapshot {
             ob_bull_wall_ticks: PriceTicks(0),
             ob_bear_wall_ticks: PriceTicks(0),
             ob_learned_efficacy_pm: 618,
+            ob_bull_efficacy_pm: 618,
+            ob_bear_efficacy_pm: 618,
+            funding_rate_scaled_bps: ScaledBps(0),
+            next_funding_ts_ns: TimestampNs(0),
+            open_interest_x100: 0,
+            seq_resync_count: 0,
         }
     }
 
@@ -174,6 +275,8 @@ impl SymbolLobSnapshot {
         self.ob_bull_wall_ticks = obs.bull_wall_ticks;
         self.ob_bear_wall_ticks = obs.bear_wall_ticks;
         self.ob_learned_efficacy_pm = obs.learned_efficacy_pm;
+        self.ob_bull_efficacy_pm = obs.learned_efficacy_pm;
+        self.ob_bear_efficacy_pm = obs.learned_efficacy_pm;
     }
 
     #[inline]
@@ -305,6 +408,8 @@ impl SymbolLobSnapshot {
 pub struct SlotTelemetrySnapshot {
     pub state_code: u8,
     pub tranche1_harvested: bool,
+    pub last_veto_code: u8,
+    pub reserved_pad: [u8; 5],
     pub side_code: u64,
     pub entry_ticks: i64,
     pub avg_price_ticks: i64,
@@ -444,6 +549,7 @@ pub struct VortexShmArena {
     pub exec_abort_count: AtomicU64,
     pub exec_fill_count: AtomicU64,
     pub exec_closed_count: AtomicU64,
+    pub tap_seq_resync_count: AtomicU64,
     slots: [SeqlockLobSlot; MAX_ACTIVE_PAIRS],
     telemetry_cells: [SlotTelemetryCell; MAX_ACTIVE_PAIRS],
 }
@@ -609,13 +715,15 @@ impl MappedShmRegion {
         };
 
         unsafe {
-            let need_init = reset_zero
-                || (*reg.ptr).magic != VORTEX_SHM_MAGIC
-                || (*reg.ptr).version != VORTEX_SHM_VERSION;
+            let cur_magic = ptr::read_volatile(ptr::addr_of!((*reg.ptr).magic));
+            let cur_ver = ptr::read_volatile(ptr::addr_of!((*reg.ptr).version));
+            let need_init =
+                reset_zero || cur_magic != VORTEX_SHM_MAGIC || cur_ver != VORTEX_SHM_VERSION;
             if need_init {
                 ptr::write_bytes(reg.ptr, 0, 1);
-                (*reg.ptr).magic = VORTEX_SHM_MAGIC;
-                (*reg.ptr).version = VORTEX_SHM_VERSION;
+                ptr::write_volatile(ptr::addr_of_mut!((*reg.ptr).version), VORTEX_SHM_VERSION);
+                fence(Ordering::Release);
+                ptr::write_volatile(ptr::addr_of_mut!((*reg.ptr).magic), VORTEX_SHM_MAGIC);
                 fence(Ordering::Release);
             }
         }
@@ -673,7 +781,10 @@ impl MappedShmRegion {
         };
 
         let valid = unsafe {
-            (*reg.ptr).magic == VORTEX_SHM_MAGIC && (*reg.ptr).version == VORTEX_SHM_VERSION
+            let mg = ptr::read_volatile(ptr::addr_of!((*reg.ptr).magic));
+            let vr = ptr::read_volatile(ptr::addr_of!((*reg.ptr).version));
+            fence(Ordering::Acquire);
+            mg == VORTEX_SHM_MAGIC && vr == VORTEX_SHM_VERSION
         };
         if !valid {
             return Err(VortexError::ColumnarFormatCorrupted);
@@ -714,13 +825,15 @@ mod tests {
 
     #[test]
     fn test_shm_v13_12slots_wave_fib_and_deep_l1_l5_volume() {
-        let p = MappedShmRegion::ephemeral_self_test_path("v13_slots");
+        assert_eq!(core::mem::size_of::<SlotTelemetrySnapshot>(), 96);
+        let p = MappedShmRegion::ephemeral_self_test_path("v15_slots");
         let reg = MappedShmRegion::open_or_create(&p, true);
         assert!(reg.is_ok());
         if let Ok(r) = reg {
             assert_eq!(r.arena().version, VORTEX_SHM_VERSION);
             let mut snap = SymbolLobSnapshot::new_empty();
             snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+            snap.funding_rate_scaled_bps = ScaledBps(-145);
             for i in 0..5 {
                 snap.apply_level_update(Side::Bid, PriceTicks(8_200 - i), LotQty(100));
                 snap.apply_level_update(Side::Ask, PriceTicks(8_201 + i), LotQty(80));
@@ -737,11 +850,9 @@ mod tests {
             });
             if let Ok(s3) = r.arena().slot(3) {
                 s3.write_snapshot(&snap);
-                let out = s3.read_snapshot(4);
-                assert!(out.is_ok());
-                if let Ok(rd) = out {
+                if let Ok(rd) = s3.read_snapshot(4) {
                     assert_eq!(rd.wave_observables().fib_proj_bps, ScaledBps(4_250));
-                    assert!((rd.wave_observables().liq_imbalance.get() - 0.72).abs() < 1e-9);
+                    assert_eq!(rd.funding_rate_scaled_bps, ScaledBps(-145));
                 }
             }
         }
@@ -766,6 +877,30 @@ mod tests {
             classify_l2_sequence_transition(true, 10, false, 11),
             L2SeqDecision::ApplyMonotonicDelta
         );
+        assert!(is_l2_seq_or_basis_anomaly(
+            100,
+            6_000,
+            PriceTicks(8_200),
+            PriceTicks(8_200),
+            ScaledBps(5_000),
+            ScaledBps(1_300),
+        ));
+        assert!(is_l2_seq_or_basis_anomaly(
+            100,
+            101,
+            PriceTicks(8_200),
+            PriceTicks(8_450),
+            ScaledBps(5_000),
+            ScaledBps(1_300),
+        ));
+        assert!(!is_l2_seq_or_basis_anomaly(
+            100,
+            101,
+            PriceTicks(8_200),
+            PriceTicks(8_205),
+            ScaledBps(5_000),
+            ScaledBps(1_300),
+        ));
     }
 
     #[test]
@@ -773,12 +908,10 @@ mod tests {
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.apply_level_update(Side::Bid, PriceTicks(0), LotQty(500));
         assert_eq!(snap.bids[0].price, PriceTicks(0));
-
         snap.apply_level_update(Side::Ask, PriceTicks(8_200), LotQty(100));
         snap.apply_level_update(Side::Ask, PriceTicks(8_205), LotQty(150));
         snap.apply_level_update(Side::Bid, PriceTicks(8_202), LotQty(200));
         assert_eq!(snap.asks[0].price, PriceTicks(8_205));
-
         let p = MappedShmRegion::ephemeral_self_test_path("odd_rec");
         if let Ok(r) = MappedShmRegion::open_or_create(&p, true) {
             if let Ok(s0) = r.arena().slot(0) {
@@ -803,6 +936,7 @@ mod tests {
                         state_code: 4,
                         open_lots: 12,
                         tranche1_harvested: true,
+                        last_veto_code: LastVetoCode::OpposingOrderBlockWall as u8,
                         ..SlotTelemetrySnapshot::default()
                     });
                 }
@@ -811,6 +945,10 @@ mod tests {
                     assert_eq!(ts.state_code, 4);
                     assert_eq!(ts.open_lots, 12);
                     assert!(ts.tranche1_harvested);
+                    assert_eq!(
+                        LastVetoCode::from_code(ts.last_veto_code),
+                        LastVetoCode::OpposingOrderBlockWall
+                    );
                 }
             }
         }

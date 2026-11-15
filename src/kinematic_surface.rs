@@ -664,6 +664,8 @@ pub fn compute_wald_v2_contracted_sl_bps(
     (contracted, gamma)
 }
 
+pub use crate::fee_cadence_beta::wald_sprt_boundaries_from_permille;
+
 #[cfg(test)]
 mod tests {
     use super::*;

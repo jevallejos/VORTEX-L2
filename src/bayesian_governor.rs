@@ -1,24 +1,28 @@
-//! 12x2 Online Bayesian Governor, Welford Var, UTC/Funding Cadence & Risk-Parity Sizer.
-
+//! 12x2 Online Bayesian Governor, Taker Beta-Binomial Prior, Regime Shadow-Rehab & Live Funding Cadence.
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
+    clippy::suboptimal_flops,
     clippy::too_many_arguments
 )]
 
+use std::sync::mpsc::SyncSender;
+
 use crate::alpha_3factor::OrthogonalFactorState;
+use crate::fee_cadence_beta::{evaluate_utc_dst_and_live_funding_cadence, FeeSchedule};
+use crate::governor_plasticity::GovernorPlasticityState;
 use crate::kinematic_surface::{
     audit_unified_63_losses_and_2160_manifold, c_clamp_i64, c_max_i64, c_min_i64, c_min_u32,
     evaluate_kinematic_surface_core, evaluate_preflight_hysteresis_core,
     extract_matrix_i64_12x2, extract_matrix_u32_12x2,
-    parse_historical_trade_scar_tuple as parse_scar_tuple_core, ScarEventKey,
-    ScarEventPayload,
+    parse_historical_trade_scar_tuple as parse_scar_tuple_core, ScarEventKey, ScarEventPayload,
 };
 use crate::lob_shm::{SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
 use crate::types::{
     evaluate_utc_and_funding_cadence, LotQty, PairSpec, PriceTicks, ScaledBps, Side,
     TemporalCadenceModulation, TimestampNs, APPROVED_SPECS,
 };
+use crate::vault_io::{atomic_write_bytes_sync, VaultIoCommand};
 
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const INIT_RETURN_VAR_BPS2: i64 = 40_000;
@@ -26,7 +30,7 @@ const MIN_VALID_UTC_EPOCH_NS: i64 = 1_577_836_800_000_000_000;
 pub const EMA_PREWARM_PATH: &str = "data/vault/vortex_ema_prewarm.json";
 const MAX_EMA_PREWARM_AGE_NS: i64 = 900_000_000_000;
 
-/// 12x2 Online Bayesian Governor with Lyapunov Crest Shield, Welford Var & UTC Cadence.
+/// 12x2 Online Bayesian Governor with Taker Prior, Regime-Shift Rehab, Welford Var & Live Funding Cadence.
 #[derive(Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; MAX_ACTIVE_PAIRS],
@@ -50,6 +54,7 @@ pub struct OnlineAdaptiveGovernor {
     abort_anchor_px_1e4: [[i64; 2]; MAX_ACTIVE_PAIRS],
     abort_last_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
     entry_warmup_until_ns: i64,
+    plasticity: GovernorPlasticityState,
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -86,6 +91,7 @@ impl OnlineAdaptiveGovernor {
             abort_anchor_px_1e4: [[i64::MIN; 2]; MAX_ACTIVE_PAIRS],
             abort_last_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
             entry_warmup_until_ns: 0,
+            plasticity: GovernorPlasticityState::new(),
         }
     }
 
@@ -96,6 +102,29 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => 0,
             Side::Ask => 1,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn active_fee_schedule(&self) -> FeeSchedule {
+        self.plasticity.active_fee_schedule()
+    }
+
+    #[inline]
+    pub fn set_active_fee_schedule(&mut self, fees: FeeSchedule) {
+        self.plasticity.set_active_fee_schedule(fees);
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn active_maker_rt_fee_bps(&self) -> i64 {
+        self.plasticity.maker_round_trip_fee_bps()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn slot_taker_prob_permille(&self, slot_idx: usize, side: Side) -> i64 {
+        self.plasticity.slot_taker_prob_permille(slot_idx, side)
     }
 
     #[inline]
@@ -122,11 +151,70 @@ impl OnlineAdaptiveGovernor {
         let d = Self::dir_idx(side);
         let mu = self.ewma_net_bps_x100[slot_idx][d];
         let sigma = self.slot_return_std_bps(slot_idx, side);
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
         (mu.saturating_mul(100)) / c_max_i64(sigma.saturating_add(fee_rt), 1)
     }
 
-    /// Evaluates continuous UTC & 8h funding cadence when ts_local_ns is a real epoch (>= 2020).
+    /// Evaluates civil DST + live SHM v15 funding carry cadence while honoring Law III off-peak floors.
+    #[must_use]
+    pub fn slot_temporal_cadence_for_side(
+        &self,
+        slot_idx: usize,
+        candidate_side: Option<Side>,
+        snap: &SymbolLobSnapshot,
+    ) -> TemporalCadenceModulation {
+        if snap.ts_local_ns.0 < MIN_VALID_UTC_EPOCH_NS {
+            return TemporalCadenceModulation::neutral();
+        }
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let eq_v = if slot_idx < MAX_ACTIVE_PAIRS {
+            self.eq_vol_5m_bps[slot_idx].max(fee_rt * 6)
+        } else {
+            fee_rt * 12
+        };
+        let dst_live = evaluate_utc_dst_and_live_funding_cadence(
+            snap.ts_local_ns,
+            snap.realized_vol_5m,
+            ScaledBps(eq_v),
+            candidate_side,
+            snap.funding_rate_scaled_bps,
+            snap.next_funding_ts_ns,
+        );
+        let base_utc = evaluate_utc_and_funding_cadence(
+            snap.ts_local_ns,
+            snap.realized_vol_5m,
+            ScaledBps(eq_v),
+        );
+
+        let carry_bps = match candidate_side {
+            Some(s) if snap.funding_rate_scaled_bps.0 != 0 => {
+                -s.sign_i64().saturating_mul(snap.funding_rate_scaled_bps.0)
+            }
+            _ => 0,
+        };
+        if carry_bps > 0 {
+            return dst_live;
+        }
+        let epoch_secs = snap.ts_local_ns.0.div_euclid(1_000_000_000);
+        let rem_8h = epoch_secs.rem_euclid(28_800);
+        let near_cut = rem_8h >= 28_650 || rem_8h <= 45;
+        if carry_bps == 0 && dst_live.intraday_percentile >= 0.48 && !near_cut {
+            return dst_live;
+        }
+        TemporalCadenceModulation {
+            intraday_percentile: dst_live.intraday_percentile,
+            snr_threshold_delta: dst_live
+                .snr_threshold_delta
+                .max(base_utc.snr_threshold_delta),
+            kin_energy_min_delta_bps: dst_live
+                .kin_energy_min_delta_bps
+                .max(base_utc.kin_energy_min_delta_bps),
+            kelly_lot_mult_permille: dst_live
+                .kelly_lot_mult_permille
+                .min(base_utc.kelly_lot_mult_permille),
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn slot_temporal_cadence(
@@ -134,23 +222,10 @@ impl OnlineAdaptiveGovernor {
         slot_idx: usize,
         snap: &SymbolLobSnapshot,
     ) -> TemporalCadenceModulation {
-        if snap.ts_local_ns.0 < MIN_VALID_UTC_EPOCH_NS {
-            return TemporalCadenceModulation::neutral();
-        }
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
-        let eq_v = if slot_idx < MAX_ACTIVE_PAIRS {
-            self.eq_vol_5m_bps[slot_idx].max(fee_rt * 6)
-        } else {
-            fee_rt * 12
-        };
-        evaluate_utc_and_funding_cadence(
-            snap.ts_local_ns,
-            snap.realized_vol_5m,
-            ScaledBps(eq_v),
-        )
+        self.slot_temporal_cadence_for_side(slot_idx, None, snap)
     }
 
-    /// SSOT Risk-Parity + Bayesian Kelly + UTC Cadence lot calculator shared 1:1 across Exec & Replay.
+    /// SSOT Risk-Parity + Bayesian Kelly + DST/Funding Cadence lot calculator shared 1:1 across Exec & Replay.
     #[inline]
     #[must_use]
     pub fn compute_slot_entry_lots(
@@ -168,7 +243,7 @@ impl OnlineAdaptiveGovernor {
         } else {
             snap.mark_price
         };
-        let cadence = self.slot_temporal_cadence(s_clamped, snap);
+        let cadence = self.slot_temporal_cadence_for_side(s_clamped, Some(side), snap);
         let (edge_bps, _, _) = self.slot_direction_diagnostics(s_clamped, side);
         let ir_x100 = self.slot_information_ratio_x100(s_clamped, side);
         let in_debt = self.is_in_scar_debt(s_clamped, side);
@@ -205,6 +280,7 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
+    /// Law V Local Runner Sovereignty: T1 split depends strictly on local slot scar debt, never global contagion.
     #[inline]
     #[must_use]
     pub const fn learned_tranche1_fraction_permille(
@@ -216,12 +292,16 @@ impl OnlineAdaptiveGovernor {
         if slot_idx >= MAX_ACTIVE_PAIRS {
             return 500;
         }
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
         let ir_x100 = c_clamp_i64(self.slot_information_ratio_x100(slot_idx, side), -60, 120);
         let mfe_c = c_clamp_i64(learned_mfe_bps, fee_rt, fee_rt * 4);
         let ir_shift = (ir_x100 - 40) * 2;
         let mfe_shift = ((mfe_c - 2 * fee_rt) * 125) / c_max_i64(fee_rt, 1);
-        let scar_add = if self.is_in_scar_debt(slot_idx, side) { 120 } else { 0 };
+        let scar_add = if self.is_in_local_slot_scar_debt(slot_idx, side) {
+            120
+        } else {
+            0
+        };
         c_clamp_i64(500 - ir_shift - mfe_shift + scar_add, 350, 650)
     }
 
@@ -237,7 +317,7 @@ impl OnlineAdaptiveGovernor {
     ) -> (i64, i64) {
         let s_clamped = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
         let spec = APPROVED_SPECS[s_clamped];
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
         let tau_bps = spec
             .tick_to_price_scaled_bps(avg_price_ticks)
             .unwrap_or(ScaledBps(fee_rt / 8))
@@ -265,7 +345,7 @@ impl OnlineAdaptiveGovernor {
     #[must_use]
     const fn elastic_wave_anchor_ttl_ns(&self, slot_idx: usize, d: usize) -> i64 {
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
         let edge_pos = if self.ewma_net_bps_x100[slot_idx][d] > 0 {
             c_min_i64(self.ewma_net_bps_x100[slot_idx][d], fee_rt * 2)
         } else {
@@ -302,12 +382,27 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
-    pub fn save_ema_prewarm_to_path(&self, path: &std::path::Path, now_ns: TimestampNs) {
+    /// Zero-Jitter 200Hz prewarm checkpoint dispatcher over bounded `VaultIoCommand` channel (`0` alloc).
+    #[inline]
+    pub fn dispatch_ema_prewarm_async(
+        &self,
+        now_ns: TimestampNs,
+        vault_tx: &SyncSender<VaultIoCommand>,
+    ) {
         if self.ewma_fast_px_1e4.iter().all(|&v| v <= 0) {
             return;
         }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let _ = vault_tx.try_send(VaultIoCommand::SaveEmaPrewarm {
+            ts_ns: now_ns.0,
+            fast_px_1e4: self.ewma_fast_px_1e4,
+            slow_px_1e4: self.ewma_slow_px_1e4,
+            eq_vol_5m_bps: self.eq_vol_5m_bps,
+        });
+    }
+
+    pub fn save_ema_prewarm_to_path(&self, path: &std::path::Path, now_ns: TimestampNs) {
+        if self.ewma_fast_px_1e4.iter().all(|&v| v <= 0) {
+            return;
         }
         let payload = serde_json::json!({
             "event": "EMA_PREWARM_V43",
@@ -317,7 +412,7 @@ impl OnlineAdaptiveGovernor {
             "eq_vol_5m_bps": self.eq_vol_5m_bps,
         });
         if let Ok(txt) = serde_json::to_string(&payload) {
-            let _ = std::fs::write(path, txt);
+            let _ = atomic_write_bytes_sync(path, txt.as_bytes());
         }
     }
 
@@ -424,6 +519,55 @@ impl OnlineAdaptiveGovernor {
             let next_eq = (prev_eq + a_eq * (obs_f - prev_eq)).round() as i64;
             self.eq_vol_5m_bps[slot_idx] = next_eq.clamp(active_regime_floor, 24_000);
         }
+        self.step_regime_shift_shadow_rehab(slot_idx, snap);
+    }
+
+    /// Rehabilitates deadlocked local scars ONLY after verified physical regime mutation (`0%` silence smoothing).
+    pub fn step_regime_shift_shadow_rehab(&mut self, slot_idx: usize, snap: &SymbolLobSnapshot) {
+        if slot_idx >= MAX_ACTIVE_PAIRS || snap.ts_local_ns.0 <= 0 {
+            return;
+        }
+        let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+        } else {
+            snap.mark_price
+        };
+        if mid_px.0 <= 0 {
+            return;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
+        let eq_vol = self.eq_vol_5m_bps[slot_idx];
+        let (drift_bps, _) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
+        let fees = self.plasticity.active_fee_schedule();
+
+        for side in [Side::Bid, Side::Ask] {
+            if !self.is_in_local_slot_scar_debt(slot_idx, side) {
+                continue;
+            }
+            let d = Self::dir_idx(side);
+            let eff_streak = self.sl_streak[slot_idx][d].max(1);
+            let p_pm = self.plasticity.slot_taker_prob_permille(slot_idx, side);
+            let b3x_bps = spec
+                .three_x_friction_barrier_bps_dynamic(mid_px, p_pm, fees)
+                .raw();
+            if self.plasticity.evaluate_shadow_rehab_step(
+                slot_idx,
+                side,
+                eff_streak,
+                tau_ns,
+                eq_vol,
+                b3x_bps,
+                drift_bps,
+                snap,
+            ) {
+                self.sl_streak[slot_idx][d] = self.sl_streak[slot_idx][d].saturating_sub(1);
+                self.cum_net_bps_x100[slot_idx][d] =
+                    GovernorPlasticityState::contract_local_debt_golden(
+                        self.cum_net_bps_x100[slot_idx][d],
+                    );
+            }
+        }
     }
 
     #[inline]
@@ -477,7 +621,7 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let d = Self::dir_idx(side);
-        let local_floor = -(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 8);
+        let local_floor = -(self.active_maker_rt_fee_bps() * 4);
         self.cum_net_bps_x100[slot_idx][d] <= local_floor || self.sl_streak[slot_idx][d] > 0
     }
 
@@ -488,7 +632,7 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let d = Self::dir_idx(side);
-        let global_floor = -(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 30);
+        let global_floor = -(self.active_maker_rt_fee_bps() * 15);
         self.is_in_local_slot_scar_debt(slot_idx, side)
             || self.global_dir_debt_bps_x100[d] < global_floor
     }
@@ -512,7 +656,7 @@ impl OnlineAdaptiveGovernor {
         if check_ts_ns > 0 && check_ts_ns < self.global_dir_cooldown_until_ns[d] {
             return Some("VETO_GLOBAL_WAVE_OR_SL_BREATHER");
         }
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
         let anchor_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
         let anchor_ts = self.wave_anchor_ts_ns[slot_idx][d];
@@ -596,7 +740,7 @@ impl OnlineAdaptiveGovernor {
         signed_geom: f64,
         snr_abs: f64,
     ) -> Result<(i64, i64), &'static str> {
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
         let eq_vol = if slot_idx < MAX_ACTIVE_PAIRS {
             self.eq_vol_5m_bps[slot_idx].max(fee_rt * 6)
         } else {
@@ -629,7 +773,16 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         let d = Self::dir_idx(side);
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let is_adverse_taker_sl = !is_maker_exit && net_scaled_bps.raw() < 0;
+        self.plasticity.observe_exit_outcome(
+            slot_idx,
+            side,
+            is_adverse_taker_sl,
+            ts_ns.0,
+            self.eq_vol_5m_bps[slot_idx],
+        );
+
         let prev_mean = self.ewma_net_bps_x100[slot_idx][d];
         let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
         let sq_clamped = diff.saturating_mul(diff).min(25_000_000);
@@ -645,7 +798,6 @@ impl OnlineAdaptiveGovernor {
 
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
         let ir_x100 = self.slot_information_ratio_x100(slot_idx, side).clamp(-50, 100);
-
         if !is_maker_exit || net_scaled_bps.raw() < -(fee_rt / 8) {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
@@ -781,9 +933,11 @@ impl OnlineAdaptiveGovernor {
             let vol_raw = snap.realized_vol_5m.raw().clamp(1_200, 15_000);
             let sweep_ttl_ns =
                 ((25_000_000_000_i64 * 6_000) / vol_raw).clamp(18_000_000_000, 45_000_000_000);
-            let since_abort_ns = snap.ts_local_ns.0.saturating_sub(self.abort_last_ts_ns[slot_idx][d]);
+            let since_abort_ns =
+                snap.ts_local_ns.0.saturating_sub(self.abort_last_ts_ns[slot_idx][d]);
             let cur_1e4 = entry_px.0.saturating_mul(10_000);
-            let move_1e4 = (cur_1e4 - self.abort_anchor_px_1e4[slot_idx][d]).saturating_mul(d_sign);
+            let move_1e4 =
+                (cur_1e4 - self.abort_anchor_px_1e4[slot_idx][d]).saturating_mul(d_sign);
             if since_abort_ns < sweep_ttl_ns && move_1e4 < 0 {
                 return Err("VETO_POST_ABORT_ADVERSE_SWEEP");
             }
@@ -805,10 +959,10 @@ impl OnlineAdaptiveGovernor {
             if fast_1e4 > 0 && slow_1e4 > 0 {
                 let mid_t = i64::midpoint(best_bid.price.0, best_ask.price.0);
                 let px_1e4 = mid_t.saturating_mul(10_000);
-                let s_drift =
-                    (((fast_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4).saturating_mul(d_sign);
-                let s_ext =
-                    (((px_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4).saturating_mul(d_sign);
+                let s_drift = (((fast_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4)
+                    .saturating_mul(d_sign);
+                let s_ext = (((px_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4)
+                    .saturating_mul(d_sign);
                 let lead_impulse = s_ext.saturating_sub(s_drift);
                 let signed_ofi = snap.factor_ofi.get() * side.sign_f64();
                 let sym_sl_tot =
@@ -838,7 +992,7 @@ impl OnlineAdaptiveGovernor {
 
     #[must_use]
     pub fn to_scar_snapshot_json(&self, ts_ns: TimestampNs) -> serde_json::Value {
-        serde_json::json!({
+        let mut val = serde_json::json!({
             "event": "GOV_SCAR_SNAPSHOT",
             "ts_ns": ts_ns.0,
             "ewma_net_bps_x100": self.ewma_net_bps_x100,
@@ -855,7 +1009,11 @@ impl OnlineAdaptiveGovernor {
             "global_dir_win_streak": self.global_dir_win_streak,
             "global_dir_cooldown_until_ns": self.global_dir_cooldown_until_ns,
             "last_global_win_dir": self.last_global_win_dir,
-        })
+        });
+        if let Some(map) = val.as_object_mut() {
+            self.plasticity.write_to_scar_json_map(map);
+        }
+        val
     }
 
     pub fn apply_scar_snapshot_json(&mut self, val: &serde_json::Value) -> Option<TimestampNs> {
@@ -930,6 +1088,7 @@ impl OnlineAdaptiveGovernor {
         if let Some(ld) = val.get("last_global_win_dir").and_then(|v| v.as_u64()) {
             self.last_global_win_dir = ld.min(255) as u8;
         }
+        self.plasticity.apply_from_scar_json(val);
         Some(TimestampNs(snap_ts))
     }
 
@@ -999,7 +1158,6 @@ impl OnlineAdaptiveGovernor {
         let cand_comp = OrthogonalFactorState::snr_composite_score(candidate_snap).abs();
         let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         let in_scar = self.is_in_scar_debt(slot_idx, side);
-
         if !spec.passes_oversized_lot_conviction_guard_with_vol(
             wallet_usdt_1e8,
             entry_px,
@@ -1019,18 +1177,21 @@ impl OnlineAdaptiveGovernor {
         ) else {
             return false;
         };
-        let cadence = self.slot_temporal_cadence(slot_idx, candidate_snap);
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let cadence = self.slot_temporal_cadence_for_side(slot_idx, Some(side), candidate_snap);
+        let fee_rt = self.active_maker_rt_fee_bps();
         let eff_e_min = (base_e_min + cadence.kin_energy_min_delta_bps)
             .clamp(fee_rt / 5, (fee_rt * 4) / 5);
         if e_kin < eff_e_min {
             return false;
         }
-
         let sl_s = self.sl_streak[slot_idx][d] as f64;
         let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
-        let debt_penalty = if debt_bps < 0.0 { ((-debt_bps) / 16_000.0).min(0.28) } else { 0.0 };
+        let debt_penalty = if debt_bps < 0.0 {
+            ((-debt_bps) / 16_000.0).min(0.28)
+        } else {
+            0.0
+        };
         let global_debt_bps = self.global_dir_debt_bps_x100[d] as f64;
         let global_penalty = if global_debt_bps < -2_000.0 {
             ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14)
@@ -1038,8 +1199,8 @@ impl OnlineAdaptiveGovernor {
             0.0
         };
         let staircase_penalty = if win_s >= 2.0 { 0.03 * (win_s - 1.0) } else { 0.0 };
-        let ir_adj =
-            (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
+        let ir_adj = (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0)
+            .clamp(-0.04, 0.05);
         let req_scar_tfi = if in_local_scar { 0.45 } else { 0.38 };
         if in_scar && candidate_snap.factor_tfi.get().abs() < req_scar_tfi {
             return false;
@@ -1050,7 +1211,6 @@ impl OnlineAdaptiveGovernor {
         {
             return false;
         }
-
         if slot_idx > 0 {
             let btc_comp = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
             let btc_ofi = btc_leader_snap.factor_ofi.get() * dir_s;
@@ -1084,8 +1244,17 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let ob_obs = candidate_snap.order_block_observables();
-        if ob_obs.vetoes_into_opposing_wall(side, spec, entry_px, candidate_snap.realized_vol_5m, candidate_snap.factor_tfi.get() * dir_s) { return false; }
-        let ob_res = ob_obs.aligned_confluence_resonance(side, spec, entry_px, candidate_snap.realized_vol_5m);
+        if ob_obs.vetoes_into_opposing_wall(
+            side,
+            spec,
+            entry_px,
+            candidate_snap.realized_vol_5m,
+            candidate_snap.factor_tfi.get() * dir_s,
+        ) {
+            return false;
+        }
+        let ob_res =
+            ob_obs.aligned_confluence_resonance(side, spec, entry_px, candidate_snap.realized_vol_5m);
         let gp_res = candidate_snap.wave_observables().golden_pocket_resonance(side);
         let adaptive_threshold = (0.42 - (0.012 * ob_res + 0.014 * ob_res * gp_res)
             + 0.08 * sl_s
@@ -1160,7 +1329,10 @@ impl OnlineAdaptiveGovernor {
             return Err("VETO_PREFLIGHT_SNR_COLLAPSE");
         }
         let spec = APPROVED_SPECS[slot_idx];
-        if snap.order_block_observables().vetoes_into_opposing_wall(side, spec, entry_px, snap.realized_vol_5m, tfi * dir_s) {
+        if snap
+            .order_block_observables()
+            .vetoes_into_opposing_wall(side, spec, entry_px, snap.realized_vol_5m, tfi * dir_s)
+        {
             return Err("VETO_PREFLIGHT_OPPOSING_OB_WALL");
         }
         let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
@@ -1178,7 +1350,11 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => (best_bid.qty.0, best_ask.qty.0),
             Side::Ask => (best_ask.qty.0, best_bid.qty.0),
         };
-        let geom_floor_lo = if signed_snr >= 0.68 && own_q_pre >= opp_q_pre { -0.06 } else { 0.00 };
+        let geom_floor_lo = if signed_snr >= 0.68 && own_q_pre >= opp_q_pre {
+            -0.06
+        } else {
+            0.00
+        };
         let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(geom_floor_lo, 0.06);
         if signed_geom < min_pre_geom {
             return Err("VETO_PREFLIGHT_GEOM_REVERSAL");
@@ -1193,14 +1369,17 @@ impl OnlineAdaptiveGovernor {
             side,
             btc_snr,
         )?;
-
         let (drift_bps, ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
         if let Ok(ok_pair) = self.evaluate_kinematic_energy_surface(
-            slot_idx, side, drift_bps, ext_bps, signed_geom, signed_snr,
+            slot_idx,
+            side,
+            drift_bps,
+            ext_bps,
+            signed_geom,
+            signed_snr,
         ) {
             return Ok(ok_pair);
         }
-
         let d = Self::dir_idx(side);
         evaluate_preflight_hysteresis_core(
             side,
@@ -1258,10 +1437,14 @@ impl OnlineAdaptiveGovernor {
             2_usize
         };
         for p in &paths[..path_count] {
-            let Ok(file) = std::fs::File::open(p) else { continue };
+            let Ok(file) = std::fs::File::open(p) else {
+                continue;
+            };
             let reader = std::io::BufReader::new(file);
             for line in reader.lines().map_while(Result::ok) {
-                let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
                 if let Some((key, payload)) =
                     Self::parse_historical_trade_scar_tuple(&val, snap_ts_ns)
                 {
@@ -1301,6 +1484,7 @@ mod tests {
     use crate::kinematic_surface::UNIFIED_LOSS_LAB_COUNT;
     use crate::lob_shm::BookLevel;
     use crate::types::BoundedScore;
+    use std::sync::mpsc;
 
     #[test]
     fn test_governor_12x2_loss_lab_staircase_abort_and_scar_json() {
@@ -1316,13 +1500,21 @@ mod tests {
         let t0 = 1_700_000_000_000_000_000_i64;
         for step in 0..3_i64 {
             gov.observe_closed_trade_at_entry(
-                3, Side::Bid, PriceTicks(8_200 + step * 5), ScaledBps(220),
-                true, TimestampNs(t0 + step * 120_000_000_000),
+                3,
+                Side::Bid,
+                PriceTicks(8_200 + step * 5),
+                ScaledBps(220),
+                true,
+                TimestampNs(t0 + step * 120_000_000_000),
             );
         }
         gov.observe_closed_trade_at_entry(
-            3, Side::Ask, PriceTicks(8_212), ScaledBps(45),
-            true, TimestampNs(t0 + 400_000_000_000),
+            3,
+            Side::Ask,
+            PriceTicks(8_212),
+            ScaledBps(45),
+            true,
+            TimestampNs(t0 + 400_000_000_000),
         );
         assert_eq!(
             gov.audit_historical_entry_veto(3, Side::Bid, 8_225, t0 + 600_000_000_000),
@@ -1335,7 +1527,9 @@ mod tests {
 
         for a in 0..4_i64 {
             gov.observe_entry_abort(
-                3, Side::Bid, PriceTicks(8_205),
+                3,
+                Side::Bid,
+                PriceTicks(8_205),
                 TimestampNs(t0 + 700_000_000_000 + a * 1_000_000_000),
             );
         }
@@ -1352,8 +1546,8 @@ mod tests {
 
     #[test]
     fn test_scar64_scar65_dedup_rehydrate_and_preflight_non_choking() {
-        let tmp_scar = std::env::temp_dir().join("vortex_gov_scar_dedup_23a.jsonl");
-        let tmp_red = std::env::temp_dir().join("vortex_gov_red_loss_23a.jsonl");
+        let tmp_scar = std::env::temp_dir().join("vortex_gov_scar_dedup_42b.jsonl");
+        let tmp_red = std::env::temp_dir().join("vortex_gov_red_loss_42b.jsonl");
         let scar_lines = concat!(
             "{\"ts_ns\":1793979746124021595,\"symbol\":\"TAOUSDT\",",
             "\"side\":\"Bid\",\"entry_ticks\":22413,\"net_bps\":0.46,\"maker_exit\":true}\n",
@@ -1374,6 +1568,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp_red);
         assert_eq!(unique_cnt, 2);
         assert!(gov.is_in_scar_debt(7, Side::Bid));
+        assert!(gov.slot_taker_prob_permille(7, Side::Bid) > 50);
 
         let mut btc = SymbolLobSnapshot::new_empty();
         btc.symbol_id = APPROVED_SPECS[0].symbol_id;
@@ -1384,7 +1579,6 @@ mod tests {
         btc.factor_ofi = BoundedScore::new_clamped(0.55);
         btc.factor_tfi = BoundedScore::new_clamped(0.60);
         btc.factor_geom = BoundedScore::new_clamped(0.25);
-
         let mut link = btc;
         link.symbol_id = APPROVED_SPECS[9].symbol_id;
         link.bids[0] = BookLevel { price: PriceTicks(10_500), qty: LotQty(320) };
@@ -1401,7 +1595,6 @@ mod tests {
     fn test_utc_funding_entry_filter_and_ssot_risk_parity_sizer() {
         let gov = OnlineAdaptiveGovernor::new();
         let w_live = 6_628_080_000_i64;
-        // Exact UTC midnight >= 2020: 1_762_992_000 = 20,405 * 86,400s (00:00:00 UTC)
         let day0_ns = 1_762_992_000_000_000_000_i64;
         let prime_1430_ns = TimestampNs(day0_ns + 14 * 3_600_000_000_000 + 1_800_000_000_000);
         let trough_2030_ns = TimestampNs(day0_ns + 20 * 3_600_000_000_000 + 1_800_000_000_000);
@@ -1418,7 +1611,6 @@ mod tests {
         btc.factor_tfi = BoundedScore::new_clamped(0.65);
         btc.factor_geom = BoundedScore::new_clamped(0.30);
 
-        // Marginal AVAX setup: SNR = 0.45*0.47 + 0.35*0.48 + 0.20*0.37 = 0.4535, E_kin = 157
         let mut avax = SymbolLobSnapshot::new_empty();
         avax.symbol_id = APPROVED_SPECS[3].symbol_id;
         avax.ts_local_ns = prime_1430_ns;
@@ -1430,7 +1622,6 @@ mod tests {
         avax.factor_tfi = BoundedScore::new_clamped(0.48);
         avax.factor_geom = BoundedScore::new_clamped(0.37);
 
-        // Passes in 14:30 UTC overlap; blocked in 20:30 UTC calm trough & -75s funding cut
         assert!(gov.authorizes_adaptive_entry_with_wallet(3, Side::Bid, w_live, &avax, &btc));
         avax.ts_local_ns = trough_2030_ns;
         avax.realized_vol_5m = ScaledBps(2_800);
@@ -1439,12 +1630,10 @@ mod tests {
         avax.realized_vol_5m = ScaledBps(3_200);
         assert!(!gov.authorizes_adaptive_entry_with_wallet(3, Side::Bid, w_live, &avax, &btc));
 
-        // Real structural breakout (vol_5m = 12_000 > 1.10x eq_vol) melts off-peak penalty
         avax.ts_local_ns = trough_2030_ns;
         avax.realized_vol_5m = ScaledBps(12_000);
         assert!(gov.authorizes_adaptive_entry_with_wallet(3, Side::Bid, w_live, &avax, &btc));
 
-        // SSOT compute_slot_entry_lots enforces constant-dollar risk parity & even split lots
         avax.ts_local_ns = prime_1430_ns;
         avax.realized_vol_5m = ScaledBps(2_500);
         let lots_calm = gov.compute_slot_entry_lots(3, Side::Bid, w_live, &avax);
@@ -1453,5 +1642,108 @@ mod tests {
         assert!(lots_calm.0 > lots_storm.0);
         assert_eq!(lots_calm.0 % 2, 0);
         assert_eq!(lots_storm.0 % 2, 0);
+    }
+
+    #[test]
+    fn test_local_scar_runner_sovereignty_and_live_shm_v15_funding_carry() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let w_live = 20_000_000_000_i64;
+        let t0 = 1_762_992_000_000_000_000_i64 + 14 * 3_600_000_000_000;
+
+        // Inflict deep global Bid scar on Slot 7 (-140 bps total -> global_dir_debt < -6_000)
+        gov.observe_closed_trade_at_entry(
+            7, Side::Bid, PriceTicks(16_000), ScaledBps(-7_000), false, TimestampNs(t0),
+        );
+        gov.observe_closed_trade_at_entry(
+            7, Side::Bid, PriceTicks(15_900), ScaledBps(-7_000), false, TimestampNs(t0 + 1_000),
+        );
+        assert!(gov.is_in_scar_debt(3, Side::Bid));
+        assert!(!gov.is_in_local_slot_scar_debt(3, Side::Bid));
+
+        // Clean Slot 3 preserves full 350 permille (35/65 Runner) while bruised Slot 7 shifts defensive
+        let t1_clean = gov.learned_tranche1_fraction_permille(3, Side::Bid, 1_600);
+        let t1_bruised = gov.learned_tranche1_fraction_permille(7, Side::Bid, 1_600);
+        assert_eq!(t1_clean, 350);
+        assert!(t1_bruised >= 470);
+
+        // Live SHM v15 funding (+2.50 bps = +250 ScaledBps, Long pays Short) 90s before 16:00 UTC cut
+        let cut_ns = 1_762_992_000_000_000_000_i64 + 16 * 3_600_000_000_000;
+        let pre_cut = TimestampNs(cut_ns - 90_000_000_000);
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+        snap.ts_local_ns = pre_cut;
+        snap.realized_vol_5m = ScaledBps(5_200);
+        snap.funding_rate_scaled_bps = ScaledBps(250);
+        snap.next_funding_ts_ns = TimestampNs(cut_ns);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_170), qty: LotQty(450) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_171), qty: LotQty(450) };
+        snap.refresh_deep_l1_l5_totals();
+
+        let fresh_gov = OnlineAdaptiveGovernor::new();
+        let cad_long_payer = fresh_gov.slot_temporal_cadence_for_side(3, Some(Side::Bid), &snap);
+        let cad_short_recv = fresh_gov.slot_temporal_cadence_for_side(3, Some(Side::Ask), &snap);
+        assert!(cad_long_payer.kin_energy_min_delta_bps > cad_short_recv.kin_energy_min_delta_bps + 60);
+        assert!(cad_short_recv.kelly_lot_mult_permille > cad_long_payer.kelly_lot_mult_permille);
+        let lots_payer = fresh_gov.compute_slot_entry_lots(3, Side::Bid, w_live, &snap);
+        let lots_recv = fresh_gov.compute_slot_entry_lots(3, Side::Ask, w_live, &snap);
+        assert!(lots_recv.0 >= lots_payer.0);
+    }
+
+    #[test]
+    fn test_btc_oversized_lot_regime_shift_shadow_rehab_and_async_prewarm() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let w_small = 6_569_400_000_i64;
+        let t0 = 1_762_992_000_000_000_000_i64 + 14 * 3_600_000_000_000 + 1_800_000_000_000;
+        gov.seed_prewarm_slot_emas(0, 6_560_000_000, 6_556_720_000, 4_800, t0);
+
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.ts_local_ns = TimestampNs(t0);
+        btc.realized_vol_5m = ScaledBps(4_800);
+        btc.bids[0] = BookLevel { price: PriceTicks(656_000), qty: LotQty(450) };
+        btc.asks[0] = BookLevel { price: PriceTicks(656_001), qty: LotQty(280) };
+        btc.refresh_deep_l1_l5_totals();
+        btc.factor_ofi = BoundedScore::new_clamped(0.88);
+        btc.factor_tfi = BoundedScore::new_clamped(0.90);
+        btc.factor_geom = BoundedScore::new_clamped(0.62);
+        assert!(gov.authorizes_adaptive_entry_with_wallet(0, Side::Bid, w_small, &btc, &btc));
+
+        // 1 SL on BTCUSDT (-22.00 bps) locks oversized-lot conviction guard
+        gov.observe_closed_trade_at_entry(
+            0, Side::Bid, PriceTicks(656_000), ScaledBps(-2_200), false, TimestampNs(t0),
+        );
+        assert!(gov.is_in_local_slot_scar_debt(0, Side::Bid));
+
+        // Law III SCAR-LOCK: 6 hours of calm operational silence (no regime shift) NEVER unlocks BTC
+        for step in 1..=12_i64 {
+            btc.ts_local_ns = TimestampNs(t0 + 3_600_000_000_000 + step * 300_000_000_000);
+            gov.step_regime_shift_shadow_rehab(0, &btc);
+        }
+        assert!(gov.is_in_local_slot_scar_debt(0, Side::Bid));
+        assert!(!gov.authorizes_adaptive_entry_with_wallet(0, Side::Bid, w_small, &btc, &btc));
+
+        // True structural volatility expansion (4_800 -> 8_200) + 3 spaced shadow impulses unlocks BTC
+        let t_shift = t0 + 8 * 300_000_000_000;
+        gov.seed_prewarm_slot_emas(0, 6_560_000_000, 6_556_720_000, 8_200, t_shift);
+        btc.realized_vol_5m = ScaledBps(8_200);
+        for k in 0..3_i64 {
+            btc.ts_local_ns = TimestampNs(t_shift + k * 300_000_000_000);
+            gov.step_regime_shift_shadow_rehab(0, &btc);
+        }
+        assert!(!gov.is_in_local_slot_scar_debt(0, Side::Bid));
+        assert!(gov.authorizes_adaptive_entry_with_wallet(0, Side::Bid, w_small, &btc, &btc));
+
+        // Verify zero-alloc off-thread EMA prewarm dispatch + GOV_SCAR_SNAPSHOT plasticity round-trip
+        let (v_tx, v_rx) = mpsc::sync_channel::<VaultIoCommand>(4);
+        gov.dispatch_ema_prewarm_async(TimestampNs(t_shift), &v_tx);
+        assert!(matches!(v_rx.try_recv(), Ok(VaultIoCommand::SaveEmaPrewarm { .. })));
+
+        gov.set_active_fee_schedule(FeeSchedule::from_live_rates_clamped(
+            ScaledBps(140), ScaledBps(400),
+        ));
+        let snap_json = gov.to_scar_snapshot_json(TimestampNs(t_shift));
+        let mut g_restored = OnlineAdaptiveGovernor::new();
+        assert_eq!(g_restored.apply_scar_snapshot_json(&snap_json), Some(TimestampNs(t_shift)));
+        assert_eq!(g_restored.active_fee_schedule().maker_fee_bps, ScaledBps(140));
     }
 }

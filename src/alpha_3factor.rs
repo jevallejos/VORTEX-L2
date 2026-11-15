@@ -804,6 +804,304 @@ impl OrthogonalFactorState {
     }
 }
 
+// === VORTEX-OMEGA V4.5 ALPHA PROD ===
+const V45_PHI: f64 = 1.618_033_988_749_895;
+const V45_INV_PHI: f64 = 0.618_033_988_749_895;
+const V45_EPPS_BUCKET_NS: i64 = 5_000_000_000;
+const V45_EPPS_TAU_SECS: f64 = 120.0;
+const V45_EPPS_PRIOR_VAR_BPS2: f64 = 25.0;
+const V45_FAST_RATE_TAU_SECS: f64 = 2.0;
+const V45_EQ_RATE_TAU_SECS: f64 = 60.0;
+const V45_SPOOF_TAU_SECS: f64 = 15.0;
+const V45_SEED_RATE_HZ: f64 = 10.0;
+
+/// O(1) Zero-Alloc 5-second Epps-aware correlation & signed beta estimator against `BTCUSDT`.
+#[derive(Copy, Clone, Debug)]
+pub struct EppsBtcCorrelationTracker {
+    last_bucket_ts_ns: i64,
+    prev_own_mid_ticks: i64,
+    prev_btc_mid_ticks: i64,
+    var_own_bps2: f64,
+    var_btc_bps2: f64,
+    cov_own_btc_bps2: f64,
+}
+
+impl Default for EppsBtcCorrelationTracker {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops
+)]
+impl EppsBtcCorrelationTracker {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_bucket_ts_ns: 0,
+            prev_own_mid_ticks: 0,
+            prev_btc_mid_ticks: 0,
+            var_own_bps2: 0.0,
+            var_btc_bps2: 0.0,
+            cov_own_btc_bps2: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn observe_5s_pair(
+        &mut self,
+        ts_ns: crate::types::TimestampNs,
+        is_btc_slot: bool,
+        own_mid: crate::types::PriceTicks,
+        btc_mid: crate::types::PriceTicks,
+    ) {
+        if own_mid.0 <= 0 || btc_mid.0 <= 0 || ts_ns.0 <= 0 {
+            return;
+        }
+        if is_btc_slot {
+            self.last_bucket_ts_ns = ts_ns.0;
+            self.prev_own_mid_ticks = own_mid.0;
+            self.prev_btc_mid_ticks = btc_mid.0;
+            return;
+        }
+        if self.last_bucket_ts_ns <= 0
+            || ts_ns.0 < self.last_bucket_ts_ns
+            || self.prev_own_mid_ticks <= 0
+            || self.prev_btc_mid_ticks <= 0
+        {
+            self.last_bucket_ts_ns = ts_ns.0;
+            self.prev_own_mid_ticks = own_mid.0;
+            self.prev_btc_mid_ticks = btc_mid.0;
+            return;
+        }
+        let dt_ns = ts_ns.0 - self.last_bucket_ts_ns;
+        if dt_ns < V45_EPPS_BUCKET_NS {
+            return;
+        }
+        let dt_s = ((dt_ns as f64) * 1e-9).clamp(5.0, 60.0);
+        let alpha = 1.0 - (-dt_s / V45_EPPS_TAU_SECS).exp();
+        let r_own = (((own_mid.0 - self.prev_own_mid_ticks) as f64) * 10_000.0
+            / (self.prev_own_mid_ticks as f64))
+            .clamp(-500.0, 500.0);
+        let r_btc = (((btc_mid.0 - self.prev_btc_mid_ticks) as f64) * 10_000.0
+            / (self.prev_btc_mid_ticks as f64))
+            .clamp(-500.0, 500.0);
+
+        self.var_own_bps2 = (1.0 - alpha) * self.var_own_bps2 + alpha * (r_own * r_own);
+        self.var_btc_bps2 = (1.0 - alpha) * self.var_btc_bps2 + alpha * (r_btc * r_btc);
+        self.cov_own_btc_bps2 = (1.0 - alpha) * self.cov_own_btc_bps2 + alpha * (r_own * r_btc);
+        self.last_bucket_ts_ns = ts_ns.0;
+        self.prev_own_mid_ticks = own_mid.0;
+        self.prev_btc_mid_ticks = btc_mid.0;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn correlation(&self, is_btc_slot: bool) -> f64 {
+        if is_btc_slot {
+            return 1.0;
+        }
+        let num = self.cov_own_btc_bps2 + V45_INV_PHI * V45_EPPS_PRIOR_VAR_BPS2;
+        let v_own = (self.var_own_bps2 + V45_EPPS_PRIOR_VAR_BPS2).max(1e-6);
+        let v_btc = (self.var_btc_bps2 + V45_EPPS_PRIOR_VAR_BPS2).max(1e-6);
+        (num / (v_own * v_btc).sqrt()).clamp(-1.0, 1.0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn correlated_beta(
+        &self,
+        is_btc_slot: bool,
+        own_vol: crate::types::ScaledBps,
+        btc_vol: crate::types::ScaledBps,
+    ) -> f64 {
+        if is_btc_slot {
+            return 1.0;
+        }
+        let rho = self.correlation(false);
+        let s_own = own_vol.raw().max(100) as f64;
+        let s_btc = btc_vol.raw().max(100) as f64;
+        (rho * (s_own / s_btc)).clamp(-V45_PHI, V45_PHI)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn correlated_beta_x1000(
+        &self,
+        is_btc_slot: bool,
+        own_vol: crate::types::ScaledBps,
+        btc_vol: crate::types::ScaledBps,
+    ) -> i64 {
+        (self.correlated_beta(is_btc_slot, own_vol, btc_vol) * 1_000.0)
+            .round()
+            .clamp(-1_618.0, 1_618.0) as i64
+    }
+}
+
+/// O(1) Event-Clock time-dilation (`[phi^-1, phi]`) and anti-spoof `GEOM` weight modulator.
+#[derive(Copy, Clone, Debug)]
+pub struct EventClockAlphaModulator {
+    last_real_ts_ns: i64,
+    virtual_clock_ns: i64,
+    fast_ewma_events: f64,
+    eq_ewma_events: f64,
+    spoof_density_ewma: f64,
+}
+
+pub type Orthogonality3FactorEngine = EventClockAlphaModulator;
+
+impl Default for EventClockAlphaModulator {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops
+)]
+impl EventClockAlphaModulator {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_real_ts_ns: 0,
+            virtual_clock_ns: 0,
+            fast_ewma_events: V45_SEED_RATE_HZ * V45_FAST_RATE_TAU_SECS,
+            eq_ewma_events: V45_SEED_RATE_HZ * V45_EQ_RATE_TAU_SECS,
+            spoof_density_ewma: 0.0,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn spoofing_density(&self) -> f64 {
+        self.spoof_density_ewma
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn event_clock_dilation(&self) -> f64 {
+        let fast_hz = (self.fast_ewma_events / V45_FAST_RATE_TAU_SECS).max(0.05);
+        let eq_hz = (self.eq_ewma_events / V45_EQ_RATE_TAU_SECS).max(1.0);
+        (fast_hz / eq_hz).sqrt().clamp(V45_INV_PHI, V45_PHI)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn adaptive_factor_weights(&self) -> (f64, f64, f64) {
+        OrthogonalFactorState::adaptive_weights_from_spoof_density(self.spoof_density_ewma)
+    }
+
+    /// Updates arrival-rate clock & spoofing EWMA; preserves zero phantom decay when `dt == 0`.
+    #[inline]
+    pub fn step_event_clock_and_spoof(
+        &mut self,
+        real_ts_ns: crate::types::TimestampNs,
+        ofi: crate::types::BoundedScore,
+        tfi: crate::types::BoundedScore,
+    ) -> crate::types::TimestampNs {
+        if real_ts_ns.0 <= 0 {
+            return real_ts_ns;
+        }
+        if self.last_real_ts_ns <= 0 || real_ts_ns.0 < self.last_real_ts_ns {
+            self.last_real_ts_ns = real_ts_ns.0;
+            self.virtual_clock_ns = real_ts_ns.0;
+            return crate::types::TimestampNs(self.virtual_clock_ns);
+        }
+        let dt_ns = real_ts_ns.0 - self.last_real_ts_ns;
+        if dt_ns == 0 {
+            return crate::types::TimestampNs(self.virtual_clock_ns);
+        }
+        let dt_s = ((dt_ns as f64) * 1e-9).clamp(1e-6, 30.0);
+        self.fast_ewma_events =
+            self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
+        self.eq_ewma_events =
+            self.eq_ewma_events * (-dt_s / V45_EQ_RATE_TAU_SECS).exp() + 1.0;
+
+        let ofi_f = f64::from(ofi.to_bps_i32()) / 10_000.0;
+        let tfi_f = f64::from(tfi.to_bps_i32()) / 10_000.0;
+        let i_spoof = if ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05 {
+            1.0
+        } else {
+            0.0
+        };
+        let alpha_sp = 1.0 - (-dt_s / V45_SPOOF_TAU_SECS).exp();
+        self.spoof_density_ewma =
+            ((1.0 - alpha_sp) * self.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
+
+        let kappa = self.event_clock_dilation();
+        let eff_step_ns = (((dt_ns as f64) * kappa).round() as i64).max(1);
+        self.virtual_clock_ns = self.virtual_clock_ns.saturating_add(eff_step_ns);
+        self.last_real_ts_ns = real_ts_ns.0;
+        crate::types::TimestampNs(self.virtual_clock_ns)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn adaptive_composite_snr(
+        &self,
+        ofi: crate::types::BoundedScore,
+        tfi: crate::types::BoundedScore,
+        geom: crate::types::BoundedScore,
+    ) -> crate::types::BoundedScore {
+        let (w_ofi, w_tfi, w_geom) = self.adaptive_factor_weights();
+        let x_ofi = f64::from(ofi.to_bps_i32()) / 10_000.0;
+        let x_tfi = f64::from(tfi.to_bps_i32()) / 10_000.0;
+        let x_geom = f64::from(geom.to_bps_i32()) / 10_000.0;
+        crate::types::BoundedScore::new_clamped(w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom)
+    }
+}
+
+#[allow(clippy::suboptimal_flops)]
+impl OrthogonalFactorState {
+    #[inline]
+    #[must_use]
+    pub fn adaptive_weights_from_spoof_density(spoof_density: f64) -> (f64, f64, f64) {
+        let excess = ((spoof_density.clamp(0.0, 1.0) - 0.15) / 0.55).clamp(0.0, 1.0);
+        let w_geom = 0.20 * (1.0 - V45_INV_PHI * excess);
+        let dw = 0.20 - w_geom;
+        let w_tfi = 0.35 + V45_INV_PHI * dw;
+        let w_ofi = 1.0 - w_tfi - w_geom;
+        (w_ofi, w_tfi, w_geom)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn adaptive_snr_from_snapshot(
+        snap: &crate::lob_shm::SymbolLobSnapshot,
+        spoof_density: f64,
+    ) -> crate::types::BoundedScore {
+        let (w_ofi, w_tfi, w_geom) = Self::adaptive_weights_from_spoof_density(spoof_density);
+        let x_ofi = f64::from(snap.factor_ofi.to_bps_i32()) / 10_000.0;
+        let x_tfi = f64::from(snap.factor_tfi.to_bps_i32()) / 10_000.0;
+        let x_geom = f64::from(snap.factor_geom.to_bps_i32()) / 10_000.0;
+        crate::types::BoundedScore::new_clamped(w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom)
+    }
+
+    /// Signed Epps-corrected lead-lag propagation beta (`0.0` on Slot 0 `BTCUSDT`, `[-PHI, +PHI]` on alts).
+    #[inline]
+    #[must_use]
+    pub fn epps_correlated_lead_lag_beta(
+        slot_idx: usize,
+        snap: &crate::lob_shm::SymbolLobSnapshot,
+        btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+        tracker: &EppsBtcCorrelationTracker,
+    ) -> f64 {
+        if slot_idx == 0 {
+            return 0.0;
+        }
+        tracker.correlated_beta(false, snap.realized_vol_5m, btc_leader_snap.realized_vol_5m)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
@@ -1118,5 +1416,154 @@ mod omega_chat5_alpha_tests {
         let beta_avax = OrthogonalFactorState::epps_btc_lead_lag_beta(3, &avax, &btc);
         assert!(beta_btc0.abs() < 1e-9);
         assert!((1.40..=1.55).contains(&beta_avax));
+    }
+}
+
+// === VORTEX-OMEGA V4.5 ALPHA TESTS ===
+#[cfg(test)]
+mod omega_v45_alpha_tests {
+    use super::*;
+    use crate::lob_shm::SymbolLobSnapshot;
+    use crate::types::{BoundedScore, PriceTicks, ScaledBps, TimestampNs};
+
+    #[test]
+    fn test_event_clock_time_dilation_burst_acceleration_and_trough_slowdown() {
+        let mut clock = EventClockAlphaModulator::new();
+        assert!((clock.event_clock_dilation() - 1.0).abs() < 1e-6);
+
+        let mut ts = 1_794_700_000_000_000_000_i64;
+        let ofi_clean = BoundedScore::new_clamped(0.50);
+        let tfi_clean = BoundedScore::new_clamped(0.45);
+        let v0 = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
+        assert_eq!(v0.0, ts);
+
+        // Same-packet burst (dt == 0) must produce zero phantom clock advance
+        let v_same = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
+        assert_eq!(v_same.0, v0.0);
+
+        // 200 Hz high-activity burst over 1.5s -> dilates cleanly up to PHI (1.618x)
+        for _ in 0..300 {
+            ts += 5_000_000;
+            let _ = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
+        }
+        assert!((clock.event_clock_dilation() - V45_PHI).abs() < 1e-6);
+
+        // 1 Hz quiet off-peak trough over 12s -> contracts cleanly down to INV_PHI (0.618x)
+        for _ in 0..12 {
+            ts += 1_000_000_000;
+            let _ = clock.step_event_clock_and_spoof(TimestampNs(ts), ofi_clean, tfi_clean);
+        }
+        assert!((clock.event_clock_dilation() - V45_INV_PHI).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_anti_spoof_geom_attenuation_and_partition_of_unity() {
+        let mut eng = Orthogonality3FactorEngine::new();
+        let (w_o0, w_t0, w_g0) = eng.adaptive_factor_weights();
+        assert!((w_o0 - 0.45).abs() < 1e-9);
+        assert!((w_t0 - 0.35).abs() < 1e-9);
+        assert!((w_g0 - 0.20).abs() < 1e-9);
+
+        // Fake passive L1-L10 wall (GEOM = +0.98, OFI = +0.72) while real tape sells (TFI = -0.48)
+        let ofi_spoof = BoundedScore::new_clamped(0.72);
+        let tfi_real = BoundedScore::new_clamped(-0.48);
+        let geom_wall = BoundedScore::new_clamped(0.98);
+        let snr_clean_weights = eng.adaptive_composite_snr(ofi_spoof, tfi_real, geom_wall);
+
+        let mut ts = 1_794_700_100_000_000_000_i64;
+        for _ in 0..35 {
+            ts += 1_000_000_000;
+            let _ = eng.step_event_clock_and_spoof(TimestampNs(ts), ofi_spoof, tfi_real);
+        }
+        assert!(eng.spoofing_density() > 0.75);
+        let (w_o1, w_t1, w_g1) = eng.adaptive_factor_weights();
+        assert!((w_o1 + w_t1 + w_g1 - 1.0).abs() < 1e-12);
+        assert!(w_g1 < 0.080 && w_t1 > 0.420);
+
+        let snr_attenuated = eng.adaptive_composite_snr(ofi_spoof, tfi_real, geom_wall);
+        assert!(snr_attenuated.to_bps_i32() + 1_100 < snr_clean_weights.to_bps_i32());
+    }
+
+    #[test]
+    fn test_epps_5s_btc_correlation_positive_decoupled_and_inverse_beta() {
+        let mut btc_self = EppsBtcCorrelationTracker::new();
+        btc_self.observe_5s_pair(
+            TimestampNs(10_000_000_000),
+            true,
+            PriceTicks(680_000),
+            PriceTicks(680_000),
+        );
+        assert!((btc_self.correlation(true) - 1.0).abs() < 1e-9);
+        assert_eq!(
+            btc_self.correlated_beta_x1000(true, ScaledBps(6_000), ScaledBps(6_000)),
+            1_000
+        );
+
+        let mut pos_trk = EppsBtcCorrelationTracker::new();
+        assert!((pos_trk.correlation(false) - V45_INV_PHI).abs() < 1e-6);
+        let mut ts = 1_794_700_000_000_000_000_i64;
+        pos_trk.observe_5s_pair(
+            TimestampNs(ts),
+            false,
+            PriceTicks(10_000),
+            PriceTicks(680_000),
+        );
+        // Sub-5s asynchronous print ignored by Epps filter
+        pos_trk.observe_5s_pair(
+            TimestampNs(ts + 2_000_000_000),
+            false,
+            PriceTicks(10_050),
+            PriceTicks(679_500),
+        );
+        assert!((pos_trk.correlation(false) - V45_INV_PHI).abs() < 1e-6);
+
+        for step in 1..=32_i64 {
+            ts += 5_000_000_000;
+            let up = (step % 2) == 1;
+            let own_px = if up { 10_015 } else { 10_000 };
+            let btc_px = if up { 680_680 } else { 680_000 };
+            pos_trk.observe_5s_pair(
+                TimestampNs(ts),
+                false,
+                PriceTicks(own_px),
+                PriceTicks(btc_px),
+            );
+        }
+        assert!(pos_trk.correlation(false) > 0.88);
+        assert!(pos_trk.correlated_beta(false, ScaledBps(9_000), ScaledBps(6_000)) > 1.25);
+
+        let mut inv_trk = EppsBtcCorrelationTracker::new();
+        let mut ts_i = 1_794_705_000_000_000_000_i64;
+        for step in 0..=40_i64 {
+            let up = (step % 2) == 1;
+            let own_px = if up { 9_985 } else { 10_000 };
+            let btc_px = if up { 680_680 } else { 680_000 };
+            inv_trk.observe_5s_pair(
+                TimestampNs(ts_i),
+                false,
+                PriceTicks(own_px),
+                PriceTicks(btc_px),
+            );
+            ts_i += 5_000_000_000;
+        }
+        assert!(inv_trk.correlation(false) < -0.70);
+        assert!(inv_trk.correlated_beta_x1000(false, ScaledBps(9_000), ScaledBps(6_000)) < -950);
+
+        let mut btc_snap = SymbolLobSnapshot::new_empty();
+        btc_snap.realized_vol_5m = ScaledBps(6_000);
+        let mut alt_snap = SymbolLobSnapshot::new_empty();
+        alt_snap.realized_vol_5m = ScaledBps(9_000);
+        assert!(
+            OrthogonalFactorState::epps_correlated_lead_lag_beta(
+                0, &btc_snap, &btc_snap, &inv_trk
+            )
+            .abs()
+                < 1e-9
+        );
+        assert!(
+            OrthogonalFactorState::epps_correlated_lead_lag_beta(
+                2, &alt_snap, &btc_snap, &inv_trk
+            ) < -0.95
+        );
     }
 }

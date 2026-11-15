@@ -1196,6 +1196,8 @@ pub fn print_auto_aligned_box(sections: &[Vec<String>]) {
     println!("\u{255a}{}\u{255d}", horiz);
 }
 
+pub use crate::fee_cadence_beta::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;

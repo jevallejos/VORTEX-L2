@@ -874,6 +874,203 @@ impl CausalElliottWaveState {
     }
 }
 
+// === VORTEX-OMEGA V4.5 WAVE PROD ===
+const V45_WAVE_INV_PHI: f64 = 0.618_033_988_749_895;
+const V45_WAVE_PHI_SQ: f64 = 2.618_033_988_749_895;
+const V45_WAVE_PHI_CU: f64 = 4.236_067_977_499_79;
+const V45_FLOW_TAU_SECS: f64 = 300.0;
+const V45_LIQ_DECAY_TAU_SECS: f64 = 15.0;
+
+/// O(1) Zero-Alloc endogenous liquidation denominator anchored to each pair's own trade notional.
+#[derive(Copy, Clone, Debug)]
+pub struct EndogenousLiquidationFloor {
+    ewma_trade_notional: f64,
+    seed_floor: f64,
+    forced_buy_accum: f64,
+    forced_sell_accum: f64,
+    last_ts_ns: i64,
+}
+
+impl Default for EndogenousLiquidationFloor {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            ewma_trade_notional: 50.0,
+            seed_floor: 130.9,
+            forced_buy_accum: 0.0,
+            forced_sell_accum: 0.0,
+            last_ts_ns: 0,
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+impl EndogenousLiquidationFloor {
+    #[inline]
+    #[must_use]
+    pub fn new_for_spec(
+        spec: crate::types::PairSpec,
+        ref_mid: crate::types::PriceTicks,
+    ) -> Self {
+        let px_usdt = ((ref_mid.0.max(1) as f64) * (spec.tick_size_1e8.max(1) as f64)) * 1e-8;
+        let step_qty = (spec.lot_step_1e8.max(1) as f64) * 1e-8;
+        let min_notional = (px_usdt * step_qty).max(5.0);
+        let seed_trade = (V45_WAVE_PHI_CU * min_notional).clamp(20.0, 9_500.0);
+        let init_floor = (V45_WAVE_PHI_SQ * seed_trade).clamp(50.0, 25_000.0);
+        Self {
+            ewma_trade_notional: seed_trade,
+            seed_floor: init_floor,
+            forced_buy_accum: 0.0,
+            forced_sell_accum: 0.0,
+            last_ts_ns: 0,
+        }
+    }
+
+    #[inline]
+    fn decay_to_timestamp(&mut self, ts_ns: crate::types::TimestampNs) -> f64 {
+        if ts_ns.0 <= 0 {
+            return 0.0;
+        }
+        if self.last_ts_ns <= 0 || ts_ns.0 <= self.last_ts_ns {
+            if self.last_ts_ns <= 0 {
+                self.last_ts_ns = ts_ns.0;
+            }
+            return 0.0;
+        }
+        let dt_s = (((ts_ns.0 - self.last_ts_ns) as f64) * 1e-9).clamp(0.0, 120.0);
+        let liq_decay = (-dt_s / V45_LIQ_DECAY_TAU_SECS).exp();
+        self.forced_buy_accum *= liq_decay;
+        self.forced_sell_accum *= liq_decay;
+        self.last_ts_ns = ts_ns.0;
+        dt_s
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn print_notional_usdt(
+        spec: crate::types::PairSpec,
+        price: crate::types::PriceTicks,
+        qty: crate::types::LotQty,
+    ) -> f64 {
+        let px_usdt = ((price.0.max(0) as f64) * (spec.tick_size_1e8.max(1) as f64)) * 1e-8;
+        let units = ((qty.0.max(0) as f64) * (spec.lot_step_1e8.max(1) as f64)) * 1e-8;
+        (px_usdt * units).max(0.0)
+    }
+
+    #[inline]
+    pub fn observe_trade_print(
+        &mut self,
+        spec: crate::types::PairSpec,
+        ts_ns: crate::types::TimestampNs,
+        price: crate::types::PriceTicks,
+        qty: crate::types::LotQty,
+    ) {
+        let dt_s = self.decay_to_timestamp(ts_ns);
+        let notional = Self::print_notional_usdt(spec, price, qty);
+        if notional <= 0.0 {
+            return;
+        }
+        let eff_dt = dt_s.max(0.05);
+        let alpha = (1.0 - (-eff_dt / V45_FLOW_TAU_SECS).exp()).clamp(0.002, 0.25);
+        self.ewma_trade_notional =
+            (1.0 - alpha) * self.ewma_trade_notional + alpha * notional.clamp(5.0, 100_000.0);
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn floor_usdt(&self) -> f64 {
+        if self.ewma_trade_notional <= 0.0 {
+            self.seed_floor.clamp(50.0, 25_000.0)
+        } else {
+            (V45_WAVE_PHI_SQ * self.ewma_trade_notional).clamp(50.0, 25_000.0)
+        }
+    }
+
+    #[inline]
+    pub fn observe_liquidation_print(
+        &mut self,
+        spec: crate::types::PairSpec,
+        ts_ns: crate::types::TimestampNs,
+        forced_book_side: crate::types::Side,
+        price: crate::types::PriceTicks,
+        qty: crate::types::LotQty,
+    ) -> crate::types::BoundedScore {
+        let _ = self.decay_to_timestamp(ts_ns);
+        let notional = Self::print_notional_usdt(spec, price, qty);
+        match forced_book_side {
+            crate::types::Side::Bid => self.forced_buy_accum += notional,
+            crate::types::Side::Ask => self.forced_sell_accum += notional,
+        }
+        self.current_imbalance()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn current_imbalance(&self) -> crate::types::BoundedScore {
+        let denom = self.floor_usdt() + self.forced_buy_accum + self.forced_sell_accum;
+        let z = ((self.forced_buy_accum - self.forced_sell_accum) / denom.max(1.0)).tanh();
+        crate::types::BoundedScore::new_clamped(z)
+    }
+}
+
+/// Cubic Hermite C1 smoothstep `S_3(u) = u^2 * (3 - 2u)` with zero slope at both boundaries.
+#[inline]
+#[must_use]
+#[allow(clippy::suboptimal_flops)]
+pub fn hermite_smoothstep_c1(x: f64, edge0: f64, edge1: f64) -> f64 {
+    let span = edge1 - edge0;
+    if span.abs() <= 1e-12 {
+        return if x >= edge1 { 1.0 } else { 0.0 };
+    }
+    let u = ((x - edge0) / span).clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// Continuous C1 Elliott-Hurst macro contradiction penalty in `[0.0, 1.0]` (replaces H=0.500 step).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn evaluate_elliott_hurst_coherence_penalty_c1(
+    side: crate::types::Side,
+    wave: WaveObservables,
+) -> f64 {
+    let s_dir = side.sign_f64();
+    let h_t = wave.hurst_exponent();
+    let phi_al = s_dir * (f64::from(wave.macro_phase.to_bps_i32()) / 10_000.0);
+    let oi_raw = f64::from(wave.oi_impulse.to_bps_i32()) / 10_000.0;
+    let fib_al_bps = s_dir * ((wave.fib_proj_bps.raw() as f64) / 100.0);
+
+    let psi_h = hermite_smoothstep_c1(h_t, 0.480, 0.525);
+    let psi_phi = hermite_smoothstep_c1(-0.18 - phi_al, 0.0, 0.14);
+    let psi_oi = hermite_smoothstep_c1(oi_raw, -0.26, -0.04);
+    let branch_oi = psi_h * psi_phi * psi_oi;
+
+    let branch_deep = hermite_smoothstep_c1(-0.55 - phi_al, 0.0, 0.14)
+        * hermite_smoothstep_c1(h_t, 0.515, 0.590);
+
+    let is_imp = matches!(
+        wave.regime,
+        WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5
+    );
+    let branch_fib = if is_imp {
+        hermite_smoothstep_c1(-30.0 - fib_al_bps, 0.0, 35.0) * psi_h
+    } else {
+        0.0
+    };
+
+    branch_oi.max(branch_deep).max(branch_fib).clamp(0.0, 1.0)
+}
+
+/// Authorizes entry/queue persistence iff smooth C1 macro penalty `< phi^-1` (`0.618034`).
+#[inline]
+#[must_use]
+pub fn passes_elliott_hurst_coherence_c1(
+    side: crate::types::Side,
+    wave: WaveObservables,
+) -> bool {
+    evaluate_elliott_hurst_coherence_penalty_c1(side, wave) < V45_WAVE_INV_PHI
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,5 +1242,69 @@ mod tests {
                     && g.tranche1_permille_delta <= -85
             })
         }));
+    }
+}
+
+// === VORTEX-OMEGA V4.5 WAVE TESTS ===
+#[cfg(test)]
+mod omega_v45_wave_tests {
+    use super::*;
+    use crate::types::{APPROVED_SPECS, BoundedScore, LotQty, PriceTicks, ScaledBps, Side, TimestampNs};
+
+    #[test]
+    fn test_endogenous_liq_floor_scales_btc_vs_wif_and_smooth_c1_trades_45_to_58() {
+        let mut btc_liq = EndogenousLiquidationFloor::new_for_spec(APPROVED_SPECS[0], PriceTicks(680_000));
+        let mut wif_liq = EndogenousLiquidationFloor::new_for_spec(APPROVED_SPECS[8], PriceTicks(1_600));
+        let mut ts = 1_794_700_000_000_000_000_i64;
+        for _ in 0..60 {
+            ts += 5_000_000_000;
+            // BTC institutional prints (~3,400 USDT/print) vs WIF retail prints (~24 USDT/print)
+            btc_liq.observe_trade_print(APPROVED_SPECS[0], TimestampNs(ts), PriceTicks(680_000), LotQty(50));
+            wif_liq.observe_trade_print(APPROVED_SPECS[8], TimestampNs(ts), PriceTicks(1_600), LotQty(150));
+        }
+        assert!(btc_liq.floor_usdt() > 3_500.0);
+        assert!(wif_liq.floor_usdt() < 250.0);
+
+        // Same $400 forced buy squeeze strongly triggers WIF (> +0.55) while barely nudging BTC (< +0.12)
+        let s_btc = btc_liq.observe_liquidation_print(
+            APPROVED_SPECS[0],
+            TimestampNs(ts + 1_000_000_000),
+            Side::Bid,
+            PriceTicks(680_000),
+            LotQty(6),
+        );
+        let s_wif = wif_liq.observe_liquidation_print(
+            APPROVED_SPECS[8],
+            TimestampNs(ts + 1_000_000_000),
+            Side::Bid,
+            PriceTicks(1_600),
+            LotQty(2_500),
+        );
+        assert!(s_wif.to_bps_i32() > 5_500 && s_btc.to_bps_i32() < 1_500);
+
+        // Smooth C1 continuity check around H = 0.495 -> 0.500 -> 0.505 (no cliff jump > 0.16)
+        let mk_wave = |h: f64, m: f64, oi: f64| WaveObservables {
+            regime: WaveRegime::NeutralWarmup,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(h),
+            macro_phase: BoundedScore::new_clamped(m),
+            oi_impulse: BoundedScore::new_clamped(oi),
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        };
+        let p_495 = evaluate_elliott_hurst_coherence_penalty_c1(Side::Ask, mk_wave(0.495, 0.70, 0.12));
+        let p_500 = evaluate_elliott_hurst_coherence_penalty_c1(Side::Ask, mk_wave(0.500, 0.70, 0.12));
+        let p_505 = evaluate_elliott_hurst_coherence_penalty_c1(Side::Ask, mk_wave(0.505, 0.70, 0.12));
+        assert!(p_495 < p_500 && p_500 < p_505);
+        assert!((p_500 - p_495) < 0.18 && (p_505 - p_500) < 0.18);
+
+        // Counterfactual parity on real live trades #45, #50, #51, #52, #53, #54, #58
+        assert!(!passes_elliott_hurst_coherence_c1(Side::Bid, mk_wave(0.605, -0.69, -0.52))); // #45 LOSS VETOED
+        assert!(passes_elliott_hurst_coherence_c1(Side::Bid, mk_wave(0.481, -0.45, 0.05)));   // #50 WIN ALLOWED
+        assert!(passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.774, 0.45, -0.29)));   // #51 WIN ALLOWED
+        assert!(passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.418, 0.85, -0.05)));   // #52 WIN ALLOWED
+        assert!(passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.495, 0.70, 0.12)));    // #53 WIN ALLOWED
+        assert!(!passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.560, 0.70, 0.05)));   // #54 VETOED
+        assert!(!passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.674, 0.30, 0.13)));   // #58 LOSS VETOED
     }
 }

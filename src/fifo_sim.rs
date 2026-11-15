@@ -1,4 +1,4 @@
-//! Deterministic L1..L4 FIFO Queue Simulator & A/B/A+B Multi-Slot Economic Ablation Lab.
+//! Deterministic L1..L5 FIFO Queue Simulator & 4-Arm Economic/Adversarial Ablation Lab (OMEGA V4.5).
 
 #![allow(
     clippy::manual_clamp,
@@ -10,6 +10,7 @@
 use std::time::Instant;
 
 use crate::alpha_3factor::SignalVerdict;
+use crate::exec_daemon::clamp_resting_queue_ahead_physical;
 use crate::execution_fsm::{
     defensive_zero_loss_maker_exit_price, offensive_win_maker_exit_price, ClosedTradeKind,
     OnlineAdaptiveGovernor, SlotExecutionEngine,
@@ -111,7 +112,7 @@ impl FifoQueueSimulator {
     #[inline]
     fn lookup_level_qty(levels: &[BookLevel; 50], target_px: PriceTicks) -> Option<LotQty> {
         let mut i = 0_usize;
-        while i < 4 {
+        while i < 5 {
             let lvl = levels[i];
             if lvl.price.0 == target_px.0 && lvl.qty.0 > 0 {
                 return Some(lvl.qty);
@@ -184,11 +185,10 @@ impl FifoQueueSimulator {
                     Side::Ask => (best_ask.price, best_ask.qty),
                 };
                 let next_obs = if cur_px.0 == limit_price.0 {
-                    if last_observed_lvl_qty.0 > 0 && cur_q.0 < last_observed_lvl_qty.0 {
-                        let credit = (last_observed_lvl_qty.0 - cur_q.0) / 4;
-                        if queue_ahead_qty.0 > 1 && credit > 0 {
-                            queue_ahead_qty = LotQty((queue_ahead_qty.0 - credit).max(1));
-                        }
+                    if cur_q.0 > 0 {
+                        queue_ahead_qty = clamp_resting_queue_ahead_physical(
+                            queue_ahead_qty, cur_q, LotQty(0), last_observed_lvl_qty,
+                        );
                     }
                     cur_q
                 } else {
@@ -243,7 +243,10 @@ impl FifoQueueSimulator {
                     }
                 };
                 self.state = SimulatedOrderState::RestingInFifoQueue {
-                    side, limit_price, order_qty, queue_ahead_qty: q_ahead,
+                    side,
+                    limit_price,
+                    order_qty,
+                    queue_ahead_qty: q_ahead,
                     last_observed_lvl_qty: q_ahead,
                 };
             }
@@ -272,11 +275,10 @@ impl FifoQueueSimulator {
                     Side::Ask => Self::lookup_level_qty(&snap.asks, limit_price),
                 };
                 let next_obs = if let Some(cur_q) = lvl_opt {
-                    if last_observed_lvl_qty.0 > 0 && cur_q.0 < last_observed_lvl_qty.0 {
-                        let credit = (last_observed_lvl_qty.0 - cur_q.0) / 4;
-                        if queue_ahead_qty.0 > 1 && credit > 0 {
-                            queue_ahead_qty = LotQty((queue_ahead_qty.0 - credit).max(1));
-                        }
+                    if cur_q.0 > 0 {
+                        queue_ahead_qty = clamp_resting_queue_ahead_physical(
+                            queue_ahead_qty, cur_q, LotQty(0), last_observed_lvl_qty,
+                        );
                     }
                     cur_q
                 } else {
@@ -543,7 +545,6 @@ pub fn run_200k_fifo_benchmark() -> (u128, u64, u64) {
     (start.elapsed().as_micros().max(1), sim.total_maker_fills, sim.total_post_only_rejects)
 }
 
-// === VORTEX-OMEGA CHAT 6 FIFO PROD ===
 pub mod omega_ablation {
     #![allow(
         clippy::cast_possible_truncation,
@@ -558,6 +559,7 @@ pub mod omega_ablation {
 
     use super::{run_ab_economic_ablation_model, AblationMode};
     use crate::alpha_3factor::SignalVerdict;
+    use crate::exec_daemon::clamp_resting_queue_ahead_physical;
     use crate::execution_fsm::{
         ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
     };
@@ -569,7 +571,6 @@ pub mod omega_ablation {
 
     pub const OMEGA_RTT_LATENCY_NS: i64 = 25_000_000;
 
-    /// Conservative L1..L4 PostOnly FIFO order simulator with 25ms RTT and 25% L2 cancel credit.
     #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
     pub enum OmegaFifoLifecycle {
         #[default]
@@ -664,10 +665,7 @@ pub mod omega_ablation {
             let now_ns = snap.ts_local_ns.0;
             match self.state {
                 OmegaFifoLifecycle::InFlightToExchange {
-                    side,
-                    limit_price,
-                    order_lots,
-                    arrival_ts_ns,
+                    side, limit_price, order_lots, arrival_ts_ns,
                 } => {
                     if now_ns < arrival_ts_ns {
                         return;
@@ -695,21 +693,13 @@ pub mod omega_ablation {
                     };
                 }
                 OmegaFifoLifecycle::RestingInFifoQueue {
-                    side,
-                    limit_price,
-                    ref mut queue_ahead_lots,
-                    ref mut last_visible_depth,
-                    ..
+                    side, limit_price, ref mut queue_ahead_lots, ref mut last_visible_depth, ..
                 } => {
                     let vis_q = Self::visible_depth_at_price(snap, side, limit_price);
-                    if vis_q.0 > 0 && vis_q.0 < last_visible_depth.0 && queue_ahead_lots.0 > 1 {
-                        let cancel_credit = (last_visible_depth.0 - vis_q.0) / 4;
-                        if cancel_credit > 0 {
-                            *queue_ahead_lots =
-                                LotQty((queue_ahead_lots.0 - cancel_credit).max(1));
-                        }
-                    }
                     if vis_q.0 > 0 {
+                        *queue_ahead_lots = clamp_resting_queue_ahead_physical(
+                            *queue_ahead_lots, vis_q, LotQty(0), *last_visible_depth,
+                        );
                         *last_visible_depth = vis_q;
                     }
                 }
@@ -727,11 +717,7 @@ pub mod omega_ablation {
             ts_ns: i64,
         ) -> Option<(PriceTicks, LotQty)> {
             let OmegaFifoLifecycle::RestingInFifoQueue {
-                side,
-                limit_price,
-                order_lots,
-                queue_ahead_lots,
-                ..
+                side, limit_price, order_lots, queue_ahead_lots, ..
             } = self.state
             else {
                 return None;
@@ -750,16 +736,12 @@ pub mod omega_ablation {
             if rem_after < 0 {
                 self.maker_fills = self.maker_fills.saturating_add(1);
                 self.state = OmegaFifoLifecycle::FilledMaker {
-                    side,
-                    fill_price: limit_price,
-                    filled_lots: order_lots,
-                    fill_ts_ns: ts_ns,
+                    side, fill_price: limit_price, filled_lots: order_lots, fill_ts_ns: ts_ns,
                 };
                 Some((limit_price, order_lots))
             } else {
                 if let OmegaFifoLifecycle::RestingInFifoQueue {
-                    queue_ahead_lots: ref mut qa,
-                    ..
+                    queue_ahead_lots: ref mut qa, ..
                 } = self.state
                 {
                     *qa = LotQty(rem_after);
@@ -842,7 +824,6 @@ pub mod omega_ablation {
             let _ = engines[s_idx].try_arm_maker_entry(&snap, verdict, lots);
             let _ = engines[s_idx].on_maker_entry_filled(TimestampNs(ts + OMEGA_RTT_LATENCY_NS));
 
-            // Step 1: Wave-3 ~38% T1 harvest on multi-lot contracts (1-lot BTC/ETH holds via Fib!)
             let win1_delta = ((base_px * 530 + 999_999) / 1_000_000).max(1);
             let px1 = base_px + win1_delta;
             snap.ts_local_ns = TimestampNs(ts + 5_000_000_000);
@@ -852,7 +833,6 @@ pub mod omega_ablation {
             snap.last_trade_price = PriceTicks(px1);
             let _ = engines[s_idx].step_open_position(&snap, &snap, &gov, &mut ledger);
 
-            // Step 2: Impulse reaches +42 bps Fibonacci target -> 100% Maker harvest
             let fib_delta = ((base_px * 4_250 + 999_999) / 1_000_000).max(4);
             let px2 = base_px + fib_delta;
             snap.ts_local_ns = TimestampNs(ts + 18_000_000_000);
@@ -933,7 +913,6 @@ pub mod omega_ablation {
 
             match ep % 4 {
                 0 => {
-                    // Regime 0: Wave-3 +50 bps expansion
                     let _ = engines[s_idx].on_maker_entry_filled(TimestampNs(ts + 50_000_000));
                     if omega_shields_enabled {
                         snap.set_wave_observables(WaveObservables {
@@ -952,9 +931,7 @@ pub mod omega_ablation {
                     snap.asks[0] = BookLevel { price: PriceTicks(base_px + d1), qty: LotQty(180) };
                     snap.mark_price = PriceTicks(base_px + d1);
                     snap.last_trade_price = PriceTicks(base_px + d1);
-                    if let Some(s1) =
-                        engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger)
-                    {
+                    if let Some(s1) = engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger) {
                         out.closed_trades += 1;
                         out.wins += u64::from(s1.net_scaled_bps.raw() >= 100);
                         out.cum_net_bps_x100 += s1.net_scaled_bps.raw();
@@ -978,9 +955,7 @@ pub mod omega_ablation {
                             fib_proj_bps: ScaledBps(4),
                         });
                     }
-                    if let Some(s2) =
-                        engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger)
-                    {
+                    if let Some(s2) = engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger) {
                         out.closed_trades += 1;
                         out.wins += u64::from(s2.net_scaled_bps.raw() >= 100);
                         out.cum_net_bps_x100 += s2.net_scaled_bps.raw();
@@ -988,7 +963,6 @@ pub mod omega_ablation {
                     }
                 }
                 1 => {
-                    // Regime 1: Wave-5 +58 bps rally followed by violent flash crash to initial SL
                     snap.realized_vol_5m = ScaledBps(5_000);
                     let _ = engines[s_idx].on_maker_entry_filled(TimestampNs(ts + 50_000_000));
                     let init_sl = engines[s_idx].last_eff_sl_ticks;
@@ -1010,24 +984,17 @@ pub mod omega_ablation {
                         });
                         let _ = engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger);
                     }
-                    // Flash crash sweeps straight down to init_sl
                     snap.ts_local_ns = TimestampNs(ts + 11_000_000_000);
-                    let crash_px = if omega_shields_enabled && engines[s_idx].chandelier_profit_sl_armed
-                    {
+                    let crash_px = if omega_shields_enabled && engines[s_idx].chandelier_profit_sl_armed {
                         PriceTicks(engines[s_idx].last_eff_sl_ticks.0 - 1)
                     } else {
                         init_sl
                     };
                     snap.mark_price = crash_px;
                     snap.last_trade_price = crash_px;
-                    if let Some(sc) =
-                        engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger)
-                    {
+                    if let Some(sc) = engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger) {
                         out.closed_trades += 1;
-                        if matches!(
-                            engines[s_idx].last_exit_sub_reason,
-                            ExitSubReason::ChandelierProfitLockSl
-                        ) {
+                        if matches!(engines[s_idx].last_exit_sub_reason, ExitSubReason::ChandelierProfitLockSl) {
                             out.chandelier_saves += 1;
                         }
                         if sc.net_scaled_bps.raw() >= 100 {
@@ -1042,7 +1009,6 @@ pub mod omega_ablation {
                     }
                 }
                 2 => {
-                    // Regime 2: Hidden institutional L1 toxic sweep (lagging OFI=+0.14)
                     let mut aborted = false;
                     if omega_shields_enabled {
                         let mut cur_q = 500_i64;
@@ -1072,9 +1038,7 @@ pub mod omega_ablation {
                         snap.ts_local_ns = TimestampNs(ts + 2_000_000_000);
                         snap.mark_price = sl_px;
                         snap.last_trade_price = sl_px;
-                        if let Some(sl_s) =
-                            engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger)
-                        {
+                        if let Some(sl_s) = engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger) {
                             out.closed_trades += 1;
                             out.losses += 1;
                             out.cum_net_bps_x100 += sl_s.net_scaled_bps.raw();
@@ -1083,7 +1047,6 @@ pub mod omega_ablation {
                     }
                 }
                 _ => {
-                    // Regime 3: Post-Fill BTCUSDT Lead-Lag Dump at t = 1s..5.4s (well before 45s!)
                     let _ = engines[s_idx].on_maker_entry_filled(TimestampNs(ts + 50_000_000));
                     let init_sl = engines[s_idx].last_eff_sl_ticks;
                     btc.factor_ofi = BoundedScore::new_clamped(-0.78);
@@ -1113,10 +1076,8 @@ pub mod omega_ablation {
 
                     snap.ts_local_ns = TimestampNs(ts + 6_000_000_000);
                     if omega_shields_enabled && (ep % 8 == 3) {
-                        // Micro-bounce escapes cleanly at Zero-Loss Maker floor
                         let z_fl = crate::execution_fsm::defensive_zero_loss_maker_exit_price(
-                            Side::Bid,
-                            PriceTicks(base_px),
+                            Side::Bid, PriceTicks(base_px),
                         );
                         snap.bids[0] = BookLevel { price: PriceTicks(z_fl.0 - 1), qty: LotQty(260) };
                         snap.asks[0] = BookLevel { price: z_fl, qty: LotQty(170) };
@@ -1131,9 +1092,7 @@ pub mod omega_ablation {
                         snap.mark_price = eff_sl;
                         snap.last_trade_price = eff_sl;
                     }
-                    if let Some(wd_s) =
-                        engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger)
-                    {
+                    if let Some(wd_s) = engines[s_idx].step_open_position(&snap, &btc, &gov, &mut ledger) {
                         out.closed_trades += 1;
                         if wd_s.net_scaled_bps.raw() >= 100 {
                             out.wins += 1;
@@ -1151,7 +1110,6 @@ pub mod omega_ablation {
         out
     }
 
-    /// Executes the 4-Arm Economic & Adversarial Ablation (`MODEL A`, `B`, `A+B`, `OMEGA`).
     #[must_use]
     pub fn run_quadruple_omega_ablation_suite() -> OmegaQuadrupleAblationReport {
         let mod_a = run_ab_economic_ablation_model(AblationMode::BaselineFixedL1A);
@@ -1218,9 +1176,55 @@ mod tests {
         assert!(mod_ab.cum_net_bps_x100 > mod_b.cum_net_bps_x100);
         assert!(mod_ab.cum_net_bps_x100 >= mod_a.cum_net_bps_x100 * 2);
     }
+
+    #[test]
+    fn test_v45_fifo_l5_depth_and_physical_queue_upper_bound_identity() {
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+        for lvl in 0..5 {
+            snap.bids[lvl] = BookLevel {
+                price: PriceTicks(8_200 - lvl as i64),
+                qty: LotQty(500 - (lvl as i64) * 50),
+            };
+            snap.asks[lvl] = BookLevel {
+                price: PriceTicks(8_201 + lvl as i64),
+                qty: LotQty(400),
+            };
+        }
+        let mut sim = FifoQueueSimulator::new();
+        sim.submit_post_only(Side::Bid, PriceTicks(8_196), LotQty(10), TimestampNs(1_000_000_000));
+        snap.ts_local_ns = TimestampNs(1_030_000_000);
+        sim.on_lob_snapshot(&snap);
+        assert!(matches!(
+            sim.state,
+            SimulatedOrderState::RestingInFifoQueue { queue_ahead_qty: LotQty(300), .. }
+        ));
+
+        // Whale cancels at L5 leaving only 19 lots visible -> Q_ahead strictly clamped <= 19
+        snap.ts_local_ns = TimestampNs(1_050_000_000);
+        snap.bids[4].qty = LotQty(19);
+        sim.on_lob_snapshot(&snap);
+        if let SimulatedOrderState::RestingInFifoQueue { queue_ahead_qty, .. } = sim.state {
+            assert!(queue_ahead_qty.0 >= 1 && queue_ahead_qty.0 <= 19);
+        } else {
+            assert_eq!(sim.total_maker_fills, 999);
+        }
+
+        let mut om = OmegaConservativeFifoOrder::new();
+        om.submit_post_only(Side::Bid, PriceTicks(8_200), LotQty(10), 1_000_000_000);
+        snap.ts_local_ns = TimestampNs(1_030_000_000);
+        om.on_lob_snapshot(&snap);
+        snap.ts_local_ns = TimestampNs(1_060_000_000);
+        snap.bids[0].qty = LotQty(22);
+        om.on_lob_snapshot(&snap);
+        if let OmegaFifoLifecycle::RestingInFifoQueue { queue_ahead_lots, .. } = om.state {
+            assert!(queue_ahead_lots.0 >= 1 && queue_ahead_lots.0 <= 22);
+        } else {
+            assert_eq!(om.maker_fills, 999);
+        }
+    }
 }
 
-// === VORTEX-OMEGA CHAT 6 FIFO TESTS ===
 #[cfg(test)]
 mod omega_chat6_fifo_tests {
     use super::*;

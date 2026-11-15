@@ -692,6 +692,294 @@ impl BybitV5LiveClient {
     }
 }
 
+// === OMEGA V4.5 STARTUP HANDSHAKE ===
+
+pub const BYBIT_INSTRUMENTS_INFO_PATH: &str = "/v5/market/instruments-info?category=linear&limit=200";
+pub const BYBIT_ACCOUNT_FEE_RATE_PATH: &str = "/v5/account/fee-rate?category=linear";
+pub const HANDSHAKE_VAULT_CACHE_PATH: &str = "data/vault/vortex_bybit_handshake.json";
+
+/// Bitmask report verifying Bybit UTA V5 live `tickSize` (`1e8`), `qtyStep` (`1e8`) & `Trading` status.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InstrumentSpecVerification {
+    pub verified_mask: u16,
+    pub mismatch_mask: u16,
+    pub halted_mask: u16,
+    pub live_tick_1e8: [i64; 12],
+    pub live_lot_step_1e8: [i64; 12],
+}
+
+impl InstrumentSpecVerification {
+    #[inline]
+    #[must_use]
+    pub const fn baseline_from_specs(specs: &[ crate::types::PairSpec; 12 ]) -> Self {
+        let mut ticks = [0_i64; 12];
+        let mut steps = [0_i64; 12];
+        let mut i = 0_usize;
+        while i < 12 {
+            ticks[i] = specs[i].tick_size_1e8;
+            steps[i] = specs[i].lot_step_1e8;
+            i += 1;
+        }
+        Self {
+            verified_mask: 0x0FFF,
+            mismatch_mask: 0,
+            halted_mask: 0,
+            live_tick_1e8: ticks,
+            live_lot_step_1e8: steps,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_slot_tradable(self, slot_idx: usize) -> bool {
+        if slot_idx >= 12 {
+            return false;
+        }
+        let bit = 1_u16 << slot_idx;
+        (self.mismatch_mask & bit) == 0 && (self.halted_mask & bit) == 0
+    }
+}
+
+/// Consolidated startup handshake state for live VIP fee rates and 12-pair contract specs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BybitStartupHandshake {
+    pub fee_schedule: crate::types::FeeSchedule,
+    pub instruments: InstrumentSpecVerification,
+    pub synced_from_exchange: bool,
+    pub ts_ns: crate::types::TimestampNs,
+}
+
+/// Exact fixed-point decimal string parser (`0` IEEE-754 drift): `scale_decimals = 8` -> `1e8`, `6` -> `ScaledBps`.
+#[must_use]
+pub fn parse_decimal_to_scaled_i64(raw: &str, scale_decimals: u32) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (neg, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, trimmed)
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i_str, f_str)) => (i_str, f_str),
+        None => (body, ""),
+    };
+    let mut acc: i128 = 0;
+    for b in int_part.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+    }
+    let mut dec_seen = 0_u32;
+    for b in frac_part.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        if dec_seen < scale_decimals {
+            acc = acc.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+            dec_seen += 1;
+        }
+    }
+    while dec_seen < scale_decimals {
+        acc = acc.checked_mul(10)?;
+        dec_seen += 1;
+    }
+    let signed = if neg { -acc } else { acc };
+    i64::try_from(signed).ok()
+}
+
+/// Parses Bybit UTA V5 `/v5/account/fee-rate` JSON into exact `FeeSchedule` (`ScaledBps`, `1 bp = 100`).
+#[allow(clippy::missing_errors_doc)]
+pub fn parse_bybit_fee_rate_json(
+    body: &str,
+    preferred_symbol: Option<&str>,
+) -> Result<crate::types::FeeSchedule, crate::types::VortexError> {
+    let root: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| crate::types::VortexError::ColumnarFormatCorrupted)?;
+    if root.get("retCode").and_then(serde_json::Value::as_i64) != Some(0) {
+        return Err(crate::types::VortexError::ColumnarFormatCorrupted);
+    }
+    let list = root
+        .get("result")
+        .and_then(|r| r.get("list"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
+    if list.is_empty() {
+        return Err(crate::types::VortexError::ColumnarFormatCorrupted);
+    }
+    let chosen = preferred_symbol
+        .and_then(|target| {
+            list.iter().find(|item| {
+                item.get("symbol").and_then(serde_json::Value::as_str) == Some(target)
+            })
+        })
+        .unwrap_or(&list[0]);
+
+    let maker_str = chosen
+        .get("makerFeeRate")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
+    let taker_str = chosen
+        .get("takerFeeRate")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
+
+    let maker_bps = parse_decimal_to_scaled_i64(maker_str, 6)
+        .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
+    let taker_bps = parse_decimal_to_scaled_i64(taker_str, 6)
+        .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
+
+    Ok(crate::types::FeeSchedule::from_live_rates_clamped(
+        crate::types::ScaledBps(maker_bps),
+        crate::types::ScaledBps(taker_bps),
+    ))
+}
+
+/// Parses Bybit UTA V5 `/v5/market/instruments-info` JSON and validates all 12 `APPROVED_SPECS`.
+#[allow(clippy::missing_errors_doc)]
+pub fn parse_bybit_instruments_info_json(
+    body: &str,
+    specs: &[crate::types::PairSpec; 12],
+) -> Result<InstrumentSpecVerification, crate::types::VortexError> {
+    let root: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| crate::types::VortexError::ColumnarFormatCorrupted)?;
+    if root.get("retCode").and_then(serde_json::Value::as_i64) != Some(0) {
+        return Err(crate::types::VortexError::ColumnarFormatCorrupted);
+    }
+    let list = root
+        .get("result")
+        .and_then(|r| r.get("list"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
+
+    let mut report = InstrumentSpecVerification::baseline_from_specs(specs);
+    report.verified_mask = 0;
+
+    for item in list {
+        let Some(sym) = item.get("symbol").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(slot_idx) = specs.iter().position(|s| s.symbol_id.name() == sym) else {
+            continue;
+        };
+        let bit = 1_u16 << slot_idx;
+        let status = item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Closed");
+        if status != "Trading" {
+            report.halted_mask |= bit;
+        }
+        let tick_opt = item
+            .get("priceFilter")
+            .and_then(|pf| pf.get("tickSize"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| parse_decimal_to_scaled_i64(s, 8));
+        let step_opt = item
+            .get("lotSizeFilter")
+            .and_then(|lf| lf.get("qtyStep"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| parse_decimal_to_scaled_i64(s, 8));
+
+        if let (Some(live_tick), Some(live_step)) = (tick_opt, step_opt) {
+            report.live_tick_1e8[slot_idx] = live_tick;
+            report.live_lot_step_1e8[slot_idx] = live_step;
+            if live_tick == specs[slot_idx].tick_size_1e8
+                && live_step == specs[slot_idx].lot_step_1e8
+                && status == "Trading"
+            {
+                report.verified_mask |= bit;
+            } else if live_tick != specs[slot_idx].tick_size_1e8
+                || live_step != specs[slot_idx].lot_step_1e8
+            {
+                report.mismatch_mask |= bit;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Runs startup handshake with atomic vault caching and safe offline fallback (Windows 11 / DNS-safe).
+#[must_use]
+pub fn execute_bybit_startup_handshake<F>(
+    ts_ns: crate::types::TimestampNs,
+    cache_path: &std::path::Path,
+    mut fetch_endpoint: F,
+) -> BybitStartupHandshake
+where
+    F: FnMut(&str, bool) -> Result<String, crate::types::VortexError>,
+{
+    let live_fees = fetch_endpoint(BYBIT_ACCOUNT_FEE_RATE_PATH, true)
+        .and_then(|b| parse_bybit_fee_rate_json(&b, Some("BTCUSDT")));
+    let live_inst = fetch_endpoint(BYBIT_INSTRUMENTS_INFO_PATH, false)
+        .and_then(|b| parse_bybit_instruments_info_json(&b, &crate::types::APPROVED_SPECS));
+
+    if let (Ok(fee_schedule), Ok(instruments)) = (live_fees, live_inst) {
+        let cache_json = serde_json::json!({
+            "event": "BYBIT_HANDSHAKE_V45",
+            "ts_ns": ts_ns.0,
+            "maker_fee_scaled_bps": fee_schedule.maker_fee_bps.0,
+            "taker_fee_scaled_bps": fee_schedule.taker_fee_bps.0,
+            "verified_mask": instruments.verified_mask,
+            "mismatch_mask": instruments.mismatch_mask,
+            "halted_mask": instruments.halted_mask,
+        });
+        if let Ok(txt) = serde_json::to_string(&cache_json) {
+            let _ = crate::vault_io::atomic_write_bytes_sync(cache_path, txt.as_bytes());
+        }
+        return BybitStartupHandshake {
+            fee_schedule,
+            instruments,
+            synced_from_exchange: true,
+            ts_ns,
+        };
+    }
+
+    if let Ok(cached_txt) = std::fs::read_to_string(cache_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached_txt) {
+            let m = val
+                .get("maker_fee_scaled_bps")
+                .and_then(serde_json::Value::as_i64);
+            let t = val
+                .get("taker_fee_scaled_bps")
+                .and_then(serde_json::Value::as_i64);
+            if let (Some(m_bps), Some(t_bps)) = (m, t) {
+                let mut inst =
+                    InstrumentSpecVerification::baseline_from_specs(&crate::types::APPROVED_SPECS);
+                if let Some(mm) = val.get("mismatch_mask").and_then(serde_json::Value::as_u64) {
+                    inst.mismatch_mask = u16::try_from(mm).unwrap_or(0);
+                }
+                if let Some(hm) = val.get("halted_mask").and_then(serde_json::Value::as_u64) {
+                    inst.halted_mask = u16::try_from(hm).unwrap_or(0);
+                }
+                return BybitStartupHandshake {
+                    fee_schedule: crate::types::FeeSchedule::from_live_rates_clamped(
+                        crate::types::ScaledBps(m_bps),
+                        crate::types::ScaledBps(t_bps),
+                    ),
+                    instruments: inst,
+                    synced_from_exchange: false,
+                    ts_ns,
+                };
+            }
+        }
+    }
+
+    BybitStartupHandshake {
+        fee_schedule: crate::types::FeeSchedule::VIP0_DEFAULT,
+        instruments: InstrumentSpecVerification::baseline_from_specs(&crate::types::APPROVED_SPECS),
+        synced_from_exchange: false,
+        ts_ns,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +1068,101 @@ mod tests {
             assert_eq!(rc_flat, 0);
         }
         let _ = srv.join();
+    }
+}
+
+#[cfg(test)]
+mod omega_v45_handshake_tests {
+    use super::*;
+    use crate::types::{APPROVED_SPECS, FeeSchedule, ScaledBps, TimestampNs, VortexError};
+
+    #[test]
+    fn test_bybit_fee_rate_vip_and_negative_maker_rebate_exact_parsing() {
+        let vip0_json = r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","takerFeeRate":"0.00055","makerFeeRate":"0.0002"}]}}"#;
+        assert_eq!(
+            parse_bybit_fee_rate_json(vip0_json, Some("BTCUSDT")),
+            Ok(FeeSchedule::VIP0_DEFAULT)
+        );
+
+        let mm_rebate_json = r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","takerFeeRate":"0.000325","makerFeeRate":"-0.00005"}]}}"#;
+        assert_eq!(
+            parse_bybit_fee_rate_json(mm_rebate_json, Some("BTCUSDT")),
+            Ok(FeeSchedule {
+                maker_fee_bps: ScaledBps(-50),
+                taker_fee_bps: ScaledBps(325),
+            })
+        );
+    }
+
+    #[test]
+    fn test_instruments_info_spec_guard_atomic_cache_and_windows_offline_fallback() {
+        let btc = APPROVED_SPECS[0];
+        let eth = APPROVED_SPECS[1];
+        let inst_json = serde_json::json!({
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "symbol": btc.symbol_id.name(),
+                        "status": "Trading",
+                        "priceFilter": { "tickSize": "0.10" },
+                        "lotSizeFilter": { "qtyStep": "0.001" }
+                    },
+                    {
+                        "symbol": eth.symbol_id.name(),
+                        "status": "Trading",
+                        "priceFilter": { "tickSize": "0.05" },
+                        "lotSizeFilter": { "qtyStep": "0.01" }
+                    },
+                    {
+                        "symbol": APPROVED_SPECS[6].symbol_id.name(),
+                        "status": "Settling",
+                        "priceFilter": { "tickSize": "0.001" },
+                        "lotSizeFilter": { "qtyStep": "0.1" }
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let fee_json = r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","takerFeeRate":"0.00040","makerFeeRate":"0.00014"}]}}"#;
+        let cache_file = std::env::temp_dir().join(format!(
+            "vortex_handshake_v45_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cache_file);
+
+        let live_hs = execute_bybit_startup_handshake(
+            TimestampNs(1_794_700_000_000_000_000),
+            &cache_file,
+            |path, signed| {
+                if signed && path == BYBIT_ACCOUNT_FEE_RATE_PATH {
+                    Ok(fee_json.to_owned())
+                } else if !signed && path == BYBIT_INSTRUMENTS_INFO_PATH {
+                    Ok(inst_json.clone())
+                } else {
+                    Err(VortexError::ColumnarIoFailure)
+                }
+            },
+        );
+        assert!(live_hs.synced_from_exchange);
+        assert_eq!(live_hs.fee_schedule.maker_fee_bps, ScaledBps(140));
+        assert_eq!(live_hs.fee_schedule.taker_fee_bps, ScaledBps(400));
+        assert!(live_hs.instruments.is_slot_tradable(0));
+        // ETH tickSize drifted (0.05 vs spec 0.01) and Slot 6 is Settling -> both vetoed safely
+        assert!(!live_hs.instruments.is_slot_tradable(1));
+        assert!(!live_hs.instruments.is_slot_tradable(6));
+
+        // Offline fallback rehydrates cached VIP rates & safety masks without network calls
+        let offline_hs = execute_bybit_startup_handshake(
+            TimestampNs(1_794_700_010_000_000_000),
+            &cache_file,
+            |_, _| Err(VortexError::ColumnarIoFailure),
+        );
+        assert!(!offline_hs.synced_from_exchange);
+        assert_eq!(offline_hs.fee_schedule.maker_fee_bps, ScaledBps(140));
+        assert!(!offline_hs.instruments.is_slot_tradable(1));
+
+        let _ = std::fs::remove_file(&cache_file);
     }
 }

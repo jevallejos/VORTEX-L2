@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA Institutional Low-Latency Execution Core (20-Module Clean-Room Architecture).
+//! VORTEX-OMEGA V4.5 Institutional 200Hz Maker-First HFT Core (24-Module Zero-Alloc Architecture, SHM v15, PAR2).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;
@@ -9,16 +9,20 @@ pub mod exec_daemon;
 pub mod exec_gateway_handlers;
 pub mod execution_fsm;
 pub mod exit_quoter;
+pub mod fee_cadence_beta;
 pub mod fifo_sim;
 pub mod forensic_parquet;
+pub mod governor_plasticity;
 pub mod http_ws_transport;
 pub mod kinematic_surface;
 pub mod lob_shm;
+pub mod markout_tracker;
 pub mod order_block;
 pub mod replay_walkforward;
 pub mod tap_ring;
 pub mod telemetry_hud;
 pub mod types;
+pub mod vault_io;
 pub mod wave_elliott;
 pub mod ws_protocol;
 
@@ -39,7 +43,7 @@ mod tests {
 
     #[test]
     fn test_phase4_constitutional_3_cli_gates_end_to_end() {
-        assert_eq!(VORTEX_SHM_VERSION, 14);
+        assert_eq!(VORTEX_SHM_VERSION, 15);
 
         // Gate 1: Ingestor SHM v13 + PAR1 Ring Self-Test (12 institutional slots)
         let tap_gate = run_isolated_tap_self_test(false);

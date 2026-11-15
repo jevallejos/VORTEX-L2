@@ -11,55 +11,90 @@ use crate::types::{
     LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, VortexError, APPROVED_SPECS,
     SPLIT_LEG_MIN_NOTIONAL_1E8,
 };
-use crate::wave_elliott::{WaveObservables, WaveRegime};
+use crate::wave_elliott::WaveRegime;
+#[cfg(test)]
+use crate::wave_elliott::WaveObservables;
 
-/// OMEGA V4.1 Law II & VI: Vetoes entries contradicting persistent Elliott macro phase (#45 & #58).
+/// OMEGA V4.5 Law II & VI: Directional [OB+, OB-] wall guard & smooth C1 Hermite macro surface.
+#[inline]
+#[must_use]
+fn directional_ob_for_side(side: Side, snap: &SymbolLobSnapshot) -> crate::order_block::OrderBlockObservables {
+    let mut obs = snap.order_block_observables();
+    let dir_pm = match side {
+        Side::Bid => snap.ob_bear_efficacy_pm,
+        Side::Ask => snap.ob_bull_efficacy_pm,
+    };
+    if dir_pm > 0 {
+        obs.learned_efficacy_pm = dir_pm;
+    }
+    obs
+}
+
 #[inline]
 #[must_use]
 pub fn passes_ob_wall_snap_guard(side: Side, snap: &SymbolLobSnapshot) -> bool {
     let spec = crate::types::spec_from_symbol_id(snap.symbol_id).unwrap_or(APPROVED_SPECS[0]);
-    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 { PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)) } else { snap.mark_price };
-    !snap.order_block_observables().vetoes_into_opposing_wall(side, spec, mid_px, snap.realized_vol_5m, snap.factor_tfi.get() * side.sign_f64())
+    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+        PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+    } else {
+        snap.mark_price
+    };
+    !directional_ob_for_side(side, snap).vetoes_into_opposing_wall(
+        side, spec, mid_px, snap.realized_vol_5m, snap.factor_tfi.get() * side.sign_f64(),
+    )
 }
 
 #[inline]
 #[must_use]
 pub fn passes_order_block_wall_guard(slot_idx: usize, side: Side, snap: &SymbolLobSnapshot) -> bool {
     let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
-    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 { PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)) } else { snap.mark_price };
-    !snap.order_block_observables().vetoes_into_opposing_wall(side, spec, mid_px, snap.realized_vol_5m, snap.factor_tfi.get() * side.sign_f64())
+    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+        PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+    } else {
+        snap.mark_price
+    };
+    !directional_ob_for_side(side, snap).vetoes_into_opposing_wall(
+        side, spec, mid_px, snap.realized_vol_5m, snap.factor_tfi.get() * side.sign_f64(),
+    )
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::suboptimal_flops)]
+pub fn evaluate_macro_coherence_surface_c1(side: Side, snap: &SymbolLobSnapshot) -> f64 {
+    let w = snap.wave_observables();
+    let base_c1 = crate::wave_elliott::evaluate_elliott_hurst_coherence_penalty_c1(side, w);
+    let dir_s = side.sign_f64();
+    let h_t = w.hurst_exponent();
+    let macro_aligned = w.macro_phase.get() * dir_s;
+    let fib_aligned_bps = (w.fib_proj_bps.raw() as f64 / 100.0) * dir_s;
+
+    let psi_h = crate::wave_elliott::hermite_smoothstep_c1(h_t, 0.494, 0.506);
+    let psi_m = crate::wave_elliott::hermite_smoothstep_c1(-0.20 - macro_aligned, 0.0, 0.08);
+    let oi_inv_branch = psi_h * psi_m;
+    let fib_branch = if matches!(w.regime, WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5) {
+        crate::wave_elliott::hermite_smoothstep_c1(-35.0 - fib_aligned_bps, 0.0, 25.0)
+            * crate::wave_elliott::hermite_smoothstep_c1(h_t, 0.488, 0.508)
+    } else {
+        0.0
+    };
+    base_c1.max(oi_inv_branch).max(fib_branch).clamp(0.0, 1.0)
 }
 
 #[inline]
 #[must_use]
 pub fn passes_elliott_macro_coherence_guard(side: Side, snap: &SymbolLobSnapshot) -> bool {
-    let w = snap.wave_observables();
-    let dir_s = side.sign_f64();
-    let macro_aligned = w.macro_phase.get() * dir_s;
-    let fib_aligned_bps = (w.fib_proj_bps.raw() as f64 / 100.0) * dir_s;
-
-    if macro_aligned <= -0.25
-        && w.hurst.get() >= WaveObservables::encode_hurst(0.502).get()
-    {
-        return false;
-    }
-    if matches!(w.regime, WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5)
-        && macro_aligned <= -0.50
-        && fib_aligned_bps <= -50.0
-        && w.hurst.get() >= WaveObservables::encode_hurst(0.50).get()
-    {
-        return false;
-    }
-    true
+    evaluate_macro_coherence_surface_c1(side, snap) < 0.618_033_988_749_895
 }
 
 pub use crate::bayesian_governor::OnlineAdaptiveGovernor;
 pub use crate::exit_quoter::{
     classify_maker_exit_sub_reason, compute_canonical_exit_quote_core,
     compute_canonical_exit_quote_omega, compute_chandelier_profit_lock_sl,
-    compute_tranche1_split_lots_core, compute_validated_sl_ticks,
-    compute_wave_dynamic_t1_permille, defensive_zero_loss_maker_exit_price,
-    dynamic_maker_floor_price, evaluate_shadow_runner_propulsion,
+    compute_elastic_offensive_win_floor_bps, compute_tranche1_split_lots_core,
+    compute_validated_sl_ticks, compute_wave_dynamic_t1_permille,
+    defensive_zero_loss_maker_exit_price, dynamic_maker_floor_price,
+    elastic_offensive_win_maker_exit_price, evaluate_shadow_runner_propulsion,
     evaluate_sl_or_emergency_flatten_core, is_chandelier_profit_locked_sl,
     offensive_win_maker_exit_price, reconcile_closed_pnl_core,
     resolve_fallback_unverified_close_core, CanonicalExitQuote, ClosedPnlQueryOutcome,
@@ -141,6 +176,8 @@ pub struct SlotExecutionEngine {
     pub learned_ir_x100: i64,
     pub learned_ret_std_bps: i64,
     pub intrinsic_tau_mkt_s: i64,
+    pub active_fees: crate::types::FeeSchedule,
+    pub learned_taker_prob_pm: i64,
     pub last_eff_sl_ticks: PriceTicks,
     pub open_vol_5m_bps: ScaledBps,
     pub ratchet_locked_gross_bps: i64,
@@ -180,6 +217,8 @@ impl SlotExecutionEngine {
             learned_ir_x100: 33,
             learned_ret_std_bps: 200,
             intrinsic_tau_mkt_s: init_tau_s,
+            active_fees: crate::types::FeeSchedule::VIP0_DEFAULT,
+            learned_taker_prob_pm: 50,
             last_eff_sl_ticks: PriceTicks(0),
             open_vol_5m_bps: ScaledBps(6_000),
             ratchet_locked_gross_bps: 0,
@@ -215,6 +254,32 @@ impl SlotExecutionEngine {
 
     #[inline]
     #[must_use]
+    pub const fn active_maker_rt_fee_bps(&self) -> i64 {
+        let rt = self.active_fees.round_trip_maker_exit_bps().raw();
+        if rt > 100 { rt } else { 100 }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn extract_12_slot_mfe_array(engines: &[Self; MAX_ACTIVE_PAIRS]) -> [i64; MAX_ACTIVE_PAIRS] {
+        let mut out = [0_i64; MAX_ACTIVE_PAIRS];
+        for (i, eng) in engines.iter().enumerate() {
+            out[i] = eng.learned_mfe_bps;
+        }
+        out
+    }
+
+    pub fn hydrate_12_slot_mfe_from_path(engines: &mut [Self; MAX_ACTIVE_PAIRS], path: &std::path::Path) {
+        let seed = (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 17) / 5;
+        let loaded = crate::vault_io::load_mfe_plasticity_from_path(path, seed);
+        for (i, eng) in engines.iter_mut().enumerate() {
+            let fee_rt = eng.active_maker_rt_fee_bps();
+            eng.learned_mfe_bps = loaded[i].clamp(fee_rt + 40, fee_rt * 12);
+        }
+    }
+
+    #[inline]
+    #[must_use]
     pub fn compute_tranche1_split_lots(
         slot_idx: usize,
         open_lots: LotQty,
@@ -226,23 +291,26 @@ impl SlotExecutionEngine {
 
     #[inline]
     pub fn sync_governor_for_side(&mut self, gov: &OnlineAdaptiveGovernor, side: Side) {
+        self.active_fees = gov.active_fee_schedule();
+        self.learned_taker_prob_pm = gov.slot_taker_prob_permille(self.slot_idx, side);
         self.learned_t1_permille =
             gov.learned_tranche1_fraction_permille(self.slot_idx, side, self.learned_mfe_bps);
         self.learned_ir_x100 = gov.slot_information_ratio_x100(self.slot_idx, side);
         self.learned_ret_std_bps = gov.slot_return_std_bps(self.slot_idx, side);
         self.intrinsic_tau_mkt_s =
             (gov.intrinsic_diffusion_clock_ns(self.slot_idx) / 1_000_000_000).max(90);
-        self.in_slot_scar_debt = gov.is_in_scar_debt(self.slot_idx, side);
+        self.in_slot_scar_debt = gov.is_in_local_slot_scar_debt(self.slot_idx, side);
     }
 
     #[inline]
     pub fn sync_governor_dynamics(&mut self, gov: &OnlineAdaptiveGovernor) {
         if let Some(side) = self.active_side() {
             self.sync_governor_for_side(gov, side);
+        } else {
+            self.active_fees = gov.active_fee_schedule();
         }
     }
 
-    /// Evaluates Moallemi-Yuan v2.0 + Hawkes opposing Taker bursts + Stoikov skew on resting L1 order.
     #[inline]
     #[must_use]
     pub fn evaluate_resting_queue_shield(
@@ -266,7 +334,57 @@ impl SlotExecutionEngine {
         )
     }
 
-    /// Advances continuous Abraham Wald SPRT v2.0 (`Lambda_t`) and arms Zero-Loss floor at `>= 3s`.
+    #[allow(clippy::suboptimal_flops)]
+    fn step_wald_sprt_v2_permille(
+        &mut self,
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+    ) -> WaldSprtState {
+        let (a_hold, b_unwind) =
+            crate::kinematic_surface::wald_sprt_boundaries_from_permille(self.learned_taker_prob_pm);
+        let now_ns = snap.ts_local_ns.0;
+        if self.wald_sprt.last_step_ts_ns <= 0 || now_ns <= self.wald_sprt.last_step_ts_ns {
+            if now_ns > 0 {
+                self.wald_sprt.last_step_ts_ns = now_ns;
+            }
+            return self.wald_sprt;
+        }
+        let dt_s = ((now_ns - self.wald_sprt.last_step_ts_ns) as f64 * 1e-9).clamp(0.001, 2.0);
+        self.wald_sprt.last_step_ts_ns = now_ns;
+        let dir_s = side.sign_f64();
+        let phi_self = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+        let (m_skew, _) = compute_stoikov_microprice_skew(side, snap);
+        let beta_btc =
+            OrthogonalFactorState::epps_btc_lead_lag_beta(self.slot_idx, snap, btc_leader_snap);
+        let btc_aligned = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
+        let y_evidence = if self.slot_idx == 0 {
+            0.70 * phi_self + 0.30 * m_skew
+        } else {
+            0.50 * phi_self + 0.20 * m_skew + 0.30 * beta_btc * btc_aligned
+        };
+        self.wald_sprt.log_likelihood = (self.wald_sprt.log_likelihood
+            + 0.963_932_022_500_210_3 * (y_evidence - 0.140_983_005_625_052_5) * dt_s)
+            .clamp(1.5 * b_unwind, a_hold);
+        if self.wald_sprt.log_likelihood <= b_unwind {
+            let excess_ratio =
+                ((b_unwind - self.wald_sprt.log_likelihood) / b_unwind.abs().max(1e-6)).max(0.0);
+            let btc_drag = if self.slot_idx > 0 {
+                (-beta_btc * btc_aligned - 0.20).max(0.0)
+            } else {
+                0.0
+            };
+            let gamma = (18.0 + 22.0 * excess_ratio + 12.0 * btc_drag).round() as i64;
+            self.wald_sprt.contraction_pct = gamma.clamp(15, 48);
+            self.wald_sprt.exhaustion_unwind_active = true;
+        } else {
+            self.wald_sprt.contraction_pct = 0;
+            self.wald_sprt.exhaustion_unwind_active = false;
+        }
+        self.wald_sprt
+    }
+
+    /// Advances continuous Wald SPRT v2.0 driven by learned `slot_taker_prob_permille` & elastic win floor.
     pub fn observe_wald_sprt_step(
         &mut self,
         snap: &SymbolLobSnapshot,
@@ -281,18 +399,8 @@ impl SlotExecutionEngine {
         else {
             return self.wald_sprt;
         };
-        let p_taker =
-            APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)].empirical_taker_exit_prob_pct;
-        let st = step_wald_sprt_v2(
-            &mut self.wald_sprt,
-            self.slot_idx,
-            side,
-            p_taker,
-            snap,
-            btc_leader_snap,
-        );
+        let st = self.step_wald_sprt_v2_permille(side, snap, btc_leader_snap);
         self.last_closed_wald_pct = self.last_closed_wald_pct.max(st.contraction_pct);
-
         let hold_s = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0) / 1_000_000_000;
         if avg_price_ticks.0 > 0 {
             let bbo_exit = match side {
@@ -315,21 +423,20 @@ impl SlotExecutionEngine {
                 0
             };
             let dir_s = side.sign_f64();
-            let own_flow =
-                (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
-
-            // Lock zero-loss Maker floor only when genuinely underwater (< -2.00 bps) with weak flow
+            let own_flow = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+            let win_floor = compute_elastic_offensive_win_floor_bps(
+                self.active_maker_rt_fee_bps(),
+                snap.realized_vol_5m,
+            )
+            .raw();
             if hold_s >= 3
                 && st.exhaustion_unwind_active
                 && cur_gross_bps < -200
                 && own_flow < 0.15
-                && cur_gross_bps < OFFENSIVE_WIN_FLOOR_GROSS_BPS
+                && cur_gross_bps < win_floor
             {
                 self.latch_defensive_floor_if_needed(true);
             }
-
-            // OMEGA V4.1 Elastic Runner Unlock (#57): release passive cap on genuine impulse revival
-            // while keeping server-side Stop-Loss 100% ratcheted (One-Way Ratchet preserved).
             if hold_s < 180 && cur_gross_bps >= 150 && own_flow >= 0.35 {
                 let w = snap.wave_observables();
                 if !w.climax_active && (w.macro_phase.get() * dir_s) > -0.25 {
@@ -340,8 +447,7 @@ impl SlotExecutionEngine {
                     {
                         if *defensive_floor_locked {
                             *defensive_floor_locked = false;
-                            self.wald_sprt.log_likelihood =
-                                self.wald_sprt.log_likelihood.max(0.0);
+                            self.wald_sprt.log_likelihood = self.wald_sprt.log_likelihood.max(0.0);
                             self.wald_sprt.exhaustion_unwind_active = false;
                         }
                     }
@@ -405,23 +511,48 @@ impl SlotExecutionEngine {
         let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
         let eq_v = min_v * 4;
         let vol_c = realized_vol_5m.raw().clamp(min_v, eq_v * 3);
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
-        let init_mfe = (fee_rt * 17) / 10;
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let init_mfe = ((fee_rt * 17) / 10).max(1);
         let mfe_c = self.learned_mfe_bps.clamp((fee_rt * 7) / 5, fee_rt * 3);
         let tau_ns = self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000;
         let base_flight_ns = tau_ns / 12_000;
-        let raw_ns = ((base_flight_ns * eq_v) / vol_c * mfe_c) / init_mfe;
-        raw_ns.clamp((base_flight_ns * 3) / 5, (base_flight_ns * 7) / 5)
+        let p_mult_pm = (950 + self.learned_taker_prob_pm).clamp(970, 1_200);
+        let raw_ns = (((base_flight_ns * eq_v) / vol_c * mfe_c) / init_mfe * p_mult_pm) / 1_000;
+        raw_ns.clamp((base_flight_ns * 3) / 5, (base_flight_ns * 8) / 5)
     }
 
-    /// Plastic MFE memory up to 12x round-trip friction (48.00 bps) for Elliott impulse legs.
+    #[inline]
+    #[must_use]
+    pub fn max_preflight_drift_ticks(&self, snap: &SymbolLobSnapshot) -> i64 {
+        let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+        let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+        } else {
+            snap.mark_price
+        };
+        spec.max_preflight_drift_ticks(mid_px, self.learned_taker_prob_pm, self.active_fees)
+    }
+
+    pub fn sync_preflight_l1_entry_auto(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+    ) -> Result<(PriceTicks, PriceTicks), VortexError> {
+        let max_drift = self.max_preflight_drift_ticks(snap);
+        self.sync_preflight_l1_entry(snap, max_drift)
+    }
+
+    /// Uncensored symmetric EWMA MFE plasticity (`eta+ = 200 pm`, `eta- = 120 pm`) in `[tau_RT + 40, 12 * tau_RT]`.
+    #[inline]
+    pub fn observe_mfe_sample_with_fee_rt(&mut self, gross_mfe_scaled_bps: i64, fee_rt_bps: i64) {
+        let eff_rt = fee_rt_bps.max(100);
+        let m_obs = gross_mfe_scaled_bps.clamp(eff_rt + 40, eff_rt.saturating_mul(12));
+        let eta_pm = if m_obs >= self.learned_mfe_bps { 200 } else { 120 };
+        self.learned_mfe_bps = ((1_000 - eta_pm) * self.learned_mfe_bps + eta_pm * m_obs) / 1_000;
+    }
+
     #[inline]
     pub fn observe_mfe_sample(&mut self, gross_mfe_scaled_bps: i64) {
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
-        if gross_mfe_scaled_bps >= fee_rt + 100 {
-            let clamped = gross_mfe_scaled_bps.clamp((fee_rt * 7) / 5, fee_rt * 12);
-            self.learned_mfe_bps = (self.learned_mfe_bps * 80 + clamped * 20) / 100;
-        }
+        self.observe_mfe_sample_with_fee_rt(gross_mfe_scaled_bps, self.active_maker_rt_fee_bps());
     }
 
     #[inline]
@@ -619,6 +750,7 @@ impl SlotExecutionEngine {
                     tranche1_harvested,
                     resting_since_ns: opened_ts.0.max(0) as u64,
                     queue_ahead_lots: 0,
+                    ..SlotTelemetrySnapshot::default()
                 }
             }
         };
@@ -780,9 +912,9 @@ impl SlotExecutionEngine {
             state_sl_px
         };
 
-        let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
-        let min_win_gross = (fee_rt * 13) / 10;
-        let win1_px = offensive_win_maker_exit_price(side, eff_entry_px, 0.50);
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let min_win_gross = compute_elastic_offensive_win_floor_bps(fee_rt, self.open_vol_5m_bps).raw();
+        let win1_px = elastic_offensive_win_maker_exit_price(side, eff_entry_px, fee_rt, self.open_vol_5m_bps, 0.50);
         let split_t1_opt = Self::compute_tranche1_split_lots(
             self.slot_idx, eff_lots, win1_px, self.learned_t1_permille,
         );
@@ -1097,6 +1229,8 @@ impl SlotExecutionEngine {
             ratchet_locked_gross_bps: self.ratchet_locked_gross_bps,
             last_closed_mfe_bps: self.last_closed_mfe_bps,
             last_closed_mae_bps: self.last_closed_mae_bps,
+            active_fees: self.active_fees,
+            learned_taker_prob_pm: self.learned_taker_prob_pm,
         })
     }
 
@@ -1218,12 +1352,9 @@ impl SlotExecutionEngine {
     ) -> ClosedTradeSummary {
         let is_maker_exit = !matches!(kind, ClosedTradeKind::ServerMarkPriceStopLoss);
         let fee_scaled_bps = if is_maker_exit {
-            ScaledBps(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2)
+            self.active_fees.round_trip_maker_exit_bps()
         } else {
-            ScaledBps(
-                ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
-                    + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
-            )
+            self.active_fees.round_trip_taker_exit_bps()
         };
         let eff_lots = LotQty(closed_lots.0.max(1));
         let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
@@ -1295,15 +1426,12 @@ impl SlotExecutionEngine {
         }
         let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
         let q1 = tranche1_lots;
-        let fee1_bps = ScaledBps(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2);
+        let fee1_bps = self.active_fees.round_trip_maker_exit_bps();
         let is_maker_exit = !matches!(leg2_kind, ClosedTradeKind::ServerMarkPriceStopLoss);
         let fee2_bps = if is_maker_exit {
             fee1_bps
         } else {
-            ScaledBps(
-                ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
-                    + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
-            )
+            self.active_fees.round_trip_taker_exit_bps()
         };
         let (pnl1, fee1, g1, _) =
             spec.compute_leg_pnl_and_fee_1e8(side, q1, avg_price_ticks, tranche1_exit_price, fee1_bps);
@@ -2160,5 +2288,56 @@ mod tests {
         assert!(eng.on_maker_entry_filled(TimestampNs(2_500_000_000)).is_ok());
         snap.ts_local_ns = TimestampNs(8_000_000_000);
         assert!(eng.compute_canonical_exit_quote(&snap).is_some_and(|q| q.target_price == PriceTicks(7_525)));
+    }
+}
+
+#[cfg(test)]
+mod omega_v45_fsm_tests {
+    use super::*;
+    use crate::lob_shm::BookLevel;
+    use crate::types::{BoundedScore, FeeSchedule};
+
+    #[test]
+    fn test_uncensored_mfe_decay_local_runner_sovereignty_c1_macro_and_dynamic_wald() {
+        let mut eng = SlotExecutionEngine::new(3);
+        for _ in 0..10 {
+            eng.observe_mfe_sample_with_fee_rt(3_600, 400);
+        }
+        let peak_mfe = eng.learned_mfe_bps;
+        assert!(peak_mfe > 3_000);
+
+        // Low-volatility lateral compression (200 ScaledBps < old 500 gate) smoothly decays MFE without survival censorship
+        for _ in 0..20 {
+            eng.observe_mfe_sample_with_fee_rt(200, 400);
+        }
+        assert!(eng.learned_mfe_bps < 1_000 && eng.learned_mfe_bps >= 440);
+
+        // Local Runner Sovereignty: global scar on Slot 7 NEVER marks clean Slot 3 in_slot_scar_debt
+        let mut gov = OnlineAdaptiveGovernor::new();
+        gov.set_active_fee_schedule(FeeSchedule::from_live_rates_clamped(ScaledBps(120), ScaledBps(380)));
+        gov.observe_closed_trade_at_entry(7, Side::Bid, PriceTicks(16_000), ScaledBps(-8_000), false, TimestampNs(1_000));
+        eng.sync_governor_for_side(&gov, Side::Bid);
+        assert!(!eng.in_slot_scar_debt);
+        assert_eq!(eng.active_maker_rt_fee_bps(), 240);
+
+        // Smooth C1 Hermite macro surface continuity around H = 0.496 -> 0.500 -> 0.505
+        let mut s = SymbolLobSnapshot::new_empty();
+        s.symbol_id = APPROVED_SPECS[3].symbol_id;
+        s.realized_vol_5m = ScaledBps(6_000);
+        s.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(400) };
+        s.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(300) };
+        s.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.498),
+            macro_phase: BoundedScore::new_clamped(0.35),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        let p_mid = evaluate_macro_coherence_surface_c1(Side::Ask, &s);
+        assert!(p_mid > 0.10 && p_mid < 0.618);
+        assert!(passes_elliott_macro_coherence_guard(Side::Ask, &s));
+        assert!(eng.max_preflight_drift_ticks(&s) >= 1);
     }
 }

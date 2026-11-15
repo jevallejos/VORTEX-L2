@@ -137,6 +137,8 @@ pub struct OpenExitContext {
     pub ratchet_locked_gross_bps: i64,
     pub last_closed_mfe_bps: i64,
     pub last_closed_mae_bps: i64,
+    pub active_fees: crate::types::FeeSchedule,
+    pub learned_taker_prob_pm: i64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -201,11 +203,39 @@ pub const fn defensive_zero_loss_maker_exit_price(
     dynamic_maker_floor_price(side, avg_price_ticks, ScaledBps(fee_rt + 25))
 }
 
+/// Law II & V Elastic Offensive Win Floor: `max(1.3 * tau_RT, 0.072 * sigma_5m)` clamped in `[tau_RT + 60, 1.5 * tau_RT]`.
 #[inline]
 #[must_use]
-pub fn offensive_win_maker_exit_price(
+pub const fn compute_elastic_offensive_win_floor_bps(
+    fee_rt_bps: i64,
+    vol_5m: ScaledBps,
+) -> ScaledBps {
+    let eff_rt = if fee_rt_bps > 100 { fee_rt_bps } else { 100 };
+    let base_13_10 = (eff_rt.saturating_mul(13) + 9) / 10;
+    let vol_pos = if vol_5m.0 > 0 { vol_5m.0 } else { 0 };
+    let vol_term = (vol_pos.saturating_mul(72)) / 1_000;
+    let raw = if base_13_10 > vol_term { base_13_10 } else { vol_term };
+    let lo = eff_rt.saturating_add(60);
+    let hi = (eff_rt.saturating_mul(3)) / 2;
+    let eff_hi = if hi > lo { hi } else { lo };
+    let bounded = if raw < lo {
+        lo
+    } else if raw > eff_hi {
+        eff_hi
+    } else {
+        raw
+    };
+    ScaledBps(bounded)
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::suboptimal_flops)]
+pub fn elastic_offensive_win_maker_exit_price(
     side: Side,
     avg_price_ticks: PriceTicks,
+    fee_rt_bps: i64,
+    vol_5m: ScaledBps,
     urgency_0_to_1: f64,
 ) -> PriceTicks {
     let u = if urgency_0_to_1.is_nan() {
@@ -213,10 +243,26 @@ pub fn offensive_win_maker_exit_price(
     } else {
         urgency_0_to_1.clamp(0.0, 1.0)
     };
-    let gross_bps =
-        (OFFENSIVE_WIN_FLOOR_GROSS_BPS as f64 + 60.0 * (0.50 - u)).round() as i64;
-    let clamped = gross_bps.clamp(OFFENSIVE_WIN_FLOOR_GROSS_BPS, OFFENSIVE_WIN_FLOOR_GROSS_BPS + 60);
+    let floor_bps = compute_elastic_offensive_win_floor_bps(fee_rt_bps, vol_5m).raw();
+    let gross_bps = (floor_bps as f64 + 60.0 * (0.50 - u)).round() as i64;
+    let clamped = gross_bps.clamp(floor_bps, floor_bps + 60);
     dynamic_maker_floor_price(side, avg_price_ticks, ScaledBps(clamped))
+}
+
+#[inline]
+#[must_use]
+pub fn offensive_win_maker_exit_price(
+    side: Side,
+    avg_price_ticks: PriceTicks,
+    urgency_0_to_1: f64,
+) -> PriceTicks {
+    elastic_offensive_win_maker_exit_price(
+        side,
+        avg_price_ticks,
+        ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2,
+        ScaledBps(0),
+        urgency_0_to_1,
+    )
 }
 
 /// Evaluates Shadow-Runner Lyapunov propulsion `S_prop` and signed flow acceleration `a_flow`.
@@ -330,8 +376,7 @@ pub fn compute_chandelier_profit_lock_sl(
         .tick_to_price_scaled_bps(ctx.avg_price_ticks)
         .unwrap_or(ScaledBps(15))
         .raw();
-    let fee_sl_rt =
-        ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw();
+    let fee_sl_rt = ctx.active_fees.round_trip_taker_exit_bps().raw().max(150);
     let green_floor_bps = fee_sl_rt + 2 * tick_bps + 100;
 
     let d_sign = ctx.side.sign_i64();
@@ -879,7 +924,8 @@ pub fn compute_canonical_exit_quote_omega(
     if ctx.avg_price_ticks.0 <= 0 || ctx.open_lots.0 <= 0 {
         return None;
     }
-    let fee_rt = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+    let fee_rt = ctx.active_fees.round_trip_maker_exit_bps().raw().max(100);
+    let win_floor_bps = compute_elastic_offensive_win_floor_bps(fee_rt, snap.realized_vol_5m).raw();
     let zero_loss_bps = fee_rt + 25;
     let dir_s = ctx.side.sign_f64();
     let d_sign = ctx.side.sign_i64();
@@ -941,7 +987,7 @@ pub fn compute_canonical_exit_quote_omega(
 
     let climax_harvest = (w_obs.climax_active || w_obs.regime == WaveRegime::ClimaxExhaustion)
         && aligned_phase > 0.0
-        && (cur_gross_bps >= zero_loss_bps || best_mfe_bps >= OFFENSIVE_WIN_FLOOR_GROSS_BPS);
+        && (cur_gross_bps >= zero_loss_bps || best_mfe_bps >= win_floor_bps);
 
     let base_def_s = (tau_s / 4).max(45);
     let eff_def_s = ((base_def_s * wave_def_mult) / 1_000).clamp(30, 240);
@@ -951,7 +997,7 @@ pub fn compute_canonical_exit_quote_omega(
         .max(ctx.learned_ret_std_bps / 6)
         .max(450);
     let stale_hold =
-        hold_s >= eff_def_s && cur_gross_bps < OFFENSIVE_WIN_FLOOR_GROSS_BPS && own_flow < 0.12;
+        hold_s >= eff_def_s && cur_gross_bps < win_floor_bps && own_flow < 0.12;
     let defensive_lock_active = ctx.defensive_floor_locked
         || worst_mae_bps <= mae_trig_bps
         || stale_hold
@@ -960,11 +1006,11 @@ pub fn compute_canonical_exit_quote_omega(
     let eff_ratchet_bps = if best_mfe_bps >= (fee_rt * 139) / 100 {
         ctx.ratchet_locked_gross_bps
             .max(fee_rt + ((best_mfe_bps - fee_rt) * 72) / 100)
-            .max(OFFENSIVE_WIN_FLOOR_GROSS_BPS)
+            .max(win_floor_bps)
     } else {
         ctx.ratchet_locked_gross_bps
     };
-    let ratchet_pullback = eff_ratchet_bps >= OFFENSIVE_WIN_FLOOR_GROSS_BPS
+    let ratchet_pullback = eff_ratchet_bps >= win_floor_bps
         && ((own_flow <= -0.12) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < 0.25));
     let shadow_crest_snap = best_mfe_bps >= fee_rt * 2
         && cur_gross_bps >= zero_loss_bps
@@ -977,7 +1023,7 @@ pub fn compute_canonical_exit_quote_omega(
         && !shadow_crest_snap
     {
         let urgency = if own_flow >= 0.45 { 0.50 } else { 0.65 };
-        let win1_raw = offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, urgency);
+        let win1_raw = elastic_offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, fee_rt, snap.realized_vol_5m, urgency);
         let win1_px = enforce_maker_bbo_bound(ctx.side, win1_raw, snap);
         let eff_t1_pm = compute_wave_dynamic_t1_permille(
             ctx.learned_t1_permille,
@@ -1011,13 +1057,13 @@ pub fn compute_canonical_exit_quote_omega(
     if defensive_lock_active || ratchet_pullback || shadow_crest_snap {
         let floor_bps = if climax_harvest || shadow_crest_snap {
             cur_gross_bps.max(eff_ratchet_bps).max(zero_loss_bps)
-        } else if ratchet_pullback || eff_ratchet_bps >= OFFENSIVE_WIN_FLOOR_GROSS_BPS {
+        } else if ratchet_pullback || eff_ratchet_bps >= win_floor_bps {
             eff_ratchet_bps
         } else {
             zero_loss_bps
         };
         let raw_px = if floor_bps <= zero_loss_bps {
-            defensive_zero_loss_maker_exit_price(ctx.side, ctx.avg_price_ticks)
+            dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(zero_loss_bps))
         } else {
             dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(floor_bps))
         };
@@ -1026,7 +1072,7 @@ pub fn compute_canonical_exit_quote_omega(
             ExitSubReason::ClimaxExhaustionHarvest
         } else if shadow_crest_snap {
             ExitSubReason::ShadowRunnerCrestHarvest
-        } else if eff_ratchet_bps >= OFFENSIVE_WIN_FLOOR_GROSS_BPS {
+        } else if eff_ratchet_bps >= win_floor_bps {
             ExitSubReason::ConvexMfeRatchetLock
         } else {
             ExitSubReason::AdverseScratchEscape
@@ -1047,7 +1093,7 @@ pub fn compute_canonical_exit_quote_omega(
     let min_win_px = dynamic_maker_floor_price(
         ctx.side,
         ctx.avg_price_ticks,
-        ScaledBps(eff_ratchet_bps.max(OFFENSIVE_WIN_FLOOR_GROSS_BPS)),
+        ScaledBps(eff_ratchet_bps.max(win_floor_bps)),
     );
     let base_tp = pick_more_ambitious_tp(ctx.side, min_win_px, ctx.structural_tp_price);
 
@@ -1087,7 +1133,7 @@ pub fn compute_canonical_exit_quote_omega(
             .max(0)
             .saturating_add(aligned_fib_rem_bps)
             .max(eff_ratchet_bps)
-            .clamp(OFFENSIVE_WIN_FLOOR_GROSS_BPS, max_fib_cap);
+            .clamp(win_floor_bps, max_fib_cap);
         fib_px = dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(fib_gross));
     }
 
@@ -1104,7 +1150,7 @@ pub fn compute_canonical_exit_quote_omega(
             .max(0)
             .saturating_add(delta_shadow)
             .max(eff_ratchet_bps)
-            .clamp(OFFENSIVE_WIN_FLOOR_GROSS_BPS, max_fib_cap);
+            .clamp(win_floor_bps, max_fib_cap);
         sentinel_px =
             dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(sent_gross));
     } else if within_float_horizon
@@ -1233,6 +1279,8 @@ mod tests {
             ratchet_locked_gross_bps: 0,
             last_closed_mfe_bps: 500,
             last_closed_mae_bps: 0,
+            active_fees: crate::types::FeeSchedule::VIP0_DEFAULT,
+            learned_taker_prob_pm: 50,
         };
 
         let q_fib = compute_canonical_exit_quote_core(&ctx, &snap);
@@ -1338,6 +1386,8 @@ mod tests {
             ratchet_locked_gross_bps: 0,
             last_closed_mfe_bps: 592,
             last_closed_mae_bps: 0,
+            active_fees: crate::types::FeeSchedule::VIP0_DEFAULT,
+            learned_taker_prob_pm: 50,
         };
 
         let kin_surge = ShadowRunnerKinematics {
@@ -1395,5 +1445,28 @@ mod tests {
         });
         let pm_w3 = compute_wave_dynamic_t1_permille(552, Side::Bid, &avax_snap, false);
         assert!(pm_w3 <= 405);
+    }
+}
+
+#[cfg(test)]
+mod omega_v45_exit_quoter_tests {
+    use super::*;
+    use crate::types::FeeSchedule;
+
+    #[test]
+    fn test_elastic_offensive_win_floor_scales_with_vip_fees_and_storm_vol() {
+        assert_eq!(compute_elastic_offensive_win_floor_bps(400, ScaledBps(5_000)), ScaledBps(520));
+        assert_eq!(compute_elastic_offensive_win_floor_bps(400, ScaledBps(9_500)), ScaledBps(600));
+        assert_eq!(compute_elastic_offensive_win_floor_bps(240, ScaledBps(3_500)), ScaledBps(312));
+        assert_eq!(compute_elastic_offensive_win_floor_bps(240, ScaledBps(5_500)), ScaledBps(360));
+
+        let px_vip0 = elastic_offensive_win_maker_exit_price(
+            Side::Bid, PriceTicks(223_700), 400, ScaledBps(5_000), 0.50,
+        );
+        let px_vip3 = elastic_offensive_win_maker_exit_price(
+            Side::Bid, PriceTicks(223_700), 240, ScaledBps(3_500), 0.50,
+        );
+        let _ = FeeSchedule::VIP0_DEFAULT;
+        assert!(px_vip3.0 > 223_700 && px_vip3.0 < px_vip0.0);
     }
 }

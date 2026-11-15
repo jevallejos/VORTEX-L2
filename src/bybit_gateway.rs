@@ -1,24 +1,32 @@
-//! Asynchronous Bybit UTA V5 Command Gateway, Private WS Parser & P0-A Emergency Flatten Handler.
+//! Asynchronous Bybit UTA V5 Command Gateway, Startup Handshake, Private WS Parser & P0-A Flatten.
 
 #![allow(
+    clippy::cast_possible_truncation,
     clippy::manual_clamp,
     clippy::manual_range_contains,
     clippy::too_many_arguments
 )]
 
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use crate::bybit_client::BybitV5LiveClient;
+use crate::bybit_client::{
+    execute_bybit_startup_handshake, BybitStartupHandshake, BybitV5LiveClient,
+    HANDSHAKE_VAULT_CACHE_PATH,
+};
 use crate::execution_fsm::{
     compute_amend_total_lots, format_bijective_order_link_id, parse_verified_avg_price_ticks,
     OrderLinkRole, WsMutationOp, WsOrderLatticeState, WsOrderRank, WsTerminalKind,
 };
+use crate::fee_cadence_beta::FeeSchedule;
 use crate::http_ws_transport::{
     boot_session_hash32, global_ws_trackers, OnlineIndexerLagEstimator,
 };
-use crate::types::{slot_from_symbol_name, LotQty, PriceTicks, Side, APPROVED_SPECS};
+use crate::types::{
+    slot_from_symbol_name, LotQty, PriceTicks, Side, TimestampNs, VortexError, APPROVED_SPECS,
+};
 
 pub const GATEWAY_CMD_CAP: usize = 64;
 pub const GATEWAY_EVT_CAP: usize = 256;
@@ -73,6 +81,7 @@ pub enum GatewayCommand {
         vac_level: usize,
         opened_ts_ns: i64,
         tranche1_harvested: bool,
+        fees: FeeSchedule,
     },
 }
 
@@ -142,6 +151,67 @@ pub enum GatewayEvent {
     WsEntryOrderTerminated {
         slot_idx: usize,
     },
+}
+
+/// Executes startup VIP fee-rate & 12-pair contract spec handshake with atomic offline fallback.
+#[must_use]
+pub fn run_daemon_startup_handshake(
+    live_capital: bool,
+    boot_ns: TimestampNs,
+) -> BybitStartupHandshake {
+    let cache_path = Path::new(HANDSHAKE_VAULT_CACHE_PATH);
+    let mut opt_client = BybitV5LiveClient::from_env_if_enabled(live_capital);
+    execute_bybit_startup_handshake(boot_ns, cache_path, |full_path, _signed| {
+        let client = opt_client.as_mut().ok_or(VortexError::ColumnarIoFailure)?;
+        let (endpoint, query) = match full_path.split_once('?') {
+            Some((ep, q)) => (ep, q),
+            None => (full_path, ""),
+        };
+        let val = client
+            .get_v5(endpoint, query)
+            .ok_or(VortexError::ColumnarIoFailure)?;
+        Ok(val.to_string())
+    })
+}
+
+/// Evaluates scale-invariant exit TP amend hysteresis (`PairSpec::min_exit_amend_step_ticks`).
+#[inline]
+#[must_use]
+pub const fn should_repeg_resting_exit_tp(
+    spec: crate::types::PairSpec,
+    side: Side,
+    ref_mid: PriceTicks,
+    resting_tp: PriceTicks,
+    resting_qty: LotQty,
+    target_px: PriceTicks,
+    eff_lots: LotQty,
+    defensive_lock: bool,
+    cur_gross_bps: i64,
+    fees: FeeSchedule,
+) -> bool {
+    if resting_tp.0 == 0 || resting_qty.0 != eff_lots.0 {
+        return true;
+    }
+    let diff = (target_px.0 - resting_tp.0).abs();
+    let moving_closer = match side {
+        Side::Bid => target_px.0 < resting_tp.0,
+        Side::Ask => target_px.0 > resting_tp.0,
+    };
+    let amend_step = spec.min_exit_amend_step_ticks(ref_mid, fees);
+    let raw_close = amend_step / 2;
+    let close_step = if raw_close < 1 {
+        1
+    } else if raw_close > 4 {
+        4
+    } else {
+        raw_close
+    };
+    let rt_raw = fees.round_trip_maker_exit_bps().raw();
+    let rt_eff = if rt_raw > 100 { rt_raw } else { 100 };
+    let fee_cushion_bps = rt_eff / 2;
+
+    (moving_closer && diff >= 1 && (defensive_lock || diff >= close_step))
+        || (!moving_closer && cur_gross_bps < fee_cushion_bps && diff >= amend_step)
 }
 
 /// Parses Bybit V5 private WS frames (wallet, position & order PostOnly cancellations).
@@ -619,6 +689,7 @@ pub fn process_gateway_command(
             vac_level,
             opened_ts_ns,
             tranche1_harvested,
+            fees,
         } => {
             let spec = APPROVED_SPECS[slot_idx];
             let sym = spec.symbol_id.name();
@@ -670,15 +741,23 @@ pub fn process_gateway_command(
                 return;
             };
             let eff_lots = LotQty(target_lots.0.min(real_lots.0).max(1));
-            let tp_diff = (target_px.0 - resting_tp.0).abs();
-            let moving_closer = match r_side {
-                Side::Bid => resting_tp.0 == 0 || target_px.0 < resting_tp.0,
-                Side::Ask => resting_tp.0 == 0 || target_px.0 > resting_tp.0,
+            let ref_mid = match verified_avg {
+                Some(px) if px.0 > 0 => px,
+                _ if target_px.0 > 0 => target_px,
+                _ => resting_tp,
             };
-            let should_repeg = resting_tp.0 == 0
-                || resting_qty != eff_lots
-                || (moving_closer && tp_diff >= 1 && (defensive_lock || tp_diff >= 2))
-                || (!moving_closer && cur_gross_bps < 200 && tp_diff >= 4);
+            let should_repeg = should_repeg_resting_exit_tp(
+                spec,
+                r_side,
+                ref_mid,
+                resting_tp,
+                resting_qty,
+                target_px,
+                eff_lots,
+                defensive_lock,
+                cur_gross_bps,
+                fees,
+            );
             let desired_role = if !tranche1_harvested && eff_lots.0 < real_lots.0 {
                 OrderLinkRole::Tranche1
             } else {
@@ -928,6 +1007,7 @@ pub fn verify_ws_private_parser_self_check() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ScaledBps;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -988,15 +1068,12 @@ mod tests {
                 return;
             };
             let mut rdr = BufReader::new(reader_sock);
-            // 1. set_position_trading_stop
             if drain_req(&mut rdr) {
                 write_json_ok(&mut writer, "{\"retCode\":0}", false);
             }
-            // 2. cancel_all_symbol_orders
             if drain_req(&mut rdr) {
                 write_json_ok(&mut writer, "{\"retCode\":0}", false);
             }
-            // 3. query_open_position_verified (open = 2.6 AVAX)
             if drain_req(&mut rdr) {
                 write_json_ok(
                     &mut writer,
@@ -1008,11 +1085,9 @@ mod tests {
                     false,
                 );
             }
-            // 4. flatten_position_market_ioc (POST /v5/order/create Market IOC)
             if drain_req(&mut rdr) {
                 write_json_ok(&mut writer, "{\"retCode\":0}", false);
             }
-            // 5. query_open_position_verified (now size == 0)
             if drain_req(&mut rdr) {
                 write_json_ok(
                     &mut writer,
@@ -1020,7 +1095,6 @@ mod tests {
                     false,
                 );
             }
-            // 6. query_closed_pnl_raw
             if drain_req(&mut rdr) {
                 write_json_ok(
                     &mut writer,
@@ -1051,5 +1125,56 @@ mod tests {
             ));
         }
         let _ = srv.join();
+    }
+
+    #[test]
+    fn test_v45_sync_open_slot_fee_adaptive_amend_hysteresis_and_startup_handshake() {
+        let btc = APPROVED_SPECS[0];
+        let avax = APPROVED_SPECS[3];
+        let vip0 = FeeSchedule::VIP0_DEFAULT;
+
+        // BTC (759_000 ticks -> min_exit_amend_step_ticks = 16): 4-tick outward float is suppressed!
+        assert!(!should_repeg_resting_exit_tp(
+            btc,
+            Side::Bid,
+            PriceTicks(759_000),
+            PriceTicks(760_000),
+            LotQty(1),
+            PriceTicks(760_004),
+            LotQty(1),
+            false,
+            120,
+            vip0,
+        ));
+        // 16-tick outward step below fee cushion triggers clean amend
+        assert!(should_repeg_resting_exit_tp(
+            btc,
+            Side::Bid,
+            PriceTicks(759_000),
+            PriceTicks(760_000),
+            LotQty(1),
+            PriceTicks(760_016),
+            LotQty(1),
+            false,
+            120,
+            vip0,
+        ));
+        // AVAX (8_200 ticks -> tau_tick = 122 -> amend_step = 1): 1-tick defensive snap-in fires immediately
+        assert!(should_repeg_resting_exit_tp(
+            avax,
+            Side::Bid,
+            PriceTicks(8_200),
+            PriceTicks(8_210),
+            LotQty(26),
+            PriceTicks(8_209),
+            LotQty(26),
+            true,
+            95,
+            FeeSchedule::from_live_rates_clamped(ScaledBps(100), ScaledBps(350)),
+        ));
+
+        let hs = run_daemon_startup_handshake(false, TimestampNs(1_794_700_000_000_000_000));
+        assert!(!hs.synced_from_exchange);
+        assert!(hs.instruments.is_slot_tradable(0));
     }
 }

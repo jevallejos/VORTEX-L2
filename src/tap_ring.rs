@@ -128,7 +128,7 @@ fn flush_parquet_batch_to_dir(
     if let Ok(checksum) = batch.write_to_file(&file_path) {
         if verbose_log {
             println!(
-                "[PAR1 FLUSH] Wrote {} live events to {} (FNV1a64: 0x{:016X})",
+                "[PAR2 FLUSH] Wrote {} live events to {} (FNV1a64: 0x{:016X})",
                 batch.len(),
                 file_path.display(),
                 checksum

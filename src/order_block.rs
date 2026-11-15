@@ -800,6 +800,308 @@ impl CausalOrderBlockEngine {
     }
 }
 
+// === VORTEX-OMEGA V4.5 OB PROD ===
+pub const OB_DIRECTIONAL_MIN_PM: i64 = 382;
+pub const OB_DIRECTIONAL_SEED_PM: i64 = 618;
+pub const OB_DIRECTIONAL_MAX_PM: i64 = 854;
+const OB_PLASTICITY_ETA_PM: i64 = 120;
+
+/// Decoupled directional Order Block plasticity (`[OB+ Demand, OB- Supply]` in `[382..=854] permille`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DirectionalObPlasticity {
+    bull_demand_pm: i64,
+    bear_supply_pm: i64,
+    samples_seen: u64,
+}
+
+impl Default for DirectionalObPlasticity {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectionalObPlasticity {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bull_demand_pm: OB_DIRECTIONAL_SEED_PM,
+            bear_supply_pm: OB_DIRECTIONAL_SEED_PM,
+            samples_seen: 0,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn directional_efficacy_pm(&self) -> (i64, i64) {
+        (self.bull_demand_pm, self.bear_supply_pm)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn midpoint_efficacy_pm(&self) -> i64 {
+        i64::midpoint(self.bull_demand_pm, self.bear_supply_pm)
+    }
+
+    #[inline]
+    pub fn set_directional_efficacy_pm(&mut self, bull_pm: i64, bear_pm: i64) {
+        self.bull_demand_pm = bull_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+        self.bear_supply_pm = bear_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+    }
+
+    /// Updates ONLY `OB+` (`is_bull_demand_ob == true`) or ONLY `OB-` (`false`) without cross-contamination.
+    #[inline]
+    pub fn observe_directional_outcome(&mut self, is_bull_demand_ob: bool, held_and_bounced: bool) {
+        let reward_pm = if held_and_bounced {
+            OB_DIRECTIONAL_MAX_PM
+        } else {
+            OB_DIRECTIONAL_MIN_PM
+        };
+        if is_bull_demand_ob {
+            let next = ((1_000 - OB_PLASTICITY_ETA_PM) * self.bull_demand_pm
+                + OB_PLASTICITY_ETA_PM * reward_pm)
+                / 1_000;
+            self.bull_demand_pm = next.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+        } else {
+            let next = ((1_000 - OB_PLASTICITY_ETA_PM) * self.bear_supply_pm
+                + OB_PLASTICITY_ETA_PM * reward_pm)
+                / 1_000;
+            self.bear_supply_pm = next.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+        }
+        self.samples_seen = self.samples_seen.saturating_add(1);
+    }
+}
+
+/// Distance-weighted zone retention utility `U_z = (S_z * 1000) / (1000 + floor(1000 * d_bps / max(vol_5m, 1500)))`.
+#[inline]
+#[must_use]
+pub const fn compute_distance_weighted_zone_utility(
+    strength_pm: i64,
+    dist_bps: crate::types::ScaledBps,
+    vol_5m: crate::types::ScaledBps,
+) -> i64 {
+    let s_pos = if strength_pm > 0 { strength_pm } else { 0 };
+    let d_pos = if dist_bps.0 > 0 { dist_bps.0 } else { 0 };
+    let v_eff = if vol_5m.0 > 1_500 { vol_5m.0 } else { 1_500 };
+    let dist_pen = (1_000_i64.saturating_mul(d_pos)) / v_eff;
+    let denom = 1_000_i64.saturating_add(dist_pen);
+    (s_pos.saturating_mul(1_000)) / denom
+}
+
+/// Selects the eviction index `[0..4)` minimizing proximity-adjusted retention utility.
+#[inline]
+#[must_use]
+pub fn select_distance_weighted_eviction_slot(
+    strengths_pm: &[i64; 4],
+    dists_bps: &[crate::types::ScaledBps; 4],
+    vol_5m: crate::types::ScaledBps,
+) -> usize {
+    let mut min_idx = 0_usize;
+    let mut min_util = i64::MAX;
+    for (idx, (&st, &ds)) in strengths_pm.iter().zip(dists_bps.iter()).enumerate() {
+        if st <= 0 {
+            return idx;
+        }
+        let u = compute_distance_weighted_zone_utility(st, ds, vol_5m);
+        if u < min_util {
+            min_util = u;
+            min_idx = idx;
+        }
+    }
+    min_idx
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProximityObZone {
+    pub low_ticks: crate::types::PriceTicks,
+    pub high_ticks: crate::types::PriceTicks,
+    pub strength_pm: i64,
+    pub created_ts: crate::types::TimestampNs,
+}
+
+/// Fixed 4-slot per side Zero-Alloc proximity bank enforcing distance-weighted eviction.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ProximityObBank {
+    pub bull_zones: [ProximityObZone; 4],
+    pub bear_zones: [ProximityObZone; 4],
+    pub plasticity: DirectionalObPlasticity,
+}
+
+impl ProximityObBank {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bull_zones: [ProximityObZone {
+                low_ticks: crate::types::PriceTicks(0),
+                high_ticks: crate::types::PriceTicks(0),
+                strength_pm: 0,
+                created_ts: crate::types::TimestampNs(0),
+            }; 4],
+            bear_zones: [ProximityObZone {
+                low_ticks: crate::types::PriceTicks(0),
+                high_ticks: crate::types::PriceTicks(0),
+                strength_pm: 0,
+                created_ts: crate::types::TimestampNs(0),
+            }; 4],
+            plasticity: DirectionalObPlasticity::new(),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn directional_efficacy_pm(&self) -> (i64, i64) {
+        self.plasticity.directional_efficacy_pm()
+    }
+
+    #[inline]
+    pub fn set_directional_efficacy_pm(&mut self, bull_pm: i64, bear_pm: i64) {
+        self.plasticity.set_directional_efficacy_pm(bull_pm, bear_pm);
+    }
+
+    pub fn insert_zone_distance_weighted(
+        &mut self,
+        is_bull_demand: bool,
+        zone: ProximityObZone,
+        live_mid: crate::types::PriceTicks,
+        vol_5m: crate::types::ScaledBps,
+    ) -> usize {
+        let arr = if is_bull_demand {
+            &mut self.bull_zones
+        } else {
+            &mut self.bear_zones
+        };
+        let mid = live_mid.0.max(1);
+        let mut strengths = [0_i64; 4];
+        let mut dists = [crate::types::ScaledBps(0); 4];
+        for (i, z) in arr.iter().enumerate() {
+            strengths[i] = z.strength_pm;
+            let ref_edge = if is_bull_demand {
+                z.high_ticks.0
+            } else {
+                z.low_ticks.0
+            };
+            let d_bps = (((live_mid.0 - ref_edge).abs() as i128 * 1_000_000) / (mid as i128)) as i64;
+            dists[i] = crate::types::ScaledBps(d_bps);
+        }
+        let target_idx = select_distance_weighted_eviction_slot(&strengths, &dists, vol_5m);
+        arr[target_idx] = zone;
+        target_idx
+    }
+}
+
+impl crate::lob_shm::SymbolLobSnapshot {
+    #[inline]
+    pub fn set_order_block_observables_directional(
+        &mut self,
+        obs: OrderBlockObservables,
+        bull_pm: i64,
+        bear_pm: i64,
+    ) {
+        let b_clamped = bull_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+        let s_clamped = bear_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+        self.set_order_block_observables(obs);
+        self.ob_bull_efficacy_pm = b_clamped;
+        self.ob_bear_efficacy_pm = s_clamped;
+        self.ob_learned_efficacy_pm = i64::midpoint(b_clamped, s_clamped);
+    }
+}
+
+/// Evaluates directional OB wall collision using `ob_bear_efficacy_pm` for `Bid` and `ob_bull_efficacy_pm` for `Ask`.
+#[inline]
+#[must_use]
+pub fn passes_directional_ob_wall_guard(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    three_x_barrier: crate::types::ScaledBps,
+) -> bool {
+    let tfi_aligned = side.sign_f64() * (f64::from(snap.factor_tfi.to_bps_i32()) / 10_000.0);
+    if tfi_aligned >= 0.88 {
+        return true;
+    }
+    let base_r = (snap.realized_vol_5m.raw() / 5).clamp(
+        (three_x_barrier.raw() * 2) / 3,
+        three_x_barrier.raw().saturating_mul(2),
+    );
+    match side {
+        crate::types::Side::Bid => {
+            if snap.ob_bear_wall_ticks.0 <= 0 || snap.ob_bear_score.to_bps_i32() < 4_500 {
+                return true;
+            }
+            let eff_r = (base_r.saturating_mul(snap.ob_bear_efficacy_pm)) / OB_DIRECTIONAL_SEED_PM;
+            snap.ob_dist_bear_bps.raw() > eff_r.max(400)
+        }
+        crate::types::Side::Ask => {
+            if snap.ob_bull_wall_ticks.0 <= 0 || snap.ob_bull_score.to_bps_i32() < 4_500 {
+                return true;
+            }
+            let eff_r = (base_r.saturating_mul(snap.ob_bull_efficacy_pm)) / OB_DIRECTIONAL_SEED_PM;
+            snap.ob_dist_bull_bps.raw() > eff_r.max(400)
+        }
+    }
+}
+
+/// Loads `[bull_pm; 12]` and `[bear_pm; 12]` with full backward compatibility for V4.4.1 JSON vaults.
+#[must_use]
+pub fn load_directional_plasticity_from_path(path: &std::path::Path) -> ([i64; 12], [i64; 12]) {
+    let mut bull = [OB_DIRECTIONAL_SEED_PM; 12];
+    let mut bear = [OB_DIRECTIONAL_SEED_PM; 12];
+    let Ok(txt) = std::fs::read_to_string(path) else {
+        return (bull, bear);
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return (bull, bear);
+    };
+    if let Some(legacy) = val.get("learned_efficacy_pm").and_then(serde_json::Value::as_array) {
+        for (i, item) in legacy.iter().take(12).enumerate() {
+            if let Some(v) = item.as_i64() {
+                let cl = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+                bull[i] = cl;
+                bear[i] = cl;
+            }
+        }
+    }
+    if let Some(b_arr) = val.get("learned_bull_pm").and_then(serde_json::Value::as_array) {
+        for (i, item) in b_arr.iter().take(12).enumerate() {
+            if let Some(v) = item.as_i64() {
+                bull[i] = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+            }
+        }
+    }
+    if let Some(s_arr) = val.get("learned_bear_pm").and_then(serde_json::Value::as_array) {
+        for (i, item) in s_arr.iter().take(12).enumerate() {
+            if let Some(v) = item.as_i64() {
+                bear[i] = v.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
+            }
+        }
+    }
+    (bull, bear)
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn save_directional_plasticity_to_path_atomic(
+    path: &std::path::Path,
+    ts_ns: i64,
+    bull_pm: &[i64; 12],
+    bear_pm: &[i64; 12],
+) -> Result<(), crate::types::VortexError> {
+    let mut mean_pm = [0_i64; 12];
+    for (i, m) in mean_pm.iter_mut().enumerate() {
+        *m = i64::midpoint(bull_pm[i], bear_pm[i]);
+    }
+    let payload = serde_json::json!({
+        "event": "OB_PLASTICITY_V45",
+        "ts_ns": ts_ns,
+        "learned_efficacy_pm": mean_pm,
+        "learned_bull_pm": bull_pm,
+        "learned_bear_pm": bear_pm,
+    });
+    let s = serde_json::to_string(&payload)
+        .map_err(|_| crate::types::VortexError::ColumnarFormatCorrupted)?;
+    crate::vault_io::atomic_write_bytes_sync(path, s.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,5 +1393,95 @@ mod tests {
         dst[3].reset_preserving_plasticity();
         assert_eq!(dst[3].learned_efficacy_permille(), 575);
         assert_eq!(dst[3].observables().learned_efficacy_pm, 575);
+    }
+}
+
+// === VORTEX-OMEGA V4.5 OB TESTS ===
+#[cfg(test)]
+mod omega_v45_ob_tests {
+    use super::*;
+    use crate::lob_shm::SymbolLobSnapshot;
+    use crate::types::{BoundedScore, PriceTicks, ScaledBps, Side, TimestampNs};
+
+    #[test]
+    fn test_decoupled_ob_bull_bear_plasticity_zero_crash_contamination_and_vault_compat() {
+        let mut plast = DirectionalObPlasticity::new();
+        assert_eq!(plast.directional_efficacy_pm(), (618, 618));
+
+        // Bearish crash breaks 10 OB+ demand floors while 6 OB- supply ceilings hold every bounce
+        for _ in 0..10 {
+            plast.observe_directional_outcome(true, false);
+        }
+        for _ in 0..6 {
+            plast.observe_directional_outcome(false, true);
+        }
+        let (bull_after, bear_after) = plast.directional_efficacy_pm();
+        assert!(bull_after < 460);
+        assert!(bear_after > 730);
+
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.realized_vol_5m = ScaledBps(6_000);
+        snap.set_order_block_observables_directional(
+            OrderBlockObservables {
+                bull_ob_score: BoundedScore::new_clamped(0.75),
+                bear_ob_score: BoundedScore::new_clamped(0.75),
+                dist_bull_ob_bps: ScaledBps(1_050),
+                dist_bear_ob_bps: ScaledBps(1_350),
+                bull_wall_ticks: PriceTicks(8_180),
+                bear_wall_ticks: PriceTicks(8_220),
+                learned_efficacy_pm: plast.midpoint_efficacy_pm(),
+            },
+            bull_after,
+            bear_after,
+        );
+        // Strong OB- ceiling vetoes Bid at 13.50 bps, while broken OB+ allows Ask at 10.50 bps
+        assert!(!passes_directional_ob_wall_guard(Side::Bid, &snap, ScaledBps(1_300)));
+        assert!(passes_directional_ob_wall_guard(Side::Ask, &snap, ScaledBps(1_300)));
+
+        // Legacy V4.4.1 JSON upgrade + V4.5 atomic round-trip
+        let tmp = std::env::temp_dir().join(format!("vortex_ob_v45_{}.json", std::process::id()));
+        let legacy = serde_json::json!({ "learned_efficacy_pm": [700, 500, 618, 618, 618, 618, 618, 618, 618, 618, 618, 618] }).to_string();
+        assert!(crate::vault_io::atomic_write_bytes_sync(&tmp, legacy.as_bytes()).is_ok());
+        let (b_leg, s_leg) = load_directional_plasticity_from_path(&tmp);
+        assert_eq!((b_leg[0], s_leg[0]), (700, 700));
+
+        let mut b_v45 = b_leg;
+        let mut s_v45 = s_leg;
+        b_v45[0] = bull_after;
+        s_v45[0] = bear_after;
+        assert!(save_directional_plasticity_to_path_atomic(&tmp, 123_456, &b_v45, &s_v45).is_ok());
+        let (b_rt, s_rt) = load_directional_plasticity_from_path(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!((b_rt[0], s_rt[0]), (bull_after, bear_after));
+    }
+
+    #[test]
+    fn test_distance_weighted_zone_eviction_preserves_near_bbo_wall() {
+        let mut bank = ProximityObBank::new();
+        let vol = ScaledBps(5_000);
+        // Slot 0: old distant block (300 bps away, strength 920) vs Slots 1..3: near BBO blocks (15..35 bps, strength 700..760)
+        let _ = bank.insert_zone_distance_weighted(
+            true,
+            ProximityObZone { low_ticks: PriceTicks(7_940), high_ticks: PriceTicks(7_954), strength_pm: 920, created_ts: TimestampNs(1) },
+            PriceTicks(8_200),
+            vol,
+        );
+        for (k, hi) in [8_185_i64, 8_180, 8_172].into_iter().enumerate() {
+            let _ = bank.insert_zone_distance_weighted(
+                true,
+                ProximityObZone { low_ticks: PriceTicks(hi - 5), high_ticks: PriceTicks(hi), strength_pm: 720 + (k as i64) * 20, created_ts: TimestampNs(2 + k as i64) },
+                PriceTicks(8_200),
+                vol,
+            );
+        }
+        // 5th fresh block right at BBO (8_196) MUST evict Slot 0 (distant 300 bps block), never the near walls!
+        let evicted = bank.insert_zone_distance_weighted(
+            true,
+            ProximityObZone { low_ticks: PriceTicks(8_192), high_ticks: PriceTicks(8_196), strength_pm: 740, created_ts: TimestampNs(10) },
+            PriceTicks(8_200),
+            vol,
+        );
+        assert_eq!(evicted, 0);
+        assert_eq!(bank.bull_zones[0].high_ticks, PriceTicks(8_196));
     }
 }
