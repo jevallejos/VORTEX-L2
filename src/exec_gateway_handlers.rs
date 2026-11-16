@@ -25,7 +25,7 @@ use crate::execution_fsm::{
     SlotExecutionEngine, VerifiedCloseResolution, MAX_CLOSE_RECONCILE_RETRIES,
 };
 use crate::fee_cadence_beta::MonetaryPortfolioBetaGuard;
-use crate::forensic_parquet::ParitySyncLedger;
+use crate::forensic_parquet::ParitySyncLedger; use crate::governor_plasticity::{DailySessionGovernor, DailyShieldPhase};
 use crate::http_ws_transport::OnlineIndexerLagEstimator;
 use crate::lob_shm::{BookLevel, LastVetoCode, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS};
 use crate::markout_tracker::{MarkoutCurveBps, SlotMarkoutRing};
@@ -56,7 +56,7 @@ pub struct ExecRuntimeState {
     pub epps_trackers: [EppsBtcCorrelationTracker; MAX_ACTIVE_PAIRS],
     pub spoof_clocks: [EventClockAlphaModulator; MAX_ACTIVE_PAIRS],
     pub markout_rings: [SlotMarkoutRing; MAX_ACTIVE_PAIRS],
-    pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS],
+    pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS], pub daily_gov: DailySessionGovernor,
     pub halt_locked: bool,
     pub drain_active: bool,
 }
@@ -86,7 +86,7 @@ impl ExecRuntimeState {
             epps_trackers: [EppsBtcCorrelationTracker::new(); MAX_ACTIVE_PAIRS],
             spoof_clocks: [EventClockAlphaModulator::new(); MAX_ACTIVE_PAIRS],
             markout_rings: [SlotMarkoutRing::new(); MAX_ACTIVE_PAIRS],
-            last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS],
+            last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS], daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8),
             halt_locked: false,
             drain_active: false,
         }
@@ -499,10 +499,41 @@ pub fn handle_gateway_event(
                     rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
                     let mk_curve = rt.markout_rings[slot_idx].last_fill_curve();
                     let lvr_5s = rt.markout_rings[slot_idx].ewma_lvr_5s_bps();
+                    let prev_closed = ledger.closed_trades_count;
+                    let prev_pnl_1e8 = ledger.cumulative_net_pnl_1e8;
+                    let prev_phase = rt.daily_gov.phase;
                     finalize_and_emit_live_close_with_markout(
                         slot_idx, res, now_ns, mk_curve, lvr_5s, cached_snaps, entry_forensics,
                         engines, gov, ledger, arena, tg_tx, vault_tx, &mut rt.halt_locked,
                     );
+                    if ledger.closed_trades_count > prev_closed {
+                        let delta_1e8 = ledger.cumulative_net_pnl_1e8.saturating_sub(prev_pnl_1e8);
+                        let live_eq = rt.wallet_1e8.max(ledger.current_equity_1e8());
+                        let new_phase = rt.daily_gov.observe_realized_cashflow(
+                            now_ns,
+                            delta_1e8,
+                            true,
+                            delta_1e8 > 0,
+                            delta_1e8 < 0,
+                            live_eq,
+                            ledger.sinking_fund_reserve_bps_x100,
+                            gov.active_maker_rt_fee_bps(),
+                            gov.portfolio_mean_eq_vol_bps(),
+                            gov.portfolio_mean_ir_x100(),
+                        );
+                        let _ = vault_tx.try_send(VaultIoCommand::SaveDailyGovernor {
+                            ts_ns: now_ns.0,
+                            state: rt.daily_gov,
+                        });
+                        if new_phase != prev_phase && matches!(new_phase, DailyShieldPhase::ProfitLockArmed | DailyShieldPhase::HibernatingProfitLocked | DailyShieldPhase::HibernatingLossCap) {
+                            let _ = tg_tx.try_send(format!(
+                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V4.8 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                                new_phase.label(),
+                                (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
+                                (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -708,7 +739,7 @@ pub fn run_oos_520_multi_regime_suite() -> Oos520MultiRegimeReport {
         if !beta_guard.can_open_with_risk_ppm(s_idx, side, cand_risk_ppm, cand_beta_x1000) {
             continue;
         }
-        if !gov.authorizes_adaptive_entry_with_wallet(s_idx, side, eq_1e8, &snap, &btc_snap) {
+        if !gov.authorizes_adaptive_entry_v48(s_idx, side, eq_1e8, ScaledBps(engines[s_idx].learned_mfe_bps), &snap, &btc_snap, 0.0, epps_beta) {
             rep.utc_funding_vetoes += 1;
             continue;
         }

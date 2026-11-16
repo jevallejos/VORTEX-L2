@@ -959,3 +959,181 @@ mod tests {
         assert!(gov.confirm_preflight_kinematics_v47(3, Side::Bid, 6_628_080_000, &avax_hedge, &btc, 0.0, -0.85).is_ok());
     }
 }
+
+impl OnlineAdaptiveGovernor {
+    /// O(1) portfolio-wide mean equilibrium 5m volatility in ScaledBps for `DailySessionGovernor`.
+    #[inline]
+    #[must_use]
+    pub fn portfolio_mean_eq_vol_bps(&self) -> i64 {
+        let mut sum = 0_i64;
+        for &v in &self.eq_vol_5m_bps {
+            sum = sum.saturating_add(v.max(1_200));
+        }
+        sum / (MAX_ACTIVE_PAIRS as i64)
+    }
+
+    /// O(1) portfolio-wide mean directional Information Ratio (`x100`) across all 24 `(slot, side)` cells.
+    #[inline]
+    #[must_use]
+    pub fn portfolio_mean_ir_x100(&self) -> i64 {
+        let mut sum = 0_i64;
+        for s_idx in 0..MAX_ACTIVE_PAIRS {
+            sum = sum.saturating_add(self.slot_information_ratio_x100(s_idx, Side::Bid));
+            sum = sum.saturating_add(self.slot_information_ratio_x100(s_idx, Side::Ask));
+        }
+        sum / ((MAX_ACTIVE_PAIRS * 2) as i64)
+    }
+
+    /// V4.8 Kelly lot sizer coupled to the C1 daily boundary damper `m_day(t) in [618..=1_000] permille`.
+    #[inline]
+    #[must_use]
+    pub fn compute_slot_entry_lots_v48(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        snap: &SymbolLobSnapshot,
+        daily_damper_permille: i64,
+    ) -> LotQty {
+        let s_clamped = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+        let spec = APPROVED_SPECS[s_clamped];
+        let entry_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price)
+        } else {
+            snap.mark_price
+        };
+        let cadence = self.slot_temporal_cadence_for_side(s_clamped, Some(side), snap);
+        let damper_c = daily_damper_permille.clamp(618, 1_000);
+        let eff_cadence_pm = ((cadence.kelly_lot_mult_permille * damper_c) / 1_000).clamp(550, 1_200);
+        let (edge_bps, _, _) = self.slot_direction_diagnostics(s_clamped, side);
+        spec.compute_risk_parity_kelly_lots_with_fees(
+            wallet_usdt_1e8,
+            entry_px,
+            snap.realized_vol_5m,
+            edge_bps,
+            self.slot_information_ratio_x100(s_clamped, side),
+            eff_cadence_pm,
+            self.is_in_scar_debt(s_clamped, side),
+            self.active_fee_schedule(),
+        )
+    }
+
+    /// V4.8 Unified Governor Gate: enforces endogenous quantum Kelly log-growth (`Delta ln W > 0`) + V4.7 shields.
+    #[inline]
+    #[must_use]
+    pub fn authorizes_adaptive_entry_v48(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        learned_mfe_bps: ScaledBps,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+    ) -> bool {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return false;
+        }
+        let entry_px = if candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0 {
+            side.select_entry_bbo_price(candidate_snap.bids[0].price, candidate_snap.asks[0].price)
+        } else {
+            candidate_snap.mark_price
+        };
+        if entry_px.0 <= 0 {
+            return false;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let taker_pm = self.slot_taker_prob_permille(slot_idx, side);
+        if !spec.passes_quantum_ev_growth_gate(
+            wallet_usdt_1e8, entry_px, candidate_snap.realized_vol_5m,
+            learned_mfe_bps, taker_pm, self.active_fee_schedule(),
+        ) {
+            return false;
+        }
+        self.authorizes_adaptive_entry_v47(
+            slot_idx, side, wallet_usdt_1e8, candidate_snap, btc_leader_snap, spoof_density, epps_signed_beta,
+        )
+    }
+
+    /// V4.8 Preflight confirmation: re-verifies quantum EV log-growth before releasing Maker order to wire.
+    #[inline]
+    pub fn confirm_preflight_kinematics_v48(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+    ) -> Result<(i64, i64), &'static str> {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Err("VETO_INVALID_SLOT");
+        }
+        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+            return Err("VETO_PREFLIGHT_INVALID_BBO");
+        };
+        let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        let spec = APPROVED_SPECS[slot_idx];
+        if !spec.passes_quantum_ev_growth_gate(
+            wallet_usdt_1e8, entry_px, snap.realized_vol_5m,
+            learned_mfe_bps, self.slot_taker_prob_permille(slot_idx, side), self.active_fee_schedule(),
+        ) {
+            return Err("VETO_PREFLIGHT_QUANTUM_EV_GROWTH");
+        }
+        self.confirm_preflight_kinematics_v47(
+            slot_idx, side, wallet_usdt_1e8, snap, btc_leader_snap, spoof_density, epps_signed_beta,
+        )
+    }
+}
+
+#[cfg(test)]
+mod v48_governor_quantum_tests {
+    use super::*;
+    use crate::lob_shm::BookLevel;
+    use crate::types::BoundedScore;
+
+    #[test]
+    fn test_v48_governor_blocks_trade13_oversized_btc_and_damps_kelly_near_daily_boundary() {
+        let gov = OnlineAdaptiveGovernor::new();
+        let t0 = 1_762_992_000_000_000_000_i64 + 14 * 3_600_000_000_000;
+        let w_65 = 6_513_770_000_i64;
+
+        let mut btc_t13 = SymbolLobSnapshot::new_empty();
+        btc_t13.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc_t13.ts_local_ns = TimestampNs(t0);
+        btc_t13.realized_vol_5m = ScaledBps(3_069);
+        btc_t13.bids[0] = BookLevel { price: PriceTicks(646_312), qty: LotQty(895) };
+        btc_t13.asks[0] = BookLevel { price: PriceTicks(646_313), qty: LotQty(1_200) };
+        btc_t13.refresh_deep_l1_l5_totals();
+        btc_t13.factor_ofi = BoundedScore::new_clamped(-0.73);
+        btc_t13.factor_tfi = BoundedScore::new_clamped(-0.88);
+        btc_t13.factor_geom = BoundedScore::new_clamped(-1.00);
+        assert!(!gov.authorizes_adaptive_entry_v48(0, Side::Ask, w_65, ScaledBps(568), &btc_t13, &btc_t13, 0.0, 0.0));
+        assert_eq!(
+            gov.confirm_preflight_kinematics_v48(0, Side::Ask, w_65, ScaledBps(568), &btc_t13, &btc_t13, 0.0, 0.0),
+            Err("VETO_PREFLIGHT_QUANTUM_EV_GROWTH")
+        );
+
+        let mut avax = btc_t13;
+        avax.symbol_id = APPROVED_SPECS[3].symbol_id;
+        avax.realized_vol_5m = ScaledBps(3_600);
+        avax.bids[0] = BookLevel { price: PriceTicks(7_263), qty: LotQty(5_506) };
+        avax.asks[0] = BookLevel { price: PriceTicks(7_264), qty: LotQty(3_200) };
+        avax.refresh_deep_l1_l5_totals();
+        avax.factor_ofi = BoundedScore::new_clamped(0.81);
+        avax.factor_tfi = BoundedScore::new_clamped(0.98);
+        avax.factor_geom = BoundedScore::new_clamped(0.45);
+        let mut btc_bull = btc_t13;
+        btc_bull.factor_ofi = BoundedScore::new_clamped(0.65);
+        btc_bull.factor_tfi = BoundedScore::new_clamped(0.70);
+        btc_bull.factor_geom = BoundedScore::new_clamped(0.40);
+        assert!(gov.authorizes_adaptive_entry_v48(3, Side::Bid, w_65, ScaledBps(628), &avax, &btc_bull, 0.0, 1.0));
+
+        let lots_full = gov.compute_slot_entry_lots_v48(3, Side::Bid, 50_000_000_000, &avax, 1_000);
+        let lots_damped = gov.compute_slot_entry_lots_v48(3, Side::Bid, 50_000_000_000, &avax, 618);
+        assert!(lots_damped.0 < lots_full.0 && lots_damped.0 >= 2 && gov.portfolio_mean_eq_vol_bps() >= 1_200);
+    }
+}

@@ -705,3 +705,96 @@ mod tests {
         assert!(lots_550.0 < lots_780.0 && lots_1200.0 > lots_780.0 && lots_550.0 % 2 == 0 && lots_1200.0 % 2 == 0);
     }
 }
+
+impl PairSpec {
+    /// Dimensionless quantum lot distortion ratio `rho_quant >= 1.0` (`min_lot_sl_loss / base_slot_risk`).
+    #[inline]
+    #[must_use]
+    pub fn quantum_lot_distortion_ratio(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        fees: FeeSchedule,
+    ) -> f64 {
+        let min_lots = self.exchange_min_notional_lots(entry_price);
+        let min_notional = self.lot_notional_1e8(min_lots, entry_price) as f64;
+        let all_in_ppm = (self.all_in_sl_loss_ppm_with_fees(entry_price, realized_vol_5m, fees).max(1)) as f64;
+        let min_lot_loss = (min_notional * all_in_ppm) * 1e-6;
+        let base_risk = (Self::base_slot_risk_budget_1e8(wallet_usdt_1e8).max(1)) as f64;
+        (min_lot_loss / base_risk).max(1.0)
+    }
+
+    /// Quantum-penalized geometric drift in ScaledBps (`1 bp = 100`) using live `p_Taker`, `MFE` & `FeeSchedule`.
+    #[inline]
+    #[must_use]
+    pub fn quantum_ev_net_drift_bps(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+    ) -> f64 {
+        const PHI_Q: f64 = 1.618_033_988_749_895;
+        const INV_PHI2_Q: f64 = 0.381_966_011_250_105;
+        let rho_q = self.quantum_lot_distortion_ratio(wallet_usdt_1e8, entry_price, realized_vol_5m, fees);
+        let p_t = (taker_prob_pm.clamp(20, 450) as f64) * 1e-3;
+        let mfe_f = learned_mfe_bps.raw().max(0) as f64;
+        let e_gross = if rho_q <= PHI_Q {
+            mfe_f.max(INV_PHI2_Q * (realized_vol_5m.raw().max(0) as f64))
+        } else {
+            mfe_f
+        };
+        let pos_rt_mkr = (fees.round_trip_maker_exit_bps().raw().max(0)) as f64;
+        let g_maker = (e_gross - pos_rt_mkr).max(25.0);
+        let sl_bps = Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
+        let tau_bps = self.tick_to_price_scaled_bps(entry_price).unwrap_or(ScaledBps(50)).raw() as f64;
+        let tkr_fee = (fees.round_trip_taker_exit_bps().raw().max(50)) as f64;
+        let lambda_taker = (1.0 - INV_PHI2_Q) * sl_bps + tkr_fee + tau_bps;
+        (1.0 - p_t) * g_maker - rho_q.powf(PHI_Q) * p_t * lambda_taker
+    }
+
+    /// Endogenous Law III/V/VII gate: blocks indivisible oversized contracts with negative Kelly log-growth.
+    #[inline]
+    #[must_use]
+    pub fn passes_quantum_ev_growth_gate(
+        self,
+        wallet_usdt_1e8: i64,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+    ) -> bool {
+        const INV_PHI2_Q: f64 = 0.381_966_011_250_105;
+        let rho_q = self.quantum_lot_distortion_ratio(wallet_usdt_1e8, entry_price, realized_vol_5m, fees);
+        let c_rt = self.expected_round_trip_cost_bps_dynamic(entry_price, taker_prob_pm, fees).raw() as f64;
+        let req_floor = (rho_q - 1.0).clamp(0.0, 1.0) * INV_PHI2_Q * c_rt;
+        self.quantum_ev_net_drift_bps(wallet_usdt_1e8, entry_price, realized_vol_5m, learned_mfe_bps, taker_prob_pm, fees) > req_floor
+    }
+}
+
+#[cfg(test)]
+mod quantum_ev_v48_tests {
+    use super::*;
+
+    #[test]
+    fn test_v48_quantum_ev_gate_silences_65usdt_btc_preserves_11_slots_and_unlocks_at_scale() {
+        let w_65 = 6_513_770_000_i64;
+        let vip0 = FeeSchedule::VIP0_DEFAULT;
+        assert!(!APPROVED_SPECS[0].passes_quantum_ev_growth_gate(
+            w_65, PriceTicks(646_312), ScaledBps(3_069), ScaledBps(568), 46, vip0
+        ));
+        assert!(APPROVED_SPECS[1].passes_quantum_ev_growth_gate(
+            w_65, PriceTicks(181_047), ScaledBps(3_238), ScaledBps(624), 48, vip0
+        ));
+        assert!(APPROVED_SPECS[3].passes_quantum_ev_growth_gate(
+            w_65, PriceTicks(7_263), ScaledBps(2_206), ScaledBps(628), 50, vip0
+        ));
+        assert!(APPROVED_SPECS[0].passes_quantum_ev_growth_gate(
+            20_000_000_000, PriceTicks(646_312), ScaledBps(3_500), ScaledBps(680), 46, vip0
+        ));
+    }
+}
