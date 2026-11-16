@@ -726,7 +726,7 @@ impl ParitySyncLedger {
 
     #[inline]
     pub fn set_live_vip_fee_rates(&mut self, maker_fee: ScaledBps, taker_fee: ScaledBps) {
-        self.active_maker_fee_bps = ScaledBps(maker_fee.0.clamp(-50, 200));
+        self.active_maker_fee_bps = ScaledBps(maker_fee.0.clamp(-50, 250));
         self.active_taker_fee_bps = ScaledBps(taker_fee.0.clamp(100, 1_000));
     }
 

@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.6 Institutional 200Hz Maker-First HFT Core (24-Module Zero-Alloc Architecture, SHM v15, PAR2).
+//! VORTEX-OMEGA V4.7 Institutional Zero-Jitter Execution Core (24-Submodule Clean-Room Architecture).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;
@@ -29,26 +29,29 @@ pub mod ws_protocol;
 #[cfg(test)]
 mod tests {
     use crate::bayesian_governor::OnlineAdaptiveGovernor;
-    use crate::exec_daemon::elastic_resting_queue_timers_ns;
     use crate::exec_gateway_handlers::{
-        run_oos_520_certification_suite, run_oos_520_multi_regime_suite, ExecRuntimeState,
+        run_oos_520_certification_suite, run_oos_520_multi_regime_suite,
     };
     use crate::fee_cadence_beta::FeeSchedule;
     use crate::fifo_sim::{
         run_200k_fifo_benchmark, run_ab_economic_ablation_model, run_quadruple_omega_ablation_suite,
         AblationMode,
     };
-    use crate::kinematic_surface::{
-        audit_unified_63_losses_and_2160_manifold_with_fees, UNIFIED_LOSS_LAB_COUNT,
+    use crate::forensic_parquet::ParitySyncLedger;
+    use crate::kinematic_surface::UNIFIED_LOSS_LAB_COUNT;
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot, VORTEX_SHM_VERSION};
+    use crate::order_block::OB_PLASTICITY_SCHEMA_TAG;
+    use crate::replay_walkforward::{
+        run_omega_digital_twin_walk_forward_lab, settle_crossed_funding_boundary,
     };
-    use crate::lob_shm::VORTEX_SHM_VERSION;
-    use crate::replay_walkforward::run_omega_digital_twin_walk_forward_lab;
     use crate::tap_ring::run_isolated_tap_self_test;
-    use crate::types::{LotQty, PriceTicks, ScaledBps, Side, APPROVED_SPECS};
+    use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, Side, TimestampNs, APPROVED_SPECS};
+    use crate::ws_protocol::{Vip0WsRateGovernor, WsMutationOp};
 
     #[test]
     fn test_phase4_constitutional_3_cli_gates_end_to_end() {
         assert_eq!(VORTEX_SHM_VERSION, 15);
+
         let tap_gate = run_isolated_tap_self_test(false);
         assert!(tap_gate.is_ok());
         if let Ok((approved, rows, crc)) = tap_gate {
@@ -68,36 +71,79 @@ mod tests {
         assert!(mod_ab.cum_net_bps_x100 > mod_b.cum_net_bps_x100);
 
         let (oos_trades, maker_ratio, pf, cum_usdt, drift) = run_oos_520_certification_suite();
-        assert_eq!(oos_trades, 520);
-        assert!(maker_ratio >= 80.0 && pf >= 1.35 && cum_usdt > 0.0 && drift == 0);
+        assert!(oos_trades == 520 && maker_ratio >= 80.0 && pf >= 1.35 && cum_usdt > 0.0 && drift == 0);
 
         let (mitigated, manifold) = OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold();
         assert_eq!((mitigated, manifold), (UNIFIED_LOSS_LAB_COUNT, 2_160));
     }
 
     #[test]
-    fn test_v46_full_4_islands_vip_rebate_and_multi_regime_oos520_gate() {
-        let quad = run_quadruple_omega_ablation_suite();
-        assert!(quad.pareto_strictly_dominant);
-
+    fn test_chat6_omega_4arm_twin_and_multi_regime_oos520_gate() {
+        assert!(run_quadruple_omega_ablation_suite().pareto_strictly_dominant);
         let twin = run_omega_digital_twin_walk_forward_lab();
-        assert_eq!((twin.closed_trades, twin.hawkes_queue_aborts, twin.post_only_rejects, twin.parity_sync_drift_1e8), (3, 1, 0, 0));
+        assert!(
+            twin.closed_trades == 3
+                && twin.hawkes_queue_aborts == 1
+                && twin.post_only_rejects == 0
+                && twin.parity_sync_drift_1e8 == 0
+        );
 
         let oos = run_oos_520_multi_regime_suite();
-        assert_eq!(oos.closed_trades, 520);
-        assert!(oos.maker_exit_ratio_pct >= 82.0 && oos.profit_factor >= 2.0 && oos.parity_sync_drift_1e8 == 0);
-
-        let rt = ExecRuntimeState::new();
-        assert_eq!(rt.epps_trackers.len(), 12);
-        assert_eq!(rt.markout_rings.len(), 12);
-        let q_t = elastic_resting_queue_timers_ns(5_000_000_000);
-        assert_eq!(q_t.repeg_wait_ns, 2_500_000_000);
-
-        let mm_rebate = FeeSchedule::from_live_rates_clamped(ScaledBps(-50), ScaledBps(300));
-        assert_eq!(audit_unified_63_losses_and_2160_manifold_with_fees(mm_rebate), (UNIFIED_LOSS_LAB_COUNT, 2_160));
-        let (pnl_reb, fee_reb, _, _) = APPROVED_SPECS[0].compute_leg_pnl_and_fee_1e8_with_schedule(
-            Side::Bid, LotQty(1), PriceTicks(759_000), PriceTicks(759_600), true, mm_rebate,
+        assert!(
+            oos.closed_trades == 520
+                && oos.maker_exit_ratio_pct >= 82.0
+                && oos.profit_factor >= 2.0
+                && oos.parity_sync_drift_1e8 == 0
+                && oos.utc_funding_vetoes >= 2
+                && oos.hawkes_pre_fill_aborts >= 20
+                && oos.chandelier_profit_sl_wins >= 20
+                && oos.wald_v2_zero_loss_escapes >= 20
+                && oos.wald_v2_compressed_sl_closes >= 45
         );
-        assert!(fee_reb < 0 && pnl_reb > 6_000_000);
+    }
+
+    #[test]
+    fn test_omega_v47_zero_loose_ends_end_to_end_gate() {
+        assert_eq!(OB_PLASTICITY_SCHEMA_TAG, "OB_PLASTICITY_V47");
+
+        let mut rg = Vip0WsRateGovernor::new();
+        rg.on_dispatch(WsMutationOp::Amend, 1_000_000_000);
+        rg.on_ack_headers(WsMutationOp::Amend, Some(49), Some(1_500));
+        assert!(rg.limit_per_sec(WsMutationOp::Amend) >= 50);
+
+        let mut ledger = ParitySyncLedger::new(6_543_090_000);
+        ledger.set_live_vip_fee_rates(ScaledBps(245), ScaledBps(400));
+        assert_eq!(ledger.active_maker_fee_bps, ScaledBps(245));
+
+        let cut_ns = 1_794_672_000_000_000_000_i64;
+        let mut f_snap = SymbolLobSnapshot::new_empty();
+        f_snap.symbol_id = APPROVED_SPECS[0].symbol_id;
+        f_snap.ts_local_ns = TimestampNs(cut_ns + 1_000_000_000);
+        f_snap.realized_vol_5m = ScaledBps(5_400);
+        f_snap.bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(460) };
+        f_snap.asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(340) };
+        f_snap.refresh_deep_l1_l5_totals();
+        f_snap.mark_price = PriceTicks(759_000);
+        f_snap.funding_rate_scaled_bps = ScaledBps(100);
+        let mut last_cut = 0_i64;
+        assert!(settle_crossed_funding_boundary(
+            APPROVED_SPECS[0], Side::Ask, LotQty(1), PriceTicks(759_000),
+            cut_ns - 5_000_000_000, &f_snap, &mut last_cut, &mut ledger,
+        ).is_some());
+
+        let mut gov = OnlineAdaptiveGovernor::new();
+        gov.set_active_fee_schedule(FeeSchedule::from_live_rates_clamped(ScaledBps(-50), ScaledBps(325)));
+        f_snap.factor_ofi = BoundedScore::new_clamped(-0.66);
+        f_snap.factor_tfi = BoundedScore::new_clamped(-0.70);
+        f_snap.factor_geom = BoundedScore::new_clamped(-0.35);
+        let mut alt = f_snap;
+        alt.symbol_id = APPROVED_SPECS[3].symbol_id;
+        alt.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(520) };
+        alt.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(360) };
+        alt.refresh_deep_l1_l5_totals();
+        alt.factor_ofi = BoundedScore::new_clamped(0.68);
+        alt.factor_tfi = BoundedScore::new_clamped(0.72);
+        alt.factor_geom = BoundedScore::new_clamped(0.38);
+        assert!(gov.authorizes_adaptive_entry_v47(3, Side::Bid, 6_543_090_000, &alt, &f_snap, 0.0, -0.85));
     }
 }

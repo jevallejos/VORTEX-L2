@@ -30,9 +30,9 @@ use crate::http_ws_transport::OnlineIndexerLagEstimator;
 use crate::lob_shm::{BookLevel, LastVetoCode, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS};
 use crate::markout_tracker::{MarkoutCurveBps, SlotMarkoutRing};
 use crate::telemetry_hud::{
-    dispatch_closed_trade_logs_v46, dispatch_open_positions_state, format_telegram_close_message,
+    dispatch_closed_trade_logs_v47, dispatch_open_positions_state, format_telegram_close_message,
     load_saved_slot_state, record_and_notify_entry_fill, restore_entry_forensics_from_json,
-    SlotForensicEntrySnapshot, VaultPersistTask, DEFAULT_WALLET_EQUITY_1E8,
+    SlotForensicEntrySnapshot, VaultIoCommand, DEFAULT_WALLET_EQUITY_1E8,
 };
 use crate::types::{
     classify_trade_badge, now_epoch_ns, BoundedScore, LotQty, PriceTicks, ScaledBps, Side,
@@ -226,7 +226,7 @@ pub fn finalize_and_emit_live_close_with_markout(
     ledger: &mut ParitySyncLedger,
     arena: &VortexShmArena,
     tg_tx: &SyncSender<String>,
-    vault_tx: &SyncSender<VaultPersistTask>,
+    vault_tx: &SyncSender<VaultIoCommand>,
     halt_locked: &mut bool,
 ) {
     let spec = APPROVED_SPECS[s_idx];
@@ -236,7 +236,7 @@ pub fn finalize_and_emit_live_close_with_markout(
     let non_punitive_exit = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
     gov.observe_closed_trade_at_entry(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, non_punitive_exit, now_ns);
     arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
-    dispatch_closed_trade_logs_v46(
+    dispatch_closed_trade_logs_v47(
         s_idx, &summary, &engines[s_idx], &entry_forensics[s_idx], &cached_snaps[s_idx],
         ledger, gov, &markout_curve, lvr_5s_scaled_bps, vault_tx, halt_locked, now_ns,
     );
@@ -270,7 +270,7 @@ pub fn finalize_and_emit_live_close(
     ledger: &mut ParitySyncLedger,
     arena: &VortexShmArena,
     tg_tx: &SyncSender<String>,
-    vault_tx: &SyncSender<VaultPersistTask>,
+    vault_tx: &SyncSender<VaultIoCommand>,
     halt_locked: &mut bool,
 ) {
     finalize_and_emit_live_close_with_markout(
@@ -291,11 +291,23 @@ pub fn handle_gateway_event(
     ledger: &mut ParitySyncLedger,
     arena: &VortexShmArena,
     tg_tx: &SyncSender<String>,
-    vault_tx: &SyncSender<VaultPersistTask>,
+    vault_tx: &SyncSender<VaultIoCommand>,
 ) {
     match evt {
         GatewayEvent::WalletUpdated { wallet_1e8: w } => {
             if w > 0 { rt.wallet_1e8 = w; }
+        }
+        GatewayEvent::HandshakeRefreshed { handshake } => {
+            if handshake.synced_from_exchange {
+                gov.set_active_fee_schedule(handshake.fee_schedule);
+                ledger.set_live_vip_fee_rates(
+                    handshake.fee_schedule.maker_fee_bps,
+                    handshake.fee_schedule.taker_fee_bps,
+                );
+                for eng in engines.iter_mut() {
+                    eng.sync_governor_dynamics(gov);
+                }
+            }
         }
         GatewayEvent::EntryPlaced { slot_idx, accepted, entry_price, sl_price } => {
             rt.slot_rpc_inflight[slot_idx] = false;
@@ -689,8 +701,9 @@ pub fn run_oos_520_multi_regime_suite() -> Oos520MultiRegimeReport {
         }
         let en_px = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
         let lots = gov.compute_slot_entry_lots(s_idx, side, eq_1e8, &snap);
-        let cand_notional = spec.lot_notional_1e8(lots, en_px);
-        let cand_risk_ppm = spec.compute_position_sl_risk_ppm(eq_1e8, cand_notional, en_px, snap.realized_vol_5m);
+        let cand_risk_ppm = crate::exec_daemon::slot_position_risk_ppm_with_fees(
+            spec, eq_1e8, en_px, lots, snap.realized_vol_5m, gov.active_fee_schedule(),
+        );
         let cand_beta_x1000 = epps_trackers[s_idx].correlated_beta_x1000(s_idx == 0, snap.realized_vol_5m, btc_snap.realized_vol_5m);
         if !beta_guard.can_open_with_risk_ppm(s_idx, side, cand_risk_ppm, cand_beta_x1000) {
             continue;
@@ -942,7 +955,7 @@ mod tests {
             assert!(engines[3].try_arm_maker_entry(&snaps[3], v, LotQty(26)).is_ok());
             assert!(engines[3].on_entry_order_resting(TimestampNs(1_000_000_000)).is_ok());
             let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(16);
-            let (vault_tx, vault_rx) = mpsc::sync_channel::<VaultPersistTask>(16);
+            let (vault_tx, vault_rx) = mpsc::sync_channel::<VaultIoCommand>(16);
             handle_gateway_event(
                 GatewayEvent::EntryFilledLive {
                     slot_idx: 3, real_side: Side::Bid, verified_avg: Some(PriceTicks(8_200)),
@@ -966,7 +979,7 @@ mod tests {
             );
             let mut saw_live_mk = false;
             while let Ok(task) = vault_rx.try_recv() {
-                if let VaultPersistTask::AppendClosedTrade { vault_line, .. } = task {
+                if let VaultIoCommand::RecordClosedTrade(cp) = task { let vault_line = crate::telemetry_hud::build_closed_trade_vault_json(cp.slot_idx, &cp.summary, &cp.eng, &cp.entry_forensics, &cp.exit_snap, &cp.ledger, &cp.markout_curve, cp.lvr_5s_scaled_bps, cp.ts_ns);
                     if vault_line.contains("\"markout_fill_bps\"") && !vault_line.contains("[0.0,0.0,0.0,0.0]") {
                         saw_live_mk = true;
                     }

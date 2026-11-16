@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VORTEX-OMEGA V4.6 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer."""
+"""VORTEX-OMEGA V4.7 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer."""
 
 import json
 import math

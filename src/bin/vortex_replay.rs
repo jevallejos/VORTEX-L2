@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.6 Deterministic FIFO Queue Benchmark, 4-Arm Pareto Ablation & 1:1 PAR2 Digital Twin CLI.
+//! VORTEX-OMEGA V4.7 Deterministic FIFO Queue Benchmark, 4-Arm Pareto Ablation & 1:1 PAR2 Digital Twin CLI.
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     if data_path.exists() {
         let wf = run_parquet_walk_forward_on_dir(data_path, true);
         println!(
-            "{}[PAR2 WALK-FORWARD ARCHIVE V4.6] Dir: {} | Files: {} | Events: {} | CumNet: {:+.2} bps{}",
+            "{}[PAR2 WALK-FORWARD ARCHIVE V4.7] Dir: {} | Files: {} | Events: {} | CumNet: {:+.2} bps{}",
             ANSI_GREEN, data_path.display(), wf.files_count, wf.total_events,
             (wf.cum_net_bps_x100 as f64) / 100.0, ANSI_RESET
         );

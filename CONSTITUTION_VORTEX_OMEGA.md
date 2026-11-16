@@ -1,6 +1,6 @@
-# CONSTITUCION TECNICA VORTEX-OMEGA V4.6 (SSOT — LEYES I A IX)
+# CONSTITUCION TECNICA VORTEX-OMEGA V4.7 (SSOT — LEYES I A IX)
 
-- **Sistema:** `VORTEX-OMEGA V4.6` (`vortex-rs v1.0.0`) — Motor Institucional Autonomo HFT Maker-First para Bybit UTA V5
+- **Sistema:** `VORTEX-OMEGA V4.7` (`vortex-rs v1.0.0`) — Motor Institucional Autonomo HFT Maker-First para Bybit UTA V5
 - **Contrato IPC de Memoria Compartida:** `VORTEX_SHM_VERSION = 15` (`/dev/shm/vortex_lob.mmap`, `#[repr(C, align(64))]`, cabecera volatil *Publish-Last*, `SlotTelemetrySnapshot` de 96 B con `LastVetoCode`)
 - **Formato Columnar Forense:** `PAR2` sin perdida (`256 B/fila`, `L1..L5` + `TickerMeta` + `LiquidationPrint` + `FNV-1a 64-bit`, retrocompatible con `PAR1`)
 - **Arquitectura Regulada:** 24 Submodulos `Zero-Alloc` en `src/` + 3 Binarios `LTO Fat` (`vortex_tap`, `vortex_replay`, `vortex_exec`) + Hook `deploy/prewarm_emas_bybit.py` + CI `.github/workflows/ci.yml`
@@ -13,7 +13,7 @@
 3. **Ley de No-Regresion Parametrica (`SCAR-LOCK`):** Ningun piso de supervivencia sellado tras una perdida real puede relajarse durante periodos de silencio operativo (`0%` reapertura sobre las `63/63` cicatrices, incluso bajo *rebates* negativos).
 4. **Paridad Exacta Gemelo-Produccion (`1:1`):** Toda guardia estructural, temporizador elastico de cola, correlacion `Epps` e ingesta `PAR2` (`TickerMeta` + `LiquidationPrint`) en `vortex_exec` se refleja simetricamente en `OmegaDigitalTwinEngine` y `run_parquet_walk_forward_on_dir`.
 
-## 2. Las 9 Leyes Constitucionales Evolutivas (V4.1 -> V4.6)
+## 2. Las 9 Leyes Constitucionales Evolutivas (V4.1 -> V4.7)
 
 - **Ley I — Verdad Contable `1e8`, *Rebates* VIP y Boveda `70/30`:** Liquidacion entera exacta en `ParitySyncLedger` y `PairSpec::compute_leg_pnl_and_fee_1e8_with_schedule` (`1 USDT = 10^8`, soporte completo de *rebates* negativos `[-50, 250] ScaledBps`), sincronizacion `set_live_vip_fee_rates`, `PARITY_SYNC Drift == 0`, `70%` a Boveda Blindada y `30%` a Reserva de Saneamiento.
 - **Ley II — Plasticidad Continua `C^1`, Elliott v2.0 y `[OB+, OB-]` por Distancia:** `EndogenousLiquidationFloor` interno en `CausalElliottWaveState` (cero `LIQ_FLOOR` fijo), superficie cubica de Hermite `C^1`, *Golden Pocket* `[0.618, 0.650]`, plasticidad desacoplada `[OB+, OB-]` (`[382..=854 permille]`), desalojo ponderado por distancia en `CausalOrderBlockEngine` y `learned_mfe_bps` sin censura.
@@ -24,3 +24,8 @@
 - **Ley VII — Universo de 12 Contratos, `Epps` 5s en Vivo y Guardia Monetaria Beta:** `[EppsBtcCorrelationTracker; 12]` activo alimentando `MonetaryPortfolioBetaGuard` (`<= 14,400 ppm` total, `<= 10,800 ppm` beta direccional firmada, max. 6 slots).
 - **Ley VIII — Dominancia Estricta de Pareto, `PAR2` `1:1` y *Markouts* LVR Vivos:** Escalera `MODEL A < MODEL B < MODEL A+B < MODEL OMEGA`, `[SlotMarkoutRing; 12]` persistiendo `markout_fill_bps` y `lvr_5s_bps` reales en `TRADE_CLOSE` y paridad `1:1` sobre `PAR2`.
 - **Ley IX — Higiene `UTF-8 LF`, Gate CI y Rotacion Diferida por Drenaje:** Cero advertencias en `clippy::pedantic`, seguimiento obligatorio de `.github/workflows/ci.yml`, corte exclusivamente mediante `DRAIN_MODE.lock` (`0` posiciones abiertas) + snapshot `SHA-256` y congelacion estadistica hasta completar `N >= 25` tiros reales en `sniper-singapur`.
+
+## Adenda Constitucional V4.7 (Zero Loose Ends & Unified Off-Thread Vault)
+- **SSOT Microestructural (`vortex_tap` <-> `PAR2` <-> `vortex_replay`):** `EndogenousLiquidationFloor` vive exclusivamente dentro de `CausalElliottWaveState` y `DirectionalObPlasticity` (`OB_PLASTICITY_V47`) dentro de `CausalOrderBlockEngine` con `FeeSchedule` dinámico.
+- **Coherencia Anti-Spoof y Signo Epps (`[-phi, +phi]`):** `OnlineAdaptiveGovernor` y `SlotExecutionEngine` propagan `spoof_density` sobre `GEOM` y `epps_signed_beta` en admisión, preflight, Wald SPRT v2.0 y trinquete `Chandelier`.
+- **Zero-Jitter Unificado + Funding 8h + VIP Horario:** Un único trabajador `vault_io` realiza toda serialización JSON/JSONL fuera del hilo de `200.0 Hz`, `settle_crossed_funding_boundary` liquida los cortes `00:00 / 08:00 / 16:00 UTC` (`Drift == 0`), `RefreshHandshake` actualiza tarifas VIP cada hora y `Vip0WsRateGovernor` auto-aprende cuotas WS `10..=200 req/s` con cancelación `110001` idempotente.

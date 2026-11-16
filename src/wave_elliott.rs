@@ -403,10 +403,24 @@ impl CausalElliottWaveState {
     }
 
     #[inline]
-    fn reversal_threshold_bps(spec: PairSpec, mid_px: PriceTicks, vol_5m: ScaledBps) -> i64 {
-        let b3x = spec.required_3x_barrier_bps(mid_px).unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS).raw().max(900);
+    #[must_use]
+    pub fn reversal_threshold_bps_dynamic(
+        spec: PairSpec,
+        mid_px: PriceTicks,
+        vol_5m: ScaledBps,
+        taker_prob_pm: i64,
+        fees: crate::fee_cadence_beta::FeeSchedule,
+    ) -> i64 {
+        let b3x = spec.three_x_friction_barrier_bps_dynamic(mid_px, taker_prob_pm, fees).raw().max(450);
         let raw = (INV_PHI * (vol_5m.raw().max(b3x) as f64)).round() as i64;
         raw.clamp(b3x, b3x.saturating_mul(8))
+    }
+
+    #[inline]
+    fn reversal_threshold_bps(spec: PairSpec, mid_px: PriceTicks, vol_5m: ScaledBps) -> i64 {
+        Self::reversal_threshold_bps_dynamic(
+            spec, mid_px, vol_5m, 50, crate::fee_cadence_beta::FeeSchedule::VIP0_DEFAULT,
+        )
     }
 
     #[inline]

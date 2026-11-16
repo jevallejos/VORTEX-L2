@@ -162,37 +162,6 @@ impl Side {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct PortfolioBetaGuard {
-    pub active_bids: usize,
-    pub active_asks: usize,
-}
-
-impl PortfolioBetaGuard {
-    #[inline] #[must_use] pub const fn new() -> Self { Self { active_bids: 0, active_asks: 0 } }
-    #[inline] #[must_use] pub const fn total_active(self) -> usize { self.active_bids.saturating_add(self.active_asks) }
-    #[inline]
-    pub fn observe_active_side(&mut self, active_side: Side) {
-        match active_side {
-            Side::Bid => self.active_bids = self.active_bids.saturating_add(1),
-            Side::Ask => self.active_asks = self.active_asks.saturating_add(1),
-        }
-    }
-    #[inline] #[must_use]
-    pub const fn can_admit_side(self, candidate_side: Side) -> bool {
-        if self.total_active() >= MAX_PORTFOLIO_OPEN_SLOTS_TOTAL { return false; }
-        match candidate_side {
-            Side::Bid => self.active_bids < MAX_DIRECTIONAL_OPEN_SLOTS_PER_SIDE,
-            Side::Ask => self.active_asks < MAX_DIRECTIONAL_OPEN_SLOTS_PER_SIDE,
-        }
-    }
-    #[inline]
-    pub fn try_admit(&mut self, candidate_side: Side) -> bool {
-        if !self.can_admit_side(candidate_side) { return false; }
-        self.observe_active_side(candidate_side);
-        true
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VortexError {
@@ -454,10 +423,17 @@ impl PairSpec {
     }
 
     #[inline] #[must_use]
-    pub const fn min_resting_l1_lots(self, entry_price: PriceTicks, realized_vol_5m: ScaledBps) -> LotQty {
+    pub const fn min_resting_l1_lots_dynamic(
+        self,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        taker_prob_pm: i64,
+        fees: crate::fee_cadence_beta::FeeSchedule,
+    ) -> LotQty {
         let one_lot_1e8 = self.lot_notional_1e8(LotQty(1), entry_price);
         if one_lot_1e8 <= 0 { return LotQty(1); }
-        let b3x = match self.required_3x_barrier_bps(entry_price) { Ok(v) => v.0, Err(_) => ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 };
+        let b3x_raw = self.three_x_friction_barrier_bps_dynamic(entry_price, taker_prob_pm, fees).0;
+        let b3x = if b3x_raw > 0 { b3x_raw } else { ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 };
         let v_eff = if realized_vol_5m.0 > b3x { realized_vol_5m.0 } else { b3x };
         let min_sup = ((v_eff as i128) * (b3x as i128) * 14) / 1_000;
         let raw = ((min_sup + (one_lot_1e8 as i128) - 1) / (one_lot_1e8 as i128)) as i64;
@@ -465,12 +441,32 @@ impl PairSpec {
     }
 
     #[inline] #[must_use]
-    pub fn passes_l1_queue_depth_and_wall_guard(
-        self, entry_price: PriceTicks, realized_vol_5m: ScaledBps, learned_edge_bps_x100: i64,
-        own_l1_lots: LotQty, opp_l1_lots: LotQty, own_deep_l1_l5_lots: LotQty, ofi_abs: f64, tfi_abs: f64,
+    pub const fn min_resting_l1_lots(self, entry_price: PriceTicks, realized_vol_5m: ScaledBps) -> LotQty {
+        self.min_resting_l1_lots_dynamic(
+            entry_price,
+            realized_vol_5m,
+            50,
+            crate::fee_cadence_beta::FeeSchedule::VIP0_DEFAULT,
+        )
+    }
+
+    #[inline] #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn passes_l1_queue_depth_and_wall_guard_dynamic(
+        self,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_edge_bps_x100: i64,
+        own_l1_lots: LotQty,
+        opp_l1_lots: LotQty,
+        own_deep_l1_l5_lots: LotQty,
+        ofi_abs: f64,
+        tfi_abs: f64,
+        taker_prob_pm: i64,
+        fees: crate::fee_cadence_beta::FeeSchedule,
     ) -> bool {
         if own_l1_lots.0 <= 0 || entry_price.0 <= 0 || self.lot_notional_1e8(own_l1_lots, entry_price) < 2_400_000_000 { return false; }
-        if own_deep_l1_l5_lots.0.max(own_l1_lots.0) < self.min_resting_l1_lots(entry_price, realized_vol_5m).0 { return false; }
+        if own_deep_l1_l5_lots.0.max(own_l1_lots.0) < self.min_resting_l1_lots_dynamic(entry_price, realized_vol_5m, taker_prob_pm, fees).0 { return false; }
         let Ok(tau_tick) = self.tick_to_price_scaled_bps(entry_price) else { return false };
         let diffusion_ticks = (realized_vol_5m.0.max(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0) as f64) / (tau_tick.0.max(1) as f64);
         let tfi_c = tfi_abs.clamp(0.0, 1.0);
@@ -482,6 +478,19 @@ impl PairSpec {
         let tot_q = (own_l1_lots.0.saturating_add(opp_l1_lots.0.max(0))).max(1);
         let max_q_pm = (780 + (((tfi_c - ofi_c).max(0.0) * 140.0) as i64)).min(920);
         (own_l1_lots.0.saturating_mul(1_000)) / tot_q <= max_q_pm
+    }
+
+    #[inline] #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn passes_l1_queue_depth_and_wall_guard(
+        self, entry_price: PriceTicks, realized_vol_5m: ScaledBps, learned_edge_bps_x100: i64,
+        own_l1_lots: LotQty, opp_l1_lots: LotQty, own_deep_l1_l5_lots: LotQty, ofi_abs: f64, tfi_abs: f64,
+    ) -> bool {
+        self.passes_l1_queue_depth_and_wall_guard_dynamic(
+            entry_price, realized_vol_5m, learned_edge_bps_x100,
+            own_l1_lots, opp_l1_lots, own_deep_l1_l5_lots, ofi_abs, tfi_abs,
+            50, crate::fee_cadence_beta::FeeSchedule::VIP0_DEFAULT,
+        )
     }
 
     #[inline] #[must_use]

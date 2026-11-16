@@ -1,5 +1,4 @@
-//! Authenticated Bybit UTA V5 REST/WS Client & P0-A Emergency Market IOC Flattener.
-
+//! Authenticated Bybit UTA V5 REST/WS Client, Idempotent Cancel & P0-A Market IOC Flattener (V4.7).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -35,11 +34,7 @@ impl std::fmt::Debug for BybitV5LiveClient {
 
 impl BybitV5LiveClient {
     #[must_use]
-    pub fn with_base_url(
-        api_key: String,
-        api_secret: String,
-        base_url: &str,
-    ) -> Option<Self> {
+    pub fn with_base_url(api_key: String, api_secret: String, base_url: &str) -> Option<Self> {
         if api_key.is_empty() || api_secret.is_empty() {
             return None;
         }
@@ -107,6 +102,18 @@ impl BybitV5LiveClient {
         serde_json::from_slice(raw).ok()
     }
 
+    #[must_use]
+    pub fn fetch_live_handshake(&mut self, ts_ns: crate::types::TimestampNs) -> BybitStartupHandshake {
+        let cache_path = std::path::Path::new(HANDSHAKE_VAULT_CACHE_PATH);
+        execute_bybit_startup_handshake(ts_ns, cache_path, |full_path, _signed| {
+            let (endpoint, query) = full_path.split_once('?').unwrap_or((full_path, ""));
+            let val = self
+                .get_v5(endpoint, query)
+                .ok_or(crate::types::VortexError::ColumnarIoFailure)?;
+            Ok(val.to_string())
+        })
+    }
+
     pub fn fetch_wallet_and_equity_usdt(&mut self) -> Option<(f64, f64, f64, f64)> {
         let q = "accountType=UNIFIED&coin=USDT";
         let val = self.get_v5("/v5/account/wallet-balance", q)?;
@@ -134,11 +141,9 @@ impl BybitV5LiveClient {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
-
         if let Some(coins) = acct.get("coin").and_then(|c| c.as_array()) {
             for c_obj in coins {
-                let c_name = c_obj.get("coin").and_then(|v| v.as_str()).unwrap_or("");
-                if c_name == "USDT" {
+                if c_obj.get("coin").and_then(|v| v.as_str()) == Some("USDT") {
                     let w_c = c_obj
                         .get("walletBalance")
                         .and_then(|v| v.as_str())
@@ -179,30 +184,18 @@ impl BybitV5LiveClient {
                 }
             }
         }
-        if w_usd > 0.0 {
-            Some((w_usd, eq_usd, av_usd, up_usd))
-        } else {
-            None
-        }
+        if w_usd > 0.0 { Some((w_usd, eq_usd, av_usd, up_usd)) } else { None }
     }
 
     pub fn has_resting_entry_order(&mut self, spec: PairSpec) -> Option<bool> {
         let sym = spec.symbol_id.name();
-        let q = format!("category=linear&symbol={sym}");
-        let val = self.get_v5("/v5/order/realtime", &q)?;
+        let val = self.get_v5("/v5/order/realtime", &format!("category=linear&symbol={sym}"))?;
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return None;
         }
-        let list = val
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())?;
+        let list = val.get("result")?.get("list")?.as_array()?;
         for item in list {
-            let ro = item
-                .get("reduceOnly")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !ro {
+            if !item.get("reduceOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
                 return Some(true);
             }
         }
@@ -226,27 +219,18 @@ impl BybitV5LiveClient {
 
     pub fn cancel_non_reduce_only_orders(&mut self, spec: PairSpec) -> usize {
         let sym = spec.symbol_id.name();
-        let q = format!("category=linear&symbol={sym}");
-        let Some(val) = self.get_v5("/v5/order/realtime", &q) else {
+        let Some(val) = self.get_v5("/v5/order/realtime", &format!("category=linear&symbol={sym}")) else {
             return 0;
         };
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return 0;
         }
-        let Some(list) = val
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())
-        else {
+        let Some(list) = val.get("result").and_then(|r| r.get("list")).and_then(|l| l.as_array()) else {
             return 0;
         };
         let mut ids_to_cancel = Vec::new();
         for item in list {
-            let ro = item
-                .get("reduceOnly")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !ro {
+            if !item.get("reduceOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
                 if let Some(oid) = item.get("orderId").and_then(|v| v.as_str()) {
                     if !oid.is_empty() {
                         ids_to_cancel.push(oid.to_string());
@@ -263,43 +247,27 @@ impl BybitV5LiveClient {
         cancelled
     }
 
-    pub fn inspect_exit_and_purge_residual_entries(
-        &mut self,
-        spec: PairSpec,
-    ) -> Option<(PriceTicks, LotQty)> {
+    pub fn inspect_exit_and_purge_residual_entries(&mut self, spec: PairSpec) -> Option<(PriceTicks, LotQty)> {
         let sym = spec.symbol_id.name();
-        let q = format!("category=linear&symbol={sym}");
-        let val = self.get_v5("/v5/order/realtime", &q)?;
+        let val = self.get_v5("/v5/order/realtime", &format!("category=linear&symbol={sym}"))?;
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return None;
         }
-        let list = val
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())?;
+        let list = val.get("result")?.get("list")?.as_array()?;
         let mut exit_info = (PriceTicks(0), LotQty(0));
         let mut orphan_entry_ids = Vec::new();
         for item in list {
-            let ro = item
-                .get("reduceOnly")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if ro {
+            if item.get("reduceOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
                 if exit_info.0 .0 == 0 {
                     let px_s = item.get("price").and_then(|v| v.as_str()).unwrap_or("0");
                     let qt_s = item
                         .get("leavesQty")
-                        .filter(|v| {
-                            v.as_str().is_some_and(|s| {
-                                s.bytes().any(|b| b.is_ascii_digit() && b != b'0')
-                            })
-                        })
+                        .filter(|v| v.as_str().is_some_and(|s| s.bytes().any(|b| b.is_ascii_digit() && b != b'0')))
                         .or_else(|| item.get("qty"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("0");
                     if let Ok(pt) = spec.parse_price_ticks(px_s) {
-                        let lq = spec.parse_lot_qty(qt_s);
-                        exit_info = (pt, lq);
+                        exit_info = (pt, spec.parse_lot_qty(qt_s));
                     }
                 }
             } else if let Some(oid) = item.get("orderId").and_then(|v| v.as_str()) {
@@ -314,19 +282,12 @@ impl BybitV5LiveClient {
         Some(exit_info)
     }
 
-    pub fn query_open_position_verified(
-        &mut self,
-        symbol: &str,
-    ) -> Option<(bool, String, Side, String)> {
-        let q = format!("category=linear&symbol={}", symbol);
-        let val = self.get_v5("/v5/position/list", &q)?;
+    pub fn query_open_position_verified(&mut self, symbol: &str) -> Option<(bool, String, Side, String)> {
+        let val = self.get_v5("/v5/position/list", &format!("category=linear&symbol={symbol}"))?;
         if val.get("retCode").and_then(|c| c.as_i64()) != Some(0) {
             return None;
         }
-        let list = val
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(|l| l.as_array())?;
+        let list = val.get("result")?.get("list")?.as_array()?;
         for pos in list {
             let sz_s = pos.get("size").and_then(|v| v.as_str()).unwrap_or("0");
             let side_s = pos.get("side").and_then(|v| v.as_str()).unwrap_or("Buy");
@@ -342,18 +303,11 @@ impl BybitV5LiveClient {
         Some((false, "0".to_string(), Side::Bid, "0".to_string()))
     }
 
-    pub fn query_closed_pnl_raw(
-        &mut self,
-        symbol: &str,
-        start_time_ms: i64,
-    ) -> Option<serde_json::Value> {
+    pub fn query_closed_pnl_raw(&mut self, symbol: &str, start_time_ms: i64) -> Option<serde_json::Value> {
         let q = if start_time_ms > 0 {
-            format!(
-                "category=linear&symbol={}&startTime={}&limit=20",
-                symbol, start_time_ms
-            )
+            format!("category=linear&symbol={symbol}&startTime={start_time_ms}&limit=20")
         } else {
-            format!("category=linear&symbol={}&limit=20", symbol)
+            format!("category=linear&symbol={symbol}&limit=20")
         };
         self.get_v5("/v5/position/closed-pnl", &q)
     }
@@ -376,13 +330,8 @@ impl BybitV5LiveClient {
     }
 
     #[must_use]
-    pub fn authorizes_ws_mutation(
-        &self,
-        op: WsMutationOp,
-        is_defensive_or_abort: bool,
-    ) -> bool {
-        self.ws_trade
-            .authorizes_mutation(op, is_defensive_or_abort, now_epoch_ns().0)
+    pub fn authorizes_ws_mutation(&self, op: WsMutationOp, is_defensive_or_abort: bool) -> bool {
+        self.ws_trade.authorizes_mutation(op, is_defensive_or_abort, now_epoch_ns().0)
     }
 
     pub fn place_order_ws_or_rest(
@@ -397,29 +346,17 @@ impl BybitV5LiveClient {
         is_entry_create: bool,
     ) -> i64 {
         if order_link_id.is_empty() {
-            return self.place_post_only_order(
-                spec,
-                order_side,
-                price,
-                qty,
-                sl_price,
-                reduce_only,
-            );
+            return self.place_post_only_order(spec, order_side, price, qty, sl_price, reduce_only);
         }
         let sym = spec.symbol_id.name();
-        let side_str = match order_side {
-            Side::Bid => "Buy",
-            Side::Ask => "Sell",
-        };
-        let px_str = spec.format_price_ticks_str(price);
-        let qty_str = spec.format_lot_qty_str(qty);
+        let side_str = match order_side { Side::Bid => "Buy", Side::Ask => "Sell" };
         let mut arg_obj = serde_json::json!({
             "category": "linear",
             "symbol": sym,
             "side": side_str,
             "orderType": "Limit",
-            "qty": qty_str,
-            "price": px_str,
+            "qty": spec.format_lot_qty_str(qty),
+            "price": spec.format_price_ticks_str(price),
             "timeInForce": "PostOnly",
             "reduceOnly": reduce_only,
             "positionIdx": 0,
@@ -430,33 +367,19 @@ impl BybitV5LiveClient {
                 let sl_exact = spec.format_price_ticks_str(sl_t);
                 if let Some(obj) = arg_obj.as_object_mut() {
                     obj.insert("stopLoss".to_string(), serde_json::Value::String(sl_exact));
-                    obj.insert(
-                        "slTriggerBy".to_string(),
-                        serde_json::Value::String("MarkPrice".to_string()),
-                    );
-                    obj.insert(
-                        "tpslMode".to_string(),
-                        serde_json::Value::String("Full".to_string()),
-                    );
+                    obj.insert("slTriggerBy".to_string(), serde_json::Value::String("MarkPrice".to_string()));
+                    obj.insert("tpslMode".to_string(), serde_json::Value::String("Full".to_string()));
                 }
             }
         }
         let recv_ms = asymmetric_recv_window_ms(is_entry_create);
         let k = self.api_key.clone();
         let s = self.api_secret.clone();
-        if let Some(ws_rc) = self.ws_trade.execute_ws_op(
-            &k,
-            &s,
-            WsMutationOp::Create,
-            "order.create",
-            recv_ms,
-            &arg_obj,
-        ) {
+        if let Some(ws_rc) = self.ws_trade.execute_ws_op(&k, &s, WsMutationOp::Create, "order.create", recv_ms, &arg_obj) {
             return if ws_rc == 110_072 { 0 } else { ws_rc };
         }
-        let body = arg_obj.to_string();
         let rc = self
-            .post_v5("/v5/order/create", &body)
+            .post_v5("/v5/order/create", &arg_obj.to_string())
             .and_then(|v| v.get("retCode")?.as_i64())
             .unwrap_or(-1);
         if rc == 110_072 { 0 } else { rc }
@@ -485,34 +408,24 @@ impl BybitV5LiveClient {
                 let sl_exact = spec.format_price_ticks_str(sl_t);
                 if let Some(obj) = arg_obj.as_object_mut() {
                     obj.insert("stopLoss".to_string(), serde_json::Value::String(sl_exact));
-                    obj.insert(
-                        "slTriggerBy".to_string(),
-                        serde_json::Value::String("MarkPrice".to_string()),
-                    );
+                    obj.insert("slTriggerBy".to_string(), serde_json::Value::String("MarkPrice".to_string()));
                 }
             }
         }
         let recv_ms = asymmetric_recv_window_ms(false);
         let k = self.api_key.clone();
         let s = self.api_secret.clone();
-        if let Some(ws_rc) = self.ws_trade.execute_ws_op(
-            &k,
-            &s,
-            WsMutationOp::Amend,
-            "order.amend",
-            recv_ms,
-            &arg_obj,
-        ) {
+        if let Some(ws_rc) = self.ws_trade.execute_ws_op(&k, &s, WsMutationOp::Amend, "order.amend", recv_ms, &arg_obj) {
             return if ws_rc == 34_040 { 0 } else { ws_rc };
         }
-        let body = arg_obj.to_string();
         let rc = self
-            .post_v5("/v5/order/amend", &body)
+            .post_v5("/v5/order/amend", &arg_obj.to_string())
             .and_then(|v| v.get("retCode")?.as_i64())
             .unwrap_or(-1);
         if rc == 34_040 { 0 } else { rc }
     }
 
+    /// Idempotent WS + REST fallback cancel (`retCode == 110_001` order-already-gone treated as `0`).
     pub fn cancel_order_ws_or_rest(&mut self, spec: PairSpec, order_link_id: &str) -> i64 {
         if order_link_id.is_empty() {
             return -1;
@@ -525,20 +438,14 @@ impl BybitV5LiveClient {
         let recv_ms = asymmetric_recv_window_ms(false);
         let k = self.api_key.clone();
         let s = self.api_secret.clone();
-        if let Some(ws_rc) = self.ws_trade.execute_ws_op(
-            &k,
-            &s,
-            WsMutationOp::Cancel,
-            "order.cancel",
-            recv_ms,
-            &arg_obj,
-        ) {
-            return ws_rc;
+        if let Some(ws_rc) = self.ws_trade.execute_ws_op(&k, &s, WsMutationOp::Cancel, "order.cancel", recv_ms, &arg_obj) {
+            return if ws_rc == 110_001 { 0 } else { ws_rc };
         }
-        let body = arg_obj.to_string();
-        self.post_v5("/v5/order/cancel", &body)
+        let rc = self
+            .post_v5("/v5/order/cancel", &arg_obj.to_string())
             .and_then(|v| v.get("retCode")?.as_i64())
-            .unwrap_or(-1)
+            .unwrap_or(-1);
+        if rc == 110_001 { 0 } else { rc }
     }
 
     /// P0-A Law V: Deterministic last-resort Market IOC reduceOnly flattener over WS + REST fallback.
@@ -553,10 +460,7 @@ impl BybitV5LiveClient {
             return -1;
         }
         let sym = spec.symbol_id.name();
-        let close_side_str = match open_side.opposite() {
-            Side::Bid => "Buy",
-            Side::Ask => "Sell",
-        };
+        let close_side_str = match open_side.opposite() { Side::Bid => "Buy", Side::Ask => "Sell" };
         let qty_str = spec.format_lot_qty_str(qty);
         let mut arg_obj = serde_json::json!({
             "category": "linear",
@@ -570,29 +474,18 @@ impl BybitV5LiveClient {
         });
         if !order_link_id.is_empty() {
             if let Some(obj) = arg_obj.as_object_mut() {
-                obj.insert(
-                    "orderLinkId".to_string(),
-                    serde_json::Value::String(order_link_id.to_string()),
-                );
+                obj.insert("orderLinkId".to_string(), serde_json::Value::String(order_link_id.to_string()));
             }
             let recv_ms = asymmetric_recv_window_ms(false);
             let k = self.api_key.clone();
             let s = self.api_secret.clone();
-            if let Some(ws_rc) = self.ws_trade.execute_ws_op(
-                &k,
-                &s,
-                WsMutationOp::Create,
-                "order.create",
-                recv_ms,
-                &arg_obj,
-            ) {
+            if let Some(ws_rc) = self.ws_trade.execute_ws_op(&k, &s, WsMutationOp::Create, "order.create", recv_ms, &arg_obj) {
                 if ws_rc == 0 || ws_rc == 110_017 || ws_rc == 110_072 {
                     return 0;
                 }
             }
         }
-        let body = arg_obj.to_string();
-        let Some(resp) = self.post_v5("/v5/order/create", &body) else {
+        let Some(resp) = self.post_v5("/v5/order/create", &arg_obj.to_string()) else {
             return -1;
         };
         let rc = resp.get("retCode").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -624,11 +517,10 @@ impl BybitV5LiveClient {
         if sl_ticks.0 <= 0 {
             return false;
         }
-        let sl_str = spec.format_price_ticks_str(sl_ticks);
         let body = serde_json::json!({
             "category": "linear",
             "symbol": spec.symbol_id.name(),
-            "stopLoss": sl_str,
+            "stopLoss": spec.format_price_ticks_str(sl_ticks),
             "slTriggerBy": "MarkPrice",
             "tpslMode": "Full",
             "positionIdx": 0,
@@ -649,10 +541,7 @@ impl BybitV5LiveClient {
         reduce_only: bool,
     ) -> i64 {
         let sym = spec.symbol_id.name();
-        let side_str = match order_side {
-            Side::Bid => "Buy",
-            Side::Ask => "Sell",
-        };
+        let side_str = match order_side { Side::Bid => "Buy", Side::Ask => "Sell" };
         let px_str = spec.format_price_ticks_str(price);
         let qty_str = spec.format_lot_qty_str(qty);
         let mut payload = serde_json::json!({
@@ -670,10 +559,7 @@ impl BybitV5LiveClient {
                 let sl_exact = spec.format_price_ticks_str(sl_t);
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("stopLoss".to_string(), serde_json::Value::String(sl_exact));
-                    obj.insert(
-                        "slTriggerBy".to_string(),
-                        serde_json::Value::String("MarkPrice".to_string()),
-                    );
+                    obj.insert("slTriggerBy".to_string(), serde_json::Value::String("MarkPrice".to_string()));
                 }
             }
         }
@@ -692,13 +578,10 @@ impl BybitV5LiveClient {
     }
 }
 
-// === OMEGA V4.5 STARTUP HANDSHAKE ===
-
 pub const BYBIT_INSTRUMENTS_INFO_PATH: &str = "/v5/market/instruments-info?category=linear&limit=200";
 pub const BYBIT_ACCOUNT_FEE_RATE_PATH: &str = "/v5/account/fee-rate?category=linear";
 pub const HANDSHAKE_VAULT_CACHE_PATH: &str = "data/vault/vortex_bybit_handshake.json";
 
-/// Bitmask report verifying Bybit UTA V5 live `tickSize` (`1e8`), `qtyStep` (`1e8`) & `Trading` status.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InstrumentSpecVerification {
     pub verified_mask: u16,
@@ -711,7 +594,7 @@ pub struct InstrumentSpecVerification {
 impl InstrumentSpecVerification {
     #[inline]
     #[must_use]
-    pub const fn baseline_from_specs(specs: &[ crate::types::PairSpec; 12 ]) -> Self {
+    pub const fn baseline_from_specs(specs: &[crate::types::PairSpec; 12]) -> Self {
         let mut ticks = [0_i64; 12];
         let mut steps = [0_i64; 12];
         let mut i = 0_usize;
@@ -740,7 +623,6 @@ impl InstrumentSpecVerification {
     }
 }
 
-/// Consolidated startup handshake state for live VIP fee rates and 12-pair contract specs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BybitStartupHandshake {
     pub fee_schedule: crate::types::FeeSchedule,
@@ -749,7 +631,6 @@ pub struct BybitStartupHandshake {
     pub ts_ns: crate::types::TimestampNs,
 }
 
-/// Exact fixed-point decimal string parser (`0` IEEE-754 drift): `scale_decimals = 8` -> `1e8`, `6` -> `ScaledBps`.
 #[must_use]
 pub fn parse_decimal_to_scaled_i64(raw: &str, scale_decimals: u32) -> Option<i64> {
     let trimmed = raw.trim();
@@ -766,10 +647,7 @@ pub fn parse_decimal_to_scaled_i64(raw: &str, scale_decimals: u32) -> Option<i64
     if body.is_empty() {
         return None;
     }
-    let (int_part, frac_part) = match body.split_once('.') {
-        Some((i_str, f_str)) => (i_str, f_str),
-        None => (body, ""),
-    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
     let mut acc: i128 = 0;
     for b in int_part.bytes() {
         if !b.is_ascii_digit() {
@@ -791,11 +669,9 @@ pub fn parse_decimal_to_scaled_i64(raw: &str, scale_decimals: u32) -> Option<i64
         acc = acc.checked_mul(10)?;
         dec_seen += 1;
     }
-    let signed = if neg { -acc } else { acc };
-    i64::try_from(signed).ok()
+    i64::try_from(if neg { -acc } else { acc }).ok()
 }
 
-/// Parses Bybit UTA V5 `/v5/account/fee-rate` JSON into exact `FeeSchedule` (`ScaledBps`, `1 bp = 100`).
 #[allow(clippy::missing_errors_doc)]
 pub fn parse_bybit_fee_rate_json(
     body: &str,
@@ -815,13 +691,8 @@ pub fn parse_bybit_fee_rate_json(
         return Err(crate::types::VortexError::ColumnarFormatCorrupted);
     }
     let chosen = preferred_symbol
-        .and_then(|target| {
-            list.iter().find(|item| {
-                item.get("symbol").and_then(serde_json::Value::as_str) == Some(target)
-            })
-        })
+        .and_then(|target| list.iter().find(|item| item.get("symbol").and_then(serde_json::Value::as_str) == Some(target)))
         .unwrap_or(&list[0]);
-
     let maker_str = chosen
         .get("makerFeeRate")
         .and_then(serde_json::Value::as_str)
@@ -830,19 +701,16 @@ pub fn parse_bybit_fee_rate_json(
         .get("takerFeeRate")
         .and_then(serde_json::Value::as_str)
         .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
-
     let maker_bps = parse_decimal_to_scaled_i64(maker_str, 6)
         .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
     let taker_bps = parse_decimal_to_scaled_i64(taker_str, 6)
         .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
-
     Ok(crate::types::FeeSchedule::from_live_rates_clamped(
         crate::types::ScaledBps(maker_bps),
         crate::types::ScaledBps(taker_bps),
     ))
 }
 
-/// Parses Bybit UTA V5 `/v5/market/instruments-info` JSON and validates all 12 `APPROVED_SPECS`.
 #[allow(clippy::missing_errors_doc)]
 pub fn parse_bybit_instruments_info_json(
     body: &str,
@@ -858,22 +726,13 @@ pub fn parse_bybit_instruments_info_json(
         .and_then(|r| r.get("list"))
         .and_then(serde_json::Value::as_array)
         .ok_or(crate::types::VortexError::ColumnarFormatCorrupted)?;
-
     let mut report = InstrumentSpecVerification::baseline_from_specs(specs);
     report.verified_mask = 0;
-
     for item in list {
-        let Some(sym) = item.get("symbol").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(slot_idx) = specs.iter().position(|s| s.symbol_id.name() == sym) else {
-            continue;
-        };
+        let Some(sym) = item.get("symbol").and_then(serde_json::Value::as_str) else { continue };
+        let Some(slot_idx) = specs.iter().position(|s| s.symbol_id.name() == sym) else { continue };
         let bit = 1_u16 << slot_idx;
-        let status = item
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Closed");
+        let status = item.get("status").and_then(serde_json::Value::as_str).unwrap_or("Closed");
         if status != "Trading" {
             report.halted_mask |= bit;
         }
@@ -887,7 +746,6 @@ pub fn parse_bybit_instruments_info_json(
             .and_then(|lf| lf.get("qtyStep"))
             .and_then(serde_json::Value::as_str)
             .and_then(|s| parse_decimal_to_scaled_i64(s, 8));
-
         if let (Some(live_tick), Some(live_step)) = (tick_opt, step_opt) {
             report.live_tick_1e8[slot_idx] = live_tick;
             report.live_lot_step_1e8[slot_idx] = live_step;
@@ -906,7 +764,6 @@ pub fn parse_bybit_instruments_info_json(
     Ok(report)
 }
 
-/// Runs startup handshake with atomic vault caching and safe offline fallback (Windows 11 / DNS-safe).
 #[must_use]
 pub fn execute_bybit_startup_handshake<F>(
     ts_ns: crate::types::TimestampNs,
@@ -920,10 +777,9 @@ where
         .and_then(|b| parse_bybit_fee_rate_json(&b, Some("BTCUSDT")));
     let live_inst = fetch_endpoint(BYBIT_INSTRUMENTS_INFO_PATH, false)
         .and_then(|b| parse_bybit_instruments_info_json(&b, &crate::types::APPROVED_SPECS));
-
     if let (Ok(fee_schedule), Ok(instruments)) = (live_fees, live_inst) {
         let cache_json = serde_json::json!({
-            "event": "BYBIT_HANDSHAKE_V45",
+            "event": "BYBIT_HANDSHAKE_V47",
             "ts_ns": ts_ns.0,
             "maker_fee_scaled_bps": fee_schedule.maker_fee_bps.0,
             "taker_fee_scaled_bps": fee_schedule.taker_fee_bps.0,
@@ -934,25 +790,17 @@ where
         if let Ok(txt) = serde_json::to_string(&cache_json) {
             let _ = crate::vault_io::atomic_write_bytes_sync(cache_path, txt.as_bytes());
         }
-        return BybitStartupHandshake {
-            fee_schedule,
-            instruments,
-            synced_from_exchange: true,
-            ts_ns,
-        };
+        return BybitStartupHandshake { fee_schedule, instruments, synced_from_exchange: true, ts_ns };
     }
-
     if let Ok(cached_txt) = std::fs::read_to_string(cache_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached_txt) {
-            let m = val
-                .get("maker_fee_scaled_bps")
-                .and_then(serde_json::Value::as_i64);
-            let t = val
-                .get("taker_fee_scaled_bps")
-                .and_then(serde_json::Value::as_i64);
+            let m = val.get("maker_fee_scaled_bps").and_then(serde_json::Value::as_i64);
+            let t = val.get("taker_fee_scaled_bps").and_then(serde_json::Value::as_i64);
             if let (Some(m_bps), Some(t_bps)) = (m, t) {
-                let mut inst =
-                    InstrumentSpecVerification::baseline_from_specs(&crate::types::APPROVED_SPECS);
+                let mut inst = InstrumentSpecVerification::baseline_from_specs(&crate::types::APPROVED_SPECS);
+                if let Some(vm) = val.get("verified_mask").and_then(serde_json::Value::as_u64) {
+                    inst.verified_mask = u16::try_from(vm).unwrap_or(0x0FFF);
+                }
                 if let Some(mm) = val.get("mismatch_mask").and_then(serde_json::Value::as_u64) {
                     inst.mismatch_mask = u16::try_from(mm).unwrap_or(0);
                 }
@@ -971,7 +819,6 @@ where
             }
         }
     }
-
     BybitStartupHandshake {
         fee_schedule: crate::types::FeeSchedule::VIP0_DEFAULT,
         instruments: InstrumentSpecVerification::baseline_from_specs(&crate::types::APPROVED_SPECS),
@@ -1015,28 +862,23 @@ mod tests {
 
     #[test]
     fn test_bybit_client_34040_sl_residual_purge_and_p0a_market_ioc_flatten() {
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
-            return;
-        };
-        let Ok(addr) = listener.local_addr() else {
-            return;
-        };
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else { return };
+        let Ok(addr) = listener.local_addr() else { return };
         let srv = thread::spawn(move || {
-            let Ok((mut writer, _)) = listener.accept() else {
-                return;
-            };
-            let Ok(reader_sock) = writer.try_clone() else {
-                return;
-            };
+            let Ok((mut writer, _)) = listener.accept() else { return };
+            let Ok(reader_sock) = writer.try_clone() else { return };
             let mut rdr = BufReader::new(reader_sock);
             if read_http_body(&mut rdr).is_some() {
                 let b1 = "{\"retCode\":34040,\"retMsg\":\"not modified\"}";
-                let r1 = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-                    b1.len(),
-                    b1
-                );
+                let r1 = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}", b1.len(), b1);
                 let _ = writer.write_all(r1.as_bytes());
+                let _ = writer.flush();
+            }
+            if let Some(cancel_req) = read_http_body(&mut rdr) {
+                assert!(cancel_req.contains("\"orderLinkId\":\"vx-idemp-cancel-s03\""));
+                let b_c = "{\"retCode\":110001,\"retMsg\":\"order not exists or too late to cancel\"}";
+                let r_c = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}", b_c.len(), b_c);
+                let _ = writer.write_all(r_c.as_bytes());
                 let _ = writer.flush();
             }
             if let Some(flatten_req) = read_http_body(&mut rdr) {
@@ -1045,26 +887,16 @@ mod tests {
                 assert!(flatten_req.contains("\"reduceOnly\":true"));
                 assert!(flatten_req.contains("\"side\":\"Buy\""));
                 let b2 = "{\"retCode\":0,\"retMsg\":\"OK\"}";
-                let r2 = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    b2.len(),
-                    b2
-                );
+                let r2 = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b2.len(), b2);
                 let _ = writer.write_all(r2.as_bytes());
                 let _ = writer.flush();
             }
         });
         let base = format!("http://127.0.0.1:{}", addr.port());
-        if let Some(mut client) =
-            BybitV5LiveClient::with_base_url("k_test".to_string(), "s_test".to_string(), &base)
-        {
+        if let Some(mut client) = BybitV5LiveClient::with_base_url("k_test".to_string(), "s_test".to_string(), &base) {
             assert!(client.set_position_trading_stop(APPROVED_SPECS[3], PriceTicks(8_090)));
-            let rc_flat = client.flatten_position_market_ioc(
-                APPROVED_SPECS[3],
-                Side::Ask,
-                LotQty(26),
-                "vx-p0a-flat-s03",
-            );
+            assert_eq!(client.cancel_order_ws_or_rest(APPROVED_SPECS[3], "vx-idemp-cancel-s03"), 0);
+            let rc_flat = client.flatten_position_market_ioc(APPROVED_SPECS[3], Side::Ask, LotQty(26), "vx-p0a-flat-s03");
             assert_eq!(rc_flat, 0);
         }
         let _ = srv.join();
@@ -1074,23 +906,16 @@ mod tests {
 #[cfg(test)]
 mod omega_v45_handshake_tests {
     use super::*;
-    use crate::types::{APPROVED_SPECS, FeeSchedule, ScaledBps, TimestampNs, VortexError};
+    use crate::types::{FeeSchedule, ScaledBps, TimestampNs, VortexError, APPROVED_SPECS};
 
     #[test]
     fn test_bybit_fee_rate_vip_and_negative_maker_rebate_exact_parsing() {
         let vip0_json = r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","takerFeeRate":"0.00055","makerFeeRate":"0.0002"}]}}"#;
-        assert_eq!(
-            parse_bybit_fee_rate_json(vip0_json, Some("BTCUSDT")),
-            Ok(FeeSchedule::VIP0_DEFAULT)
-        );
-
+        assert_eq!(parse_bybit_fee_rate_json(vip0_json, Some("BTCUSDT")), Ok(FeeSchedule::VIP0_DEFAULT));
         let mm_rebate_json = r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","takerFeeRate":"0.000325","makerFeeRate":"-0.00005"}]}}"#;
         assert_eq!(
             parse_bybit_fee_rate_json(mm_rebate_json, Some("BTCUSDT")),
-            Ok(FeeSchedule {
-                maker_fee_bps: ScaledBps(-50),
-                taker_fee_bps: ScaledBps(325),
-            })
+            Ok(FeeSchedule { maker_fee_bps: ScaledBps(-50), taker_fee_bps: ScaledBps(325) })
         );
     }
 
@@ -1102,34 +927,15 @@ mod omega_v45_handshake_tests {
             "retCode": 0,
             "result": {
                 "list": [
-                    {
-                        "symbol": btc.symbol_id.name(),
-                        "status": "Trading",
-                        "priceFilter": { "tickSize": "0.10" },
-                        "lotSizeFilter": { "qtyStep": "0.001" }
-                    },
-                    {
-                        "symbol": eth.symbol_id.name(),
-                        "status": "Trading",
-                        "priceFilter": { "tickSize": "0.05" },
-                        "lotSizeFilter": { "qtyStep": "0.01" }
-                    },
-                    {
-                        "symbol": APPROVED_SPECS[6].symbol_id.name(),
-                        "status": "Settling",
-                        "priceFilter": { "tickSize": "0.001" },
-                        "lotSizeFilter": { "qtyStep": "0.1" }
-                    }
+                    { "symbol": btc.symbol_id.name(), "status": "Trading", "priceFilter": { "tickSize": "0.10" }, "lotSizeFilter": { "qtyStep": "0.001" } },
+                    { "symbol": eth.symbol_id.name(), "status": "Trading", "priceFilter": { "tickSize": "0.05" }, "lotSizeFilter": { "qtyStep": "0.01" } },
+                    { "symbol": APPROVED_SPECS[6].symbol_id.name(), "status": "Settling", "priceFilter": { "tickSize": "0.001" }, "lotSizeFilter": { "qtyStep": "0.1" } }
                 ]
             }
         })
         .to_string();
-
         let fee_json = r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","takerFeeRate":"0.00040","makerFeeRate":"0.00014"}]}}"#;
-        let cache_file = std::env::temp_dir().join(format!(
-            "vortex_handshake_v45_{}.json",
-            std::process::id()
-        ));
+        let cache_file = std::env::temp_dir().join(format!("vortex_handshake_v47_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&cache_file);
 
         let live_hs = execute_bybit_startup_handshake(
@@ -1149,11 +955,9 @@ mod omega_v45_handshake_tests {
         assert_eq!(live_hs.fee_schedule.maker_fee_bps, ScaledBps(140));
         assert_eq!(live_hs.fee_schedule.taker_fee_bps, ScaledBps(400));
         assert!(live_hs.instruments.is_slot_tradable(0));
-        // ETH tickSize drifted (0.05 vs spec 0.01) and Slot 6 is Settling -> both vetoed safely
         assert!(!live_hs.instruments.is_slot_tradable(1));
         assert!(!live_hs.instruments.is_slot_tradable(6));
 
-        // Offline fallback rehydrates cached VIP rates & safety masks without network calls
         let offline_hs = execute_bybit_startup_handshake(
             TimestampNs(1_794_700_010_000_000_000),
             &cache_file,
@@ -1161,8 +965,8 @@ mod omega_v45_handshake_tests {
         );
         assert!(!offline_hs.synced_from_exchange);
         assert_eq!(offline_hs.fee_schedule.maker_fee_bps, ScaledBps(140));
+        assert_eq!(offline_hs.instruments.verified_mask, live_hs.instruments.verified_mask);
         assert!(!offline_hs.instruments.is_slot_tradable(1));
-
         let _ = std::fs::remove_file(&cache_file);
     }
 }

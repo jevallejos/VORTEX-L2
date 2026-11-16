@@ -13,7 +13,7 @@
 use core::f64::consts::TAU;
 
 use crate::types::{
-    PairSpec, PortfolioBetaGuard, PriceTicks, ScaledBps, Side, TemporalCadenceModulation,
+    PairSpec, PriceTicks, ScaledBps, Side, TemporalCadenceModulation,
     TimestampNs,
 };
 
@@ -524,10 +524,7 @@ impl PairSpec {
     }
 }
 
-impl PortfolioBetaGuard {
-    pub const MAX_PORTFOLIO_RISK_PPM: i64 = MAX_PORTFOLIO_RISK_PPM;
-    pub const MAX_DIRECTIONAL_BETA_RISK_PPM: i64 = MAX_DIRECTIONAL_BETA_RISK_PPM;
-}
+
 
 /// Law VII Dollar-Weighted Portfolio Risk & Directional Beta Guard (<= 14,400 ppm total, <= 9,000 ppm beta).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

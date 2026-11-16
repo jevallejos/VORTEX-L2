@@ -1,4 +1,4 @@
-//! 12x2 Online Bayesian Governor, Directional [OB+, OB-] Guard, Live VIP Fees & Regime Rehab (V4.6).
+//! 12x2 Online Bayesian Governor, Anti-Spoof SNR, Signed Epps Beta, [OB+, OB-] & Regime Rehab (V4.7).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -23,11 +23,12 @@ use crate::types::{
     evaluate_utc_and_funding_cadence, LotQty, PairSpec, PriceTicks, ScaledBps, Side,
     TemporalCadenceModulation, TimestampNs, APPROVED_SPECS,
 };
-use crate::vault_io::{atomic_write_bytes_sync, VaultIoCommand};
+use crate::vault_io::VaultIoCommand;
 
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const INIT_RETURN_VAR_BPS2: i64 = 40_000;
 const MIN_VALID_UTC_EPOCH_NS: i64 = 1_577_836_800_000_000_000;
+const EPPS_PHI_CAP: f64 = 1.618_033_988_749_895;
 pub const EMA_PREWARM_PATH: &str = "data/vault/vortex_ema_prewarm.json";
 const MAX_EMA_PREWARM_AGE_NS: i64 = 900_000_000_000;
 
@@ -297,25 +298,6 @@ impl OnlineAdaptiveGovernor {
         });
     }
 
-    pub fn save_ema_prewarm_to_path(&self, path: &std::path::Path, now_ns: TimestampNs) {
-        if self.ewma_fast_px_1e4.iter().all(|&v| v <= 0) { return; }
-        let payload = serde_json::json!({
-            "event": "EMA_PREWARM_V43",
-            "ts_ns": now_ns.0,
-            "ewma_fast_px_1e4": self.ewma_fast_px_1e4,
-            "ewma_slow_px_1e4": self.ewma_slow_px_1e4,
-            "eq_vol_5m_bps": self.eq_vol_5m_bps,
-        });
-        if let Ok(txt) = serde_json::to_string(&payload) {
-            let _ = atomic_write_bytes_sync(path, txt.as_bytes());
-        }
-    }
-
-    #[inline]
-    pub fn save_ema_prewarm_file(&self, now_ns: TimestampNs) {
-        self.save_ema_prewarm_to_path(std::path::Path::new(EMA_PREWARM_PATH), now_ns);
-    }
-
     #[must_use]
     pub fn load_ema_prewarm_from_path(&mut self, path: &std::path::Path, now_ns: TimestampNs) -> usize {
         let Ok(raw) = std::fs::read_to_string(path) else { return 0 };
@@ -352,8 +334,12 @@ impl OnlineAdaptiveGovernor {
         };
         if mid_ticks <= 0 { return; }
         let px_1e4 = mid_ticks.saturating_mul(10_000);
+        let slot_tkr_pm = i64::midpoint(
+            self.slot_taker_prob_permille(slot_idx, Side::Bid),
+            self.slot_taker_prob_permille(slot_idx, Side::Ask),
+        );
         let b3x_floor = APPROVED_SPECS[slot_idx]
-            .three_x_friction_barrier_bps_dynamic(PriceTicks(mid_ticks), 50, self.active_fee_schedule())
+            .three_x_friction_barrier_bps_dynamic(PriceTicks(mid_ticks), slot_tkr_pm, self.active_fee_schedule())
             .raw();
         let active_regime_floor = b3x_floor.saturating_mul(2);
         let obs_vol = snap.realized_vol_5m.raw();
@@ -618,7 +604,7 @@ impl OnlineAdaptiveGovernor {
         }
         if slot_idx > 0 {
             let glob_debt = (-self.global_dir_debt_bps_x100[d]).max(0) as f64;
-            let opp_macro = (-snap.wave_macro_phase.get() * side.sign_f64()).max(0.0);
+            let opp_macro = (-snap.wave_observables().macro_phase.get() * side.sign_f64()).max(0.0);
             if glob_debt >= 8_000.0 || self.global_dir_sl_streak[d] >= 1 || opp_macro > 0.05 {
                 let min_btc_snr = (-0.04 + 0.04 * (glob_debt / 10_000.0).tanh() + 0.85 * (opp_macro - 0.05).max(0.0)).clamp(-0.04, 0.28);
                 if btc_signed_snr < min_btc_snr { return Err("VETO_SCAR64_BTC_DEBT_HEADWIND"); }
@@ -703,9 +689,17 @@ impl OnlineAdaptiveGovernor {
         Some(TimestampNs(snap_ts))
     }
 
+    /// V4.7 Unified Governor Gate coupled to anti-spoof `GEOM` SNR, signed Epps beta & dynamic VIP `FeeSchedule`.
     #[must_use]
-    pub fn authorizes_adaptive_entry_with_wallet(
-        &self, slot_idx: usize, side: Side, wallet_usdt_1e8: i64, candidate_snap: &SymbolLobSnapshot, btc_leader_snap: &SymbolLobSnapshot,
+    pub fn authorizes_adaptive_entry_v47(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
     ) -> bool {
         if slot_idx >= MAX_ACTIVE_PAIRS { return false; }
         if self.entry_warmup_until_ns > 0 && candidate_snap.ts_local_ns.0 > 0 && candidate_snap.ts_local_ns.0 < self.entry_warmup_until_ns { return false; }
@@ -720,14 +714,15 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => (candidate_snap.bids[0].qty, candidate_snap.asks[0].qty, candidate_snap.deep_bid_lots_l1_l5),
             Side::Ask => (candidate_snap.asks[0].qty, candidate_snap.bids[0].qty, candidate_snap.deep_ask_lots_l1_l5),
         };
-        if !spec.passes_l1_queue_depth_and_wall_guard(
+        if !spec.passes_l1_queue_depth_and_wall_guard_dynamic(
             entry_px, candidate_snap.realized_vol_5m, self.ewma_net_bps_x100[slot_idx][d],
             own_q, opp_q, own_deep, candidate_snap.factor_ofi.get().abs(), candidate_snap.factor_tfi.get().abs(),
+            self.slot_taker_prob_permille(slot_idx, side), fees,
         ) { return false; }
         let (self_drift_bps, self_ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, candidate_snap);
         let dir_s = side.sign_f64();
         let signed_geom = candidate_snap.factor_geom.get() * dir_s;
-        let cand_comp = OrthogonalFactorState::snr_composite_score(candidate_snap).abs();
+        let cand_comp = OrthogonalFactorState::adaptive_snr_from_snapshot(candidate_snap, spoof_density).get().abs();
         let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         let in_scar = self.is_in_scar_debt(slot_idx, side);
         if !spec.passes_oversized_lot_conviction_guard_with_vol_and_fees(
@@ -747,16 +742,22 @@ impl OnlineAdaptiveGovernor {
         let ir_adj = (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
         if in_scar && candidate_snap.factor_tfi.get().abs() < (if in_local_scar { 0.45 } else { 0.38 }) { return false; }
         if self.sl_streak[slot_idx][d] >= 1 && self.ewma_net_bps_x100[slot_idx][d] <= -800 && cand_comp < 0.72 { return false; }
-        if slot_idx > 0 {
-            let btc_comp = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
-            let (btc_ofi, btc_tfi) = (btc_leader_snap.factor_ofi.get() * dir_s, btc_leader_snap.factor_tfi.get() * dir_s);
+        let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
+        let beta_sign = if beta_c >= 0.0 { 1.0 } else { -1.0 };
+        let btc_signed_snr = if slot_idx == 0 {
+            OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
+        } else {
+            beta_c * (OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s)
+        };
+        if slot_idx > 0 && beta_c.abs() >= 0.05 {
+            let btc_ofi = btc_leader_snap.factor_ofi.get() * dir_s * beta_sign;
+            let btc_tfi = btc_leader_snap.factor_tfi.get() * dir_s * beta_sign;
             if cand_comp >= 0.50 && !in_local_scar {
-                if btc_comp < -0.08 || (btc_ofi < -0.18 && btc_tfi < -0.18) { return false; }
-            } else if btc_ofi < -0.05 || btc_tfi < -0.05 || btc_comp < (0.08 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty)) {
+                if btc_signed_snr < -0.08 || (btc_ofi < -0.18 && btc_tfi < -0.18) { return false; }
+            } else if btc_ofi < -0.05 || btc_tfi < -0.05 || btc_signed_snr < (0.08 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty)) {
                 return false;
             }
         }
-        let btc_signed_snr = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
         let Ok(wave_mod) = crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(
             candidate_snap.wave_observables(), side, btc_signed_snr,
         ) else { return false; };
@@ -765,12 +766,23 @@ impl OnlineAdaptiveGovernor {
         if opposing_ob_for_side(side, candidate_snap).vetoes_into_opposing_wall_dynamic(
             side, spec, entry_px, candidate_snap.realized_vol_5m, candidate_snap.factor_tfi.get() * dir_s, taker_pm, fees,
         ) { return false; }
-        let ob_res = aligned_ob_for_side(side, candidate_snap).aligned_confluence_resonance(side, spec, entry_px, candidate_snap.realized_vol_5m);
+        let ob_res = aligned_ob_for_side(side, candidate_snap)
+            .aligned_confluence_resonance_dynamic(side, spec, entry_px, candidate_snap.realized_vol_5m, taker_pm, fees);
         let gp_res = candidate_snap.wave_observables().golden_pocket_resonance(side);
         let adaptive_threshold = (0.42 - (0.012 * ob_res + 0.014 * ob_res * gp_res)
             + 0.08 * sl_s + debt_penalty + global_penalty + staircase_penalty
             + wave_mod.snr_threshold_delta + cadence.snr_threshold_delta - ir_adj).clamp(0.36, 0.84);
         cand_comp >= adaptive_threshold
+    }
+
+    #[inline] #[must_use]
+    pub fn authorizes_adaptive_entry_with_wallet(
+        &self, slot_idx: usize, side: Side, wallet_usdt_1e8: i64, candidate_snap: &SymbolLobSnapshot, btc_leader_snap: &SymbolLobSnapshot,
+    ) -> bool {
+        self.authorizes_adaptive_entry_v47(
+            slot_idx, side, wallet_usdt_1e8, candidate_snap, btc_leader_snap,
+            0.0, if slot_idx == 0 { 0.0 } else { 1.0 },
+        )
     }
 
     #[inline] #[must_use]
@@ -783,8 +795,16 @@ impl OnlineAdaptiveGovernor {
         (raw_ns as i64).clamp((base_flow_ns * 16) / 25, (base_flow_ns * 28) / 25)
     }
 
-    pub fn confirm_preflight_kinematics_non_choking(
-        &self, slot_idx: usize, side: Side, wallet_usdt_1e8: i64, snap: &SymbolLobSnapshot, btc_leader_snap: &SymbolLobSnapshot,
+    /// V4.7 Preflight confirmation coupled to anti-spoof `GEOM` SNR & signed Epps beta.
+    pub fn confirm_preflight_kinematics_v47(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
     ) -> Result<(i64, i64), &'static str> {
         if slot_idx >= MAX_ACTIVE_PAIRS { return Err("VETO_INVALID_SLOT"); }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else { return Err("VETO_PREFLIGHT_INVALID_BBO"); };
@@ -794,7 +814,7 @@ impl OnlineAdaptiveGovernor {
         if let Some(veto) = self.audit_historical_entry_veto(slot_idx, side, entry_px.0, snap.ts_local_ns.0) { return Err(veto); }
         let dir_s = side.sign_f64();
         if (ofi * dir_s) < 0.08 { return Err("VETO_PREFLIGHT_OFI_DECAY"); }
-        let signed_snr = OrthogonalFactorState::snr_composite_score(snap) * dir_s;
+        let signed_snr = OrthogonalFactorState::adaptive_snr_from_snapshot(snap, spoof_density).get() * dir_s;
         if signed_snr < 0.30 { return Err("VETO_PREFLIGHT_SNR_COLLAPSE"); }
         let spec = APPROVED_SPECS[slot_idx];
         let fees = self.active_fee_schedule();
@@ -808,8 +828,15 @@ impl OnlineAdaptiveGovernor {
         let (own_q, opp_q) = match side { Side::Bid => (best_bid.qty.0, best_ask.qty.0), Side::Ask => (best_ask.qty.0, best_bid.qty.0) };
         let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(if signed_snr >= 0.68 && own_q >= opp_q { -0.06 } else { 0.00 }, 0.06);
         if signed_geom < min_pre_geom { return Err("VETO_PREFLIGHT_GEOM_REVERSAL"); }
-        let btc_snr = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
-        if slot_idx > 0 && btc_snr < -0.08 && signed_snr < 0.62 { return Err("VETO_PREFLIGHT_BTC_HEADWIND"); }
+        let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
+        let btc_snr = if slot_idx == 0 {
+            OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
+        } else {
+            beta_c * (OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s)
+        };
+        if slot_idx > 0 && beta_c.abs() >= 0.05 && btc_snr < -0.08 && signed_snr < 0.62 {
+            return Err("VETO_PREFLIGHT_BTC_HEADWIND");
+        }
         self.audit_scar64_entry_and_sweep_shield(slot_idx, side, snap, btc_snr)?;
         let _ = crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(snap.wave_observables(), side, btc_snr)?;
         let (drift_bps, ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
@@ -820,6 +847,16 @@ impl OnlineAdaptiveGovernor {
         evaluate_preflight_hysteresis_with_fees(
             side, self.eq_vol_5m_bps[slot_idx], self.ewma_net_bps_x100[slot_idx][d],
             self.slot_information_ratio_x100(slot_idx, side), drift_bps, ext_bps, signed_geom, min_pre_geom, signed_snr, fees,
+        )
+    }
+
+    #[inline]
+    pub fn confirm_preflight_kinematics_non_choking(
+        &self, slot_idx: usize, side: Side, wallet_usdt_1e8: i64, snap: &SymbolLobSnapshot, btc_leader_snap: &SymbolLobSnapshot,
+    ) -> Result<(i64, i64), &'static str> {
+        self.confirm_preflight_kinematics_v47(
+            slot_idx, side, wallet_usdt_1e8, snap, btc_leader_snap,
+            0.0, if slot_idx == 0 { 0.0 } else { 1.0 },
         )
     }
 
@@ -875,7 +912,7 @@ mod tests {
     use crate::types::BoundedScore;
 
     #[test]
-    fn test_v46_governor_directional_ob_asymmetry_and_scar_manifold() {
+    fn test_v47_governor_directional_ob_anti_spoof_and_inverse_epps_beta() {
         assert_eq!(OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold(), (UNIFIED_LOSS_LAB_COUNT, 2_160));
         let mut gov = OnlineAdaptiveGovernor::new();
         gov.set_active_fee_schedule(FeeSchedule::from_live_rates_clamped(ScaledBps(100), ScaledBps(350)));
@@ -896,7 +933,6 @@ mod tests {
         avax.bids[0] = BookLevel { price: PriceTicks(8_170), qty: LotQty(500) };
         avax.asks[0] = BookLevel { price: PriceTicks(8_171), qty: LotQty(380) };
         avax.refresh_deep_l1_l5_totals();
-        // Broken OB+ demand (382 pm) vs rock-solid OB- supply (854 pm) at identical 1,250 ScaledBps distance
         avax.set_order_block_observables_directional(
             OrderBlockObservables {
                 bull_ob_score: BoundedScore::new_clamped(0.46),
@@ -910,18 +946,16 @@ mod tests {
             382,
             854,
         );
-        // Bid into strong OB- (854 pm) MUST VETO while Ask into weak OB+ (382 pm) IS AUTHORIZED!
         assert!(!gov.authorizes_adaptive_entry_with_wallet(3, Side::Bid, 6_628_080_000, &avax, &btc));
+
+        // Inverse Epps beta (-0.85): when BTC dumps (-0.65), inverse-correlated AVAX Bid hedge is AUTHORIZED!
+        let mut avax_hedge = avax;
+        avax_hedge.set_order_block_observables_directional(OrderBlockObservables::default(), 618, 618);
         btc.factor_ofi = BoundedScore::new_clamped(-0.65);
         btc.factor_tfi = BoundedScore::new_clamped(-0.65);
         btc.factor_geom = BoundedScore::new_clamped(-0.35);
-        avax.bids[0].qty = LotQty(380);
-        avax.asks[0].qty = LotQty(500);
-        avax.refresh_deep_l1_l5_totals();
-        avax.factor_ofi = BoundedScore::new_clamped(-0.65);
-        avax.factor_tfi = BoundedScore::new_clamped(-0.65);
-        avax.factor_geom = BoundedScore::new_clamped(-0.35);
-        assert!(gov.authorizes_adaptive_entry_with_wallet(3, Side::Ask, 6_628_080_000, &avax, &btc));
-        assert!(gov.confirm_preflight_kinematics_non_choking(3, Side::Ask, 6_628_080_000, &avax, &btc).is_ok());
+        assert!(!gov.authorizes_adaptive_entry_v47(3, Side::Bid, 6_628_080_000, &avax_hedge, &btc, 0.0, 0.85));
+        assert!(gov.authorizes_adaptive_entry_v47(3, Side::Bid, 6_628_080_000, &avax_hedge, &btc, 0.0, -0.85));
+        assert!(gov.confirm_preflight_kinematics_v47(3, Side::Bid, 6_628_080_000, &avax_hedge, &btc, 0.0, -0.85).is_ok());
     }
 }

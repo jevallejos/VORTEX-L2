@@ -708,7 +708,6 @@ pub struct EventClockAlphaModulator {
     spoof_density_ewma: f64,
 }
 
-pub type Orthogonality3FactorEngine = EventClockAlphaModulator;
 
 impl Default for EventClockAlphaModulator {
     #[inline]
