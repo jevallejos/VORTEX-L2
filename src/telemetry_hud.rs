@@ -549,8 +549,11 @@ fn make_ascii_bar(pct: f64, width: usize) -> String {
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(width - filled))
 }
 
+pub const V48_INCEPTION_UTC_DAY: i64 = 20_773;
+
 pub fn render_live_hud(arena: &VortexShmArena) {
-    let now_ns = now_epoch_ns().0.max(0) as u64;
+    let ts_now = now_epoch_ns();
+    let now_ns = ts_now.0.max(0) as u64;
     let hb_ns = arena.heartbeat_ns.load(Ordering::Acquire);
     let hb_age_ms = if hb_ns > 0 && now_ns >= hb_ns { (now_ns - hb_ns) / 1_000_000 } else { 0 };
     let resyncs = arena.tap_seq_resync_count.load(Ordering::Relaxed);
@@ -558,7 +561,9 @@ pub fn render_live_hud(arena: &VortexShmArena) {
     let halt_active = Path::new(HALT_LOCK_PATH).exists();
     let fees = load_hud_fee_schedule();
     let fee_rt = fees.round_trip_maker_exit_bps().raw().max(100);
-    let dg = load_daily_governor_from_path(Path::new(DAILY_GOVERNOR_VAULT_PATH), DEFAULT_WALLET_EQUITY_1E8);
+    let mut dg = load_daily_governor_from_path(Path::new(DAILY_GOVERNOR_VAULT_PATH), DEFAULT_WALLET_EQUITY_1E8);
+    let w_est = dg.day_open_equity_1e8.saturating_add(dg.day_realized_pnl_1e8).max(5_000_000_000);
+    let _ = dg.sync_utc_day(ts_now, w_est);
     let dg_col = match dg.phase {
         DailyShieldPhase::ActiveHunting => ANSI_GREEN,
         DailyShieldPhase::ProfitLockArmed => ANSI_SKY_BLUE,
@@ -577,8 +582,6 @@ pub fn render_live_hud(arena: &VortexShmArena) {
     let mut sec_rows = Vec::with_capacity(MAX_ACTIVE_PAIRS);
     let (mut open_slots_count, mut queued_slots_count) = (0_usize, 0_usize);
     let btc_snap = arena.slot(0).and_then(|s| s.read_snapshot(4)).unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
-    let w_est = dg.day_open_equity_1e8.saturating_add(dg.day_realized_pnl_1e8).max(5_000_000_000);
-
     for s_idx in 0..MAX_ACTIVE_PAIRS {
         let spec = APPROVED_SPECS[s_idx];
         let snap = arena.slot(s_idx).and_then(|s| s.read_snapshot(4)).unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
@@ -617,19 +620,35 @@ pub fn render_live_hud(arena: &VortexShmArena) {
             verd_col = format!("{ANSI_YELLOW}\u{1f7e1} QUEUE_L1_WAIT {ANSI_RESET}");
         } else if snap.sequence_id > 0 {
             let mid_px = PriceTicks(i64::midpoint(snap.bids[0].price.0.max(1), snap.asks[0].price.0.max(1)));
-            let beta_hud = OrthogonalFactorState::epps_btc_lead_lag_beta(s_idx, &snap, &btc_snap);
             let q_ok = spec.passes_quantum_ev_growth_gate(w_est, mid_px, snap.realized_vol_5m, ScaledBps((fee_rt * 17) / 10), 50, fees);
-            match OrthogonalFactorState::evaluate_entry_signal_v46(
-                spec, &snap, &btc_snap, ScaledBps((fee_rt * 17) / 10), ScaledBps(fee_rt / 2), 50, fees, 0.0, beta_hud,
-            ) {
-                SignalVerdict::SpoofingVeto => verd_col = format!("{ANSI_ORANGE}\u{1f7e0} SPOOF_VETO    {ANSI_RESET}"),
-                SignalVerdict::AuthorizeMakerEntry { .. } if !q_ok => verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}"),
-                SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => verd_col = format!("{ANSI_GREEN}\u{1f7e2} ARM_BID_L1    {ANSI_RESET}"),
-                SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => verd_col = format!("{ANSI_RED}\u{1f534} ARM_ASK_L1    {ANSI_RESET}"),
-                SignalVerdict::NeutralNoAction => {
-                    let vc = LastVetoCode::from_code(tel.last_veto_code);
-                    if vc != LastVetoCode::None {
-                        verd_col = format!("{ANSI_GRAY}\u{26aa} {:<14}{ANSI_RESET}", format_veto_badge(vc));
+            let vc = LastVetoCode::from_code(tel.last_veto_code);
+            if halt_active {
+                verd_col = format!("{ANSI_RED}\u{1f534} HALT_LOCKED   {ANSI_RESET}");
+            } else if drain_active {
+                verd_col = format!("{ANSI_ORANGE}\u{1f7e0} DRAIN_MODE    {ANSI_RESET}");
+            } else if dg.is_hibernating() {
+                verd_col = if q_ok {
+                    format!("{ANSI_GRAY}\u{26aa} SLEEP_DAILY   {ANSI_RESET}")
+                } else {
+                    format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}")
+                };
+            } else if vc == LastVetoCode::WarmupOrLock {
+                verd_col = format!("{ANSI_GRAY}\u{26aa} WARMUP_LOCK   {ANSI_RESET}");
+            } else {
+                let beta_hud = OrthogonalFactorState::epps_btc_lead_lag_beta(s_idx, &snap, &btc_snap);
+                match OrthogonalFactorState::evaluate_entry_signal_v46(
+                    spec, &snap, &btc_snap, ScaledBps((fee_rt * 17) / 10), ScaledBps(fee_rt / 2), 50, fees, 0.0, beta_hud,
+                ) {
+                    SignalVerdict::SpoofingVeto => verd_col = format!("{ANSI_ORANGE}\u{1f7e0} SPOOF_VETO    {ANSI_RESET}"),
+                    SignalVerdict::AuthorizeMakerEntry { .. } if !q_ok => verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}"),
+                    SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => verd_col = format!("{ANSI_GREEN}\u{1f7e2} ARM_BID_L1    {ANSI_RESET}"),
+                    SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => verd_col = format!("{ANSI_RED}\u{1f534} ARM_ASK_L1    {ANSI_RESET}"),
+                    SignalVerdict::NeutralNoAction => {
+                        if !q_ok {
+                            verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}");
+                        } else if vc != LastVetoCode::None {
+                            verd_col = format!("{ANSI_GRAY}\u{26aa} {:<14}{ANSI_RESET}", format_veto_badge(vc));
+                        }
                     }
                 }
             }
@@ -653,10 +672,252 @@ pub fn render_live_hud(arena: &VortexShmArena) {
     print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_ftr]);
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ScalingSemaphoreReport {
+    pub v48_trades: usize,
+    pub v48_days: usize,
+    pub v48_maker_closes: usize,
+    pub v48_mkr_pct: f64,
+    pub global_mkr_pct: f64,
+    pub pf_v48: f64,
+    pub pf_infinite: bool,
+    pub wallet_usdt: f64,
+    pub vault_70_ok: bool,
+    pub defended_days: usize,
+    pub catastrophic_breaches: usize,
+    pub parity_drift_1e8: i64,
+    pub halt_active: bool,
+    pub gate1_ok: bool,
+    pub gate2_ok: bool,
+    pub gate3_ok: bool,
+    pub gate4_ok: bool,
+    pub gates_passed: usize,
+}
+
+impl ScalingSemaphoreReport {
+    #[inline]
+    #[must_use]
+    pub const fn all_green(&self) -> bool {
+        self.gates_passed == 4
+    }
+}
+
+#[must_use]
+pub fn evaluate_capital_scaling_semaphore(
+    vault_path: &Path,
+    wallet_1e8: i64,
+    vault_locked_bps_x100: i64,
+    global_mkr_pct: f64,
+    parity_drift_1e8: i64,
+    halt_active: bool,
+    live_dg: &DailySessionGovernor,
+    fees: FeeSchedule,
+) -> ScalingSemaphoreReport {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut v48_trades = 0_usize;
+    let mut v48_maker_closes = 0_usize;
+    let mut v48_profit_1e8 = 0_i64;
+    let mut v48_loss_1e8 = 0_i64;
+    let mut catastrophic_breaches = 0_usize;
+    let mut v48_days_set = BTreeSet::new();
+    let mut day_events: BTreeMap<i64, Vec<(i64, i64, bool, bool, bool)>> = BTreeMap::new();
+    if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY {
+        v48_days_set.insert(live_dg.utc_day_idx);
+    }
+    let def_fee_f = (fees.round_trip_maker_exit_bps().raw() as f64) / 100.0;
+    let mut sim_ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+    sim_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
+    if let Ok(file) = File::open(vault_path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
+            let is_v48 = v.get("schema").and_then(serde_json::Value::as_str) == Some("V4.8");
+            match v.get("event").and_then(serde_json::Value::as_str) {
+                Some("TRADE_CLOSE") => {
+                    let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("UNKNOWN");
+                    let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                    let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                    let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(def_fee_f);
+                    let mkr = v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                    let net_sc = ScaledBps((n_bps * 100.0).round() as i64);
+                    let fee_sc = ScaledBps((f_bps * 100.0).round() as i64);
+                    let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(&v, slot_from_symbol_name(sym), side_from_str(side_s), net_sc, fee_sc, fees);
+                    let eq_before = sim_ledger.current_equity_1e8();
+                    sim_ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
+                    if is_v48 {
+                        v48_trades += 1;
+                        if mkr { v48_maker_closes += 1; }
+                        if pnl_1e8 >= 0 { v48_profit_1e8 = v48_profit_1e8.saturating_add(pnl_1e8); }
+                        else { v48_loss_1e8 = v48_loss_1e8.saturating_add(pnl_1e8.abs()); }
+                        if u_day > 0 { v48_days_set.insert(u_day); }
+                    }
+                    if u_day >= V48_INCEPTION_UTC_DAY {
+                        if is_catastrophic_loss_breach(pnl_1e8, eq_before) { catastrophic_breaches += 1; }
+                        day_events.entry(u_day).or_default().push((ts, pnl_1e8, true, n_bps >= 1.0, n_bps < -0.50));
+                    }
+                }
+                Some("FUNDING_SETTLEMENT") => {
+                    let f_1e8 = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let n_1e8 = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
+                    if f_1e8 != 0 {
+                        sim_ledger.record_funding_settlement(f_1e8, n_1e8);
+                        if is_v48 && u_day > 0 { v48_days_set.insert(u_day); }
+                        if u_day >= V48_INCEPTION_UTC_DAY {
+                            day_events.entry(u_day).or_default().push((ts, f_1e8, false, false, false));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut defended_set = BTreeSet::new();
+    if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY && live_dg.is_hibernating() {
+        defended_set.insert(live_dg.utc_day_idx);
+    }
+    let fee_rt = fees.round_trip_maker_exit_bps().raw().max(100);
+    let base_eq = wallet_1e8.max(DEFAULT_WALLET_EQUITY_1E8);
+    for (&d_idx, evs) in &day_events {
+        let mut sim_dg = DailySessionGovernor::new(base_eq);
+        sim_dg.utc_day_idx = d_idx;
+        let mut eq_r = base_eq;
+        for &(ts_e, dp, is_tr, is_w, is_l) in evs {
+            eq_r = eq_r.saturating_add(dp);
+            let _ = sim_dg.observe_realized_cashflow(TimestampNs(ts_e), dp, is_tr, is_w, is_l, eq_r, 0, fee_rt, 3_600, 33);
+            if sim_dg.is_hibernating() { defended_set.insert(d_idx); }
+        }
+    }
+    let pf_infinite = v48_trades > 0 && v48_loss_1e8 == 0 && v48_profit_1e8 > 0;
+    let pf_v48 = if v48_trades == 0 { 0.0 } else if pf_infinite { 99.99 } else { (v48_profit_1e8 as f64) / (v48_loss_1e8.max(1) as f64) };
+    let v48_mkr_pct = if v48_trades > 0 { (v48_maker_closes as f64 * 100.0) / (v48_trades as f64) } else { 0.0 };
+    let v48_days = v48_days_set.len();
+    let defended_days = defended_set.len();
+    let vault_70_ok = vault_locked_bps_x100 > 1_250;
+    let gate1_ok = v48_trades >= 50 && v48_days >= 12;
+    let gate2_ok = v48_trades >= 10 && pf_v48 >= 1.35 && wallet_1e8 >= 6_700_000_000 && vault_70_ok;
+    let gate3_ok = v48_trades >= 10 && v48_mkr_pct >= 82.0 && !halt_active && parity_drift_1e8 == 0;
+    let gate4_ok = defended_days >= 2 && catastrophic_breaches == 0 && !halt_active;
+    let gates_passed = usize::from(gate1_ok) + usize::from(gate2_ok) + usize::from(gate3_ok) + usize::from(gate4_ok);
+    ScalingSemaphoreReport {
+        v48_trades, v48_days, v48_maker_closes, v48_mkr_pct, global_mkr_pct, pf_v48, pf_infinite,
+        wallet_usdt: (wallet_1e8 as f64) / 100_000_000.0, vault_70_ok, defended_days,
+        catastrophic_breaches, parity_drift_1e8, halt_active, gate1_ok, gate2_ok, gate3_ok, gate4_ok, gates_passed,
+    }
+}
+// === VORTEX_V48_DASHBOARD_SPLIT_ANCHOR ===
+
+pub fn render_capital_scaling_semaphore(
+    rep: &ScalingSemaphoreReport,
+    dg: &DailySessionGovernor,
+) {
+    let fmt_gate = |idx: u8, ok: bool, pending_tag: &str, name: &str, c2: String, c3: String| -> String {
+        let (col, ico, st_lbl) = if ok {
+            (ANSI_GREEN, "\u{1f7e2}", "CUMPLIDO   ")
+        } else {
+            (ANSI_YELLOW, "\u{1f7e1}", pending_tag)
+        };
+        let c1 = format!("{col}{ico} [REQ {idx}/4 {st_lbl}] {name:<18}{ANSI_RESET}");
+        fmt_3col(c1, c2, c3)
+    };
+    let g1_pct = (((rep.v48_trades.min(50) as f64) / 50.0) * 50.0
+        + ((rep.v48_days.min(12) as f64) / 12.0) * 50.0)
+        .clamp(0.0, 100.0);
+    let g1_c2 = format!(
+        "[{}] {:>2}/50t ({:>5.1}%)",
+        make_ascii_bar(g1_pct, 14),
+        rep.v48_trades,
+        g1_pct
+    );
+    let g1_c3 = format!("Dias UTC V4.8: {:>2}/12 dias", rep.v48_days);
+
+    let w_pct = ((rep.wallet_usdt / 67.0) * 100.0).clamp(0.0, 100.0);
+    let g2_c2 = format!(
+        "[{}] {:>5.2}/67.00\x24 ({:>5.1}%)",
+        make_ascii_bar(w_pct, 14),
+        rep.wallet_usdt,
+        w_pct
+    );
+    let pf_txt = if rep.v48_trades < 10 {
+        format!("N/A ({}/10t)", rep.v48_trades)
+    } else if rep.pf_infinite {
+        "INF (0 loss)".to_string()
+    } else {
+        format!("{:.2}", rep.pf_v48)
+    };
+    let v70_txt = if rep.vault_70_ok { "Vault>12.5b OK" } else { "Vault<=12.5b" };
+    let g2_c3 = format!("PF V4.8: {pf_txt:<12} | {v70_txt}");
+
+    let mkr_ref = if rep.v48_trades >= 10 { rep.v48_mkr_pct } else { rep.global_mkr_pct };
+    let g3_pct = ((mkr_ref / 82.0) * 100.0).clamp(0.0, 100.0);
+    let g3_tag = if rep.v48_trades < 10 { "MUESTRA MIN" } else { "EN PROGRESO" };
+    let g3_c2 = format!("[{}] {:>5.1}%/82.0%", make_ascii_bar(g3_pct, 14), mkr_ref);
+    let mkr_v48_txt = if rep.v48_trades == 0 {
+        "N/A (0t)".to_string()
+    } else {
+        format!("{:.1}% ({}/{}t)", rep.v48_mkr_pct, rep.v48_maker_closes, rep.v48_trades)
+    };
+    let g3_c3 = format!(
+        "V4.8 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
+        rep.parity_drift_1e8,
+        usize::from(rep.halt_active)
+    );
+
+    let g4_pct = (((rep.defended_days.min(2) as f64) / 2.0) * 100.0).clamp(0.0, 100.0);
+    let g4_c2 = format!(
+        "[{}] {:>2}/2 defensas ({:>3.0}%)",
+        make_ascii_bar(g4_pct, 14),
+        rep.defended_days,
+        g4_pct
+    );
+    let g4_c3 = format!(
+        "Hoy: {} ({} brechas)",
+        dg.phase.label(),
+        rep.catastrophic_breaches
+    );
+
+    let all_pct = (rep.gates_passed as f64) * 25.0;
+    let wake_note = if dg.is_hibernating() {
+        " (Despierta 00:00 UTC / 21:00 CL)"
+    } else {
+        ""
+    };
+    let verdict_line = if rep.all_green() {
+        format!(
+            "  \u{2022} Veredicto     : {ANSI_GREEN}\u{1f7e2} SEMAFORO VERDE (4/4) \u{2014} MOTOR VALIDADO: Apto para inyectar Escalon 1 (\x24155-\x24165 USDT -> BTC 12/12).{ANSI_RESET}"
+        )
+    } else {
+        format!(
+            "  \u{2022} Veredicto     : {ANSI_YELLOW}\u{1f7e1} EN VALIDACION ({}/4) \u{2014} Mantener capital base (\x24{:.2} USDT) sin inyectar aun.{ANSI_RESET}",
+            rep.gates_passed, rep.wallet_usdt
+        )
+    };
+    let sec_hdr = vec![format!(
+        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V4.8 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
+    )];
+    let sec_gates = vec![
+        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V4.8", g1_c2, g1_c3),
+        fmt_gate(2, rep.gate2_ok, "EN PROGRESO", "Expectativa & Cap.", g2_c2, g2_c3),
+        fmt_gate(3, rep.gate3_ok, g3_tag, "Ejecucion Maker", g3_c2, g3_c3),
+        fmt_gate(4, rep.gate4_ok, "EN PROGRESO", "Resiliencia Escudo", g4_c2, g4_c3),
+    ];
+    let sec_ftr = vec![
+        format!(
+            "  \u{2022} Avance Global : [{}] {}/4 Requisitos en Verde \u{2502} Estado Hoy: {}{wake_note}",
+            make_ascii_bar(all_pct, 20),
+            rep.gates_passed,
+            dg.phase.label()
+        ),
+        verdict_line,
+    ];
+    print_auto_aligned_box(&[sec_hdr, sec_gates, sec_ftr]);
+}
+
 pub fn render_trades_and_executive_dashboard() {
     let mut rows_out = Vec::new();
     let (mut total, mut wins, mut partials, mut scratches, mut losses, mut maker_closes) = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
     let (mut cum_gross, mut cum_fee, mut cum_net, mut sum_mfe, mut sum_mae, mut sum_hold_s) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut sum_cashflow_1e8 = 0_i64;
     let fees = load_hud_fee_schedule();
     let mut dash_ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
     dash_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
@@ -668,7 +929,10 @@ pub fn render_trades_and_executive_dashboard() {
                 Some("FUNDING_SETTLEMENT") => {
                     let f_1e8 = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let n_1e8 = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
-                    if f_1e8 != 0 { dash_ledger.record_funding_settlement(f_1e8, n_1e8); }
+                    if f_1e8 != 0 {
+                        dash_ledger.record_funding_settlement(f_1e8, n_1e8);
+                        sum_cashflow_1e8 = sum_cashflow_1e8.saturating_add(f_1e8);
+                    }
                 }
                 Some("TRADE_CLOSE") => {
                     total += 1;
@@ -693,6 +957,7 @@ pub fn render_trades_and_executive_dashboard() {
                     let fee_sc = ScaledBps((f_bps * 100.0).round() as i64);
                     let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(&v, slot_from_symbol_name(sym), side_from_str(side_s), net_sc, fee_sc, fees);
                     dash_ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
+                    sum_cashflow_1e8 = sum_cashflow_1e8.saturating_add(pnl_1e8);
                     let (col, icon, lbl) = classify_trade_badge(n_bps, is_partial);
                     rows_out.push(format!(
                         "{col}{icon} [TRADE #{total:<3} {lbl}] {sym:<10} {side_s:<3} \u{2502} {en_t:>7}t->{ex_t:<7}t \u{2502} G:{g_bps:>+6.2} F:{f_bps:>5.2} N:{n_bps:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{mfe:>+6.2} MAE:{mae:>+6.2} \u{2502} {:>4}s \u{2502} {sub_r:<21} (Mkr={mkr}){ANSI_RESET}",
@@ -731,12 +996,14 @@ pub fn render_trades_and_executive_dashboard() {
     let lock_pct = (dg.locked_profit_floor_ppm(arm_ppm) as f64) / 10_000.0;
     let day_usdt = (dg.day_realized_pnl_1e8 as f64) / 100_000_000.0;
     let day_pct = (dg.day_pnl_ppm() as f64) / 10_000.0;
+    let parity_drift_1e8 = (dash_ledger.cumulative_net_pnl_1e8 - sum_cashflow_1e8).abs();
+    let halt_active = Path::new(HALT_LOCK_PATH).exists();
 
     let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V4.8 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
     let sec_kpi = vec![
         fmt_3col(
             format!("Wallet: {w_usdt:.4} USDT (Eq: {eq_usdt:.4} | Avail: {av_usdt:.4})"),
-            format!("Open UPL: {upl_usdt:+.4} USDT | Noc.10x: {eff_notional:.2}$"),
+            format!("Open UPL: {upl_usdt:+.4} USDT | Noc.10x: {eff_notional:.2}\x24"),
             format!("Fees: Mkr {:+.2}bp / Tkr {:.2}bp", (fees.maker_fee_bps.raw() as f64) / 100.0, (fees.taker_fee_bps.raw() as f64) / 100.0),
         ),
         fmt_3col(
@@ -755,7 +1022,7 @@ pub fn render_trades_and_executive_dashboard() {
             format!("Fase UTC: {}", dg.phase.label()),
         ),
         fmt_3col(
-            format!("Cum Gross: {cum_gross:+.2}bp | Fee: {:+.2}bp ({fee_usdt:+.4}$) | Fnd:{fnd_usdt:+.4}$", -cum_fee),
+            format!("Cum Gross: {cum_gross:+.2}bp | Fee: {:+.2}bp ({fee_usdt:+.4}\x24) | Fnd:{fnd_usdt:+.4}\x24", -cum_fee),
             format!("Cum Net: {cum_net:+.2}bp ({:+.2}%@10x | {net_usdt:+.4} USDT)", cum_net / 10.0),
             format!("{ANSI_DARK_GREEN}Vault 70%: {locked_bps:+.2}bp{ANSI_RESET} | Res 30%: {reserve_bps:+.2}bp"),
         ),
@@ -766,4 +1033,74 @@ pub fn render_trades_and_executive_dashboard() {
         ),
     ];
     print_auto_aligned_box(&[sec_hdr, rows_out, sec_kpi]);
+    let sem_rep = evaluate_capital_scaling_semaphore(
+        Path::new(AI_FORENSIC_VAULT_PATH),
+        w_1e8,
+        dash_ledger.vault_locked_profit_bps_x100,
+        mkr_pct,
+        parity_drift_1e8,
+        halt_active,
+        &dg,
+        fees,
+    );
+    render_capital_scaling_semaphore(&sem_rep, &dg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_v48_capital_scaling_semaphore_yellow_to_green_transition() {
+        let tmp_vault = std::env::temp_dir().join(format!("vortex_sem_v48_{}.jsonl", std::process::id()));
+        let _ = fs::remove_file(&tmp_vault);
+        let mut dg = DailySessionGovernor::new(6_513_770_000);
+        dg.utc_day_idx = V48_INCEPTION_UTC_DAY;
+        dg.phase = DailyShieldPhase::HibernatingLossCap;
+
+        let legacy_row = serde_json::json!({
+            "event": "TRADE_CLOSE", "schema": "V4.7", "ts_ns": V48_INCEPTION_UTC_DAY * 86_400_000_000_000 + 3_600_000_000_000,
+            "symbol": "SUIUSDT", "side": "Ask", "entry_ticks": 7279, "exit_ticks": 7270,
+            "net_bps": 8.36, "fee_bps": 4.0, "net_pnl_1e8": 1_600_000, "fee_1e8": 760_000, "maker_exit": true
+        }).to_string();
+        assert!(fs::write(&tmp_vault, format!("{legacy_row}\n")).is_ok());
+
+        let rep0 = evaluate_capital_scaling_semaphore(
+            &tmp_vault, 6_513_770_000, 1_250, 84.62, 0, false, &dg, FeeSchedule::VIP0_DEFAULT,
+        );
+        assert_eq!((rep0.v48_trades, rep0.v48_days, rep0.defended_days, rep0.gates_passed), (0, 1, 1, 0));
+        assert!(!rep0.all_green());
+
+        let mut lines = String::new();
+        for idx in 0..52_i64 {
+            let day_idx = V48_INCEPTION_UTC_DAY + 1 + (idx / 4);
+            let ts_ns = day_idx * 86_400_000_000_000 + (idx % 4 + 1) * 3_600_000_000_000;
+            let (is_mkr, net_bps, pnl_1e8) = if idx == 4 {
+                (true, 18.0, 95_000_000_i64)
+            } else if idx == 5 {
+                (false, -12.0, -35_000_000_i64)
+            } else if idx % 9 == 8 {
+                (false, -19.5, -3_800_000_i64)
+            } else {
+                (true, 4.5, 950_000_i64)
+            };
+            let row = serde_json::json!({
+                "event": "TRADE_CLOSE", "schema": "V4.8", "ts_ns": ts_ns,
+                "symbol": "AVAXUSDT", "side": "Bid", "entry_ticks": 8200, "exit_ticks": 8207,
+                "net_bps": net_bps, "fee_bps": if is_mkr { 4.0 } else { 7.5 },
+                "net_pnl_1e8": pnl_1e8, "fee_1e8": 750_000, "maker_exit": is_mkr
+            });
+            lines.push_str(&row.to_string());
+            lines.push('\n');
+        }
+        assert!(fs::write(&tmp_vault, lines).is_ok());
+
+        let rep_green = evaluate_capital_scaling_semaphore(
+            &tmp_vault, 6_745_000_000, 2_840, 88.46, 0, false, &dg, FeeSchedule::VIP0_DEFAULT,
+        );
+        render_capital_scaling_semaphore(&rep_green, &dg);
+        assert!(rep_green.gate1_ok && rep_green.gate2_ok && rep_green.gate3_ok && rep_green.gate4_ok);
+        assert!(rep_green.all_green());
+        let _ = fs::remove_file(&tmp_vault);
+    }
 }
