@@ -720,7 +720,7 @@ pub fn evaluate_capital_scaling_semaphore(
     let mut v48_loss_1e8 = 0_i64;
     let mut catastrophic_breaches = 0_usize;
     let mut v48_days_set = BTreeSet::new();
-    let mut day_events: BTreeMap<i64, Vec<(i64, i64, bool, bool, bool)>> = BTreeMap::new();
+    type DailyCashflowSample = (i64, i64, bool, bool, bool); let mut day_events: BTreeMap<i64, Vec<DailyCashflowSample>> = BTreeMap::new();
     if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY {
         v48_days_set.insert(live_dg.utc_day_idx);
     }
