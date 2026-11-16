@@ -1,4 +1,4 @@
-//! Deterministic L1..L5 FIFO Queue Simulator & 4-Arm Economic/Adversarial Ablation Lab (OMEGA V4.5).
+//! Deterministic L1..L5 FIFO Queue Simulator & 4-Arm Economic/Adversarial Ablation Lab (OMEGA V4.8).
 
 #![allow(
     clippy::manual_clamp,

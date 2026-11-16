@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""VORTEX-OMEGA V4.7 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer."""
-
+"""VORTEX-OMEGA V4.8 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
 import json
 import math
 import os
@@ -22,7 +21,6 @@ SPECS = [
     ("NEARUSDT", 100_000),
     ("LTCUSDT", 1_000_000),
 ]
-
 PARKINSON_K = 0.600_561_20 * math.sqrt(5.0)
 
 
@@ -39,11 +37,18 @@ def decimal_to_ticks(val_str: str, tick_size_1e8: int) -> int:
 
 def fetch_1m_klines(symbol: str, limit: int = 90) -> list:
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/4.6"})
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    rows = data.get("result", {}).get("list", [])
-    return list(reversed(rows))
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/4.8"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            rows = data.get("result", {}).get("list", [])
+            if rows:
+                return list(reversed(rows))
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.30 * (attempt + 1))
+    return []
 
 
 def main() -> int:
@@ -55,15 +60,11 @@ def main() -> int:
     slow_arr = [0] * 12
     vol_arr = [4_800] * 12
     hydrated = 0
-
     a_fast = 1.0 - math.exp(-60.0 / 20.0)
     a_slow = 1.0 - math.exp(-60.0 / 300.0)
 
     for idx, (sym, tick_1e8) in enumerate(SPECS):
-        try:
-            rows = fetch_1m_klines(sym, 90)
-        except Exception:
-            continue
+        rows = fetch_1m_klines(sym, 90)
         if not rows:
             continue
         f_px = 0.0
@@ -82,7 +83,6 @@ def main() -> int:
                 s_px += a_slow * (px_1e4 - s_px)
             hl_bps = ((max(0, hi_t - lo_t) * 1_000_000) / max(1, cl_t)) * PARKINSON_K
             hl_samples.append(hl_bps)
-
         fast_arr[idx] = int(round(f_px))
         slow_arr[idx] = int(round(s_px))
         recent_vol = sum(hl_samples[-15:]) / max(1, len(hl_samples[-15:]))
@@ -91,7 +91,6 @@ def main() -> int:
 
     if hydrated == 0:
         return 0
-
     now_ns = time.time_ns()
     payload = {
         "event": "EMA_PREWARM_V43",
@@ -103,7 +102,7 @@ def main() -> int:
     tmp_path = out_path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp_path, out_path)
-    print(f"[PREWARM OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
+    print(f"[PREWARM V4.8 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
     return 0
 
 

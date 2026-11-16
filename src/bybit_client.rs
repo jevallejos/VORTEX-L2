@@ -1,4 +1,4 @@
-//! Authenticated Bybit UTA V5 REST/WS Client, Idempotent Cancel & P0-A Market IOC Flattener (V4.7).
+//! Authenticated Bybit UTA V5 REST/WS Client, Idempotent Cancel & P0-A Market IOC Flattener (V4.8).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,

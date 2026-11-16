@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.7 Autonomous Execution CLI Wrapper (Delegates 200Hz Core to exec_daemon).
+//! VORTEX-OMEGA V4.8 Autonomous Execution CLI Wrapper (Delegates 200Hz Core to exec_daemon).
 use std::process::ExitCode;
 
 fn main() -> ExitCode {

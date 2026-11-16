@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.7 Institutional Zero-Jitter Execution Core (24-Submodule Clean-Room Architecture).
+//! VORTEX-OMEGA V4.8 Institutional Zero-Jitter Execution Core (24-Submodule Clean-Room Architecture).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;
@@ -145,5 +145,72 @@ mod tests {
         alt.factor_tfi = BoundedScore::new_clamped(0.72);
         alt.factor_geom = BoundedScore::new_clamped(0.38);
         assert!(gov.authorizes_adaptive_entry_v47(3, Side::Bid, 6_543_090_000, &alt, &f_snap, 0.0, -0.85));
+    }
+}
+
+#[cfg(test)]
+mod omega_v48_constitutional_gate {
+    use crate::alpha_3factor::SignalVerdict;
+    use crate::execution_fsm::SlotExecutionEngine;
+    use crate::fee_cadence_beta::FeeSchedule;
+    use crate::governor_plasticity::{DailySessionGovernor, DailyShieldPhase};
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
+    use crate::markout_tracker::SlotMarkoutRing;
+    use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, Side, TimestampNs, APPROVED_SPECS};
+    use crate::vault_io::{is_catastrophic_loss_breach, VaultIoCommand};
+
+    #[test]
+    fn test_omega_v48_elastic_daily_shield_quantum_ev_and_toxicity_gate() {
+        assert!(core::mem::size_of::<VaultIoCommand>() <= 512);
+        assert!(!is_catastrophic_loss_breach(-30_211_283, 6_513_770_000));
+        assert!(is_catastrophic_loss_breach(-110_000_000, 6_513_770_000));
+
+        let w_65 = 6_513_770_000_i64;
+        assert!(!APPROVED_SPECS[0].passes_quantum_ev_growth_gate(
+            w_65, PriceTicks(646_312), ScaledBps(3_069), ScaledBps(568), 46, FeeSchedule::VIP0_DEFAULT,
+        ));
+        assert!(APPROVED_SPECS[3].passes_quantum_ev_growth_gate(
+            w_65, PriceTicks(7_263), ScaledBps(2_206), ScaledBps(628), 50, FeeSchedule::VIP0_DEFAULT,
+        ));
+
+        let mut dg = DailySessionGovernor::new(w_65);
+        let day1 = TimestampNs(1_794_787_200_000_000_000 + 7_200_000_000_000);
+        assert_eq!(
+            dg.observe_realized_cashflow(day1, 70_000_000, true, true, false, w_65 + 70_000_000, 381, 400, 3_200, 45),
+            DailyShieldPhase::ProfitLockArmed
+        );
+        assert_eq!(
+            dg.observe_realized_cashflow(day1, -26_000_000, true, false, true, w_65 + 44_000_000, 381, 400, 3_200, 45),
+            DailyShieldPhase::HibernatingProfitLocked
+        );
+        assert!(dg.sync_utc_day(TimestampNs(day1.0 + 86_400_000_000_000), w_65 + 44_000_000) && !dg.is_hibernating());
+
+        let mut s3 = SymbolLobSnapshot::new_empty();
+        s3.symbol_id = APPROVED_SPECS[3].symbol_id;
+        s3.ts_local_ns = TimestampNs(10_000_000_000);
+        s3.realized_vol_5m = ScaledBps(6_000);
+        s3.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(450) };
+        s3.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(320) };
+        s3.mark_price = PriceTicks(8_200);
+        s3.last_trade_price = PriceTicks(8_200);
+        let mut eng = SlotExecutionEngine::new(3);
+        let v = SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, target_excursion_scaled_bps: ScaledBps(680) };
+        assert!(eng.try_arm_maker_entry(&s3, v, LotQty(22)).is_ok() && eng.on_maker_entry_filled(TimestampNs(10_000_000_000)).is_ok());
+        let init_dist = 8_200 - eng.last_eff_sl_ticks.0;
+        let mut ring = SlotMarkoutRing::new();
+        ring.arm_fill_probe(Side::Bid, PriceTicks(8_200), PriceTicks(8_200), TimestampNs(10_000_000_000));
+        for &(px, t) in &[(8_197_i64, 10_300_000_000_i64), (8_196, 11_200_000_000), (8_192, 16_000_000_000), (8_188, 25_500_000_000)] {
+            ring.step_clock(PriceTicks(px), TimestampNs(t), 200);
+        }
+        s3.ts_local_ns = TimestampNs(25_500_000_000);
+        s3.bids[0] = BookLevel { price: PriceTicks(8_188), qty: LotQty(180) };
+        s3.asks[0] = BookLevel { price: PriceTicks(8_189), qty: LotQty(490) };
+        s3.mark_price = PriceTicks(8_188);
+        s3.last_trade_price = PriceTicks(8_188);
+        s3.factor_ofi = BoundedScore::new_clamped(-0.55);
+        s3.factor_tfi = BoundedScore::new_clamped(-0.62);
+        let z = eng.observe_post_fill_toxicity_and_wald_v48(&s3, &s3, 1.0, &ring, 1.2);
+        assert!(eng.maybe_ratchet_sl_with_toxicity_v48(&s3, &s3, 1.0, z).is_some());
+        assert!((8_200 - eng.last_eff_sl_ticks.0) * 100 <= init_dist * 35);
     }
 }

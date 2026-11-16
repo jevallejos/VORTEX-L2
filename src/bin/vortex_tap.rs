@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.7 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 + Unified SSOT Engines).
+//! VORTEX-OMEGA V4.8 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 + Live VIP Fees).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use vortex_rs::alpha_3factor::{EventClockAlphaModulator, OrthogonalFactorState};
 use vortex_rs::bybit_client::parse_decimal_to_scaled_i64;
+use vortex_rs::fee_cadence_beta::FeeSchedule;
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
 #[cfg(target_os = "linux")]
 use vortex_rs::http_ws_transport::{parse_endpoint_url, KeepAliveHttpConn};
@@ -32,6 +33,7 @@ use vortex_rs::tap_ring::{
     inspect_live_shm_readonly, prune_expired_parquet_segment, run_isolated_tap_self_test,
     AsyncParquetRingWriter, SAMPLE_VOL_5M_BPS,
 };
+use vortex_rs::telemetry_hud::load_hud_fee_schedule;
 use vortex_rs::types::{
     now_epoch_ns, slot_from_symbol_name, LotQty, PriceTicks, ScaledBps, Side, TimestampNs,
     VortexError, ANSI_GREEN, ANSI_RESET, APPROVED_SPECS,
@@ -55,6 +57,7 @@ struct TapLiveState {
     has_live_mark_px: [bool; MAX_ACTIVE_PAIRS],
     has_book_snapshot: [bool; MAX_ACTIVE_PAIRS],
     last_ticker_par2_ns: [i64; MAX_ACTIVE_PAIRS],
+    active_fees: FeeSchedule,
     batch: Box<ColumnarParquetBatch>,
     vault_tx: Option<SyncSender<VaultIoCommand>>,
     last_ob_persist_ns: i64,
@@ -64,17 +67,24 @@ impl TapLiveState {
     #[must_use]
     fn new(enable_async_vault: bool) -> Self {
         let mut ob_states = [CausalOrderBlockEngine::new(); MAX_ACTIVE_PAIRS];
-        if enable_async_vault {
+        let active_fees = if enable_async_vault {
             let (bull_arr, bear_arr) =
                 load_directional_plasticity_from_path(Path::new(OB_PLASTICITY_VAULT_PATH));
             for s in 0..MAX_ACTIVE_PAIRS {
                 ob_states[s].set_directional_efficacy_pm(bull_arr[s], bear_arr[s]);
             }
+            let live_fees = load_hud_fee_schedule();
             println!(
-                "{}\u{1f7e2} [OB PLASTICITY V4.7 REHYDRATE] Hydrated 12/12 directional [OB+, OB-] SSOT slots{}",
-                ANSI_GREEN, ANSI_RESET
+                "{}\u{1f7e2} [OB PLASTICITY V4.8 REHYDRATE] Hydrated 12/12 [OB+, OB-] SSOT slots | Fees: {:+.2}/{:.2}bp{}",
+                ANSI_GREEN,
+                (live_fees.maker_fee_bps.raw() as f64) / 100.0,
+                (live_fees.taker_fee_bps.raw() as f64) / 100.0,
+                ANSI_RESET
             );
-        }
+            live_fees
+        } else {
+            FeeSchedule::VIP0_DEFAULT
+        };
         let vault_tx = if enable_async_vault {
             Some(spawn_vault_io_worker(Arc::new(AtomicLockWatch::default())))
         } else {
@@ -89,12 +99,21 @@ impl TapLiveState {
             has_live_mark_px: [false; MAX_ACTIVE_PAIRS],
             has_book_snapshot: [false; MAX_ACTIVE_PAIRS],
             last_ticker_par2_ns: [0; MAX_ACTIVE_PAIRS],
+            active_fees,
             batch: Box::<ColumnarParquetBatch>::default(),
             vault_tx,
             last_ob_persist_ns: 0,
         };
         st.reset_session_preserving_plasticity();
         st
+    }
+
+    #[inline]
+    fn set_active_fee_schedule(&mut self, fees: FeeSchedule) {
+        self.active_fees = fees;
+        for s in 0..MAX_ACTIVE_PAIRS {
+            self.ob_states[s].set_fee_and_taker_context(fees, 50);
+        }
     }
 
     fn reset_session_preserving_plasticity(&mut self) {
@@ -106,6 +125,7 @@ impl TapLiveState {
             self.wave_states[s].reset();
             self.ob_states[s].reset_preserving_plasticity();
             self.ob_states[s].set_realized_vol_5m(init_vol);
+            self.ob_states[s].set_fee_and_taker_context(self.active_fees, 50);
             let (bull_pm, bear_pm) = self.ob_states[s].directional_efficacy_pm();
             let prev_resyncs = self.active_snaps[s].seq_resync_count;
             self.active_snaps[s] = SymbolLobSnapshot::new_empty();
@@ -140,6 +160,17 @@ impl TapLiveState {
     }
 
     #[inline]
+    fn maybe_run_60s_maintenance(&mut self, ts_ns: i64, reload_vault_fees: bool) {
+        if ts_ns.saturating_sub(self.last_ob_persist_ns) < 60_000_000_000 {
+            return;
+        }
+        if reload_vault_fees {
+            self.set_active_fee_schedule(load_hud_fee_schedule());
+        }
+        self.dispatch_ob_plasticity_async(ts_ns);
+    }
+
+    #[inline]
     fn push_par2_row(&mut self, row: &ColumnarMarketRow, writer: Option<&AsyncParquetRingWriter>) {
         if self.batch.push_row(row).is_err() {
             if let Some(w) = writer {
@@ -156,9 +187,7 @@ impl TapLiveState {
         let (bull_pm, bear_pm) = self.ob_states[slot_idx].directional_efficacy_pm();
         self.active_snaps[slot_idx].set_order_block_observables_directional(obs, bull_pm, bear_pm);
     }
-}
 
-impl TapLiveState {
     /// Processes 1 Bybit V5 public WS frame; returns `true` iff a severe L2 sequence gap requires resync.
     fn ingest_public_ws_text(
         &mut self,
@@ -179,6 +208,7 @@ impl TapLiveState {
             let Some(data) = val.get("data") else { return false };
             let incoming_u = data.get("u").and_then(serde_json::Value::as_u64).unwrap_or(0);
             let prev_seq = self.active_snaps[slot_idx].sequence_id;
+
             match classify_l2_sequence_transition(self.has_book_snapshot[slot_idx], prev_seq, is_snapshot, incoming_u) {
                 L2SeqDecision::ResetAndApplySnapshot => {
                     self.active_snaps[slot_idx].bids = [BookLevel::default(); 50];
@@ -233,7 +263,8 @@ impl TapLiveState {
             if self.active_snaps[slot_idx].last_trade_price.0 <= 0 {
                 self.active_snaps[slot_idx].last_trade_price = mid_l1;
             }
-            let b3x = spec.required_3x_barrier_bps(mid_l1).unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS);
+
+            let b3x = spec.three_x_friction_barrier_bps_dynamic(mid_l1, 50, self.active_fees);
             if self.has_live_mark_px[slot_idx]
                 && is_l2_seq_or_basis_anomaly(
                     prev_seq, incoming_u, mid_l1, self.active_snaps[slot_idx].mark_price,
@@ -244,8 +275,8 @@ impl TapLiveState {
                     self.active_snaps[slot_idx].seq_resync_count.saturating_add(1);
                 arena.tap_seq_resync_count.fetch_add(1, Ordering::Relaxed);
             }
-            let next_vol = self.factor_states[slot_idx].observe_mid_and_step_elastic_vol(
-                spec, mid_l1, local_ns.0, self.active_snaps[slot_idx].realized_vol_5m,
+            let next_vol = self.factor_states[slot_idx].observe_mid_and_step_elastic_vol_with_fees(
+                spec, mid_l1, local_ns.0, self.active_snaps[slot_idx].realized_vol_5m, 50, self.active_fees,
             );
             self.active_snaps[slot_idx].realized_vol_5m = next_vol;
             self.ob_states[slot_idx].set_realized_vol_5m(next_vol);
@@ -253,6 +284,7 @@ impl TapLiveState {
             self.active_snaps[slot_idx].set_wave_observables(w_obs);
             let ob_q = self.ob_states[slot_idx].observe_mid_quote(spec, mid_l1);
             self.publish_ob_observables(slot_idx, ob_q);
+
             let virt_ts = self.event_clocks[slot_idx].step_event_clock_and_spoof(
                 local_ns, self.active_snaps[slot_idx].factor_ofi, self.active_snaps[slot_idx].factor_tfi,
             );
@@ -352,6 +384,7 @@ impl TapLiveState {
             let Some(d_root) = val.get("data") else { return false };
             let item = d_root.as_array().and_then(|a| a.first()).unwrap_or(d_root);
             let (mut meta_changed, mut mp_updated) = (false, false);
+
             if let Some(oi_s) = item.get("openInterest").and_then(serde_json::Value::as_str) {
                 if let Some(oi_x100) = parse_decimal_to_scaled_i64(oi_s, 2) {
                     let clean_oi = oi_x100.max(0);
@@ -418,11 +451,12 @@ impl TapLiveState {
 }
 
 fn run_par2_shm_v15_self_check() -> Result<(), VortexError> {
-    let eph_shm = MappedShmRegion::ephemeral_self_test_path("tap_par2_v15_ssot");
+    let eph_shm = MappedShmRegion::ephemeral_self_test_path("tap_par2_v15_v48");
     let res = (|| -> Result<(), VortexError> {
         let reg = MappedShmRegion::open_or_create(&eph_shm, true)?;
         let arena = reg.arena();
         let mut st = TapLiveState::new(false);
+        st.set_active_fee_schedule(FeeSchedule::from_live_rates_clamped(ScaledBps(-50), ScaledBps(300)));
         let t0 = 1_794_700_000_000_000_000_i64;
         let f_l2 = r#"{"topic":"orderbook.50.AVAXUSDT","type":"snapshot","ts":1794700000000,"data":{"s":"AVAXUSDT","u":100,"b":[["8.180","400"],["8.179","350"],["8.178","320"],["8.177","300"],["8.176","280"]],"a":[["8.181","360"],["8.182","340"],["8.183","310"],["8.184","290"],["8.185","270"]]}}"#;
         let f_tk = r#"{"topic":"tickers.AVAXUSDT","ts":1794700000100,"data":{"symbol":"AVAXUSDT","markPrice":"8.182","openInterest":"125000.50","fundingRate":"-0.000145","nextFundingTime":"1794700800000"}}"#;
@@ -432,13 +466,15 @@ fn run_par2_shm_v15_self_check() -> Result<(), VortexError> {
         let _ = st.ingest_public_ws_text(f_tk, TimestampNs(t0 + 100_000_000), arena, None);
         let _ = st.ingest_public_ws_text(f_tr, TimestampNs(t0 + 200_000_000), arena, None);
         let _ = st.ingest_public_ws_text(f_lq, TimestampNs(t0 + 300_000_000), arena, None);
-        st.dispatch_ob_plasticity_async(t0 + 300_000_000);
+        st.maybe_run_60s_maintenance(t0 + 61_000_000_000, false);
+
         let rd = arena.slot(3)?.read_snapshot(4)?;
         if rd.funding_rate_scaled_bps != ScaledBps(-145)
             || rd.open_interest_x100 != 12_500_050
             || rd.mark_price != PriceTicks(8_182)
             || rd.wave_observables().liq_imbalance.to_bps_i32() <= 0
             || st.wave_states[3].active_liquidation_floor_usdt() < 50.0
+            || st.active_fees.maker_fee_bps != ScaledBps(-50)
             || st.batch.len() != 4
         {
             return Err(VortexError::ColumnarFormatCorrupted);
@@ -495,7 +531,7 @@ fn warm_start_elliott_and_order_blocks(state: &mut TapLiveState) {
         }
     }
     println!(
-        "{}\u{1f7e2} [TAP WARM-START V4.7] Hydrated {}/12 slots (Chunked Keep-Alive TLS -> Elliott + [OB+, OB-] SSOT){}",
+        "{}\u{1f7e2} [TAP WARM-START V4.8] Hydrated {}/12 slots (Chunked Keep-Alive TLS -> Elliott + [OB+, OB-] + Live VIP){}",
         ANSI_GREEN, hydrated_slots, ANSI_RESET
     );
 }
@@ -512,9 +548,11 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, _writer: AsyncParquetRingWri
 fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWriter) -> ! {
     let mut state = TapLiveState::new(true);
     loop {
+        state.set_active_fee_schedule(load_hud_fee_schedule());
         state.reset_session_preserving_plasticity();
         warm_start_elliott_and_order_blocks(&mut state);
         state.dispatch_ob_plasticity_async(now_epoch_ns().0);
+
         if let Ok((mut socket, _)) = tungstenite::connect(BYBIT_PUBLIC_LINEAR_WS) {
             configure_ws_tcp_stream(&mut socket);
             let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 4);
@@ -540,9 +578,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
                     }
                     last_ping_ns = local_ns.0;
                 }
-                if local_ns.0.saturating_sub(state.last_ob_persist_ns) >= 60_000_000_000 {
-                    state.dispatch_ob_plasticity_async(local_ns.0);
-                }
+                state.maybe_run_60s_maintenance(local_ns.0, true);
                 let txt = match msg {
                     tungstenite::Message::Text(t) => t,
                     tungstenite::Message::Ping(payload) => {
@@ -569,13 +605,15 @@ fn main() -> ExitCode {
     let shm_path = MappedShmRegion::default_shm_path();
     let sep = "=".repeat(80);
     let dash = "-".repeat(80);
+
     println!("{sep}");
     println!(
-        "[VORTEX-TAP OMEGA V4.7] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
+        "[VORTEX-TAP OMEGA V4.8] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
         VORTEX_SHM_VERSION,
         shm_path.display()
     );
     println!("{sep}");
+
     let Ok((approved, rows, checksum)) = run_isolated_tap_self_test(true) else {
         return ExitCode::FAILURE;
     };
@@ -587,11 +625,13 @@ fn main() -> ExitCode {
         "[SEQLOCK SHM v15 & PAR2 OK] Isolated Gate Slots: {} | Rows Verified: {} (+4 PAR2 Live) | FNV1a64: 0x{:016X}",
         approved, rows, checksum
     );
+
     if !is_daemon {
         inspect_live_shm_readonly(&shm_path);
         println!("{sep}");
         return ExitCode::SUCCESS;
     }
+
     println!("{sep}");
     prune_expired_parquet_segment(Path::new("data"), 0);
     let Ok(region) = MappedShmRegion::open_or_create(&shm_path, true) else {

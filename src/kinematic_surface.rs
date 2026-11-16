@@ -1,4 +1,4 @@
-//! Pure C1 Kinematic Free-Energy Surface, Live VIP Fee Scaling, Hawkes/Stoikov Shield & LOSS-LAB 63/63 (V4.6).
+//! Pure C1 Kinematic Free-Energy Surface, Live VIP Fee Scaling, Hawkes/Stoikov Shield & LOSS-LAB 63/63 (V4.8).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,

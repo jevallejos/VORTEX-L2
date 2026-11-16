@@ -1,4 +1,4 @@
-//! Asynchronous Bybit UTA V5 Command Gateway, Hourly VIP Handshake, Private WS Parser & P0-A Flatten (V4.7).
+//! Asynchronous Bybit UTA V5 Command Gateway, Hourly VIP Handshake, Private WS Parser & P0-A Flatten (V4.8).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::manual_clamp,

@@ -1,4 +1,4 @@
-//! Causal 6-Pivot Elliott Wave v2.0 Automaton, Endogenous Liquidation Floor & C1 Hermite Surface (V4.6).
+//! Causal 6-Pivot Elliott Wave v2.0 Automaton, Endogenous Liquidation Floor & C1 Hermite Surface (V4.8).
 #![allow(
     clippy::cast_precision_loss,
     clippy::manual_clamp,

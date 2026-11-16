@@ -1,4 +1,4 @@
-//! Zero-Alloc Bi-Directional Order Block Engine (OB+ / OB-) with Distance-Weighted Eviction & Live VIP Fees (V4.7).
+//! Zero-Alloc Bi-Directional Order Block Engine (OB+ / OB-) with Distance-Weighted Eviction & Live VIP Fees (V4.8).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,

@@ -1,4 +1,4 @@
-//! 12x2 Online Bayesian Governor, Anti-Spoof SNR, Signed Epps Beta, [OB+, OB-] & Regime Rehab (V4.7).
+//! 12x2 Online Bayesian Governor, Anti-Spoof SNR, Signed Epps Beta, [OB+, OB-] & Regime Rehab (V4.8).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,

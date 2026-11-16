@@ -1,4 +1,4 @@
-//! Native FIPS 180-4 HMAC-SHA256, Conservative Decimal Parsers, WS Lattice & Adaptive VIP Rate Governor (V4.7).
+//! Native FIPS 180-4 HMAC-SHA256, Conservative Decimal Parsers, WS Lattice & Adaptive VIP Rate Governor (V4.8).
 use crate::types::{LotQty, PairSpec, PriceTicks, Side, VortexError};
 
 const SHA256_K: [u32; 64] = [

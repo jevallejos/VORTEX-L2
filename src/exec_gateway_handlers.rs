@@ -1,4 +1,4 @@
-//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V4.6).
+//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V4.8).
 #![allow(
     clippy::cast_precision_loss,
     clippy::manual_clamp,
@@ -615,7 +615,7 @@ pub fn bootstrap_live_adopt_if_enabled(
             };
             engines[s_idx].sync_to_shm_telemetry(arena);
             println!(
-                "{}\u{1f7e2} [VORTEX-OMEGA V4.6 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
+                "{}\u{1f7e2} [VORTEX-OMEGA V4.8 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
                 ANSI_GREEN, s_idx, sym_name, side_p, sz_s, bybit_avg_t.0, sl_t.0, sl_ok, t1_done, ANSI_RESET
             );
         }

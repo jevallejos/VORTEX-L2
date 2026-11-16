@@ -1,4 +1,4 @@
-//! Continuous 1:1 Walk-Forward PAR1/PAR2 Replay Engine, 8h Funding Settlement & Digital Twin (V4.7).
+//! Continuous 1:1 Walk-Forward PAR1/PAR2 Replay Engine, Elastic Daily Shield, Quantum EV & Digital Twin (V4.8).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -34,6 +34,7 @@ use crate::fifo_sim::{FifoQueueSimulator, SimulatedOrderState, INITIAL_REPLAY_EQ
 use crate::forensic_parquet::{
     ColumnarMarketRow, ColumnarParquetBatch, Par2EventKind, ParitySyncLedger,
 };
+use crate::governor_plasticity::DailySessionGovernor;
 use crate::lob_shm::{LastVetoCode, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
 use crate::markout_tracker::SlotMarkoutRing;
 use crate::order_block::{CausalOrderBlockEngine, OB_PLASTICITY_VAULT_PATH};
@@ -57,6 +58,8 @@ pub struct WalkForwardReport {
     pub par2_ticker_events: u64,
     pub par2_liq_events: u64,
     pub spoof_vetoes: u64,
+    pub quantum_ev_vetoes: u64,
+    pub daily_hibernations: u64,
     pub armed: u64,
     pub queue_aborts: u64,
     pub tp_aborts_verified: u64,
@@ -95,10 +98,7 @@ pub fn settle_crossed_funding_boundary(
     last_settled_cut: &mut i64,
     ledger: &mut ParitySyncLedger,
 ) -> Option<i64> {
-    if open_lots.0 <= 0
-        || opened_ts_ns < MIN_FUNDING_EPOCH_NS
-        || snap.ts_local_ns.0 <= opened_ts_ns
-    {
+    if open_lots.0 <= 0 || opened_ts_ns < MIN_FUNDING_EPOCH_NS || snap.ts_local_ns.0 <= opened_ts_ns {
         return None;
     }
     let open_cut = opened_ts_ns.div_euclid(1_000_000_000).div_euclid(28_800);
@@ -144,13 +144,10 @@ pub(crate) fn step_par2_observables_on_row(
     taker_prob_pm: i64,
 ) {
     let spec = APPROVED_SPECS[s_idx];
-    let prev_funding = snap.funding_rate_scaled_bps;
-    let prev_next_f = snap.next_funding_ts_ns;
-    let prev_oi = snap.open_interest_x100;
+    let (prev_funding, prev_next_f, prev_oi) = (snap.funding_rate_scaled_bps, snap.next_funding_ts_ns, snap.open_interest_x100);
     row.apply_to_lob_snapshot(snap);
     ob_engine.set_realized_vol_5m(snap.realized_vol_5m);
     ob_engine.set_fee_and_taker_context(fees, taker_prob_pm);
-
     if matches!(row.par2_kind, Par2EventKind::TickerMeta) {
         snap.funding_rate_scaled_bps = row.funding_rate_scaled_bps;
         if row.next_funding_ts_ns.0 > 0 { snap.next_funding_ts_ns = row.next_funding_ts_ns; }
@@ -162,16 +159,13 @@ pub(crate) fn step_par2_observables_on_row(
         if snap.next_funding_ts_ns.0 == 0 && prev_next_f.0 > 0 { snap.next_funding_ts_ns = prev_next_f; }
         if snap.open_interest_x100 == 0 && prev_oi > 0 { snap.open_interest_x100 = prev_oi; }
     }
-
     if row.open_interest_x100 > 0 {
         let oi_contracts = (row.open_interest_x100 as f64) / 100.0;
         ob_engine.observe_open_interest(oi_contracts);
         if matches!(row.par2_kind, Par2EventKind::TickerMeta) || row.open_interest_x100 != prev_oi {
-            let w_oi = wave_state.observe_open_interest(spec, oi_contracts, snap.ts_local_ns.0);
-            snap.set_wave_observables(w_oi);
+            snap.set_wave_observables(wave_state.observe_open_interest(spec, oi_contracts, snap.ts_local_ns.0));
         }
     }
-
     match row.par2_kind {
         Par2EventKind::PublicTradePrint if row.price_ticks.0 > 0 => {
             wave_state.observe_public_trade_notional(spec, snap.ts_local_ns, row.price_ticks, row.lot_qty);
@@ -181,16 +175,13 @@ pub(crate) fn step_par2_observables_on_row(
         }
         Par2EventKind::LiquidationPrint if row.lot_qty.0 > 0 => {
             let eff_liq_px = if row.price_ticks.0 > 0 { row.price_ticks } else { snap.mark_price };
-            let w_liq = wave_state.observe_liquidation_with_price(spec, row.side, row.lot_qty, eff_liq_px, snap.ts_local_ns.0);
-            snap.set_wave_observables(w_liq);
+            snap.set_wave_observables(wave_state.observe_liquidation_with_price(spec, row.side, row.lot_qty, eff_liq_px, snap.ts_local_ns.0));
         }
         _ => {}
     }
-
     if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
         let mid_w = PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0));
-        let w_obs = wave_state.observe_price_tick(spec, mid_w, snap.ts_local_ns.0, snap.realized_vol_5m);
-        snap.set_wave_observables(w_obs);
+        snap.set_wave_observables(wave_state.observe_price_tick(spec, mid_w, snap.ts_local_ns.0, snap.realized_vol_5m));
         let ob_mid = ob_engine.observe_mid_quote(spec, mid_w);
         if ob_mid.bull_wall_ticks.0 > 0 || ob_mid.bear_wall_ticks.0 > 0 {
             let (bull_pm, bear_pm) = ob_engine.directional_efficacy_pm();
@@ -215,12 +206,14 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
 
     let mut engines = SlotExecutionEngine::new_12_slot_array();
     let mut gov = OnlineAdaptiveGovernor::new();
+    let mut daily_gov = DailySessionGovernor::new(INITIAL_REPLAY_EQUITY_1E8);
     let mut wave_states = [CausalElliottWaveState::new(); MAX_ACTIVE_PAIRS];
     let mut ob_engines = [CausalOrderBlockEngine::new(); MAX_ACTIVE_PAIRS];
     let mut markout_rings = [SlotMarkoutRing::new(); MAX_ACTIVE_PAIRS];
     let mut epps_trackers = [EppsBtcCorrelationTracker::new(); MAX_ACTIVE_PAIRS];
     let mut spoof_clocks = [EventClockAlphaModulator::new(); MAX_ACTIVE_PAIRS];
     let mut last_funding_cut = [0_i64; MAX_ACTIVE_PAIRS];
+
     if verbose {
         let _ = gov.rehydrate_from_scar_and_loss_files(
             Path::new(SCAR_MEMORY_VAULT_PATH), Path::new(RED_LOSS_BOX_PATH),
@@ -244,6 +237,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
     let mut armed_ts_latch = [0_i64; MAX_ACTIVE_PAIRS];
     let mut first_ring_ts_ns = 0_i64;
     let require_ring_warmup = files.len() >= 64;
+
     let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let init_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 4);
     for s in 0..MAX_ACTIVE_PAIRS {
@@ -260,21 +254,13 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
             let Some(row) = batch.get_row(i) else { continue };
             let Some(s_idx) = row.symbol_id.slot_index() else { continue };
             rep.total_events += 1;
+
             let fees = gov.active_fee_schedule();
-            let slot_tkr_pm = i64::midpoint(
-                gov.slot_taker_prob_permille(s_idx, Side::Bid),
-                gov.slot_taker_prob_permille(s_idx, Side::Ask),
-            );
-            step_par2_observables_on_row(
-                s_idx, &row, &mut snaps[s_idx], &mut wave_states[s_idx],
-                &mut ob_engines[s_idx], &mut markout_rings[s_idx], fees, slot_tkr_pm,
-            );
-            if first_ring_ts_ns == 0 && snaps[s_idx].ts_local_ns.0 > 0 {
-                first_ring_ts_ns = snaps[s_idx].ts_local_ns.0;
-            }
-            let _ = spoof_clocks[s_idx].step_event_clock_and_spoof(
-                snaps[s_idx].ts_local_ns, snaps[s_idx].factor_ofi, snaps[s_idx].factor_tfi,
-            );
+            let slot_tkr_pm = i64::midpoint(gov.slot_taker_prob_permille(s_idx, Side::Bid), gov.slot_taker_prob_permille(s_idx, Side::Ask));
+            step_par2_observables_on_row(s_idx, &row, &mut snaps[s_idx], &mut wave_states[s_idx], &mut ob_engines[s_idx], &mut markout_rings[s_idx], fees, slot_tkr_pm);
+            if first_ring_ts_ns == 0 && snaps[s_idx].ts_local_ns.0 > 0 { first_ring_ts_ns = snaps[s_idx].ts_local_ns.0; }
+
+            let _ = spoof_clocks[s_idx].step_event_clock_and_spoof(snaps[s_idx].ts_local_ns, snaps[s_idx].factor_ofi, snaps[s_idx].factor_tfi);
             let mid_now = PriceTicks(i64::midpoint(snaps[s_idx].bids[0].price.0.max(1), snaps[s_idx].asks[0].price.0.max(1)));
             let mid_btc = PriceTicks(i64::midpoint(snaps[0].bids[0].price.0.max(1), snaps[0].asks[0].price.0.max(1)));
             epps_trackers[s_idx].observe_5s_pair(snaps[s_idx].ts_local_ns, s_idx == 0, mid_now, mid_btc);
@@ -298,20 +284,30 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
             let cur_snap = snaps[s_idx];
             let btc_snap = snaps[0];
             let spec = APPROVED_SPECS[s_idx];
+            let spoof_d = spoof_clocks[s_idx].spoofing_density();
+            let evt_dil = spoof_clocks[s_idx].event_clock_dilation();
             let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &cur_snap, &btc_snap, &epps_trackers[s_idx]);
+
+            let eq_now = ledger.current_equity_1e8();
+            let was_sleeping = daily_gov.is_hibernating();
+            let p_day = gov.slot_temporal_cadence(0, &btc_snap).intraday_percentile;
+            let _ = daily_gov.evaluate_intraday_gate(
+                cur_snap.ts_local_ns, eq_now, ledger.sinking_fund_reserve_bps_x100,
+                gov.active_maker_rt_fee_bps(), gov.portfolio_mean_eq_vol_bps(), gov.portfolio_mean_ir_x100(), p_day,
+            );
+            if !was_sleeping && daily_gov.is_hibernating() { rep.daily_hibernations += 1; }
+            let block_new_entries = daily_gov.is_hibernating();
 
             match engines[s_idx].state {
                 OrderLifecycleState::Idle => {
-                    let eq_1e8 = ledger.current_equity_1e8();
-                    let beta_guard = build_monetary_beta_guard_with_epps(eq_1e8, &engines, &snaps, &epps_trackers, fees);
-                    let spoof_d = spoof_clocks[s_idx].spoofing_density();
-                    let comp_raw = OrthogonalFactorState::adaptive_snr_from_snapshot(&cur_snap, spoof_d).get();
-                    let probe_side = if comp_raw >= 0.0 { Side::Bid } else { Side::Ask };
+                    if block_new_entries { continue; }
+                    let beta_guard = build_monetary_beta_guard_with_epps(eq_now, &engines, &snaps, &epps_trackers, fees);
+                    let probe_side = if OrthogonalFactorState::adaptive_snr_from_snapshot(&cur_snap, spoof_d).get() >= 0.0 { Side::Bid } else { Side::Ask };
                     let (dir_edge, _, _) = gov.slot_direction_diagnostics(s_idx, probe_side);
                     let taker_pm = gov.slot_taker_prob_permille(s_idx, probe_side);
+                    let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
                     let verdict = OrthogonalFactorState::evaluate_entry_signal_v46(
-                        spec, &cur_snap, &btc_snap, ScaledBps(engines[s_idx].learned_mfe_bps),
-                        ScaledBps(dir_edge), taker_pm, fees, spoof_d, epps_beta,
+                        spec, &cur_snap, &btc_snap, mfe_s, ScaledBps(dir_edge), taker_pm, fees, spoof_d, epps_beta,
                     );
                     match verdict {
                         SignalVerdict::SpoofingVeto => rep.spoof_vetoes += 1,
@@ -319,20 +315,28 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             let warm_dt = cur_snap.ts_local_ns.0.saturating_sub(first_ring_ts_ns);
                             if require_ring_warmup && (first_ring_ts_ns <= 0 || warm_dt < 300_000_000_000) { continue; }
                             let s_taker_pm = gov.slot_taker_prob_permille(s_idx, side);
+                            let cand_px = side.select_entry_bbo_price(cur_snap.bids[0].price, cur_snap.asks[0].price);
+                            if !spec.passes_quantum_ev_growth_gate(eq_now, cand_px, cur_snap.realized_vol_5m, mfe_s, s_taker_pm, fees) {
+                                rep.quantum_ev_vetoes += 1;
+                                continue;
+                            }
                             if !passes_elliott_macro_coherence_guard(side, &cur_snap)
                                 || !passes_order_block_wall_guard_dynamic(s_idx, side, &cur_snap, s_taker_pm, fees)
                                 || !can_stage_same_direction_entry(s_idx, side, cur_snap.ts_local_ns, &engines, &snaps)
                             {
                                 continue;
                             }
-                            let lots = gov.compute_slot_entry_lots(s_idx, side, eq_1e8, &cur_snap);
-                            let cand_px = side.select_entry_bbo_price(cur_snap.bids[0].price, cur_snap.asks[0].price);
-                            let risk_ppm = slot_position_risk_ppm_with_fees(spec, eq_1e8, cand_px, lots, cur_snap.realized_vol_5m, fees);
+                            let daily_damper_pm = daily_gov.kelly_boundary_damper_permille(
+                                ledger.sinking_fund_reserve_bps_x100, gov.active_maker_rt_fee_bps(),
+                                gov.portfolio_mean_eq_vol_bps(), gov.portfolio_mean_ir_x100(),
+                            );
+                            let lots = gov.compute_slot_entry_lots_v48(s_idx, side, eq_now, &cur_snap, daily_damper_pm);
+                            let risk_ppm = slot_position_risk_ppm_with_fees(spec, eq_now, cand_px, lots, cur_snap.realized_vol_5m, fees);
                             let beta_x1000 = epps_trackers[s_idx].correlated_beta_x1000(
                                 s_idx == 0, cur_snap.realized_vol_5m, ScaledBps(btc_snap.realized_vol_5m.0.max(2_500)),
                             );
                             if beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000)
-                                && gov.authorizes_adaptive_entry_with_wallet(s_idx, side, eq_1e8, &cur_snap, &btc_snap)
+                                && gov.authorizes_adaptive_entry_v48(s_idx, side, eq_now, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta)
                             {
                                 engines[s_idx].sync_governor_for_side(&gov, side);
                                 if engines[s_idx].try_arm_maker_entry(&cur_snap, verdict, lots).is_ok()
@@ -350,10 +354,12 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     engines[s_idx].sync_governor_dynamics(&gov);
                     match entry_fifo[s_idx].state {
                         SimulatedOrderState::Inactive => {
+                            if block_new_entries { engines[s_idx].state = OrderLifecycleState::Idle; continue; }
                             if cur_snap.ts_local_ns.0.saturating_sub(submitted_ts.0) < engines[s_idx].elastic_preflight_window_ns(cur_snap.realized_vol_5m) {
                                 continue;
                             }
-                            if gov.confirm_preflight_kinematics_non_choking(s_idx, side, ledger.current_equity_1e8(), &cur_snap, &btc_snap).is_err() {
+                            let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
+                            if gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_err() {
                                 engines[s_idx].state = OrderLifecycleState::Idle;
                                 continue;
                             }
@@ -420,12 +426,13 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             let macro_contradiction = elapsed_ns >= q_timers.macro_abort_ns
                                 && (!passes_elliott_macro_coherence_guard(side, &cur_snap)
                                     || !passes_order_block_wall_guard_dynamic(s_idx, side, &cur_snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees));
-                            let dq_abort = headwind_erosion || macro_contradiction
+                            let dq_abort = block_new_entries || headwind_erosion || macro_contradiction
                                 || (elapsed_ns >= 25_000_000 && at_l1 && check_queue_depletion_velocity_abort(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap))
                                 || flow_imp <= -0.42;
                             if elapsed_ns >= (max_chase_ns * 3) / 4 || total_chase_ns >= max_chase_ns || dq_abort {
                                 gov.observe_entry_abort(s_idx, side, entry_price, cur_snap.ts_local_ns);
-                                markout_rings[s_idx].arm_abort_probe(side, entry_price, LastVetoCode::HawkesStoikovQueueAbort, cur_snap.ts_local_ns);
+                                let veto_c = if block_new_entries { LastVetoCode::WarmupOrLock } else { LastVetoCode::HawkesStoikovQueueAbort };
+                                markout_rings[s_idx].arm_abort_probe(side, entry_price, veto_c, cur_snap.ts_local_ns);
                                 entry_fifo[s_idx].reset();
                                 engines[s_idx].state = OrderLifecycleState::Idle;
                                 rep.queue_aborts += 1;
@@ -443,7 +450,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     Side::Bid => new_l1.0 > entry_price.0 && (new_l1.0 - entry_price.0) <= max_chase_ticks,
                                     Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase_ticks,
                                 };
-                                if moved_away && gov.confirm_preflight_kinematics_non_choking(s_idx, side, ledger.current_equity_1e8(), &cur_snap, &btc_snap).is_ok() {
+                                let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
+                                if moved_away && gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok() {
                                     if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&cur_snap, new_l1) {
                                         engines[s_idx].next_peg_allowed_ts_ns = cur_snap.ts_local_ns.0 + q_timers.repeg_cooldown_ns;
                                         engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, cur_snap.ts_local_ns);
@@ -457,11 +465,15 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                 }
                 OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, mut peak_favorable_price, mut worst_adverse_price, open_lots, sl_trigger_price, opened_ts, .. } => {
                     engines[s_idx].sync_governor_dynamics(&gov);
-                    if settle_crossed_funding_boundary(spec, side, open_lots, avg_price_ticks, opened_ts.0, &cur_snap, &mut last_funding_cut[s_idx], &mut ledger).is_some() {
+                    if let Some(f_1e8) = settle_crossed_funding_boundary(spec, side, open_lots, avg_price_ticks, opened_ts.0, &cur_snap, &mut last_funding_cut[s_idx], &mut ledger) {
                         rep.funding_settlements += 1;
+                        let _ = daily_gov.observe_realized_cashflow(
+                            cur_snap.ts_local_ns, f_1e8, false, false, false, ledger.current_equity_1e8(),
+                            ledger.sinking_fund_reserve_bps_x100, gov.active_maker_rt_fee_bps(),
+                            gov.portfolio_mean_eq_vol_bps(), gov.portfolio_mean_ir_x100(),
+                        );
                     }
                     engines[s_idx].observe_open_flow_kinematics(&cur_snap);
-                    let _ = engines[s_idx].observe_wald_sprt_step_with_beta(&cur_snap, &btc_snap, epps_beta);
                     let ref_px = if cur_snap.last_trade_price.0 > 0 { cur_snap.last_trade_price } else {
                         match side { Side::Bid => cur_snap.asks[0].price, Side::Ask => cur_snap.bids[0].price }
                     };
@@ -482,6 +494,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     let avg_d = avg_price_ticks.0.max(1);
                     engines[s_idx].last_closed_mfe_bps = ((peak_favorable_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_d;
                     engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_d;
+                    let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v48(&cur_snap, &btc_snap, epps_beta, &markout_rings[s_idx], evt_dil);
+
                     if engines[s_idx].last_eff_sl_ticks.0 <= 0 { engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
                     let eff_sl_px = engines[s_idx].last_eff_sl_ticks;
                     let sl_hit = match side {
@@ -505,6 +519,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             closed_opt = engines[s_idx].finalize_open_position_close(ClosedTradeKind::MakerPassiveUnwind, fill_price, fill_ts_ns, &mut ledger);
                         }
                     }
+
                     if let Some(summary) = closed_opt {
                         rep.closed += 1;
                         if summary.is_maker_exit { rep.maker_closes += 1; }
@@ -516,6 +531,11 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                         gov.observe_closed_trade_at_entry(
                             s_idx, summary.side, summary.entry_price, summary.net_scaled_bps,
                             summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100, cur_snap.ts_local_ns,
+                        );
+                        let _ = daily_gov.observe_realized_cashflow(
+                            cur_snap.ts_local_ns, summary.net_pnl_1e8, true, summary.net_pnl_1e8 > 0, summary.net_pnl_1e8 < 0,
+                            ledger.current_equity_1e8(), ledger.sinking_fund_reserve_bps_x100,
+                            gov.active_maker_rt_fee_bps(), gov.portfolio_mean_eq_vol_bps(), gov.portfolio_mean_ir_x100(),
                         );
                         if verbose {
                             let net_f = (net_r as f64) / 100.0;
@@ -534,7 +554,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     }
                     if let Some(quote) = engines[s_idx].compute_canonical_exit_quote(&cur_snap) {
                         engines[s_idx].latch_defensive_floor_if_needed(quote.defensive_lock_active);
-                        let _ = engines[s_idx].maybe_ratchet_chandelier_or_wald_sl(&cur_snap, &btc_snap);
+                        let _ = engines[s_idx].maybe_ratchet_sl_with_toxicity_v48(&cur_snap, &btc_snap, epps_beta, zeta_tox);
                         let (rest_tp, rest_q) = exit_fifo[s_idx].resting_price_and_qty();
                         let (preempt, delay_ns) = compute_exit_sync_schedule_with_fees(&quote, rest_tp, avg_price_ticks, engines[s_idx].active_fees);
                         let peg_ready = preempt || cur_snap.ts_local_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns;
@@ -556,6 +576,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
             }
         }
     }
+
     let (mut lvr_sum, mut lvr_cnt) = (0_i64, 0_i64);
     for mr in &markout_rings {
         rep.tp_aborts_verified += mr.true_positive_aborts().0;
@@ -581,8 +602,8 @@ pub fn print_walk_forward_summary(rep: &WalkForwardReport) {
         rep.par2_ticker_events, rep.par2_liq_events, rep.funding_settlements
     );
     println!(
-        "  -> Live Walk-Forward Replay  : {ANSI_ORANGE}Spoof={} | {ANSI_YELLOW}Arm={} | Abr={}(TP:{}) | Rej={} | Fil={} | {ANSI_GREEN}Cls={} (W:{}/S:{}/L:{}) | LVR5s={:+.2}bp{ANSI_RESET}",
-        rep.spoof_vetoes, rep.armed, rep.queue_aborts, rep.tp_aborts_verified, rep.post_only_rejects,
+        "  -> Live Walk-Forward Replay  : {ANSI_ORANGE}Spoof={} QEv={} DaySlp={} | {ANSI_YELLOW}Arm={} | Abr={}(TP:{}) | Rej={} | Fil={} | {ANSI_GREEN}Cls={} (W:{}/S:{}/L:{}) | LVR5s={:+.2}bp{ANSI_RESET}",
+        rep.spoof_vetoes, rep.quantum_ev_vetoes, rep.daily_hibernations, rep.armed, rep.queue_aborts, rep.tp_aborts_verified, rep.post_only_rejects,
         rep.fills, rep.closed, rep.wins, rep.scratches, rep.losses, (rep.ewma_lvr_5s_bps as f64) / 100.0
     );
     let (wf_col, wf_ico) = if rep.cum_net_bps_x100 >= 0 && rep.losses == 0 { (ANSI_GREEN, "\u{1f7e2}") } else { (ANSI_RED, "\u{1f534}") };
@@ -624,6 +645,7 @@ pub mod omega_twin {
         OmegaFifoLifecycle,
     };
     use crate::forensic_parquet::{ColumnarMarketRow, MarketEventKind, ParitySyncLedger};
+    use crate::governor_plasticity::DailySessionGovernor;
     use crate::lob_shm::{BookLevel, LastVetoCode, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
     use crate::markout_tracker::SlotMarkoutRing;
     use crate::order_block::CausalOrderBlockEngine;
@@ -664,6 +686,7 @@ pub mod omega_twin {
     pub struct OmegaDigitalTwinEngine {
         pub engines: [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
         pub gov: OnlineAdaptiveGovernor,
+        pub daily_gov: DailySessionGovernor,
         pub ledger: ParitySyncLedger,
         pub entry_fifo: [OmegaConservativeFifoOrder; MAX_ACTIVE_PAIRS],
         pub exit_fifo: [OmegaConservativeFifoOrder; MAX_ACTIVE_PAIRS],
@@ -689,6 +712,7 @@ pub mod omega_twin {
             Self {
                 engines: SlotExecutionEngine::new_12_slot_array(),
                 gov: OnlineAdaptiveGovernor::new(),
+                daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8),
                 ledger: ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8),
                 entry_fifo: [OmegaConservativeFifoOrder::new(); MAX_ACTIVE_PAIRS],
                 exit_fifo: [OmegaConservativeFifoOrder::new(); MAX_ACTIVE_PAIRS],
@@ -745,8 +769,19 @@ pub mod omega_twin {
             let mid_btc = PriceTicks(i64::midpoint(btc_snap.bids[0].price.0.max(1), btc_snap.asks[0].price.0.max(1)));
             self.epps_trackers[s_idx].observe_5s_pair(ev.snap.ts_local_ns, s_idx == 0, mid_now, mid_btc);
             let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &ev.snap, &btc_snap, &self.epps_trackers[s_idx]);
+            let spoof_d = self.spoof_clocks[s_idx].spoofing_density();
+            let evt_dil = self.spoof_clocks[s_idx].event_clock_dilation();
             let now_ns = ev.snap.ts_local_ns;
             let spec = APPROVED_SPECS[s_idx];
+
+            let eq_now = self.ledger.current_equity_1e8();
+            let p_day = self.gov.slot_temporal_cadence(0, &btc_snap).intraday_percentile;
+            let _ = self.daily_gov.evaluate_intraday_gate(
+                now_ns, eq_now, self.ledger.sinking_fund_reserve_bps_x100,
+                self.gov.active_maker_rt_fee_bps(), self.gov.portfolio_mean_eq_vol_bps(),
+                self.gov.portfolio_mean_ir_x100(), p_day,
+            );
+            let block_new_entries = self.daily_gov.is_hibernating();
 
             let (mut entry_fill_opt, mut exit_fill_opt, mut opp_tape_lots) = (None, None, LotQty(0));
             match ev.kind {
@@ -769,32 +804,36 @@ pub mod omega_twin {
 
             match self.engines[s_idx].state {
                 OrderLifecycleState::Idle => {
-                    let eq_1e8 = self.ledger.current_equity_1e8();
-                    let beta_guard = build_monetary_beta_guard_with_epps(eq_1e8, &self.engines, &self.cached_snaps, &self.epps_trackers, fees);
-                    let spoof_d = self.spoof_clocks[s_idx].spoofing_density();
+                    if block_new_entries { return; }
+                    let beta_guard = build_monetary_beta_guard_with_epps(eq_now, &self.engines, &self.cached_snaps, &self.epps_trackers, fees);
                     let probe_side = if OrthogonalFactorState::adaptive_snr_from_snapshot(&ev.snap, spoof_d).get() >= 0.0 { Side::Bid } else { Side::Ask };
                     let (probe_edge, _, _) = self.gov.slot_direction_diagnostics(s_idx, probe_side);
                     let taker_pm = self.gov.slot_taker_prob_permille(s_idx, probe_side);
+                    let mfe_s = ScaledBps(self.engines[s_idx].learned_mfe_bps);
                     let verdict = OrthogonalFactorState::evaluate_entry_signal_v46(
-                        spec, &ev.snap, &btc_snap, ScaledBps(self.engines[s_idx].learned_mfe_bps),
-                        ScaledBps(probe_edge), taker_pm, fees, spoof_d, epps_beta,
+                        spec, &ev.snap, &btc_snap, mfe_s, ScaledBps(probe_edge), taker_pm, fees, spoof_d, epps_beta,
                     );
                     if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
                         let s_taker_pm = self.gov.slot_taker_prob_permille(s_idx, side);
-                        if !passes_elliott_macro_coherence_guard(side, &ev.snap)
+                        let cand_px = side.select_entry_bbo_price(ev.snap.bids[0].price, ev.snap.asks[0].price);
+                        if !spec.passes_quantum_ev_growth_gate(eq_now, cand_px, ev.snap.realized_vol_5m, mfe_s, s_taker_pm, fees)
+                            || !passes_elliott_macro_coherence_guard(side, &ev.snap)
                             || !passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, s_taker_pm, fees)
                             || !can_stage_same_direction_entry(s_idx, side, now_ns, &self.engines, &self.cached_snaps)
                         {
                             return;
                         }
-                        let lots = self.gov.compute_slot_entry_lots(s_idx, side, eq_1e8, &ev.snap);
-                        let cand_px = side.select_entry_bbo_price(ev.snap.bids[0].price, ev.snap.asks[0].price);
-                        let risk_ppm = slot_position_risk_ppm_with_fees(spec, eq_1e8, cand_px, lots, ev.snap.realized_vol_5m, fees);
+                        let daily_damper_pm = self.daily_gov.kelly_boundary_damper_permille(
+                            self.ledger.sinking_fund_reserve_bps_x100, self.gov.active_maker_rt_fee_bps(),
+                            self.gov.portfolio_mean_eq_vol_bps(), self.gov.portfolio_mean_ir_x100(),
+                        );
+                        let lots = self.gov.compute_slot_entry_lots_v48(s_idx, side, eq_now, &ev.snap, daily_damper_pm);
+                        let risk_ppm = slot_position_risk_ppm_with_fees(spec, eq_now, cand_px, lots, ev.snap.realized_vol_5m, fees);
                         let beta_x1000 = self.epps_trackers[s_idx].correlated_beta_x1000(
                             s_idx == 0, ev.snap.realized_vol_5m, ScaledBps(btc_snap.realized_vol_5m.0.max(2_500)),
                         );
                         if beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000)
-                            && self.gov.authorizes_adaptive_entry_with_wallet(s_idx, side, eq_1e8, &ev.snap, &btc_snap)
+                            && self.gov.authorizes_adaptive_entry_v48(s_idx, side, eq_now, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta)
                         {
                             self.engines[s_idx].sync_governor_for_side(&self.gov, side);
                             let _ = self.engines[s_idx].try_arm_maker_entry(&ev.snap, verdict, lots);
@@ -803,8 +842,10 @@ pub mod omega_twin {
                 }
                 OrderLifecycleState::PlacingEntryMaker { side, qty, submitted_ts, .. } => {
                     self.engines[s_idx].sync_governor_dynamics(&self.gov);
+                    if block_new_entries { self.engines[s_idx].state = OrderLifecycleState::Idle; return; }
                     if now_ns.0.saturating_sub(submitted_ts.0) >= self.engines[s_idx].elastic_preflight_window_ns(ev.snap.realized_vol_5m) {
-                        if self.gov.confirm_preflight_kinematics_non_choking(s_idx, side, self.ledger.current_equity_1e8(), &ev.snap, &btc_snap).is_ok() {
+                        let mfe_s = ScaledBps(self.engines[s_idx].learned_mfe_bps);
+                        if self.gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
                             if let Ok((synced_px, _)) = self.engines[s_idx].sync_preflight_l1_entry_auto(&ev.snap) {
                                 self.entry_fifo[s_idx].submit_post_only(side, synced_px, qty, now_ns.0);
                                 let _ = self.engines[s_idx].on_entry_order_resting(now_ns);
@@ -846,10 +887,11 @@ pub mod omega_twin {
                         let macro_contradiction = elapsed_ns >= q_timers.macro_abort_ns
                             && (!passes_elliott_macro_coherence_guard(side, &ev.snap)
                                 || !passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, self.engines[s_idx].learned_taker_prob_pm, self.engines[s_idx].active_fees));
-                        if (elapsed_ns >= 25_000_000 && q_verdict.abort_now) || macro_contradiction {
+                        if block_new_entries || (elapsed_ns >= 25_000_000 && q_verdict.abort_now) || macro_contradiction {
                             self.entry_fifo[s_idx].cancel();
                             self.gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
-                            self.markout_rings[s_idx].arm_abort_probe(side, entry_price, LastVetoCode::HawkesStoikovQueueAbort, now_ns);
+                            let veto_c = if block_new_entries { LastVetoCode::WarmupOrLock } else { LastVetoCode::HawkesStoikovQueueAbort };
+                            self.markout_rings[s_idx].arm_abort_probe(side, entry_price, veto_c, now_ns);
                             self.engines[s_idx].state = OrderLifecycleState::Idle;
                             self.report.hawkes_queue_aborts += 1;
                             return;
@@ -863,7 +905,12 @@ pub mod omega_twin {
                         {
                             let new_l1 = side.select_entry_bbo_price(ev.snap.bids[0].price, ev.snap.asks[0].price);
                             let max_chase = spec.max_repeg_chase_ticks(entry_price, self.engines[s_idx].learned_taker_prob_pm, self.engines[s_idx].active_fees);
-                            if (new_l1.0 - entry_price.0).abs() <= max_chase {
+                            let moved_away = match side {
+                                Side::Bid => new_l1.0 > entry_price.0 && (new_l1.0 - entry_price.0) <= max_chase,
+                                Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase,
+                            };
+                            let mfe_s = ScaledBps(self.engines[s_idx].learned_mfe_bps);
+                            if moved_away && self.gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
                                 if let Ok(repeg_sl) = self.engines[s_idx].compute_repeg_sl_trigger(&ev.snap, new_l1) {
                                     self.engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);
                                     self.entry_fifo[s_idx].submit_post_only(side, new_l1, qty, now_ns.0);
@@ -885,9 +932,13 @@ pub mod omega_twin {
                         self.report.cum_net_pnl_1e8 = self.report.cum_net_pnl_1e8.saturating_add(f_pnl);
                         self.sum_trade_pnl_1e8 = self.sum_trade_pnl_1e8.saturating_add(f_pnl);
                         self.report.parity_sync_drift_1e8 = (self.ledger.cumulative_net_pnl_1e8 - self.sum_trade_pnl_1e8).abs();
+                        let _ = self.daily_gov.observe_realized_cashflow(
+                            now_ns, f_pnl, false, false, false, self.ledger.current_equity_1e8(),
+                            self.ledger.sinking_fund_reserve_bps_x100, self.gov.active_maker_rt_fee_bps(),
+                            self.gov.portfolio_mean_eq_vol_bps(), self.gov.portfolio_mean_ir_x100(),
+                        );
                     }
                     self.engines[s_idx].observe_open_flow_kinematics(&ev.snap);
-                    let _ = self.engines[s_idx].observe_wald_sprt_step_with_beta(&ev.snap, &btc_snap, epps_beta);
                     let ref_px = if ev.snap.last_trade_price.0 > 0 { ev.snap.last_trade_price } else { ev.snap.mark_price };
                     match side {
                         Side::Bid => {
@@ -909,6 +960,8 @@ pub mod omega_twin {
                     self.engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0 - avg_price_ticks.0) * d_sign).saturating_mul(1_000_000) / denom;
                     self.engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
                     self.engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
+                    let zeta_tox = self.engines[s_idx].observe_post_fill_toxicity_and_wald_v48(&ev.snap, &btc_snap, epps_beta, &self.markout_rings[s_idx], evt_dil);
+
                     if self.engines[s_idx].last_eff_sl_ticks.0 <= 0 { self.engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
                     let eff_sl = self.engines[s_idx].last_eff_sl_ticks;
                     let sl_crossed = match side {
@@ -930,6 +983,11 @@ pub mod omega_twin {
                         ) {
                             let non_pun = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
                             self.gov.observe_closed_trade_at_entry(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, non_pun, now_ns);
+                            let _ = self.daily_gov.observe_realized_cashflow(
+                                now_ns, summary.net_pnl_1e8, true, summary.net_pnl_1e8 > 0, summary.net_pnl_1e8 < 0,
+                                self.ledger.current_equity_1e8(), self.ledger.sinking_fund_reserve_bps_x100,
+                                self.gov.active_maker_rt_fee_bps(), self.gov.portfolio_mean_eq_vol_bps(), self.gov.portfolio_mean_ir_x100(),
+                            );
                             self.record_summary(&summary);
                         }
                         return;
@@ -963,6 +1021,11 @@ pub mod omega_twin {
                             ClosedTradeKind::MakerPassiveUnwind, fill_px, now_ns, &mut self.ledger,
                         ) {
                             self.gov.observe_closed_trade_at_entry(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, true, now_ns);
+                            let _ = self.daily_gov.observe_realized_cashflow(
+                                now_ns, summary.net_pnl_1e8, true, summary.net_pnl_1e8 > 0, summary.net_pnl_1e8 < 0,
+                                self.ledger.current_equity_1e8(), self.ledger.sinking_fund_reserve_bps_x100,
+                                self.gov.active_maker_rt_fee_bps(), self.gov.portfolio_mean_eq_vol_bps(), self.gov.portfolio_mean_ir_x100(),
+                            );
                             self.record_summary(&summary);
                         }
                         return;
@@ -970,7 +1033,7 @@ pub mod omega_twin {
                     let Some(quote) = self.engines[s_idx].compute_canonical_exit_quote(&ev.snap) else { return; };
                     self.engines[s_idx].last_closed_wald_pct = self.engines[s_idx].last_closed_wald_pct.max(quote.wald_pct);
                     self.engines[s_idx].latch_defensive_floor_if_needed(quote.defensive_lock_active);
-                    let _ = self.engines[s_idx].maybe_ratchet_chandelier_or_wald_sl(&ev.snap, &btc_snap);
+                    let _ = self.engines[s_idx].maybe_ratchet_sl_with_toxicity_v48(&ev.snap, &btc_snap, epps_beta, zeta_tox);
                     self.engines[s_idx].last_exit_sub_reason = quote.sub_reason;
                     let (preempt, delay_ns) = compute_exit_sync_schedule_with_fees(&quote, resting_exit_price, avg_price_ticks, self.engines[s_idx].active_fees);
                     if resting_exit_price != quote.target_price && (preempt || now_ns.0 >= self.engines[s_idx].next_peg_allowed_ts_ns) {
@@ -1164,7 +1227,8 @@ pub mod omega_twin {
         let ev_per_sec = (200_000_u128 * 1_000_000) / elapsed_us.max(1);
         let ab = run_quadruple_omega_ablation_suite();
         let twin = run_omega_digital_twin_walk_forward_lab();
-        let sec_title = vec![format!("{ANSI_SKY_BLUE}[VORTEX-REPLAY OMEGA V4.7] 4-ARM PARETO ABLATION & 1:1 PAR2 DIGITAL TWIN GATE{ANSI_RESET}")];
+
+        let sec_title = vec![format!("{ANSI_SKY_BLUE}[VORTEX-REPLAY OMEGA V4.8] 4-ARM PARETO ABLATION & 1:1 PAR2 DIGITAL TWIN GATE{ANSI_RESET}")];
         let sec_fifo = vec![format!("  {ANSI_GREEN}200k FIFO Queue Sim{ANSI_RESET}: {ev_per_sec} ev/s | Passive Fills: {fills} | PostOnly Rejects: {rejects}")];
         let sec_arms = vec![
             format!("  MODEL A   (Baseline Fixed L1)      : {:>+8.2} bps net", (ab.arm_a_baseline_net_bps_x100 as f64) / 100.0),
@@ -1183,6 +1247,7 @@ pub mod omega_twin {
             twin.closed_trades, (twin.cum_net_bps_x100 as f64) / 100.0, twin.hawkes_queue_aborts, twin.post_only_rejects, twin.parity_sync_drift_1e8
         )];
         print_auto_aligned_box(&[sec_title, sec_fifo, sec_arms, sec_twin]);
+
         ev_per_sec >= 100_000 && fills == 1_000 && rejects == 0 && ab.pareto_strictly_dominant
             && twin.closed_trades == 3 && twin.hawkes_queue_aborts == 1 && twin.post_only_rejects == 0
             && twin.parity_sync_drift_1e8 == 0 && twin.cum_net_bps_x100 >= 7_000
@@ -1196,17 +1261,17 @@ mod tests {
     use super::*;
     use crate::forensic_parquet::MarketEventKind;
     use crate::lob_shm::BookLevel;
-    use crate::types::TimestampNs;
+    use crate::types::{BoundedScore, TimestampNs};
     use crate::wave_elliott::WaveRegime;
 
     #[test]
-    fn test_v47_par2_wave_climax_ob_hydration_and_8h_funding_settlement() {
+    fn test_v48_par2_wave_climax_quantum_btc_veto_and_daily_twin_parity() {
         assert!(run_and_print_omega_chat6_twin_certification());
-
         let mut twin = OmegaDigitalTwinEngine::new();
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = APPROVED_SPECS[8].symbol_id;
         snap.realized_vol_5m = ScaledBps(5_000);
+
         for (idx, &px) in [1_600_i64, 1_620, 1_607, 1_645, 1_632, 1_650].iter().enumerate() {
             snap.sequence_id = (idx + 1) as u64;
             snap.ts_local_ns = TimestampNs((idx as i64 + 1) * 2_000_000_000);
@@ -1219,41 +1284,50 @@ mod tests {
         }
         snap.sequence_id = 10;
         snap.ts_local_ns = TimestampNs(14_000_000_000);
-        let tk1 = ColumnarMarketRow::from_ticker_meta(&snap, PriceTicks(1_650), 10_000_000, ScaledBps(135), TimestampNs(20_000_000_000));
-        twin.ingest_par2_row(&tk1);
+        twin.ingest_par2_row(&ColumnarMarketRow::from_ticker_meta(&snap, PriceTicks(1_650), 10_000_000, ScaledBps(135), TimestampNs(20_000_000_000)));
         snap.sequence_id = 11;
         snap.ts_local_ns = TimestampNs(16_000_000_000);
-        let tk2 = ColumnarMarketRow::from_ticker_meta(&snap, PriceTicks(1_650), 9_700_000, ScaledBps(135), TimestampNs(20_000_000_000));
-        twin.ingest_par2_row(&tk2);
+        twin.ingest_par2_row(&ColumnarMarketRow::from_ticker_meta(&snap, PriceTicks(1_650), 9_700_000, ScaledBps(135), TimestampNs(20_000_000_000)));
         snap.sequence_id = 12;
         snap.ts_local_ns = TimestampNs(17_000_000_000);
-        let liq = ColumnarMarketRow::from_liquidation_print(&snap, Side::Bid, PriceTicks(1_651), LotQty(6_000), 9_700_000);
-        twin.ingest_par2_row(&liq);
+        twin.ingest_par2_row(&ColumnarMarketRow::from_liquidation_print(&snap, Side::Bid, PriceTicks(1_651), LotQty(6_000), 9_700_000));
 
         let w_obs = twin.cached_snaps[8].wave_observables();
         assert_eq!(twin.cached_snaps[8].funding_rate_scaled_bps, ScaledBps(135));
-        assert!(w_obs.oi_impulse.get() < -0.10);
-        assert_eq!(w_obs.regime, WaveRegime::ClimaxExhaustion);
-        assert!(w_obs.climax_active);
+        assert!(w_obs.oi_impulse.get() < -0.10 && w_obs.regime == WaveRegime::ClimaxExhaustion && w_obs.climax_active);
 
-        // Verify exact 1e8 8h funding settlement across 16:00:00 UTC boundary with zero duplicate settlements
+        // V4.8 Quantum EV Gate in Twin: oversized 0.001 BTC at ~$65.14 USDT remains strictly Idle
+        let mut btc_t13 = SymbolLobSnapshot::new_empty();
+        btc_t13.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc_t13.is_eligible = true;
+        btc_t13.sequence_id = 50;
+        btc_t13.ts_local_ns = TimestampNs(1_794_790_000_000_000_000);
+        btc_t13.realized_vol_5m = ScaledBps(3_200);
+        btc_t13.bids[0] = BookLevel { price: PriceTicks(646_312), qty: LotQty(900) };
+        btc_t13.asks[0] = BookLevel { price: PriceTicks(646_313), qty: LotQty(1_200) };
+        btc_t13.refresh_deep_l1_l5_totals();
+        btc_t13.mark_price = PriceTicks(646_312);
+        btc_t13.last_trade_price = PriceTicks(646_312);
+        btc_t13.factor_ofi = BoundedScore::new_clamped(0.82);
+        btc_t13.factor_tfi = BoundedScore::new_clamped(0.88);
+        btc_t13.factor_geom = BoundedScore::new_clamped(0.65);
+        twin.ledger.initial_equity_1e8 = 6_513_770_000;
+        twin.engines[0].learned_mfe_bps = 568;
+        twin.ingest_event(&TwinReplayEvent {
+            slot_idx: 0, kind: MarketEventKind::L2BookSnapshot, aggressor_side: Side::Bid,
+            trade_price: PriceTicks(646_312), trade_lots: LotQty(1), snap: btc_t13,
+        });
+        assert!(matches!(twin.engines[0].state, OrderLifecycleState::Idle));
+
         let cut_ns = 1_794_672_000_000_000_000_i64;
         let mut f_snap = SymbolLobSnapshot::new_empty();
         f_snap.mark_price = PriceTicks(10_000);
-        f_snap.funding_rate_scaled_bps = ScaledBps(200); // +2.00 bps: Short (Ask) receives +2.00 bps
+        f_snap.funding_rate_scaled_bps = ScaledBps(200);
         f_snap.ts_local_ns = TimestampNs(cut_ns + 5_000_000_000);
         let mut last_cut = 0_i64;
         let mut led = ParitySyncLedger::new(6_543_090_000);
-        let settled = settle_crossed_funding_boundary(
-            APPROVED_SPECS[3], Side::Ask, LotQty(20), PriceTicks(10_000),
-            cut_ns - 10_000_000_000, &f_snap, &mut last_cut, &mut led,
-        );
-        assert_eq!(settled, Some(400_000));
-        assert_eq!(led.cumulative_funding_1e8, 400_000);
+        assert_eq!(settle_crossed_funding_boundary(APPROVED_SPECS[3], Side::Ask, LotQty(20), PriceTicks(10_000), cut_ns - 10_000_000_000, &f_snap, &mut last_cut, &mut led), Some(400_000));
         assert_eq!(led.current_equity_1e8() - led.initial_equity_1e8, 400_000);
-        assert!(settle_crossed_funding_boundary(
-            APPROVED_SPECS[3], Side::Ask, LotQty(20), PriceTicks(10_000),
-            cut_ns - 10_000_000_000, &f_snap, &mut last_cut, &mut led,
-        ).is_none());
+        assert!(settle_crossed_funding_boundary(APPROVED_SPECS[3], Side::Ask, LotQty(20), PriceTicks(10_000), cut_ns - 10_000_000_000, &f_snap, &mut last_cut, &mut led).is_none());
     }
 }

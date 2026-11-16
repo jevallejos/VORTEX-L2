@@ -1,24 +1,24 @@
-# VORTEX-OMEGA V4.7 — Autonomous 200Hz Maker-First HFT Engine (Bybit UTA V5)
+# VORTEX-OMEGA V4.8 — Autonomous 200Hz Maker-First HFT Engine (Bybit UTA V5)
 
 Motor institucional cuantitativo de alta frecuencia en Rust (`Zero-Alloc`, `LTO Fat`, `panic = "abort"`) para ejecucion pasiva `Limit PostOnly` sobre 12 contratos perpetuos lineales USDT en Bybit Unified Trading Account (UTA V5).
 
-## 1. Resumen Ejecutivo e Identidad Operativa V4.7
+## 1. Resumen Ejecutivo e Identidad Operativa V4.8
 
-| Parametro | Especificacion Certificada V4.7 |
+| Parametro | Especificacion Certificada V4.8 |
 | :--- | :--- |
-| **Version del Motor** | `VORTEX-OMEGA V4.7` (`vortex-rs v1.0.0`) |
+| **Version del Motor** | `VORTEX-OMEGA V4.8` (`vortex-rs v1.0.0`) |
 | **Contrato IPC Memoria Compartida** | `VORTEX_SHM_VERSION = 15` (`/dev/shm/vortex_lob.mmap`, `#[repr(C, align(64))]`) |
 | **Formato Columnar Forense** | `PAR2` sin perdida (`256 B/fila`, `L1..L5` + `TickerMeta` + `LiquidationPrint` + `FNV-1a 64-bit`) |
 | **Cadencia del Demonio Custodio** | `200.0 Hz` (`5 ms`) `Zero-Jitter` (`0` I/O sincrono en ruta caliente) + WS `wss://stream.bybit.com/v5/trade` |
 | **Arquitectura Modular** | `24` submodulos `Zero-Alloc` en `src/` + `3` binarios `LTO Fat` (`vortex_tap`, `vortex_replay`, `vortex_exec`) |
-| **Suite y Compuertas** | Suite `/dev/shm` `100%` en verde, `Clippy pedantic = 0 warnings`, `OOS 520` (`Maker >= 80%`, `PF >= 1.35`, `Drift == 0`) |
+| **Suite y Compuertas** | `56/56` tests en `/dev/shm` (`100%`), `Clippy pedantic = 0 warnings`, `OOS 520` (`Maker >= 80%`, `PF >= 1.35`, `Drift == 0`) |
 
-## 2. Las 4 Islas Auto-Aprendidas Conectadas en V4.7 y Tarifas VIP Vivas
+## 2. Escudos Institucionales V4.8 y las 4 Islas Auto-Aprendidas
 
-- **Isla 1 — Correlacion `Epps` Viva (`5 s`), Pesos Anti-Spoof `GEOM` y Barrera `3x` Dinamica:** `[EppsBtcCorrelationTracker; 12]` alimenta `MonetaryPortfolioBetaGuard` y `evaluate_entry_signal_v46` con beta firmada `[-phi, +phi]`, pesos `GEOM` atenuados bajo spoofing (`w_OFI + w_TFI + w_GEOM == 1`) y puerta `3x` acoplada a `BetaBinomialTakerPrior` + `FeeSchedule` vivo.
-- **Isla 2 — Desalojo `Order Block` por Distancia y Guardia Direccional `[OB+, OB-]`:** `CausalOrderBlockEngine` retiene muros cercanos al BBO mediante `select_distance_weighted_eviction_slot`, escala el *front-run* TP con `FeeSchedule` y `OnlineAdaptiveGovernor` separa `ob_bear_efficacy_pm` (`Bid`) de `ob_bull_efficacy_pm` (`Ask`).
-- **Isla 3 — Curvas `Markout` y `LVR 5s` en Boveda Forense:** `[SlotMarkoutRing; 12]` muestrea curvas post-fill y post-aborto (`+250ms, +1s, +5s, +15s`) persistiendo `markout_fill_bps` y `lvr_5s_bps` reales en `vortex_ai_forensic_vault.jsonl`.
-- **Isla 4 — `Zero-Jitter` Asincrono al 100%, *Rebates* VIP y Paridad `1:1` `PAR2`:** `gov.dispatch_ema_prewarm_async` elimina escrituras sincronas en `200.0 Hz`, `ParitySyncLedger` y `PairSpec` liquidan tarifas VIP y *rebates* negativos (`Drift == 0`), Kelly abre el rango completo `[550..=1200 permille]`, `CausalElliottWaveState` integra `EndogenousLiquidationFloor` interno y `replay_walkforward.rs` inyecta `TickerMeta` + `LiquidationPrint` en paridad `1:1`.
+- **Escudo Diario Elastico UTC (`DailySessionGovernor`):** Tope diario acoplado a la Reserva del `30%` (`[-3,883..-6,283 ppm]`), meta diaria auto-aprendida con candado convexo *High-Water Mark*, amortiguador Kelly `C^1` (`[618..=1000 permille]`) y despertar autonomo en `00:00:00 UTC`.
+- **Compuerta Cuantica de Crecimiento Geometrico (`passes_quantum_ev_growth_gate`):** Bloquea de forma endogena lotes indivisibles sobredimensionados con deriva geometrica negativa (silenciando `BTCUSDT` a capital bajo y reactivandolo automaticamente al escalar capital o *rebates* VIP).
+- **Evacuacion Post-Fill `Glosten-Milgrom + Wald SPRT v2.0`:** Evalua `zeta_tox` sobre `SlotMarkoutRing` (`+250ms, +1s, +5s`); ante barridos con `MFE <= 1 tick` e inversion de flujo, activa escape Maker cero-perdida y contrae el Stop-Loss servidor con Hermite `C^1` entre `64%` y `83%`.
+- **Desacople Celular vs. Catastrofico y Persistencia `FUNDING_SETTLEMENT`:** Aisla Stop-Loss normales en su celda `12x2` (reservando `HALTED_ON_LOSS.lock` a brechas `>= 14,400 ppm`), persiste liquidaciones `8h` con `FNV-1a` y restaura barras de progreso y panel diario en `vortex_exec --trades` (`vortex 360`).
 
 ## 3. Comandos de Compilacion, Verificacion y Operacion
 

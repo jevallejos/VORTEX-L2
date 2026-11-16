@@ -1,4 +1,4 @@
-//! Orthogonal 3-Factor Alpha, Anti-Spoof GEOM Weights, Dynamic 3x Barrier, Epps 5s & LVDBS (V4.6).
+//! Orthogonal 3-Factor Alpha, Anti-Spoof GEOM Weights, Dynamic 3x Barrier, Epps 5s & LVDBS (V4.8).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -844,5 +844,94 @@ mod tests {
             ),
             SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
         ));
+    }
+}
+
+impl OrthogonalFactorState {
+    /// V4.8 P2-3: Elastic Parkinson 5m volatility window coupled to live VIP `FeeSchedule` & `taker_prob_pm`.
+    #[inline]
+    pub fn observe_mid_and_step_elastic_vol_with_fees(
+        &mut self,
+        spec: PairSpec,
+        obs_px: PriceTicks,
+        ts_ns: i64,
+        current_vol: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+    ) -> ScaledBps {
+        if obs_px.0 <= 0 || ts_ns <= 0 {
+            return current_vol;
+        }
+        if self.vol_anchor_px.0 <= 0 || self.vol_window_start_ts_ns <= 0 {
+            self.vol_anchor_px = obs_px;
+            self.vol_low_px = obs_px;
+            self.vol_high_px = obs_px;
+            self.vol_window_start_ts_ns = ts_ns;
+            return current_vol;
+        }
+        if obs_px.0 < self.vol_low_px.0 {
+            self.vol_low_px = obs_px;
+        }
+        if obs_px.0 > self.vol_high_px.0 {
+            self.vol_high_px = obs_px;
+        }
+        let dt_ns = ts_ns.saturating_sub(self.vol_window_start_ts_ns);
+        let min_win_ns = (BASE_VOL_WIN_NS * 3) / 10;
+        if dt_ns < min_win_ns {
+            return current_vol;
+        }
+        let b3x = spec
+            .three_x_friction_barrier_bps_dynamic(self.vol_anchor_px, taker_prob_pm, fees)
+            .raw()
+            .max(1);
+        let raw_win_ns = ((BASE_VOL_WIN_NS as i128 * (b3x.saturating_mul(4) as i128))
+            / (current_vol.raw().max(b3x) as i128)) as i64;
+        if dt_ns < raw_win_ns.clamp(min_win_ns, BASE_VOL_WIN_NS * 2) {
+            return current_vol;
+        }
+        let updated = Self::update_realized_vol_5m_parkinson(
+            current_vol,
+            self.vol_anchor_px,
+            self.vol_low_px,
+            self.vol_high_px,
+            obs_px,
+            dt_ns,
+        );
+        self.vol_anchor_px = obs_px;
+        self.vol_low_px = obs_px;
+        self.vol_high_px = obs_px;
+        self.vol_window_start_ts_ns = ts_ns;
+        updated
+    }
+}
+
+#[cfg(test)]
+mod v48_parkinson_vip_tests {
+    use super::*;
+    use crate::types::APPROVED_SPECS;
+
+    #[test]
+    fn test_v48_elastic_parkinson_window_scales_with_live_vip_fee_schedule() {
+        let avax = APPROVED_SPECS[3];
+        let mut st_vip0 = OrthogonalFactorState::new();
+        let mut st_reb = OrthogonalFactorState::new();
+        let vip_rebate = FeeSchedule::from_live_rates_clamped(ScaledBps(-50), ScaledBps(300));
+        let seed_vol = ScaledBps(2_500);
+
+        let _ = st_vip0.observe_mid_and_step_elastic_vol_with_fees(
+            avax, PriceTicks(8_200), 1_000_000_000, seed_vol, 50, FeeSchedule::VIP0_DEFAULT,
+        );
+        let _ = st_reb.observe_mid_and_step_elastic_vol_with_fees(
+            avax, PriceTicks(8_200), 1_000_000_000, seed_vol, 35, vip_rebate,
+        );
+
+        let v0_2s = st_vip0.observe_mid_and_step_elastic_vol_with_fees(
+            avax, PriceTicks(8_240), 3_000_000_000, seed_vol, 50, FeeSchedule::VIP0_DEFAULT,
+        );
+        let vreb_2s = st_reb.observe_mid_and_step_elastic_vol_with_fees(
+            avax, PriceTicks(8_240), 3_000_000_000, seed_vol, 35, vip_rebate,
+        );
+        assert_eq!(v0_2s, seed_vol);
+        assert!(vreb_2s.raw() > seed_vol.raw());
     }
 }

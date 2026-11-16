@@ -629,7 +629,6 @@ pub fn step_12_slot_daemon_tick(
     }
     (open_count, pending_entry_count)
 }
-
 pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> ExitCode {
     let tg_tx = spawn_bounded_telegram_notifier();
     let lock_watch = Arc::new(AtomicLockWatch::default());
@@ -651,27 +650,34 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     for eng in &mut engines {
         eng.sync_governor_dynamics(&gov);
     }
-    rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena); rt.daily_gov = rehydrate_daily_governor_from_vault(now_epoch_ns(), rt.wallet_1e8.max(ledger.current_equity_1e8()), &ledger, &gov);
-    SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
 
+    rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
+    SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
     let prewarmed_slots = gov.load_ema_prewarm_file(boot_ns);
     if live_capital {
         let warmup_ns = if prewarmed_slots >= MAX_ACTIVE_PAIRS { 15_000_000_000_i64 } else { 75_000_000_000_i64 };
         gov.set_entry_warmup_until_ns(boot_ns.0.saturating_add(warmup_ns));
         println!(
-            "{ANSI_GREEN}\u{1f7e2} [EMA PREWARM V4.7] Hydrated {prewarmed_slots}/12 slots | Live L2 stabilize: {}s | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
+            "{ANSI_GREEN}\u{1f7e2} [EMA PREWARM V4.8] Hydrated {prewarmed_slots}/12 slots | Live L2 stabilize: {}s | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
             warmup_ns / 1_000_000_000,
             (startup_hs.fee_schedule.maker_fee_bps.raw() as f64) / 100.0,
             (startup_hs.fee_schedule.taker_fee_bps.raw() as f64) / 100.0
         );
     }
     bootstrap_live_adopt_if_enabled(live_capital, arena, &gov, &mut rt, &mut entry_forensics, &mut engines);
+    if live_capital && rt.wallet_1e8 > 0 {
+        ledger.initial_equity_1e8 = rt.wallet_1e8.saturating_sub(ledger.cumulative_net_pnl_1e8);
+    }
+    let boot_eq = rt.wallet_1e8.max(ledger.current_equity_1e8());
+    rt.daily_gov = rehydrate_daily_governor_from_vault(now_epoch_ns(), boot_eq, &ledger, &gov);
+    let _ = vault_tx.try_send(VaultIoCommand::SaveDailyGovernor { ts_ns: boot_ns.0, state: rt.daily_gov });
+
     let gateway = BybitAsyncGateway::spawn_if_enabled(live_capital);
     let mut last_wallet_sync_ns = boot_ns.0;
     let mut last_handshake_refresh_ns = boot_ns.0;
     let mut last_rest_dispatch_ns = 0_i64;
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V4.8 200.0 Hz ARMED] Unified Zero-Jitter Vault + Anti-Spoof Epps + 8h Funding + Hourly VIP.{ANSI_RESET}"
+        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V4.8 200.0 Hz ARMED] Elastic Daily Shield + Quantum EV + Toxic Unwind + 8h Funding.{ANSI_RESET}"
     );
 
     loop {
@@ -708,47 +714,39 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         if let Some(ref gw) = gateway {
             while let Some(evt) = gw.try_recv() {
                 if let GatewayEvent::HandshakeRefreshed { handshake: hs } = &evt {
-                    if hs.synced_from_exchange {
-                        instruments = hs.instruments;
-                    }
+                    if hs.synced_from_exchange { instruments = hs.instruments; }
                 }
-                let prev_halt = rt.halt_locked;
-                let prev_closed = ledger.closed_trades_count;
+                let (prev_halt, prev_closed) = (rt.halt_locked, ledger.closed_trades_count);
                 handle_gateway_event(
                     evt, now_ns, Some(gw), &mut rt, &cached_snaps, &entry_forensics,
                     &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
                 );
-                if rt.halt_locked && !prev_halt {
-                    lock_watch.latch_halt_in_ram();
-                }
+                if rt.halt_locked && !prev_halt { lock_watch.latch_halt_in_ram(); }
                 if ledger.closed_trades_count > prev_closed {
                     let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
-                        ts_ns: now_ns.0,
-                        learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
+                        ts_ns: now_ns.0, learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
                     });
                 }
             }
         }
 
-        let _ = { let eq_fnd = rt.wallet_1e8.max(ledger.current_equity_1e8()); settle_live_8h_funding_cuts_v48(&engines, &cached_snaps, &mut last_funding_cut, &mut ledger, Some(&vault_tx), Some((&mut rt.daily_gov, now_ns, eq_fnd, &gov))) };
+        let eq_fnd = rt.wallet_1e8.max(ledger.current_equity_1e8());
+        let _ = settle_live_8h_funding_cuts_v48(
+            &engines, &cached_snaps, &mut last_funding_cut, &mut ledger,
+            Some(&vault_tx), Some((&mut rt.daily_gov, now_ns, eq_fnd, &gov)),
+        );
 
         if now_ns.0.saturating_sub(last_wallet_sync_ns) >= 30_000_000_000 {
             last_wallet_sync_ns = now_ns.0;
             gov.dispatch_ema_prewarm_async(now_ns, &vault_tx);
             let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
-                ts_ns: now_ns.0,
-                learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
+                ts_ns: now_ns.0, learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
             });
-            if let Some(ref gw) = gateway {
-                let _ = gw.try_send(GatewayCommand::SyncWallet);
-            }
+            if let Some(ref gw) = gateway { let _ = gw.try_send(GatewayCommand::SyncWallet); }
         }
-
         if now_ns.0.saturating_sub(last_handshake_refresh_ns) >= HOURLY_HANDSHAKE_REFRESH_NS {
             last_handshake_refresh_ns = now_ns.0;
-            if let Some(ref gw) = gateway {
-                let _ = gw.try_send(GatewayCommand::RefreshHandshake { now_ns });
-            }
+            if let Some(ref gw) = gateway { let _ = gw.try_send(GatewayCommand::RefreshHandshake { now_ns }); }
         }
 
         let (open_count, pending_entry_count) = step_12_slot_daemon_tick(
@@ -756,12 +754,9 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
             &mut last_rest_dispatch_ns, &cached_snaps, &mut entry_forensics,
             &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
         );
-
         let any_inflight = rt.slot_rpc_inflight.iter().any(|&b| b);
         if rt.drain_active && open_count == 0 && pending_entry_count == 0 && !any_inflight {
-            let _ = tg_tx.try_send(
-                "\u{1f7e2} [VORTEX-OMEGA V4.8 DRAIN COMPLETE] 0 open positions verified (Wallet == Equity).".to_string(),
-            );
+            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V4.8 DRAIN COMPLETE] 0 open positions verified (Wallet == Equity).".to_string());
             let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
             if vault_tx.send(VaultIoCommand::FlushBarrier(ack_tx)).is_ok() {
                 let _ = ack_rx.recv_timeout(Duration::from_secs(2));
@@ -778,46 +773,29 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
 
 pub fn run_exec_cli_entrypoint() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let is_live_hud = args.iter().any(|a| a == "--live");
-    let is_trades = args.iter().any(|a| a == "--trades");
-    let is_daemon = args.iter().any(|a| a == "--daemon");
-    let is_live_cap = args.iter().any(|a| a == "--live-capital");
     let shm_path = MappedShmRegion::default_shm_path();
-
-    if is_live_hud {
+    if args.iter().any(|a| a == "--live") {
         match MappedShmRegion::open_existing_read_only(&shm_path) {
             Ok(reg) => render_live_hud(reg.arena()),
-            Err(_) => println!(
-                "{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V4.8 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}",
-                shm_path.display()
-            ),
+            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V4.8 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
         }
         return ExitCode::SUCCESS;
     }
-    if is_trades {
+    if args.iter().any(|a| a == "--trades") {
         render_trades_and_executive_dashboard();
         return ExitCode::SUCCESS;
     }
     let (oos_trades, maker_ratio, pf, cum_usdt, drift) = run_oos_520_certification_suite();
     let sep = "=".repeat(80);
-    println!("{sep}");
-    println!("[VORTEX-EXEC OMEGA V4.7] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER");
-    println!("{sep}");
+    println!("{sep}\n[VORTEX-EXEC OMEGA V4.8] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> OOS Closed Trades Verified : {oos_trades} (Gate >= 500){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Maker Exit Ratio           : {maker_ratio:.2}% (Gate >= 80.00%){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Net Profit Factor (PostFee): {pf:.2} (Gate >= 1.35){ANSI_RESET}");
-    println!(
-        "  {ANSI_GREEN}\u{1f7e2} -> Cumulative Net PnL (OOS)   : + {cum_usdt:.4} USDT | PARITY_SYNC Drift: {drift} units{ANSI_RESET}"
-    );
-    println!("{sep}");
-    if oos_trades < 500 || maker_ratio < 80.0 || pf < 1.35 || drift != 0 {
-        return ExitCode::FAILURE;
-    }
-    if is_daemon {
-        let Ok(reg) = MappedShmRegion::open_or_create(&shm_path, false) else {
-            return ExitCode::FAILURE;
-        };
-        return run_autonomous_12_slot_daemon(reg.arena(), is_live_cap);
+    println!("  {ANSI_GREEN}\u{1f7e2} -> Cumulative Net PnL (OOS)   : + {cum_usdt:.4} USDT | PARITY_SYNC Drift: {drift} units{ANSI_RESET}\n{sep}");
+    if oos_trades < 500 || maker_ratio < 80.0 || pf < 1.35 || drift != 0 { return ExitCode::FAILURE; }
+    if args.iter().any(|a| a == "--daemon") {
+        let Ok(reg) = MappedShmRegion::open_or_create(&shm_path, false) else { return ExitCode::FAILURE; };
+        return run_autonomous_12_slot_daemon(reg.arena(), args.iter().any(|a| a == "--live-capital"));
     }
     ExitCode::SUCCESS
 }
@@ -825,153 +803,101 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution_fsm::ExitOrderRole;
+    use crate::execution_fsm::{ClosedTradeKind, ClosedTradeSummary, ExitOrderRole};
+    use crate::governor_plasticity::DailyShieldPhase;
     use crate::lob_shm::BookLevel;
+    use crate::markout_tracker::MarkoutCurveBps;
     use crate::types::BoundedScore;
 
     #[test]
-    fn test_v47_p0b_halt_custody_unified_vault_io_8h_funding_and_anti_spoof_arming() {
-        assert!(!is_safe_halt_standby(true, 1, 0, false));
-        assert!(is_safe_halt_standby(true, 0, 0, false));
+    fn test_v48_daemon_p0b_custody_8h_funding_cellular_sl_and_utc_wakeup() {
+        assert!(!is_safe_halt_standby(true, 1, 0, false) && is_safe_halt_standby(true, 0, 0, false));
+        let mut s_ref = SymbolLobSnapshot::new_empty();
+        s_ref.symbol_id = APPROVED_SPECS[3].symbol_id;
+        s_ref.realized_vol_5m = ScaledBps(5_000);
+        s_ref.mark_price = PriceTicks(8_237);
+        s_ref.last_trade_price = PriceTicks(8_237);
+        s_ref.bids[0] = BookLevel { price: PriceTicks(8_236), qty: LotQty(350) };
+        s_ref.asks[0] = BookLevel { price: PriceTicks(8_237), qty: LotQty(200) };
+        assert_eq!(select_safe_live_sl_ticks(Side::Bid, PriceTicks(8_200), PriceTicks(8_120), PriceTicks(8_226), &s_ref), Some(PriceTicks(8_226)));
+        let q_pre = CanonicalExitQuote {
+            role: ExitOrderRole::StandardMakerExit100, target_price: PriceTicks(762_500), order_lots: LotQty(1),
+            sub_reason: ExitSubReason::ShadowRunnerCrestHarvest, vac_level: 1, defensive_lock_active: false,
+            urgent_close_repeg: true, cur_gross_bps: 4_611, wald_pct: 0,
+        };
+        assert_eq!(compute_exit_sync_schedule_with_fees(&q_pre, PriceTicks(766_400), PriceTicks(759_000), FeeSchedule::VIP0_DEFAULT), (true, 250_000_000));
 
-        let shm_path = MappedShmRegion::ephemeral_self_test_path("p0b_v47_unified_daemon");
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("v48_daemon_gate");
         if let Ok(r) = MappedShmRegion::open_or_create(&shm_path, true) {
-            let (tg_tx, _) = mpsc::sync_channel::<String>(8);
-            let watch = Arc::new(AtomicLockWatch::default());
-            let (vault_tx, _) = mpsc::sync_channel::<VaultIoCommand>(16);
+            let (tg_tx, _) = mpsc::sync_channel::<String>(16);
+            let watch = Arc::new(AtomicLockWatch::new(false, false));
+            let (vault_tx, vault_rx) = mpsc::sync_channel::<VaultIoCommand>(16);
             let inst = InstrumentSpecVerification::baseline_from_specs(&APPROVED_SPECS);
             let mut rt = ExecRuntimeState::new();
-            let mut last_rest = 0_i64;
+            rt.wallet_1e8 = 6_513_770_000;
+            let day1_ns = TimestampNs(1_794_787_200_000_000_000 + 14 * 3_600_000_000_000);
+            let _ = rt.daily_gov.sync_utc_day(day1_ns, rt.wallet_1e8);
             let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
-            for (idx, s) in snaps.iter_mut().enumerate() {
-                s.symbol_id = APPROVED_SPECS[idx].symbol_id;
-                s.is_eligible = true;
-                s.sequence_id = 1;
-                s.ts_local_ns = TimestampNs(200_000_000_000);
-                s.realized_vol_5m = ScaledBps(6_500);
-                s.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(450) };
-                s.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(320) };
-                s.refresh_deep_l1_l5_totals();
-                s.mark_price = PriceTicks(8_200);
-                s.last_trade_price = PriceTicks(8_200);
-                s.factor_ofi = BoundedScore::new_clamped(0.68);
-                s.factor_tfi = BoundedScore::new_clamped(0.72);
-                s.factor_geom = BoundedScore::new_clamped(0.40);
-            }
-            for idx in [1_usize, 2] { snaps[idx].sequence_id = 0; }
-            let mut forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
-            let mut engines = SlotExecutionEngine::new_12_slot_array();
-            let mut gov = OnlineAdaptiveGovernor::new();
-            let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
-            let (_, pend) = step_12_slot_daemon_tick(
-                TimestampNs(200_000_000_000), None, inst, Some(&watch), &mut rt, &mut last_rest,
-                &snaps, &mut forensics, &mut engines, &mut gov, &mut ledger, r.arena(), &tg_tx, &vault_tx,
-            );
-            assert!(pend >= 1);
+            snaps[0].symbol_id = APPROVED_SPECS[0].symbol_id;
+            snaps[0].is_eligible = true;
+            snaps[0].sequence_id = 10;
+            snaps[0].ts_local_ns = day1_ns;
+            snaps[0].realized_vol_5m = ScaledBps(5_500);
+            snaps[0].bids[0] = BookLevel { price: PriceTicks(646_312), qty: LotQty(2_500) };
+            snaps[0].asks[0] = BookLevel { price: PriceTicks(646_313), qty: LotQty(1_200) };
+            snaps[0].refresh_deep_l1_l5_totals();
+            snaps[0].mark_price = PriceTicks(646_312);
+            snaps[0].last_trade_price = PriceTicks(646_312);
+            snaps[0].factor_ofi = BoundedScore::new_clamped(0.85);
+            snaps[0].factor_tfi = BoundedScore::new_clamped(0.92);
+            snaps[0].factor_geom = BoundedScore::new_clamped(0.75);
+            snaps[3] = snaps[0];
+            snaps[3].symbol_id = APPROVED_SPECS[3].symbol_id;
+            snaps[3].bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(450) };
+            snaps[3].asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(320) };
+            snaps[3].refresh_deep_l1_l5_totals();
+            snaps[3].mark_price = PriceTicks(8_200);
+            snaps[3].last_trade_price = PriceTicks(8_200);
 
-            // Verify live 8h funding settlement helper on open slot
-            let cut_ns = 1_794_672_000_000_000_000_i64;
-            let armed_s = engines.iter().position(|e| !matches!(e.state, OrderLifecycleState::Idle)).unwrap_or(0); let _ = engines[armed_s].on_maker_entry_filled(TimestampNs(cut_ns - 5_000_000_000));
-            snaps[armed_s].ts_local_ns = TimestampNs(cut_ns + 2_000_000_000);
-            snaps[armed_s].funding_rate_scaled_bps = ScaledBps(-150);
+            let mut entry_f = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+            let mut engines = SlotExecutionEngine::new_12_slot_array();
+            engines[0].learned_mfe_bps = 680;
+            engines[3].learned_mfe_bps = 680;
+            let mut gov = OnlineAdaptiveGovernor::new();
+            let mut ledger = ParitySyncLedger::new(rt.wallet_1e8);
+            let mut last_rest = 0_i64;
+
+            let cell_sl = ClosedTradeSummary {
+                kind: ClosedTradeKind::ServerMarkPriceStopLoss, side: Side::Ask,
+                entry_price: PriceTicks(8_200), exit_price: PriceTicks(8_235), closed_lots: LotQty(22),
+                legs_consolidated: 1, gross_scaled_bps: ScaledBps(-426), fee_scaled_bps: ScaledBps(750),
+                net_scaled_bps: ScaledBps(-1_176), net_pnl_1e8: -21_200_000, fee_1e8: 13_500_000, is_maker_exit: false,
+            };
+            dispatch_closed_trade_logs_with_locks(
+                3, &cell_sl, &engines[3], &entry_f[3], &snaps[3], &ledger, &gov,
+                &MarkoutCurveBps::default(), 0, &vault_tx, Some(&watch), &mut rt.halt_locked, day1_ns,
+            );
+            assert!(!rt.halt_locked && !watch.is_halt_locked());
+
+            rt.daily_gov.phase = DailyShieldPhase::HibernatingProfitLocked;
+            assert_eq!(step_12_slot_daemon_tick(day1_ns, None, inst, Some(&watch), &mut rt, &mut last_rest, &snaps, &mut entry_f, &mut engines, &mut gov, &mut ledger, r.arena(), &tg_tx, &vault_tx), (0, 0));
+
+            let day2_ns = TimestampNs(day1_ns.0 + 86_400_000_000_000);
+            snaps[0].ts_local_ns = day2_ns;
+            snaps[3].ts_local_ns = day2_ns;
+            assert_eq!(step_12_slot_daemon_tick(day2_ns, None, inst, Some(&watch), &mut rt, &mut last_rest, &snaps, &mut entry_f, &mut engines, &mut gov, &mut ledger, r.arena(), &tg_tx, &vault_tx), (0, 1));
+            assert_eq!(rt.daily_gov.phase, DailyShieldPhase::ActiveHunting);
+            let tel0 = r.arena().telemetry(0).map(|t| t.read_consistent_or_default(2)).unwrap_or_default();
+            assert_eq!(LastVetoCode::from_code(tel0.last_veto_code), LastVetoCode::QueueDepthOrOversizedLot);
+            assert!(matches!(engines[3].state, OrderLifecycleState::PlacingEntryMaker { side: Side::Bid, .. }));
+
+            let _ = engines[3].on_maker_entry_filled(TimestampNs(1_794_844_800_000_000_000 - 5_000_000_000));
+            snaps[3].ts_local_ns = TimestampNs(1_794_844_800_000_000_000 + 2_000_000_000);
+            snaps[3].funding_rate_scaled_bps = ScaledBps(-150);
             let mut f_cuts = [0_i64; MAX_ACTIVE_PAIRS];
             assert_eq!(settle_live_8h_funding_cuts(&engines, &snaps, &mut f_cuts, &mut ledger), 1);
-            assert!(ledger.cumulative_funding_1e8 > 0);
+            assert!(ledger.cumulative_funding_1e8 > 0 && vault_rx.try_recv().is_ok());
         }
-        let _ = std::fs::remove_file(&shm_path);
-    }
-
-    #[test]
-    fn test_live_200hz_shadow_runner_preemption_and_safe_chandelier_sl_dispatch() {
-        let mut snap = SymbolLobSnapshot::new_empty();
-        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
-        snap.realized_vol_5m = ScaledBps(5_000);
-        snap.mark_price = PriceTicks(8_237);
-        snap.last_trade_price = PriceTicks(8_237);
-        snap.bids[0] = BookLevel { price: PriceTicks(8_236), qty: LotQty(350) };
-        snap.asks[0] = BookLevel { price: PriceTicks(8_237), qty: LotQty(200) };
-        assert_eq!(
-            select_safe_live_sl_ticks(Side::Bid, PriceTicks(8_200), PriceTicks(8_120), PriceTicks(8_226), &snap),
-            Some(PriceTicks(8_226))
-        );
-        let snap_quote = CanonicalExitQuote {
-            role: ExitOrderRole::StandardMakerExit100,
-            target_price: PriceTicks(762_500),
-            order_lots: LotQty(1),
-            sub_reason: ExitSubReason::ShadowRunnerCrestHarvest,
-            vac_level: 1,
-            defensive_lock_active: false,
-            urgent_close_repeg: true,
-            cur_gross_bps: 4_611,
-            wald_pct: 0,
-        };
-        let (preempt, cd_fast) = compute_exit_sync_schedule_with_fees(
-            &snap_quote, PriceTicks(766_400), PriceTicks(759_000), FeeSchedule::VIP0_DEFAULT,
-        );
-        assert!(preempt && cd_fast == 250_000_000);
-    }
-}
-#[cfg(test)]
-mod v48_daemon_daily_shield_tests {
-    use super::*;
-    use crate::governor_plasticity::DailyShieldPhase;
-    use crate::lob_shm::BookLevel;
-
-    #[test]
-    fn test_v48_daemon_p0b_hibernation_custody_quantum_veto_and_utc_wakeup() {
-        assert!(!is_safe_halt_standby(true, 1, 0, false));
-        assert!(is_safe_halt_standby(true, 0, 0, false));
-
-        let shm_path = MappedShmRegion::ephemeral_self_test_path("v48_daily_shield_daemon");
-        let reg = MappedShmRegion::open_or_create(&shm_path, true).ok();
-        assert!(reg.is_some());
-        let Some(reg) = reg else { return };
-        let arena = reg.arena();
-
-        let locks = Arc::new(AtomicLockWatch::new(false, false));
-        let vault_tx = spawn_vault_io_worker(Arc::clone(&locks));
-        let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(16);
-        let mut rt = ExecRuntimeState::new();
-        rt.wallet_1e8 = 6_513_770_000;
-        let day1_ns = TimestampNs(1_794_787_200_000_000_000 + 14 * 3_600_000_000_000);
-        let _ = rt.daily_gov.sync_utc_day(day1_ns, rt.wallet_1e8);
-        rt.daily_gov.phase = DailyShieldPhase::HibernatingProfitLocked;
-
-        let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
-        snaps[0].symbol_id = APPROVED_SPECS[0].symbol_id;
-        snaps[0].sequence_id = 10;
-        snaps[0].ts_local_ns = day1_ns;
-        snaps[0].realized_vol_5m = ScaledBps(5_500);
-        snaps[0].bids[0] = BookLevel { price: PriceTicks(646_312), qty: LotQty(2_500) };
-        snaps[0].asks[0] = BookLevel { price: PriceTicks(646_313), qty: LotQty(1_200) };
-        snaps[0].refresh_deep_l1_l5_totals();
-        snaps[0].factor_ofi = crate::types::BoundedScore::new_clamped(0.85);
-        snaps[0].factor_tfi = crate::types::BoundedScore::new_clamped(0.92);
-        snaps[0].factor_geom = crate::types::BoundedScore::new_clamped(0.75);
-
-        let mut entry_f = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
-        let mut engines: [SlotExecutionEngine; MAX_ACTIVE_PAIRS] = core::array::from_fn(SlotExecutionEngine::new);
-        engines[0].learned_mfe_bps = 680;
-        let mut gov = OnlineAdaptiveGovernor::new();
-        let mut ledger = ParitySyncLedger::new(rt.wallet_1e8);
-        let mut last_rest = 0_i64;
-        let inst = InstrumentSpecVerification::baseline_from_specs(&APPROVED_SPECS);
-
-        let (op1, pe1) = step_12_slot_daemon_tick(
-            day1_ns, None, inst, Some(&locks), &mut rt, &mut last_rest,
-            &snaps, &mut entry_f, &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
-        );
-        assert_eq!((op1, pe1), (0, 0));
-
-        let day2_ns = TimestampNs(day1_ns.0 + 86_400_000_000_000);
-        snaps[0].ts_local_ns = day2_ns;
-        let _ = step_12_slot_daemon_tick(
-            day2_ns, None, inst, Some(&locks), &mut rt, &mut last_rest,
-            &snaps, &mut entry_f, &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
-        );
-        assert_eq!(rt.daily_gov.phase, DailyShieldPhase::ActiveHunting);
-        let tel0 = arena.telemetry(0).map(|t| t.read_consistent_or_default(2)).unwrap_or_default();
-        assert!(matches!(engines[0].state, OrderLifecycleState::Idle) && matches!(LastVetoCode::from_code(tel0.last_veto_code), LastVetoCode::QueueDepthOrOversizedLot | LastVetoCode::Friction3xOrEligibility));
         let _ = std::fs::remove_file(&shm_path);
     }
 }

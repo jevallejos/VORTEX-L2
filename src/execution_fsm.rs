@@ -1,4 +1,4 @@
-//! Autonomous 12-Slot Execution FSM, Live VIP Fee Propagation, Signed Epps Wald SPRT & Chandelier SL (V4.7).
+//! Autonomous 12-Slot Execution FSM, Live VIP Fee Propagation, Signed Epps Wald SPRT & Chandelier SL (V4.8).
 #![allow(clippy::manual_clamp, clippy::suboptimal_flops, clippy::too_many_arguments)]
 
 use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
