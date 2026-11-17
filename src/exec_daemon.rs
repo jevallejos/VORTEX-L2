@@ -627,6 +627,7 @@ pub fn step_12_slot_daemon_tick(
             if matches!(engines[s_idx].state, OrderLifecycleState::Idle) { publish_slot_veto_code(arena, s_idx, LastVetoCode::WarmupOrLock); }
         }
     }
+    rt.step_v49_deep_telemetry_200hz(now_ns, cached_snaps, engines, gov, ledger, Some(vault_tx));
     (open_count, pending_entry_count)
 }
 pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool) -> ExitCode {
@@ -899,5 +900,61 @@ mod tests {
             assert!(ledger.cumulative_funding_1e8 > 0 && vault_rx.try_recv().is_ok());
         }
         let _ = std::fs::remove_file(&shm_path);
+    }
+}
+
+#[cfg(test)]
+mod v49_daemon_telemetry_tests {
+    use super::*;
+    use crate::execution_fsm::record_live_ws_pulse;
+    use crate::lob_shm::BookLevel;
+
+    #[test]
+    fn test_v49_daemon_1hz_position_path_and_ws_pulse_end_to_end() {
+        record_live_ws_pulse(980, 99);
+        let mut rt = ExecRuntimeState::new();
+        let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+        let mut engines = SlotExecutionEngine::new_12_slot_array();
+        let gov = OnlineAdaptiveGovernor::new();
+        let ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let (vtx, vrx) = mpsc::sync_channel::<VaultIoCommand>(32);
+
+        snaps[1].symbol_id = APPROVED_SPECS[1].symbol_id;
+        snaps[1].ts_local_ns = TimestampNs(1_794_880_271_000_000_000);
+        snaps[1].realized_vol_5m = ScaledBps(3_000);
+        snaps[1].bids[0] = BookLevel { price: PriceTicks(182_033), qty: LotQty(120) };
+        snaps[1].asks[0] = BookLevel { price: PriceTicks(182_034), qty: LotQty(120) };
+        snaps[1].mark_price = PriceTicks(182_033);
+        snaps[1].last_trade_price = PriceTicks(182_033);
+
+        let verdict = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(670),
+        };
+        assert!(engines[1].try_arm_maker_entry(&snaps[1], verdict, LotQty(1)).is_ok());
+        assert!(engines[1].on_maker_entry_filled(TimestampNs(1_794_880_271_000_000_000)).is_ok());
+
+        for sec in 0..4_i64 {
+            let t_now = TimestampNs(1_794_880_271_000_000_000 + sec * 1_000_000_000);
+            snaps[1].ts_local_ns = t_now;
+            snaps[1].last_trade_price = PriceTicks(182_033 + sec * 25);
+            rt.step_v49_deep_telemetry_200hz(t_now, &snaps, &engines, &gov, &ledger, Some(&vtx));
+        }
+        assert_eq!(rt.intra_rings[1].len(), 4);
+
+        rt.emit_live_position_path_from_delta_v49(
+            15, 1, Side::Bid, PriceTicks(182_033), LotQty(1), 391_644,
+            TimestampNs(1_794_880_271_000_000_000), TimestampNs(1_794_880_355_000_000_000),
+            &snaps[1], &vtx,
+        );
+        assert!(rt.intra_rings[1].is_empty());
+
+        let mut verified_path = false;
+        while let Ok(cmd) = vrx.try_recv() {
+            if let VaultIoCommand::RecordPositionPath(p) = cmd {
+                verified_path = p.trade_id == 15 && p.sample_count == 4 && p.ws_rtt_us == 980;
+            }
+        }
+        assert!(verified_path);
     }
 }

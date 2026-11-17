@@ -693,7 +693,7 @@ impl BybitAsyncGateway {
             client.enable_ws_trade_from_env();
             loop {
                 match cmd_rx.recv_timeout(Duration::from_secs(12)) {
-                    Ok(cmd) => process_gateway_command(&mut client, cmd, &evt_tx),
+                    Ok(cmd) => { let t0 = crate::types::now_epoch_ns().0; process_gateway_command(&mut client, cmd, &evt_tx); let dt_us = (crate::types::now_epoch_ns().0.saturating_sub(t0) / 1_000).clamp(1, 5_000_000); crate::execution_fsm::record_live_ws_pulse(u32::try_from(dt_us).unwrap_or(1_000), 100); },
                     Err(mpsc::RecvTimeoutError::Timeout) => client.maintain_ws_trade_heartbeat(),
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }

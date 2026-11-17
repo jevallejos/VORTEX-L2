@@ -1300,3 +1300,270 @@ mod v48_toxicity_unwind_tests {
         assert!(new_sl_dist * 100 <= init_sl_dist * 35);
     }
 }
+
+static LAST_WS_RTT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LAST_WS_QUOTA_REM: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(100);
+
+#[inline]
+pub fn record_live_ws_pulse(rtt_us: u32, quota_rem: u16) {
+    if rtt_us > 0 {
+        LAST_WS_RTT_US.store(rtt_us, core::sync::atomic::Ordering::Relaxed);
+    }
+    LAST_WS_QUOTA_REM.store(quota_rem, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+#[must_use]
+pub fn read_live_ws_pulse() -> (u32, u16) {
+    (
+        LAST_WS_RTT_US.load(core::sync::atomic::Ordering::Relaxed),
+        LAST_WS_QUOTA_REM.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Stack-only 1Hz intra-trade trajectory ring (`0` heap allocs inside the `200.0 Hz` loop).
+#[derive(Copy, Clone, Debug)]
+pub struct SlotIntraTradeRing {
+    samples: [crate::vault_io::IntraTradeSample; crate::vault_io::MAX_INTRA_TRADE_SAMPLES],
+    sample_count: u16,
+    last_rel_sec: i64,
+    opened_ts_ns: i64,
+}
+
+impl Default for SlotIntraTradeRing {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SlotIntraTradeRing {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            samples: [crate::vault_io::IntraTradeSample {
+                rel_sec: 0,
+                mid_delta_sbps: 0,
+                tp_delta_sbps: 0,
+                sl_delta_sbps: 0,
+                ofi_pm: 0,
+                tfi_pm: 0,
+                wald_shrink_pm: 0,
+                zeta_tox_pm: 0,
+            }; crate::vault_io::MAX_INTRA_TRADE_SAMPLES],
+            sample_count: 0,
+            last_rel_sec: -1,
+            opened_ts_ns: 0,
+        }
+    }
+
+    #[inline]
+    pub fn reset_on_open(&mut self, opened_ts: TimestampNs) {
+        self.sample_count = 0;
+        self.last_rel_sec = -1;
+        self.opened_ts_ns = opened_ts.0;
+    }
+
+    #[inline]
+    pub fn observe_200hz_tick(
+        &mut self,
+        eng: &SlotExecutionEngine,
+        snap: &SymbolLobSnapshot,
+        zeta_tox: f64,
+    ) {
+        let Some(smp) = eng.sample_intra_trade_1hz(snap, zeta_tox) else {
+            self.last_rel_sec = -1;
+            return;
+        };
+        let OrderLifecycleState::PositionOpenMakerExit { opened_ts, .. } = eng.state else {
+            return;
+        };
+        if self.opened_ts_ns != opened_ts.0 {
+            self.reset_on_open(opened_ts);
+        }
+        let sec_i64 = i64::from(smp.rel_sec);
+        if sec_i64 <= self.last_rel_sec {
+            return;
+        }
+        self.last_rel_sec = sec_i64;
+        let idx = usize::from(self.sample_count);
+        if idx < crate::vault_io::MAX_INTRA_TRADE_SAMPLES {
+            self.samples[idx] = smp;
+            self.sample_count = self.sample_count.saturating_add(1);
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> u16 {
+        self.sample_count
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.sample_count == 0
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn build_position_path_summary(
+        &self,
+        trade_id: u64,
+        slot_idx: usize,
+        summary: &ClosedTradeSummary,
+        opened_ts_ns: TimestampNs,
+        closed_ts_ns: TimestampNs,
+        markout_5h: crate::markout_tracker::MarkoutCurve5hBps,
+    ) -> crate::vault_io::PositionPathSummary {
+        let (ws_rtt_us, ws_quota_rem) = read_live_ws_pulse();
+        crate::vault_io::PositionPathSummary {
+            trade_id,
+            slot_idx: (slot_idx.min(MAX_ACTIVE_PAIRS - 1)) as u8,
+            side: summary.side,
+            opened_ts_ns,
+            closed_ts_ns,
+            entry_ticks: summary.entry_price,
+            exit_ticks: summary.exit_price,
+            net_scaled_bps: summary.net_scaled_bps,
+            markout_5h,
+            sample_count: self.sample_count,
+            ws_rtt_us,
+            ws_quota_rem,
+            samples: self.samples,
+        }
+    }
+}
+
+impl SlotExecutionEngine {
+    /// Pure 1Hz intra-trade state projection in `ScaledBps` & permille (`0` allocations).
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    pub fn sample_intra_trade_1hz(
+        &self,
+        snap: &SymbolLobSnapshot,
+        zeta_tox: f64,
+    ) -> Option<crate::vault_io::IntraTradeSample> {
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            sl_trigger_price,
+            opened_ts,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        if avg_price_ticks.0 <= 0 {
+            return None;
+        }
+        let dt_s = (snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0) / 1_000_000_000)
+            .clamp(0, i64::from(u16::MAX)) as u16;
+        let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0)
+        } else if snap.mark_price.0 > 0 {
+            snap.mark_price.0
+        } else {
+            avg_price_ticks.0
+        };
+        let sgn = side.sign_i64();
+        let denom = avg_price_ticks.0.max(1);
+        let to_i16_sbps = |px: i64| -> i16 {
+            let v = ((px - avg_price_ticks.0).saturating_mul(sgn).saturating_mul(1_000_000)) / denom;
+            v.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+        };
+        let tp_px = if self.wald_sprt.exhaustion_unwind_active {
+            crate::exit_quoter::defensive_zero_loss_maker_exit_price_with_fees(
+                side,
+                avg_price_ticks,
+                self.active_fees,
+            )
+            .0
+        } else {
+            let step = ((denom.saturating_mul(self.learned_mfe_bps.max(450))) / 1_000_000).max(1);
+            avg_price_ticks.0.saturating_add(sgn.saturating_mul(step))
+        };
+        let eff_sl = if self.last_eff_sl_ticks.0 > 0 {
+            self.last_eff_sl_ticks.0
+        } else {
+            sl_trigger_price.0
+        };
+        let ofi_pm = (snap.factor_ofi.get() * 1_000.0).round().clamp(-1_000.0, 1_000.0) as i16;
+        let tfi_pm = (snap.factor_tfi.get() * 1_000.0).round().clamp(-1_000.0, 1_000.0) as i16;
+        let wald_pm = (self.wald_sprt.contraction_pct.clamp(0, 100) * 10) as u16;
+        let z_pm = (zeta_tox.clamp(0.0, 6.0) * 1_000.0).round() as u16;
+        Some(crate::vault_io::IntraTradeSample {
+            rel_sec: dt_s,
+            mid_delta_sbps: to_i16_sbps(mid_px),
+            tp_delta_sbps: to_i16_sbps(tp_px),
+            sl_delta_sbps: to_i16_sbps(eff_sl),
+            ofi_pm,
+            tfi_pm,
+            wald_shrink_pm: wald_pm,
+            zeta_tox_pm: z_pm,
+        })
+    }
+}
+
+#[cfg(test)]
+mod v49_intra_trade_path_tests {
+    use super::*;
+    use crate::lob_shm::BookLevel;
+    use crate::markout_tracker::MarkoutCurve5hBps;
+    use crate::types::BoundedScore;
+
+    #[test]
+    fn test_v49_intra_trade_1hz_ring_zero_alloc_capture_and_ws_pulse() {
+        record_live_ws_pulse(1_420, 96);
+        assert_eq!(read_live_ws_pulse(), (1_420, 96));
+        let mut s = SymbolLobSnapshot::new_empty();
+        s.symbol_id = APPROVED_SPECS[3].symbol_id;
+        s.ts_local_ns = TimestampNs(5_000_000_000);
+        s.realized_vol_5m = ScaledBps(5_200);
+        s.bids[0] = BookLevel { price: PriceTicks(7_200), qty: LotQty(400) };
+        s.asks[0] = BookLevel { price: PriceTicks(7_201), qty: LotQty(400) };
+        s.mark_price = PriceTicks(7_200);
+        s.last_trade_price = PriceTicks(7_200);
+        s.factor_ofi = BoundedScore::new_clamped(0.60);
+        s.factor_tfi = BoundedScore::new_clamped(0.85);
+
+        let mut eng = SlotExecutionEngine::new(3);
+        let v = SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, target_excursion_scaled_bps: ScaledBps(650) };
+        assert!(eng.try_arm_maker_entry(&s, v, LotQty(18)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(5_000_000_000)).is_ok());
+
+        let mut ring = SlotIntraTradeRing::new();
+        for tick in 0..450_i64 {
+            s.ts_local_ns = TimestampNs(5_000_000_000 + tick * 5_000_000);
+            s.bids[0].price = PriceTicks(7_200 + (tick / 200));
+            s.asks[0].price = PriceTicks(7_201 + (tick / 200));
+            ring.observe_200hz_tick(&eng, &s, 0.35);
+        }
+        assert_eq!(ring.len(), 3);
+        let dummy_sum = ClosedTradeSummary {
+            side: Side::Bid,
+            closed_lots: LotQty(18),
+            entry_price: PriceTicks(7_200),
+            exit_price: PriceTicks(7_205),
+            gross_scaled_bps: ScaledBps(694),
+            fee_scaled_bps: ScaledBps(400),
+            net_scaled_bps: ScaledBps(294),
+            net_pnl_1e8: 380_000,
+            fee_1e8: 518_400,
+            legs_consolidated: 1,
+            is_maker_exit: true,
+            kind: ClosedTradeKind::MakerPassiveUnwind,
+        };
+        let path_sum = ring.build_position_path_summary(
+            16, 3, &dummy_sum, TimestampNs(5_000_000_000), TimestampNs(7_250_000_000), MarkoutCurve5hBps::default(),
+        );
+        assert_eq!(path_sum.sample_count, 3);
+        assert_eq!(path_sum.ws_rtt_us, 1_420);
+        assert_eq!(path_sum.samples[2].rel_sec, 2);
+    }
+}

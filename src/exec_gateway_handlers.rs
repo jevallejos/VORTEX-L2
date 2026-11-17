@@ -56,7 +56,7 @@ pub struct ExecRuntimeState {
     pub epps_trackers: [EppsBtcCorrelationTracker; MAX_ACTIVE_PAIRS],
     pub spoof_clocks: [EventClockAlphaModulator; MAX_ACTIVE_PAIRS],
     pub markout_rings: [SlotMarkoutRing; MAX_ACTIVE_PAIRS],
-    pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS], pub daily_gov: DailySessionGovernor,
+    pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS], pub daily_gov: DailySessionGovernor, pub intra_rings: [crate::execution_fsm::SlotIntraTradeRing; MAX_ACTIVE_PAIRS], pub last_plasticity_audit_ns: i64, pub last_persisted_utc_day: i64,
     pub halt_locked: bool,
     pub drain_active: bool,
 }
@@ -86,7 +86,7 @@ impl ExecRuntimeState {
             epps_trackers: [EppsBtcCorrelationTracker::new(); MAX_ACTIVE_PAIRS],
             spoof_clocks: [EventClockAlphaModulator::new(); MAX_ACTIVE_PAIRS],
             markout_rings: [SlotMarkoutRing::new(); MAX_ACTIVE_PAIRS],
-            last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS], daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8),
+            last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS], daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8), intra_rings: [crate::execution_fsm::SlotIntraTradeRing::new(); MAX_ACTIVE_PAIRS], last_plasticity_audit_ns: 0, last_persisted_utc_day: -1,
             halt_locked: false,
             drain_active: false,
         }
@@ -499,6 +499,12 @@ pub fn handle_gateway_event(
                     rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
                     let mk_curve = rt.markout_rings[slot_idx].last_fill_curve();
                     let lvr_5s = rt.markout_rings[slot_idx].ewma_lvr_5s_bps();
+                    let pre_open = match engines[slot_idx].state {
+                        OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, open_lots, opened_ts, .. } => {
+                            Some((side, avg_price_ticks, open_lots, opened_ts))
+                        }
+                        _ => None,
+                    };
                     let prev_closed = ledger.closed_trades_count;
                     let prev_pnl_1e8 = ledger.cumulative_net_pnl_1e8;
                     let prev_phase = rt.daily_gov.phase;
@@ -507,6 +513,13 @@ pub fn handle_gateway_event(
                         engines, gov, ledger, arena, tg_tx, vault_tx, &mut rt.halt_locked,
                     );
                     if ledger.closed_trades_count > prev_closed {
+                        let delta_1e8 = ledger.cumulative_net_pnl_1e8.saturating_sub(prev_pnl_1e8);
+                        if let Some((p_side, p_entry, p_lots, p_open_ts)) = pre_open {
+                            rt.emit_live_position_path_from_delta_v49(
+                                ledger.closed_trades_count, slot_idx, p_side, p_entry, p_lots,
+                                delta_1e8, p_open_ts, now_ns, &cached_snaps[slot_idx], vault_tx,
+                            );
+                        }
                         let delta_1e8 = ledger.cumulative_net_pnl_1e8.saturating_sub(prev_pnl_1e8);
                         let live_eq = rt.wallet_1e8.max(ledger.current_equity_1e8());
                         let new_phase = rt.daily_gov.observe_realized_cashflow(
@@ -1020,5 +1033,167 @@ mod tests {
             assert_eq!(ClosedTradeKind::MakerPassiveUnwind, ClosedTradeKind::MakerPassiveUnwind);
         }
         let _ = std::fs::remove_file(&shm_path);
+    }
+}
+
+impl ExecRuntimeState {
+    #[allow(
+        clippy::cast_lossless,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::too_many_arguments,
+        clippy::unnecessary_cast
+    )]
+    pub fn step_v49_deep_telemetry_200hz(
+        &mut self,
+        now_ns: TimestampNs,
+        cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+        engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+        gov: &OnlineAdaptiveGovernor,
+        ledger: &ParitySyncLedger,
+        vault_tx: Option<&SyncSender<VaultIoCommand>>,
+    ) {
+        for s_idx in 0..MAX_ACTIVE_PAIRS {
+            if let Some(vtx) = vault_tx {
+                while let Some(ab) = self.markout_rings[s_idx].pop_resolved_abort() {
+                    let rec = crate::vault_io::QueueAbortRecord::from_resolved_sample(s_idx as u8, ab);
+                    let _ = vtx.try_send(VaultIoCommand::RecordQueueAbort(Box::new(rec)));
+                }
+            }
+            let z_tox = if let OrderLifecycleState::PositionOpenMakerExit {
+                avg_price_ticks, opened_ts, ..
+            } = engines[s_idx].state
+            {
+                let c_rt = APPROVED_SPECS[s_idx].expected_round_trip_cost_bps_dynamic(
+                    avg_price_ticks.max(PriceTicks(1)),
+                    engines[s_idx].learned_taker_prob_pm,
+                    engines[s_idx].active_fees,
+                );
+                self.markout_rings[s_idx].active_fill_toxicity_zeta(opened_ts, c_rt)
+            } else {
+                0.0
+            };
+            self.intra_rings[s_idx].observe_200hz_tick(&engines[s_idx], &cached_snaps[s_idx], z_tox);
+        }
+        let Some(vtx) = vault_tx else { return };
+        if now_ns.0 >= 1_577_836_800_000_000_000 {
+            let cur_day = now_ns.0.div_euclid(86_400_000_000_000);
+            let live_eq = self.wallet_1e8.max(ledger.current_equity_1e8());
+            let rolled = self.daily_gov.sync_utc_day(now_ns, live_eq);
+            if rolled || self.last_persisted_utc_day != cur_day {
+                self.last_persisted_utc_day = cur_day;
+                let _ = vtx.try_send(VaultIoCommand::SaveDailyGovernor {
+                    ts_ns: now_ns.0,
+                    state: self.daily_gov,
+                });
+            }
+            if now_ns.0.saturating_sub(self.last_plasticity_audit_ns) >= 900_000_000_000 {
+                self.last_plasticity_audit_ns = now_ns.0;
+                let mut taker_prob_pm = [[50_i64; 2]; MAX_ACTIVE_PAIRS];
+                let mut learned_mfe_bps = [0_i64; MAX_ACTIVE_PAIRS];
+                let mut ob_bull_pm = [0_i64; MAX_ACTIVE_PAIRS];
+                let mut ob_bear_pm = [0_i64; MAX_ACTIVE_PAIRS];
+                let mut epps_corr_pm = [0_i16; MAX_ACTIVE_PAIRS];
+                for s in 0..MAX_ACTIVE_PAIRS {
+                    taker_prob_pm[s] = [
+                        gov.slot_taker_prob_permille(s, Side::Bid),
+                        gov.slot_taker_prob_permille(s, Side::Ask),
+                    ];
+                    learned_mfe_bps[s] = engines[s].learned_mfe_bps;
+                    ob_bull_pm[s] = cached_snaps[s].ob_bull_efficacy_pm as i64;
+                    ob_bear_pm[s] = cached_snaps[s].ob_bear_efficacy_pm as i64;
+                    let rho = self.epps_trackers[s].correlation(s == 0);
+                    epps_corr_pm[s] = (rho * 1_000.0).round().clamp(-1_000.0, 1_000.0) as i16;
+                }
+                let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
+                let _ = vtx.try_send(VaultIoCommand::SavePlasticityAudit(Box::new(
+                    crate::vault_io::PlasticityAuditSnapshot {
+                        ts_ns: now_ns.0,
+                        taker_prob_pm,
+                        learned_mfe_bps,
+                        ob_bull_pm,
+                        ob_bear_pm,
+                        epps_corr_pm,
+                        ws_rtt_us,
+                        ws_quota_rem,
+                    },
+                )));
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+    pub fn emit_live_position_path_from_delta_v49(
+        &mut self,
+        trade_id: u64,
+        slot_idx: usize,
+        side: Side,
+        entry_px: PriceTicks,
+        open_lots: LotQty,
+        delta_net_1e8: i64,
+        opened_ts_ns: TimestampNs,
+        closed_ts_ns: TimestampNs,
+        exit_snap: &SymbolLobSnapshot,
+        vault_tx: &SyncSender<VaultIoCommand>,
+    ) {
+        let s_idx = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+        let notional = APPROVED_SPECS[s_idx].lot_notional_1e8(open_lots.max(LotQty(1)), entry_px.max(PriceTicks(1))).max(1);
+        let net_sbps = ScaledBps((((i128::from(delta_net_1e8)) * 1_000_000) / (i128::from(notional))) as i64);
+        let exit_px = if exit_snap.last_trade_price.0 > 0 { exit_snap.last_trade_price } else { entry_px };
+        let synth = crate::execution_fsm::ClosedTradeSummary {
+            side, closed_lots: open_lots, entry_price: entry_px, exit_price: exit_px,
+            gross_scaled_bps: net_sbps, fee_scaled_bps: ScaledBps(0), net_scaled_bps: net_sbps,
+            net_pnl_1e8: delta_net_1e8, fee_1e8: 0, legs_consolidated: 1, is_maker_exit: true,
+            kind: crate::execution_fsm::ClosedTradeKind::MakerPassiveUnwind,
+        };
+        let m5 = self.markout_rings[s_idx].last_fill_curve_5h();
+        let path_sum = self.intra_rings[s_idx].build_position_path_summary(
+            trade_id, s_idx, &synth, opened_ts_ns, closed_ts_ns, m5,
+        );
+        self.intra_rings[s_idx].reset_on_open(TimestampNs(0));
+        let _ = vault_tx.try_send(VaultIoCommand::RecordPositionPath(Box::new(path_sum)));
+    }
+}
+
+#[cfg(test)]
+mod v49_runtime_telemetry_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn test_v49_runtime_drains_aborts_utc_rollover_and_15m_plasticity() {
+        let mut rt = ExecRuntimeState::new();
+        let snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+        let engines = SlotExecutionEngine::new_12_slot_array();
+        let gov = OnlineAdaptiveGovernor::new();
+        let ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let (vtx, vrx) = mpsc::sync_channel::<VaultIoCommand>(16);
+
+        rt.markout_rings[4].arm_abort_probe_v49(
+            Side::Ask, PriceTicks(19_000), LastVetoCode::HawkesStoikovQueueAbort,
+            TimestampNs(1_794_880_000_000_000_000), TimestampNs(1_794_880_001_000_000_000),
+            LotQty(400), LotQty(90),
+        );
+        for dt_s in [1_i64, 2, 6, 16, 61] {
+            rt.markout_rings[4].step_clock(
+                PriceTicks(19_050),
+                TimestampNs(1_794_880_001_000_000_000 + dt_s * 1_000_000_000),
+                200,
+            );
+        }
+        rt.step_v49_deep_telemetry_200hz(
+            TimestampNs(1_794_880_065_000_000_000), &snaps, &engines, &gov, &ledger, Some(&vtx),
+        );
+        let (mut got_abort, mut got_dg, mut got_plast) = (false, false, false);
+        while let Ok(cmd) = vrx.try_recv() {
+            match cmd {
+                VaultIoCommand::RecordQueueAbort(r) => got_abort = r.is_true_positive && r.slot_idx == 4,
+                VaultIoCommand::SaveDailyGovernor { .. } => got_dg = true,
+                VaultIoCommand::SavePlasticityAudit(_) => got_plast = true,
+                _ => {}
+            }
+        }
+        assert!(got_abort && got_dg && got_plast);
     }
 }

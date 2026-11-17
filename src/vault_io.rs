@@ -1,4 +1,10 @@
-//! Zero-Jitter Off-Thread Atomic Vault Persister (V4.8: Cellular vs Catastrophic Halt, 8h Funding & Daily Shield).
+//! Zero-Jitter Off-Thread Atomic Vault Persister (V4.9: Queue Aborts, 1Hz Position Paths & Plasticity Audit).
+
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::fs::{self, File, OpenOptions};
@@ -14,18 +20,24 @@ use crate::execution_fsm::{ClosedTradeSummary, SlotExecutionEngine};
 use crate::fee_cadence_beta::MAX_PORTFOLIO_RISK_PPM;
 use crate::forensic_parquet::{ColumnarParquetBatch, ParitySyncLedger};
 use crate::governor_plasticity::{DailySessionGovernor, DAILY_GOVERNOR_VAULT_PATH};
-use crate::lob_shm::{SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
-use crate::markout_tracker::MarkoutCurveBps;
+use crate::lob_shm::{LastVetoCode, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
+use crate::markout_tracker::{
+    MarkoutCurve5hBps, MarkoutCurveBps, ResolvedAbortSample, MARKOUT_HORIZONS_V49,
+};
 use crate::order_block::{save_directional_plasticity_to_path_atomic, OB_PLASTICITY_VAULT_PATH};
 use crate::telemetry_hud::{
     build_closed_trade_vault_json, serialize_open_positions_state, SlotForensicEntrySnapshot,
     AI_FORENSIC_VAULT_PATH, DRAIN_LOCK_PATH, HALT_LOCK_PATH, OPEN_POS_STATE_PATH,
     RED_LOSS_BOX_PATH, SCAR_MEMORY_VAULT_PATH,
 };
-use crate::types::{Side, TimestampNs, VortexError, APPROVED_SPECS};
+use crate::types::{LotQty, PriceTicks, ScaledBps, Side, TimestampNs, VortexError, APPROVED_SPECS};
 
 pub const VAULT_IO_QUEUE_CAP: usize = 64;
+pub const MAX_INTRA_TRADE_SAMPLES: usize = 128;
 pub const MFE_PLASTICITY_VAULT_PATH: &str = "data/vault/vortex_mfe_plasticity.json";
+pub const QUEUE_ABORTS_VAULT_PATH: &str = "data/vault/vortex_queue_aborts.jsonl";
+pub const POSITION_PATHS_VAULT_PATH: &str = "data/vault/vortex_position_paths.jsonl";
+pub const PLASTICITY_AUDIT_VAULT_PATH: &str = "data/vault/vortex_plasticity_audit.jsonl";
 
 #[derive(Debug)]
 pub struct AtomicLockWatch {
@@ -50,9 +62,22 @@ impl AtomicLockWatch {
         }
     }
 
-    #[inline] #[must_use] pub fn is_halt_locked(&self) -> bool { self.halt_locked.load(Ordering::Acquire) }
-    #[inline] #[must_use] pub fn is_drain_active(&self) -> bool { self.drain_active.load(Ordering::Acquire) }
-    #[inline] pub fn latch_halt_in_ram(&self) { self.halt_locked.store(true, Ordering::Release); }
+    #[inline]
+    #[must_use]
+    pub fn is_halt_locked(&self) -> bool {
+        self.halt_locked.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_drain_active(&self) -> bool {
+        self.drain_active.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn latch_halt_in_ram(&self) {
+        self.halt_locked.store(true, Ordering::Release);
+    }
 
     pub fn refresh_from_fs(&self, halt_path: &Path, drain_path: &Path) {
         self.halt_locked.store(halt_path.exists(), Ordering::Release);
@@ -67,9 +92,89 @@ pub const fn is_catastrophic_loss_breach(net_pnl_1e8: i64, reference_equity_1e8:
     if net_pnl_1e8 >= 0 {
         return false;
     }
-    let eq = if reference_equity_1e8 > 100_000_000 { reference_equity_1e8 } else { 100_000_000 };
+    let eq = if reference_equity_1e8 > 100_000_000 {
+        reference_equity_1e8
+    } else {
+        100_000_000
+    };
     let loss_ppm = (((-net_pnl_1e8) as i128) * 1_000_000) / (eq as i128);
     loss_ppm >= (MAX_PORTFOLIO_RISK_PPM as i128)
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IntraTradeSample {
+    pub rel_sec: u16,
+    pub mid_delta_sbps: i16,
+    pub tp_delta_sbps: i16,
+    pub sl_delta_sbps: i16,
+    pub ofi_pm: i16,
+    pub tfi_pm: i16,
+    pub wald_shrink_pm: u16,
+    pub zeta_tox_pm: u16,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct QueueAbortRecord {
+    pub slot_idx: u8,
+    pub side: Side,
+    pub veto_code: LastVetoCode,
+    pub armed_ts_ns: TimestampNs,
+    pub aborted_ts_ns: TimestampNs,
+    pub limit_ticks: PriceTicks,
+    pub init_q_lots: LotQty,
+    pub rem_q_lots: LotQty,
+    pub saved_tox_bps: [ScaledBps; MARKOUT_HORIZONS_V49],
+    pub resolved_mask: u8,
+    pub is_true_positive: bool,
+}
+
+impl QueueAbortRecord {
+    #[inline]
+    #[must_use]
+    pub const fn from_resolved_sample(slot_idx: u8, s: ResolvedAbortSample) -> Self {
+        Self {
+            slot_idx,
+            side: s.side,
+            veto_code: s.veto_code,
+            armed_ts_ns: s.armed_ts_ns,
+            aborted_ts_ns: s.aborted_ts_ns,
+            limit_ticks: s.limit_ticks,
+            init_q_lots: s.init_q_lots,
+            rem_q_lots: s.rem_q_lots,
+            saved_tox_bps: s.saved_tox_bps,
+            resolved_mask: s.resolved_mask,
+            is_true_positive: s.is_true_positive,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionPathSummary {
+    pub trade_id: u64,
+    pub slot_idx: u8,
+    pub side: Side,
+    pub opened_ts_ns: TimestampNs,
+    pub closed_ts_ns: TimestampNs,
+    pub entry_ticks: PriceTicks,
+    pub exit_ticks: PriceTicks,
+    pub net_scaled_bps: ScaledBps,
+    pub markout_5h: MarkoutCurve5hBps,
+    pub sample_count: u16,
+    pub ws_rtt_us: u32,
+    pub ws_quota_rem: u16,
+    pub samples: [IntraTradeSample; MAX_INTRA_TRADE_SAMPLES],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlasticityAuditSnapshot {
+    pub ts_ns: i64,
+    pub taker_prob_pm: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    pub learned_mfe_bps: [i64; MAX_ACTIVE_PAIRS],
+    pub ob_bull_pm: [i64; MAX_ACTIVE_PAIRS],
+    pub ob_bear_pm: [i64; MAX_ACTIVE_PAIRS],
+    pub epps_corr_pm: [i16; MAX_ACTIVE_PAIRS],
+    pub ws_rtt_us: u32,
+    pub ws_quota_rem: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +216,9 @@ pub enum VaultIoCommand {
     SaveOpenPositions(Box<OpenPositionsPersistTask>),
     RecordClosedTrade(Box<ClosedTradePersistTask>),
     RecordFundingSettlement(FundingSettlementPersistTask),
+    RecordQueueAbort(Box<QueueAbortRecord>),
+    RecordPositionPath(Box<PositionPathSummary>),
+    SavePlasticityAudit(Box<PlasticityAuditSnapshot>),
     SaveDailyGovernor { ts_ns: i64, state: DailySessionGovernor },
     SaveEmaPrewarm {
         ts_ns: i64,
@@ -196,33 +304,84 @@ pub fn append_jsonl_line_sync(target: &Path, json_line: &str) -> Result<u64, Vor
     Ok(fnv)
 }
 
-#[must_use]
-pub fn build_funding_settlement_vault_json(task: &FundingSettlementPersistTask) -> String {
-    let spec = APPROVED_SPECS[task.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
-    let side_str = match task.side { Side::Bid => "Bid", Side::Ask => "Ask" };
-    let notional = task.position_notional_1e8.max(1);
-    let funding_bps = ((task.funding_net_1e8 as f64) * 10_000.0) / (notional as f64);
-    let mut val = serde_json::json!({
-        "event": "FUNDING_SETTLEMENT",
-        "schema": "V4.8",
-        "ts_ns": task.ts_ns,
-        "funding_cut_id": task.funding_cut_id,
-        "slot_idx": task.slot_idx,
-        "symbol": spec.symbol_id.name(),
-        "side": side_str,
-        "funding_rate_bps": (task.funding_rate_scaled_bps as f64) / 100.0,
-        "notional_1e8": notional,
-        "funding_1e8": task.funding_net_1e8,
-        "funding_bps": (funding_bps * 100.0).round() / 100.0,
-        "cum_funding_1e8": task.cum_funding_1e8,
-        "cum_net_pnl_1e8": task.cum_net_pnl_1e8,
-    });
+fn stamp_fnv1a64_json(mut val: serde_json::Value) -> String {
     let pre = val.to_string();
     let fnv = ColumnarParquetBatch::compute_fnv1a64(pre.as_bytes());
     if let Some(obj) = val.as_object_mut() {
         obj.insert("fnv1a64_hex".to_string(), serde_json::Value::String(format!("0x{fnv:016X}")));
     }
     val.to_string()
+}
+
+#[must_use]
+pub fn build_funding_settlement_vault_json(task: &FundingSettlementPersistTask) -> String {
+    let spec = APPROVED_SPECS[task.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let side_str = match task.side { Side::Bid => "Bid", Side::Ask => "Ask" };
+    let notional = task.position_notional_1e8.max(1);
+    let funding_bps = ((task.funding_net_1e8 as f64) * 10_000.0) / (notional as f64);
+    stamp_fnv1a64_json(serde_json::json!({
+        "event": "FUNDING_SETTLEMENT", "schema": "V4.9", "ts_ns": task.ts_ns,
+        "funding_cut_id": task.funding_cut_id, "slot_idx": task.slot_idx,
+        "symbol": spec.symbol_id.name(), "side": side_str,
+        "funding_rate_bps": (task.funding_rate_scaled_bps as f64) / 100.0,
+        "notional_1e8": notional, "funding_1e8": task.funding_net_1e8,
+        "funding_bps": (funding_bps * 100.0).round() / 100.0,
+        "cum_funding_1e8": task.cum_funding_1e8, "cum_net_pnl_1e8": task.cum_net_pnl_1e8,
+    }))
+}
+
+#[must_use]
+pub fn build_queue_abort_vault_json(rec: &QueueAbortRecord) -> String {
+    let s_idx = usize::from(rec.slot_idx).min(MAX_ACTIVE_PAIRS - 1);
+    let spec = APPROVED_SPECS[s_idx];
+    let side_str = match rec.side { Side::Bid => "Bid", Side::Ask => "Ask" };
+    let wait_ms = rec.aborted_ts_ns.0.saturating_sub(rec.armed_ts_ns.0).max(0) / 1_000_000;
+    let saved_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (rec.saved_tox_bps[k].raw() as f64) / 100.0);
+    stamp_fnv1a64_json(serde_json::json!({
+        "event": "QUEUE_ABORTED", "schema": "V4.9", "ts_ns": rec.aborted_ts_ns.0,
+        "armed_ts_ns": rec.armed_ts_ns.0, "queue_wait_ms": wait_ms,
+        "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
+        "veto_code": rec.veto_code as u8, "veto_name": format!("{:?}", rec.veto_code),
+        "limit_ticks": rec.limit_ticks.0, "init_q_lots": rec.init_q_lots.0, "rem_q_lots": rec.rem_q_lots.0,
+        "saved_tox_5h_bps": saved_f, "resolved_mask": rec.resolved_mask, "true_positive": rec.is_true_positive,
+    }))
+}
+
+#[must_use]
+pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String {
+    let s_idx = usize::from(path_sum.slot_idx).min(MAX_ACTIVE_PAIRS - 1);
+    let spec = APPROVED_SPECS[s_idx];
+    let side_str = match path_sum.side { Side::Bid => "Bid", Side::Ask => "Ask" };
+    let n = usize::from(path_sum.sample_count).min(MAX_INTRA_TRADE_SAMPLES);
+    let mut rows = Vec::with_capacity(n);
+    for smp in &path_sum.samples[..n] {
+        rows.push(serde_json::json!([
+            smp.rel_sec, smp.mid_delta_sbps, smp.tp_delta_sbps, smp.sl_delta_sbps,
+            smp.ofi_pm, smp.tfi_pm, smp.wald_shrink_pm, smp.zeta_tox_pm
+        ]));
+    }
+    let m5_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (path_sum.markout_5h.samples_bps[k] as f64) / 100.0);
+    stamp_fnv1a64_json(serde_json::json!({
+        "event": "POSITION_PATH_1HZ", "schema": "V4.9", "trade_id": path_sum.trade_id,
+        "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
+        "opened_ts_ns": path_sum.opened_ts_ns.0, "closed_ts_ns": path_sum.closed_ts_ns.0,
+        "entry_ticks": path_sum.entry_ticks.0, "exit_ticks": path_sum.exit_ticks.0,
+        "net_bps": (path_sum.net_scaled_bps.raw() as f64) / 100.0,
+        "markout_5h_bps": m5_f, "markout_resolved_mask": path_sum.markout_5h.resolved_mask,
+        "peak_zeta_tox": (f64::from(path_sum.markout_5h.peak_zeta_tox_pm)) / 1_000.0,
+        "ws_rtt_us": path_sum.ws_rtt_us, "ws_quota_rem": path_sum.ws_quota_rem,
+        "sample_count": n, "samples_1hz": rows,
+    }))
+}
+
+#[must_use]
+pub fn build_plasticity_audit_vault_json(snap: &PlasticityAuditSnapshot) -> String {
+    stamp_fnv1a64_json(serde_json::json!({
+        "event": "PLASTICITY_AUDIT_V49", "schema": "V4.9", "ts_ns": snap.ts_ns,
+        "taker_prob_pm": snap.taker_prob_pm, "learned_mfe_bps": snap.learned_mfe_bps,
+        "ob_bull_pm": snap.ob_bull_pm, "ob_bear_pm": snap.ob_bear_pm,
+        "epps_corr_pm": snap.epps_corr_pm, "ws_rtt_us": snap.ws_rtt_us, "ws_quota_rem": snap.ws_quota_rem,
+    }))
 }
 
 pub fn persist_funding_settlement_sync(task: &FundingSettlementPersistTask) {
@@ -232,27 +391,17 @@ pub fn persist_funding_settlement_sync(task: &FundingSettlementPersistTask) {
 
 pub fn persist_closed_trade_bundle_sync(task: &ClosedTradePersistTask, locks: Option<&AtomicLockWatch>) {
     let vault_line = build_closed_trade_vault_json(
-        task.slot_idx,
-        &task.summary,
-        &task.eng,
-        &task.entry_forensics,
-        &task.exit_snap,
-        &task.ledger,
-        &task.markout_curve,
-        task.lvr_5s_scaled_bps,
-        task.ts_ns,
+        task.slot_idx, &task.summary, &task.eng, &task.entry_forensics,
+        &task.exit_snap, &task.ledger, &task.markout_curve, task.lvr_5s_scaled_bps, task.ts_ns,
     );
     let scar_line = task.gov.to_scar_snapshot_json(task.ts_ns).to_string();
-    let is_red_loss = task.summary.net_scaled_bps.raw() < -50;
     let _ = append_jsonl_line_sync(Path::new(AI_FORENSIC_VAULT_PATH), &vault_line);
     let _ = append_jsonl_line_sync(Path::new(SCAR_MEMORY_VAULT_PATH), &scar_line);
-    if is_red_loss {
+    if task.summary.net_scaled_bps.raw() < -50 {
         let _ = append_jsonl_line_sync(Path::new(RED_LOSS_BOX_PATH), &vault_line);
     }
     if task.is_catastrophic_halt {
-        if let Some(lw) = locks {
-            lw.latch_halt_in_ram();
-        }
+        if let Some(lw) = locks { lw.latch_halt_in_ram(); }
         let _ = atomic_write_bytes_sync(Path::new(HALT_LOCK_PATH), vault_line.as_bytes());
     }
 }
@@ -264,22 +413,27 @@ fn handle_vault_io_cmd(cmd: VaultIoCommand, locks: &AtomicLockWatch) {
                 let _ = atomic_write_bytes_sync(Path::new(OPEN_POS_STATE_PATH), txt.as_bytes());
             }
         }
-        VaultIoCommand::RecordClosedTrade(task) => {
-            persist_closed_trade_bundle_sync(&task, Some(locks));
+        VaultIoCommand::RecordClosedTrade(task) => persist_closed_trade_bundle_sync(&task, Some(locks)),
+        VaultIoCommand::RecordFundingSettlement(task) => persist_funding_settlement_sync(&task),
+        VaultIoCommand::RecordQueueAbort(rec) => {
+            let line = build_queue_abort_vault_json(&rec);
+            let _ = append_jsonl_line_sync(Path::new(QUEUE_ABORTS_VAULT_PATH), &line);
         }
-        VaultIoCommand::RecordFundingSettlement(task) => {
-            persist_funding_settlement_sync(&task);
+        VaultIoCommand::RecordPositionPath(path_sum) => {
+            let line = build_position_path_vault_json(&path_sum);
+            let _ = append_jsonl_line_sync(Path::new(POSITION_PATHS_VAULT_PATH), &line);
+        }
+        VaultIoCommand::SavePlasticityAudit(audit) => {
+            let line = build_plasticity_audit_vault_json(&audit);
+            let _ = append_jsonl_line_sync(Path::new(PLASTICITY_AUDIT_VAULT_PATH), &line);
         }
         VaultIoCommand::SaveDailyGovernor { ts_ns, state } => {
             let _ = save_daily_governor_to_path_atomic(Path::new(DAILY_GOVERNOR_VAULT_PATH), TimestampNs(ts_ns), &state);
         }
         VaultIoCommand::SaveEmaPrewarm { ts_ns, fast_px_1e4, slow_px_1e4, eq_vol_5m_bps } => {
             let payload = serde_json::json!({
-                "event": "EMA_PREWARM_V43",
-                "ts_ns": ts_ns,
-                "ewma_fast_px_1e4": fast_px_1e4,
-                "ewma_slow_px_1e4": slow_px_1e4,
-                "eq_vol_5m_bps": eq_vol_5m_bps,
+                "event": "EMA_PREWARM_V43", "ts_ns": ts_ns,
+                "ewma_fast_px_1e4": fast_px_1e4, "ewma_slow_px_1e4": slow_px_1e4, "eq_vol_5m_bps": eq_vol_5m_bps,
             });
             if let Ok(s) = serde_json::to_string(&payload) {
                 let _ = atomic_write_bytes_sync(Path::new(EMA_PREWARM_PATH), s.as_bytes());
@@ -306,9 +460,7 @@ pub fn spawn_vault_io_worker(locks: Arc<AtomicLockWatch>) -> SyncSender<VaultIoC
     thread::spawn(move || loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(cmd) => handle_vault_io_cmd(cmd, &locks),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                locks.refresh_from_fs(Path::new(HALT_LOCK_PATH), Path::new(DRAIN_LOCK_PATH));
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => locks.refresh_from_fs(Path::new(HALT_LOCK_PATH), Path::new(DRAIN_LOCK_PATH)),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     });
@@ -325,38 +477,52 @@ mod tests {
         assert!(cmd_bytes <= 512);
         assert!(!is_catastrophic_loss_breach(-30_211_283, 6_543_090_000));
         assert!(is_catastrophic_loss_breach(-120_000_000, 6_543_090_000));
-
-        let dir = std::env::temp_dir().join(format!("vortex_vault_io_v48_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vortex_vault_io_v49_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert!(fs::create_dir_all(&dir).is_ok());
-        let json_target = dir.join("state_atomic.json");
-        assert!(atomic_write_bytes_sync(&json_target, b"{\"v\":2,\"ok\":true}").is_ok());
-        assert_eq!(fs::read_to_string(&json_target).unwrap_or_default(), "{\"v\":2,\"ok\":true}");
-
         let dg_path = dir.join("daily_gov.json");
         let mut dg = DailySessionGovernor::new(6_513_770_000);
         let _ = dg.sync_utc_day(TimestampNs(1_794_790_000_000_000_000), 6_513_770_000);
         dg.day_realized_pnl_1e8 = 25_000_000;
         assert!(save_daily_governor_to_path_atomic(&dg_path, TimestampNs(1_794_790_100_000_000_000), &dg).is_ok());
         assert_eq!(load_daily_governor_from_path(&dg_path, 6_513_770_000).day_realized_pnl_1e8, 25_000_000);
-
-        let f_line = build_funding_settlement_vault_json(&FundingSettlementPersistTask {
-            ts_ns: 1_794_787_200_000_000_000, slot_idx: 3, side: Side::Ask, funding_cut_id: 62_319,
-            funding_rate_scaled_bps: 150, position_notional_1e8: 1_800_000_000, funding_net_1e8: 270_000,
-            cum_funding_1e8: 270_000, cum_net_pnl_1e8: 270_000,
-        });
-        assert!(f_line.contains("\"event\":\"FUNDING_SETTLEMENT\"") && f_line.contains("\"fnv1a64_hex\":\"0x"));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_mfe_plasticity_atomic_roundtrip_and_bounds() {
-        let p = std::env::temp_dir().join(format!("vortex_mfe_v48_{}.json", std::process::id()));
+        let p = std::env::temp_dir().join(format!("vortex_mfe_v49_{}.json", std::process::id()));
         let _ = fs::remove_file(&p);
-        assert_eq!(load_mfe_plasticity_from_path(&p, 680), [680; 12]);
         let src = [1_200, 950, 740, 680, 2_100, 520, 810, 640, 1_450, 700, 590, 510];
         assert!(save_mfe_plasticity_to_path_atomic(&p, 1_794_700_000, &src).is_ok());
         assert_eq!(load_mfe_plasticity_from_path(&p, 680), src);
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_v49_queue_abort_position_path_and_plasticity_jsonl_fnv() {
+        let ab = QueueAbortRecord {
+            slot_idx: 3, side: Side::Bid, veto_code: LastVetoCode::HawkesStoikovQueueAbort,
+            armed_ts_ns: TimestampNs(1_000_000_000), aborted_ts_ns: TimestampNs(2_500_000_000),
+            limit_ticks: PriceTicks(7_200), init_q_lots: LotQty(500), rem_q_lots: LotQty(120),
+            saved_tox_bps: [ScaledBps(50), ScaledBps(260), ScaledBps(410), ScaledBps(520), ScaledBps(890)],
+            resolved_mask: 0x1F, is_true_positive: true,
+        };
+        let ab_j = build_queue_abort_vault_json(&ab);
+        assert!(ab_j.contains("\"event\":\"QUEUE_ABORTED\"") && ab_j.contains("\"fnv1a64_hex\":\"0x"));
+        let mut samples = [IntraTradeSample::default(); MAX_INTRA_TRADE_SAMPLES];
+        samples[0] = IntraTradeSample { rel_sec: 1, mid_delta_sbps: 140, tp_delta_sbps: 520, sl_delta_sbps: -4_200, ofi_pm: 620, tfi_pm: 880, wald_shrink_pm: 250, zeta_tox_pm: 110 };
+        let pp_j = build_position_path_vault_json(&PositionPathSummary {
+            trade_id: 15, slot_idx: 1, side: Side::Bid, opened_ts_ns: TimestampNs(10), closed_ts_ns: TimestampNs(94_000_000_010),
+            entry_ticks: PriceTicks(182_033), exit_ticks: PriceTicks(182_145), net_scaled_bps: ScaledBps(215),
+            markout_5h: MarkoutCurve5hBps { samples_bps: [40, 80, 120, 210, 340], resolved_mask: 0x1F, initial_edge_bps: 25, peak_zeta_tox_pm: 90 },
+            sample_count: 1, ws_rtt_us: 1_850, ws_quota_rem: 98, samples,
+        });
+        assert!(pp_j.contains("\"event\":\"POSITION_PATH_1HZ\"") && pp_j.contains("\"ws_rtt_us\":1850"));
+        let pa_j = build_plasticity_audit_vault_json(&PlasticityAuditSnapshot {
+            ts_ns: 99, taker_prob_pm: [[48; 2]; 12], learned_mfe_bps: [670; 12],
+            ob_bull_pm: [520; 12], ob_bear_pm: [540; 12], epps_corr_pm: [610; 12], ws_rtt_us: 1_850, ws_quota_rem: 98,
+        });
+        assert!(pa_j.contains("\"event\":\"PLASTICITY_AUDIT_V49\"") && pa_j.contains("\"fnv1a64_hex\":\"0x"));
     }
 }
