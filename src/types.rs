@@ -847,24 +847,27 @@ impl PairSpec {
         let p_mkr = 1.0 - p_tkr;
         let c_mkr_rt = fees.round_trip_maker_exit_bps().raw() as f64;
         let c_tkr_rt = (fees.round_trip_taker_exit_bps().raw().max(100)) as f64;
-        let mfe_eff = (learned_mfe_bps.max(0) as f64) - c_mkr_rt;
+        let eq_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0.saturating_mul(4));
+        let eq_sl = Self::elastic_server_sl_distance_bps_with_fees(eq_vol, fees).raw().max(100) as f64;
+        let srv_sl = Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
+        let g_clamped = signed_geom.clamp(-1.0, 1.0);
+        let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
+        let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
+        let vol_scale = 1.0 + h_vol * ((srv_sl / eq_sl) - 1.0).max(0.0);
+        let mfe_eff = (learned_mfe_bps.max(0) as f64) * vol_scale - c_mkr_rt;
         if mfe_eff <= 10.0 {
             return false;
         }
-        let srv_sl =
-            Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
         let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt;
-        let u_g = ((signed_geom.clamp(-1.0, 1.0) - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
+        let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
         let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
         let (al_raw, op_raw) = match side {
             Side::Bid => (ob_bull_pm, ob_bear_pm),
             Side::Ask => (ob_bear_pm, ob_bull_pm),
         };
-        let al_f = f64::from(al_raw.max(382));
-        let op_f = f64::from(op_raw.max(382));
-        let ob_ratio = (al_f / op_f).clamp(INV_PHI, PHI);
+        let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
         let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
-        let eff_tail_cost = (p_tkr * wald_sl_net) / (INV_PHI2 + q_struct);
+        let eff_tail_cost = (p_tkr * wald_sl_net) / (INV_PHI + PHI * q_struct);
         (p_mkr * mfe_eff) > eff_tail_cost
     }
 }
