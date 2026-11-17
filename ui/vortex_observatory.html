@@ -1,1 +1,599 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="vortex-csrf" content="__VORTEX_CSRF__"><title>VORTEX Observatory V4.9</title></head><body>VORTEX-OMEGA V4.9 SEED</body></html>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta id="vortex-csrf-meta" name="vortex-csrf" content="__VORTEX_CSRF__">
+<title>VORTEX-OMEGA V4.9 — Institutional Observatory (SHM v15 / VKL1)</title>
+<script src="https://unpkg.com/lightweight-charts@5.0.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#070b12;--panel:#0d1421;--panel2:#121b2d;--brd:#1e2d47;--txt:#e2e8f0;--muted:#8899b0;--cyan:#38bdf8;--green:#22c55e;--gold:#facc15;--orange:#fb923c;--red:#ef4444;--mono:'JetBrains Mono','Cascadia Code',Consolas,monospace;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:Inter,system-ui,-apple-system,sans-serif;font-size:12px;line-height:1.35;overflow-x:hidden}
+.mono{font-family:var(--mono)}
+.topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--brd)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.4px;color:var(--cyan)}
+.pill{padding:2px 8px;border-radius:4px;border:1px solid var(--brd);background:var(--panel2);font-family:var(--mono);font-size:11px}
+.pill.ok{border-color:#166534;color:var(--green);background:#082213}
+.pill.warn{border-color:#9a3412;color:var(--orange);background:#261207}
+.pill.bad{border-color:#991b1b;color:var(--red);background:#2a0909}
+.sem-wrap{display:flex;align-items:center;gap:5px}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 12px;background:#0a101b;border-bottom:1px solid var(--brd)}
+.ctrl-grp{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+select,button{background:var(--panel2);color:var(--txt);border:1px solid var(--brd);border-radius:4px;padding:4px 8px;font-size:11px;font-family:var(--mono);cursor:pointer}
+button:hover{border-color:var(--cyan)}
+button.tf-btn.active{background:#0e304d;border-color:var(--cyan);color:var(--cyan);font-weight:700}
+button.btn-ai{background:#0d293e;border-color:#0284c7;color:#7dd3fc}
+button.btn-drain{background:#2a1608;border-color:#c2410c;color:var(--orange);font-weight:700}
+button.btn-drain.active{background:#431407;border-color:var(--red);color:#fca5a5}
+button.btn-lab{background:#112233;border-color:#334155;color:#cbd5e1}
+.kpi-strip{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:6px;padding:8px 12px}
+.kpi-card{background:var(--panel);border:1px solid var(--brd);border-radius:5px;padding:6px 9px}
+.kpi-lbl{font-size:10px;text-transform:uppercase;color:var(--muted);letter-spacing:.4px}
+.kpi-val{font-family:var(--mono);font-size:13px;font-weight:700;margin-top:2px}
+.main-grid{display:grid;grid-template-columns:1fr 310px;gap:8px;padding:0 12px 8px}
+.card{background:var(--panel);border:1px solid var(--brd);border-radius:5px;overflow:hidden;display:flex;flex-direction:column}
+.card-hdr{display:flex;align-items:center;justify-content:space-between;padding:5px 9px;background:var(--panel2);border-bottom:1px solid var(--brd);font-weight:600;font-size:11px;color:#cbd5e1}
+#chart-main{width:100%;height:315px;position:relative}
+#chart-sub{width:100%;height:115px;border-top:1px solid var(--brd);position:relative}
+.ladder-row{display:grid;grid-template-columns:1fr 1fr 64px;padding:2px 8px;font-family:var(--mono);font-size:11px;position:relative}
+.ladder-ask{color:#f87171}.ladder-bid{color:#4ade80}
+.ladder-mid{padding:4px 8px;text-align:center;font-family:var(--mono);font-weight:700;background:#080d16;border-top:1px solid var(--brd);border-bottom:1px solid var(--brd);color:var(--cyan)}
+.bot-grid{display:grid;grid-template-columns:1.35fr 1fr;gap:8px;padding:0 12px 12px}
+.tbl-wrap{overflow:auto;max-height:310px}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+th,td{padding:4px 6px;border-bottom:1px solid #162238;text-align:right;white-space:nowrap}
+th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;z-index:2}
+td.l,th.l{text-align:left}
+tr.slot-row:hover,tr.trade-row:hover{background:#152238;cursor:pointer}
+tr.selected-row{background:#132a46}
+.band-GOLD_SURGE{color:var(--gold);font-weight:700}
+.band-GREEN_WIN{color:var(--green);font-weight:700}
+.band-CYAN_SCRATCH{color:var(--cyan)}
+.band-RED_HEAT{color:var(--red);font-weight:700}
+.band-IDLE{color:var(--muted)}
+.player-box{padding:8px;border-top:1px solid var(--brd);background:#090f1a}
+#path-canvas{width:100%;height:110px;display:block;background:#060a11;border:1px solid var(--brd);border-radius:4px;margin-top:5px}
+#lab-console{padding:6px 8px;font-family:var(--mono);font-size:10px;color:#93c5fd;background:#05080f;border-top:1px solid var(--brd);min-height:26px;white-space:pre-wrap}
+#vortex-toast{position:fixed;bottom:14px;right:14px;padding:8px 14px;background:#0e2a47;border:1px solid var(--cyan);color:#fff;border-radius:5px;font-family:var(--mono);font-size:11px;display:none;z-index:99}
+@media(max-width:1100px){.kpi-strip{grid-template-columns:repeat(2,1fr)}.main-grid,.bot-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span>VORTEX-OMEGA V4.9 OBSERVATORY</span>
+    <span id="hdr-shm" class="pill warn">SHM v15: INIT</span>
+    <span id="hdr-hb" class="pill">HB: -- ms | Resyncs: 0</span>
+    <span id="hdr-rtt" class="pill">WS RTT: -- us</span>
+    <span id="hdr-mode" class="pill ok">ACTIVE_200HZ</span>
+  </div>
+  <div class="sem-wrap">
+    <span class="kpi-lbl">SEMAFORO 4/4:</span>
+    <span id="sem-1" class="pill">OOS520</span>
+    <span id="sem-2" class="pill">Vault70</span>
+    <span id="sem-3" class="pill">Mkr80%</span>
+    <span id="sem-4" class="pill">25Tiros</span>
+    <span id="sem-score" class="pill">0/4</span>
+  </div>
+</header>
+
+<section class="toolbar">
+  <div class="ctrl-grp">
+    <label class="kpi-lbl" for="sel-symbol">PAR:</label>
+    <select id="sel-symbol"></select>
+    <div id="tf-group" class="ctrl-grp">
+      <button type="button" class="tf-btn" data-tf="1s">1s</button>
+      <button type="button" class="tf-btn active" data-tf="1m">1m</button>
+      <button type="button" class="tf-btn" data-tf="5m">5m</button>
+      <button type="button" class="tf-btn" data-tf="15m">15m</button>
+      <button type="button" class="tf-btn" data-tf="1h">1h</button>
+      <button type="button" class="tf-btn" data-tf="4h">4h</button>
+      <button type="button" class="tf-btn" data-tf="1d">1d</button>
+    </div>
+  </div>
+  <div class="ctrl-grp">
+    <button type="button" id="btn-clip-360" class="btn-ai">1-Clic VORTEX 360 (Gemini)</button>
+    <button type="button" id="btn-clip-trade" class="btn-ai">1-Clic Autopsia Tiro</button>
+    <button type="button" id="btn-drain" class="btn-drain">DRAIN_MODE: OFF (Open: 0/6)</button>
+    <button type="button" class="btn-lab" data-lab="1">LAB 1 PAR2</button>
+    <button type="button" class="btn-lab" data-lab="2">LAB 2 PAR2Z</button>
+    <button type="button" class="btn-lab" data-lab="3">LAB 3 OOS520</button>
+    <button type="button" class="btn-lab" data-lab="4">LAB 4 TWIN</button>
+  </div>
+</section>
+
+<section class="kpi-strip">
+  <div class="kpi-card"><div class="kpi-lbl">Patrimonio Conciliado</div><div id="kpi-equity" class="kpi-val">-- USDT</div></div>
+  <div class="kpi-card"><div class="kpi-lbl">PnL Neto Acumulado</div><div id="kpi-net" class="kpi-val">-- USDT</div></div>
+  <div class="kpi-card"><div class="kpi-lbl">Boveda 70% / Reserva 30%</div><div id="kpi-vault" class="kpi-val">-- / -- bps</div></div>
+  <div class="kpi-card"><div class="kpi-lbl">Escudo Diario UTC</div><div id="kpi-daily" class="kpi-val">--% (ACTIVE)</div></div>
+  <div class="kpi-card"><div class="kpi-lbl">Salidas Maker &amp; Muestra</div><div id="kpi-maker" class="kpi-val">--% (0/25)</div></div>
+  <div class="kpi-card"><div class="kpi-lbl">Flujo Ordenes SHM</div><div id="kpi-counts" class="kpi-val">Arm:0 Abr:0 Fil:0</div></div>
+</section>
+
+<section class="main-grid">
+  <div class="card">
+    <div class="card-hdr">
+      <span id="chart-title">BTCUSDT [1m] — Velas Perpetuas VKL1 + [OB+/OB-] + Entry/TP/SL</span>
+      <span id="chart-overlay-info" class="mono">OFI: 0.00 | TFI: 0.00 | H: 0.50 | OB: 618/618</span>
+    </div>
+    <div id="chart-main"></div>
+    <div id="chart-sub"></div>
+  </div>
+  <div class="card">
+    <div class="card-hdr"><span>Escalera L1..L5 &amp; Muros OB</span><span id="ob-walls-info" class="mono">OB+/-</span></div>
+    <div id="l5-asks"></div>
+    <div id="l5-spread" class="ladder-mid">Spread: -- ticks</div>
+    <div id="l5-bids"></div>
+    <div class="card-hdr"><span>Precision Escudos (True Positives)</span><span>TP / Tot</span></div>
+    <div class="tbl-wrap" style="max-height:145px">
+      <table><thead><tr><th class="l">Escudo Veto</th><th>TP</th><th>Tot</th><th>Prec%</th></tr></thead><tbody id="aborts-prec-body"></tbody></table>
+    </div>
+  </div>
+</section>
+
+<section class="bot-grid">
+  <div class="card">
+    <div class="card-hdr"><span>Matriz Viva 12 Carriles (SHM v15 SeqLock @ 5 Hz)</span><span id="slots-summary" class="mono">Open: 0/6 | Queue: 0</span></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th class="l">Par</th><th>PyG UPL (%@10x)</th><th>Tiempo/Cola</th><th>Bid</th><th>Ask</th><th>Spr</th><th>OFI</th><th>TFI</th><th>Wave / OB+- / Fnd</th><th class="l">Estado / Veto</th></tr></thead>
+        <tbody id="slots-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-hdr"><span>Historial Forense &amp; Pelicula Intra-Trade 1 Hz</span><span id="trades-total-lbl" class="mono">Cerrados: 0</span></div>
+    <div class="tbl-wrap" style="max-height:145px">
+      <table>
+        <thead><tr><th>#</th><th class="l">Par</th><th>Lado</th><th>Net bps</th><th>MFE/MAE</th><th>Hold</th><th class="l">Motivo</th></tr></thead>
+        <tbody id="trades-body"></tbody>
+      </table>
+    </div>
+    <div class="player-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+        <span id="path-title" class="mono">Selecciona un tiro para inspeccionar trayectoria 1 Hz</span>
+        <span id="path-step-lbl" class="mono">t=0s</span>
+      </div>
+      <div id="path-markout-5h" class="mono" style="font-size:10px;color:var(--muted);margin-top:2px">Markout 5h (+250ms..+60s): --</div>
+      <input type="range" id="path-slider" min="0" max="0" value="0" style="width:100%;margin-top:4px">
+      <canvas id="path-canvas" width="520" height="110"></canvas>
+    </div>
+    <div id="lab-console">[LAB IDLE] Listo para ejecutar compuertas autonomas LAB 1..4 (Nice=19).</div>
+  </div>
+</section>
+<div id="vortex-toast"></div>
+<script>
+const VORTEX_SYMBOLS = [
+  "BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT","TAOUSDT","SUIUSDT",
+  "ORDIUSDT","PENDLEUSDT","WIFUSDT","LINKUSDT","FETUSDT","NEARUSDT"
+];
+const VX = {
+  csrf: (document.getElementById("vortex-csrf-meta") || {}).content || "",
+  symbol: "BTCUSDT",
+  tf: "1m",
+  state: null,
+  candles: [],
+  trades: [],
+  selectedTradeId: null,
+  activePath: null,
+  chartMain: null,
+  chartSub: null,
+  candleSeries: null,
+  ofiSeries: null,
+  tfiSeries: null,
+  priceLines: [],
+  sse: null
+};
+
+function el(id) { return document.getElementById(id); }
+function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n.toFixed(d) : (0).toFixed(d); }
+function sgn(v, d) { const n = Number(v) || 0; return (n >= 0 ? "+" : "") + n.toFixed(d); }
+function showToast(msg) {
+  const t = el("vortex-toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.style.display = "block";
+  clearTimeout(VX.toastTimer);
+  VX.toastTimer = setTimeout(function() { t.style.display = "none"; }, 2600);
+}
+
+function addCompatSeries(chart, kind, opts) {
+  const LWC = window.LightweightCharts;
+  if (!LWC || !chart) return null;
+  if (typeof chart.addSeries === "function") {
+    if (kind === "candle" && LWC.CandlestickSeries) return chart.addSeries(LWC.CandlestickSeries, opts);
+    if (kind === "hist" && LWC.HistogramSeries) return chart.addSeries(LWC.HistogramSeries, opts);
+    if (kind === "line" && LWC.LineSeries) return chart.addSeries(LWC.LineSeries, opts);
+  }
+  if (kind === "candle" && typeof chart.addCandlestickSeries === "function") return chart.addCandlestickSeries(opts);
+  if (kind === "hist" && typeof chart.addHistogramSeries === "function") return chart.addHistogramSeries(opts);
+  if (kind === "line" && typeof chart.addLineSeries === "function") return chart.addLineSeries(opts);
+  return null;
+}
+
+function initCharts() {
+  const mBox = el("chart-main"), sBox = el("chart-sub"), LWC = window.LightweightCharts;
+  if (!LWC || !mBox || !sBox) return;
+  const baseCfg = {
+    layout: { background: { color: "#0d1421" }, textColor: "#8899b0", fontSize: 11 },
+    grid: { vertLines: { color: "#142033" }, horzLines: { color: "#142033" } },
+    timeScale: { timeVisible: true, secondsVisible: true, borderColor: "#1e2d47" },
+    rightPriceScale: { borderColor: "#1e2d47" }
+  };
+  VX.chartMain = LWC.createChart(mBox, Object.assign({ width: mBox.clientWidth || 720, height: 315 }, baseCfg));
+  VX.chartSub = LWC.createChart(sBox, Object.assign({ width: sBox.clientWidth || 720, height: 115 }, baseCfg));
+  VX.candleSeries = addCompatSeries(VX.chartMain, "candle", {
+    upColor: "#22c55e", downColor: "#ef4444", borderVisible: false, wickUpColor: "#22c55e", wickDownColor: "#ef4444"
+  });
+  VX.ofiSeries = addCompatSeries(VX.chartSub, "hist", { priceFormat: { type: "price", precision: 2, minMove: 0.01 } });
+  VX.tfiSeries = addCompatSeries(VX.chartSub, "line", { color: "#38bdf8", lineWidth: 2 });
+  window.addEventListener("resize", function() {
+    if (VX.chartMain) VX.chartMain.applyOptions({ width: mBox.clientWidth || 720 });
+    if (VX.chartSub) VX.chartSub.applyOptions({ width: sBox.clientWidth || 720 });
+  });
+}
+
+function clearPriceLines() {
+  if (!VX.candleSeries) return;
+  while (VX.priceLines.length > 0) {
+    const ln = VX.priceLines.pop();
+    try { VX.candleSeries.removePriceLine(ln); } catch (_) {}
+  }
+}
+
+function pushLevelLine(px, color, style, title) {
+  if (!VX.candleSeries || !(px > 0)) return;
+  try {
+    const ln = VX.candleSeries.createPriceLine({
+      price: px, color: color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: title
+    });
+    if (ln) VX.priceLines.push(ln);
+  } catch (_) {}
+}
+
+function syncSlotOverlays() {
+  if (!VX.state || !Array.isArray(VX.state.slots)) return;
+  const slot = VX.state.slots.find(function(s) { return s.symbol === VX.symbol; });
+  if (!slot) return;
+  el("chart-title").textContent = VX.symbol + " [" + VX.tf + "] — VKL1 + [OB+/OB-] + Entry/TP/SL (" + slot.wave_regime + ")";
+  el("chart-overlay-info").textContent =
+    "OFI:" + sgn(slot.ofi, 2) + " | TFI:" + sgn(slot.tfi, 2) +
+    " | H:" + num(slot.hurst, 2) + " | OB:" + slot.ob_bull_pm + "/" + slot.ob_bear_pm;
+  el("ob-walls-info").textContent = "OB+ " + num(slot.ob_bull_px, 4) + " | OB- " + num(slot.ob_bear_px, 4);
+
+  clearPriceLines();
+  pushLevelLine(slot.ob_bull_px, "#16a34a", 2, "OB+ (" + slot.ob_bull_pm + "pm)");
+  pushLevelLine(slot.ob_bear_px, "#dc2626", 2, "OB- (" + slot.ob_bear_pm + "pm)");
+  if (slot.state_code >= 1 && slot.entry_px > 0) pushLevelLine(slot.entry_px, "#facc15", 0, "ENTRY " + slot.side);
+  if (slot.state_code >= 3 && slot.tp_px > 0) pushLevelLine(slot.tp_px, "#38bdf8", 0, "MAKER TP");
+  if (slot.state_code >= 3 && slot.sl_px > 0) pushLevelLine(slot.sl_px, "#ef4444", 1, "SERVER SL");
+
+  const asksHtml = (slot.asks_l5 || []).slice().reverse().map(function(lv, idx) {
+    return "<div class='ladder-row ladder-ask'><span>" + num(lv[0], 4) + "</span><span>" + num(lv[1], 3) + "</span><span>A" + (5 - idx) + "</span></div>";
+  }).join("");
+  const bidsHtml = (slot.bids_l5 || []).map(function(lv, idx) {
+    return "<div class='ladder-row ladder-bid'><span>" + num(lv[0], 4) + "</span><span>" + num(lv[1], 3) + "</span><span>B" + (idx + 1) + "</span></div>";
+  }).join("");
+  el("l5-asks").innerHTML = asksHtml;
+  el("l5-spread").textContent = "Mid/Mark: " + num(slot.mark || slot.bid, 4) + " | Spread: " + slot.spread_ticks + "t";
+  el("l5-bids").innerHTML = bidsHtml;
+}
+
+async function loadCandles() {
+  try {
+    const r = await fetch("/api/candles?symbol=" + encodeURIComponent(VX.symbol) + "&tf=" + encodeURIComponent(VX.tf) + "&limit=320");
+    if (!r.ok) return;
+    const j = await r.json();
+    const arr = Array.isArray(j.candles) ? j.candles : [];
+    VX.candles = arr;
+    if (VX.candleSeries && arr.length > 0) {
+      const bars = [], ofiPts = [], tfiPts = [];
+      let prevT = -1;
+      for (let i = 0; i < arr.length; i++) {
+        const c = arr[i];
+        if (c.time <= prevT) continue;
+        prevT = c.time;
+        bars.push({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
+        ofiPts.push({ time: c.time, value: c.ofi, color: c.ofi >= 0 ? "rgba(34,197,94,0.65)" : "rgba(239,68,68,0.65)" });
+        tfiPts.push({ time: c.time, value: c.tfi });
+      }
+      VX.candleSeries.setData(bars);
+      if (VX.ofiSeries) VX.ofiSeries.setData(ofiPts);
+      if (VX.tfiSeries) VX.tfiSeries.setData(tfiPts);
+    }
+    syncSlotOverlays();
+  } catch (_) {}
+}
+
+function setSemPill(id, ok, txt) {
+  const node = el(id);
+  if (!node) return;
+  node.textContent = txt;
+  node.className = "pill " + (ok ? "ok" : "warn");
+}
+
+function renderLiveState(st) {
+  VX.state = st;
+  const shmEl = el("hdr-shm");
+  shmEl.textContent = "SHM v" + st.shm_version + ": " + (st.shm_online ? "ONLINE" : "OFFLINE");
+  shmEl.className = "pill " + (st.shm_online ? "ok" : "warn");
+  el("hdr-hb").textContent = "HB: " + st.hb_age_ms + " ms | Resyncs: " + st.resyncs;
+  el("hdr-rtt").textContent = "WS RTT: " + st.ws_rtt_us + " us";
+
+  const modeEl = el("hdr-mode");
+  if (st.halt_locked) { modeEl.textContent = "HALTED_ON_LOSS"; modeEl.className = "pill bad"; }
+  else if (st.drain_mode) { modeEl.textContent = "DRAIN_MODE (P0-B)"; modeEl.className = "pill warn"; }
+  else if (st.daily_shield && st.daily_shield.hibernating) { modeEl.textContent = st.daily_shield.phase; modeEl.className = "pill warn"; }
+  else { modeEl.textContent = "ACTIVE_200HZ"; modeEl.className = "pill ok"; }
+
+  const sm = st.semaphore_4_4 || {};
+  setSemPill("sem-1", sm.oos_520_ok, "OOS520");
+  setSemPill("sem-2", sm.vault_70_ok, "Vault70");
+  setSemPill("sem-3", sm.maker_80_ok, "Mkr80%");
+  setSemPill("sem-4", sm.sample_25_ok, "25Tiros");
+  setSemPill("sem-score", sm.passed === 4, (sm.passed || 0) + "/4");
+
+  const lg = st.ledger || {}, ds = st.daily_shield || {}, ct = st.counters || {};
+  el("kpi-equity").textContent = num(lg.equity_usdt, 4) + " USDT";
+  el("kpi-net").textContent = sgn(lg.net_pnl_usdt, 4) + " USDT";
+  el("kpi-vault").textContent = sgn(lg.vault_70_bps, 2) + " / " + sgn(lg.reserve_30_bps, 2) + " bps";
+  el("kpi-daily").textContent = sgn(ds.day_pct, 2) + "% (" + (ds.phase || "ACTIVE") + ")";
+  el("kpi-maker").textContent = num(lg.maker_ratio_pct, 1) + "% (" + (lg.trades_total || 0) + "/" + (lg.sample_target || 25) + ")";
+  el("kpi-counts").textContent = "Arm:" + (ct.armed || 0) + " Abr:" + (ct.aborts || 0) + " Fil:" + (ct.fills || 0);
+
+  const dBtn = el("btn-drain");
+  dBtn.textContent = "DRAIN_MODE: " + (st.drain_mode ? "ON" : "OFF") + " (Open: " + st.open_slots + "/6)";
+  dBtn.className = "btn-drain" + (st.drain_mode ? " active" : "");
+  el("slots-summary").textContent = "Open: " + st.open_slots + "/6 | Queue: " + st.queued_slots;
+
+  if (Array.isArray(st.slots)) {
+    el("slots-body").innerHTML = st.slots.map(function(s) {
+      const selCls = s.symbol === VX.symbol ? " selected-row" : "";
+      const pyg = s.state_code >= 3 ? (sgn(s.upl_bps, 2) + "bp (" + sgn(s.upl_pct_10x, 2) + "%)") : "-";
+      const tCol = s.state_code >= 3 ? (s.hold_sec + "s") : (s.state_code >= 1 ? ("Q:" + s.hold_sec + "s (" + s.queue_ahead_lots + "L)") : "-");
+      const wob = s.wave_regime + " " + s.ob_bull_pm + "/" + s.ob_bear_pm + " " + sgn(s.funding_bps, 1) + "b";
+      return "<tr class='slot-row" + selCls + "' data-sym='" + s.symbol + "'>" +
+        "<td>" + s.slot_idx + "</td><td class='l'>" + s.symbol + "</td>" +
+        "<td class='band-" + s.upl_band + "'>" + pyg + "</td><td>" + tCol + "</td>" +
+        "<td>" + num(s.bid, 4) + "</td><td>" + num(s.ask, 4) + "</td><td>" + s.spread_ticks + "</td>" +
+        "<td>" + sgn(s.ofi, 2) + "</td><td>" + sgn(s.tfi, 2) + "</td><td>" + wob + "</td>" +
+        "<td class='l'>" + s.veto_badge + "</td></tr>";
+    }).join("");
+  }
+  syncSlotOverlays();
+}
+
+function connectSseStream() {
+  if (VX.sse) { try { VX.sse.close(); } catch (_) {} }
+  const es = new EventSource("/api/stream");
+  VX.sse = es;
+  es.addEventListener("state", function(ev) {
+    try { renderLiveState(JSON.parse(ev.data)); } catch (_) {}
+  });
+  es.onerror = function() {
+    try { es.close(); } catch (_) {}
+    setTimeout(connectSseStream, 2000);
+  };
+}
+
+async function copyTextSafe(txt) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(txt);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = txt;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+}
+
+function drawPositionPathCanvas(cursorIdx) {
+  const cv = el("path-canvas");
+  if (!cv) return;
+  const g = cv.getContext("2d");
+  const w = cv.width, h = cv.height;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = "#060a11";
+  g.fillRect(0, 0, w, h);
+  const p = VX.activePath;
+  const samples = p && Array.isArray(p.samples) ? p.samples : [];
+  if (samples.length === 0) {
+    g.fillStyle = "#8899b0";
+    g.font = "11px Consolas, monospace";
+    g.fillText("Sin muestras 1 Hz registradas para el tiro seleccionado.", 14, 56);
+    return;
+  }
+  const vals = [0];
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    vals.push((s.mid_delta_sbps || 0) / 100.0, (s.tp_delta_sbps || 0) / 100.0, (s.sl_delta_sbps || 0) / 100.0);
+  }
+  let lo = Math.min.apply(null, vals) - 2.0, hi = Math.max.apply(null, vals) + 2.0;
+  if (hi - lo < 4.0) { hi += 2.0; lo -= 2.0; }
+  const xAt = function(i) { return 12 + (i / Math.max(1, samples.length - 1)) * (w - 24); };
+  const yAt = function(bps) { return h - 10 - ((bps - lo) / (hi - lo)) * (h - 20); };
+
+  g.strokeStyle = "#1e2d47";
+  g.beginPath(); g.moveTo(12, yAt(0)); g.lineTo(w - 12, yAt(0)); g.stroke();
+
+  const plotSeries = function(key, col) {
+    g.strokeStyle = col; g.lineWidth = 1.6; g.beginPath();
+    for (let i = 0; i < samples.length; i++) {
+      const x = xAt(i), y = yAt((samples[i][key] || 0) / 100.0);
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.stroke();
+  };
+  plotSeries("sl_delta_sbps", "#ef4444");
+  plotSeries("tp_delta_sbps", "#38bdf8");
+  plotSeries("mid_delta_sbps", "#facc15");
+
+  const idx = Math.max(0, Math.min(samples.length - 1, cursorIdx || 0));
+  const cur = samples[idx];
+  const cx = xAt(idx);
+  g.strokeStyle = "#e2e8f0"; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(cx, 6); g.lineTo(cx, h - 6); g.stroke();
+  el("path-step-lbl").textContent =
+    "t=" + (cur.rel_sec || idx) + "s | Mid:" + sgn((cur.mid_delta_sbps || 0) / 100.0, 2) +
+    "bp | TP:" + sgn((cur.tp_delta_sbps || 0) / 100.0, 2) +
+    "bp | SL:" + sgn((cur.sl_delta_sbps || 0) / 100.0, 2) +
+    "bp | Zeta:" + num((cur.zeta_tox_pm || 0) / 1000.0, 2);
+}
+
+async function loadPositionPath(tradeId) {
+  try {
+    const q = tradeId ? ("?trade_id=" + encodeURIComponent(tradeId)) : "";
+    const r = await fetch("/api/paths" + q);
+    if (!r.ok) return;
+    const j = await r.json();
+    VX.activePath = j.found ? j.path : null;
+    const samples = VX.activePath && Array.isArray(VX.activePath.samples) ? VX.activePath.samples : [];
+    const sl = el("path-slider");
+    sl.max = String(Math.max(0, samples.length - 1));
+    sl.value = String(Math.max(0, samples.length - 1));
+    if (VX.activePath) {
+      el("path-title").textContent = "Tiro #" + VX.activePath.trade_id + " (" + (VX.activePath.symbol || "") + " " + (VX.activePath.side || "") + ") — " + samples.length + " muestras 1 Hz";
+      const m5 = VX.activePath.markout_5h_bps || VX.activePath.markout_fill_bps || [];
+      el("path-markout-5h").textContent = "Markout (+250ms..+60s): [" + m5.map(function(x) { return sgn(x, 2); }).join(", ") + "] bps";
+    } else {
+      el("path-title").textContent = "Tiro #" + (tradeId || "--") + " sin ruta 1 Hz persistida";
+      el("path-markout-5h").textContent = "Markout 5h (+250ms..+60s): --";
+    }
+    drawPositionPathCanvas(Number(sl.value));
+  } catch (_) {}
+}
+
+async function loadTradesAndAborts() {
+  try {
+    const rt = await fetch("/api/trades?limit=80");
+    if (rt.ok) {
+      const jt = await rt.json();
+      VX.trades = Array.isArray(jt.trades) ? jt.trades : [];
+      el("trades-total-lbl").textContent = "Cerrados: " + (jt.total_closed || 0);
+      if (!VX.selectedTradeId && VX.trades.length > 0) {
+        VX.selectedTradeId = VX.trades[0].trade_id;
+        loadPositionPath(VX.selectedTradeId);
+      }
+      el("trades-body").innerHTML = VX.trades.map(function(t) {
+        const tid = t.trade_id || 0;
+        const nb = Number(t.net_bps) || 0;
+        const cls = nb >= 1.0 ? "band-GREEN_WIN" : (nb >= -0.5 ? "band-CYAN_SCRATCH" : "band-RED_HEAT");
+        const sel = tid === VX.selectedTradeId ? " selected-row" : "";
+        return "<tr class='trade-row" + sel + "' data-tid='" + tid + "'>" +
+          "<td>#" + tid + "</td><td class='l'>" + (t.symbol || "") + "</td><td>" + (t.side || "") + "</td>" +
+          "<td class='" + cls + "'>" + sgn(nb, 2) + "</td>" +
+          "<td>" + sgn(t.mfe_bps, 1) + "/" + sgn(t.mae_bps, 1) + "</td>" +
+          "<td>" + Math.round((Number(t.hold_ms) || 0) / 1000) + "s</td>" +
+          "<td class='l'>" + (t.exit_sub_reason || "MakerExit") + "</td></tr>";
+      }).join("");
+    }
+    const ra = await fetch("/api/aborts?limit=80");
+    if (ra.ok) {
+      const ja = await ra.json();
+      const sp = Array.isArray(ja.shield_precision) ? ja.shield_precision : [];
+      el("aborts-prec-body").innerHTML = sp.length > 0 ? sp.map(function(row) {
+        return "<tr><td class='l'>" + row.veto + "</td><td>" + row.tp + "</td><td>" + row.total + "</td><td>" + num(row.precision_pct, 1) + "%</td></tr>";
+      }).join("") : "<tr><td class='l' colspan='4'>Sin abortos resueltos aun</td></tr>";
+    }
+  } catch (_) {}
+}
+
+async function copyClipEndpoint(path, label) {
+  try {
+    const r = await fetch(path);
+    const j = await r.json();
+    if (j && j.markdown) {
+      await copyTextSafe(j.markdown);
+      showToast(label + " copiado al portapapeles (0 ANSI)");
+    }
+  } catch (_) { showToast("Error al copiar reporte Markdown"); }
+}
+
+async function toggleDrainMode() {
+  const cur = !!(VX.state && VX.state.drain_mode);
+  const openN = (VX.state && VX.state.open_slots) || 0;
+  const actionTxt = cur ? "RETIRAR DRAIN_MODE y reanudar entradas" : "ACTIVAR DRAIN_MODE (P0-B)";
+  if (!window.confirm("Confirmar " + actionTxt + " | Posiciones abiertas actuales: " + openN + "/6")) return;
+  try {
+    const r = await fetch("/api/cmd/drain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-vortex-csrf": VX.csrf },
+      body: JSON.stringify({ enable: !cur })
+    });
+    const j = await r.json();
+    showToast("DRAIN_MODE=" + j.drain_mode + " (Open: " + j.open_slots + "/6)");
+    const st = await (await fetch("/api/state")).json();
+    renderLiveState(st);
+  } catch (_) { showToast("Fallo al conmutar DRAIN_MODE"); }
+}
+
+async function runLabGate(labId) {
+  el("lab-console").textContent = "[LAB " + labId + "] Ejecutando compuerta determinista en segundo plano...";
+  try {
+    const r = await fetch("/api/cmd/lab", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-vortex-csrf": VX.csrf },
+      body: JSON.stringify({ lab_id: Number(labId) })
+    });
+    const j = await r.json();
+    el("lab-console").textContent = "[LAB " + labId + " RESULT] " + JSON.stringify(j);
+    showToast("LAB " + labId + " completado (ok=" + !!j.ok + ")");
+  } catch (_) { el("lab-console").textContent = "[LAB " + labId + "] Error de comunicacion local."; }
+}
+
+function bootObservatory() {
+  const sel = el("sel-symbol");
+  sel.innerHTML = VORTEX_SYMBOLS.map(function(s) { return "<option value='" + s + "'>" + s + "</option>"; }).join("");
+  sel.value = VX.symbol;
+  sel.addEventListener("change", function() { VX.symbol = sel.value; loadCandles(); syncSlotOverlays(); });
+
+  el("tf-group").addEventListener("click", function(ev) {
+    const b = ev.target.closest(".tf-btn");
+    if (!b) return;
+    VX.tf = b.getAttribute("data-tf") || "1m";
+    document.querySelectorAll(".tf-btn").forEach(function(x) { x.classList.toggle("active", x === b); });
+    loadCandles();
+  });
+  el("slots-body").addEventListener("click", function(ev) {
+    const tr = ev.target.closest(".slot-row");
+    if (!tr) return;
+    VX.symbol = tr.getAttribute("data-sym") || "BTCUSDT";
+    sel.value = VX.symbol;
+    loadCandles();
+    if (VX.state) renderLiveState(VX.state);
+  });
+  el("trades-body").addEventListener("click", function(ev) {
+    const tr = ev.target.closest(".trade-row");
+    if (!tr) return;
+    VX.selectedTradeId = Number(tr.getAttribute("data-tid")) || null;
+    loadPositionPath(VX.selectedTradeId);
+    loadTradesAndAborts();
+  });
+  el("path-slider").addEventListener("input", function(ev) { drawPositionPathCanvas(Number(ev.target.value)); });
+  el("btn-clip-360").addEventListener("click", function() { copyClipEndpoint("/api/clip/360", "VORTEX 360"); });
+  el("btn-clip-trade").addEventListener("click", function() {
+    const q = VX.selectedTradeId ? ("?trade_id=" + VX.selectedTradeId) : "";
+    copyClipEndpoint("/api/clip/trade" + q, "Autopsia Tiro #" + (VX.selectedTradeId || "ultimo"));
+  });
+  el("btn-drain").addEventListener("click", toggleDrainMode);
+  document.querySelectorAll(".btn-lab").forEach(function(b) {
+    b.addEventListener("click", function() { runLabGate(b.getAttribute("data-lab")); });
+  });
+
+  initCharts();
+  fetch("/api/state").then(function(r) { return r.json(); }).then(renderLiveState).catch(function() {});
+  loadCandles();
+  loadTradesAndAborts();
+  connectSseStream();
+  setInterval(function() { loadCandles(); loadTradesAndAborts(); }, 4000);
+}
+window.addEventListener("DOMContentLoaded", bootObservatory);
+</script>
+</body>
+</html>
