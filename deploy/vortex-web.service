@@ -1,0 +1,19 @@
+[Unit]
+Description=VORTEX-OMEGA V4.9 Loopback Observatory & 5Hz SSE Bridge (127.0.0.1:8787, SHM v15 Read-Only)
+After=network-online.target vortex-tap.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/vortex-rs
+ExecStart=/home/ubuntu/vortex-rs/bin/vortex_web --daemon --port 8787
+Restart=always
+RestartSec=3
+Nice=19
+IOSchedulingClass=idle
+OOMScoreAdjust=200
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

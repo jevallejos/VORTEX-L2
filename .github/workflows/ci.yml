@@ -1,4 +1,4 @@
-name: VORTEX-OMEGA V4.8 Constitutional Gate (SHM v15 & PAR2)
+name: VORTEX-OMEGA V4.9 Constitutional Gate (SHM v15, PAR2Z, VKL1 & 4-Binary Suite)
 
 on:
   push:
@@ -11,7 +11,7 @@ env:
 
 jobs:
   constitutional-gate-linux:
-    name: Ubuntu /dev/shm Test Suite & 3-CLI Gate
+    name: Ubuntu /dev/shm 72-Test & 4-CLI LTO Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -19,7 +19,7 @@ jobs:
 
       - name: Gate 0 - UTF-8 LF & Secret Hygiene Audit
         run: |
-          python3 -c 'import pathlib, subprocess, sys; files = subprocess.check_output(["git", "ls-files"], text=True).splitlines(); bad_ext = (".pdb", ".mmap", ".parquet", ".jsonl"); bad = [f for f in files if f == ".env" or f.startswith(".env.") or (f.endswith(".lock") and f != "Cargo.lock") or f.endswith(bad_ext)]; crlf = [f for f in files if pathlib.Path(f).is_file() and b"\r" in pathlib.Path(f).read_bytes()]; sys.exit("Forbidden or CRLF: " + str(bad + crlf) if (bad or crlf) else 0)'
+          python3 -c 'import pathlib, subprocess, sys; files = subprocess.check_output(["git", "ls-files"], text=True).splitlines(); bad_ext = (".pdb", ".mmap", ".parquet", ".jsonl", ".vkl1", ".par2z"); bad = [f for f in files if f == ".env" or f.startswith(".env.") or (f.endswith(".lock") and f != "Cargo.lock") or f.endswith(bad_ext)]; crlf = [f for f in files if pathlib.Path(f).is_file() and b"\r" in pathlib.Path(f).read_bytes()]; sys.exit("Forbidden or CRLF: " + str(bad + crlf) if (bad or crlf) else 0)'
 
       - name: Install Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -29,10 +29,10 @@ jobs:
       - name: Gate 1 - Cargo Clippy Pedantic Zero-Warnings
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Gate 2 - Deterministic Suite on Linux /dev/shm
+      - name: Gate 2 - Deterministic 72-Test Suite on Linux /dev/shm
         run: cargo test --lib -- --test-threads=1
 
-      - name: Gate 3 - LTO Fat Release Build & 3 Autonomous CLI Gates
+      - name: Gate 3 - LTO Fat Release Build & 4 Autonomous CLI Gates
         run: |
           cargo build --release --bins
           ./target/release/vortex_tap
@@ -40,4 +40,5 @@ jobs:
           ./target/release/vortex_replay --dir /tmp/vortex_empty_par2_gate
           rmdir /tmp/vortex_empty_par2_gate
           ./target/release/vortex_exec
-          sha256sum target/release/vortex_tap target/release/vortex_replay target/release/vortex_exec
+          ./target/release/vortex_web
+          sha256sum target/release/vortex_tap target/release/vortex_replay target/release/vortex_exec target/release/vortex_web

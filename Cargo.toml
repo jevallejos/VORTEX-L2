@@ -3,7 +3,7 @@ name = "vortex-rs"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.88"
-description = "VORTEX-OMEGA V4.8 Autonomous 200Hz Maker-First HFT Engine (24 Modules, SHM v15, PAR2)"
+description = "VORTEX-OMEGA V4.9 Autonomous 200Hz Maker-First HFT Engine (27 Modules, 4 Binaries, SHM v15, VKL1, PAR2Z & Observatory Web)"
 license = "Proprietary"
 publish = false
 
