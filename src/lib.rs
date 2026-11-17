@@ -22,6 +22,8 @@ pub mod replay_walkforward;
 pub mod tap_ring;
 pub mod telemetry_hud;
 pub mod types;
+pub mod candle_store;
+pub mod par2_archiver;
 pub mod vault_io;
 pub mod wave_elliott;
 pub mod ws_protocol;

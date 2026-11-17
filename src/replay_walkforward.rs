@@ -1357,3 +1357,63 @@ mod v49_replay_twin_parity_tests {
         assert!(gov.authorizes_adaptive_entry_v49(4, Side::Ask, 6_502_850_000, 1_000, ScaledBps(594), &s, &s, 0.0, 1.0).is_err());
     }
 }
+
+/// Restores up to `max_segments` from cold `.par2z` archives and runs 1:1 `Walk-Forward` replay.
+#[must_use]
+pub fn run_par2z_archive_walk_forward(
+    archive_root: &Path,
+    max_segments: usize,
+    verbose: bool,
+) -> WalkForwardReport {
+    let eph = std::env::temp_dir().join(format!(
+        "vortex_par2z_wf_{}_{}",
+        std::process::id(),
+        crate::types::now_epoch_ns().0
+    ));
+    let _ = fs::remove_dir_all(&eph);
+    let restored = crate::par2_archiver::restore_par2z_archive_to_dir(
+        archive_root,
+        &eph,
+        max_segments.max(1),
+    )
+    .unwrap_or(0);
+    let rep = if restored > 0 {
+        run_parquet_walk_forward_on_dir(&eph, verbose)
+    } else {
+        WalkForwardReport::default()
+    };
+    let _ = fs::remove_dir_all(&eph);
+    rep
+}
+
+#[cfg(test)]
+mod v49_par2z_walkforward_tests {
+    use super::*;
+    use crate::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
+
+    #[test]
+    fn test_v49_par2z_cold_archive_walk_forward_end_to_end() {
+        let root = std::env::temp_dir().join(format!("vortex_wf_arc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let raw_dir = root.join("raw");
+        let arc_dir = root.join("archive");
+        assert!(fs::create_dir_all(&raw_dir).is_ok());
+
+        let mut s = SymbolLobSnapshot::new_empty();
+        s.symbol_id = APPROVED_SPECS[0].symbol_id;
+        s.ts_local_ns = crate::types::TimestampNs(1_763_350_000_000_000_000);
+        s.bids[0] = crate::lob_shm::BookLevel { price: PriceTicks(650_000), qty: LotQty(250) };
+        s.asks[0] = crate::lob_shm::BookLevel { price: PriceTicks(650_001), qty: LotQty(250) };
+        s.mark_price = PriceTicks(650_000);
+        let mut b = ColumnarParquetBatch::new();
+        assert!(b.push_row(&ColumnarMarketRow::from_lob_snapshot(&s, MarketEventKind::L2BookSnapshot, Side::Bid, s.mark_price, LotQty(250))).is_ok());
+        let seg = raw_dir.join("vortex_l2_segment_000001.parquet");
+        assert!(b.write_to_file(&seg).is_ok());
+        assert!(crate::par2_archiver::archive_parquet_segment_file(&seg, &arc_dir).is_ok());
+
+        let rep = run_par2z_archive_walk_forward(&arc_dir, 16, false);
+        assert_eq!(rep.files_count, 1);
+        assert_eq!(rep.total_events, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+}

@@ -1,0 +1,275 @@
+//! Lossless Cold PAR2 Archiver (`.par2z` / `VPZ1`, Stride-256 XOR-Delta + Zero-RLE + FNV-1a 64-bit).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::module_name_repetitions
+)]
+
+use crate::forensic_parquet::ColumnarParquetBatch;
+use crate::types::VortexError;
+
+pub const VPZ1_MAGIC: [u8; 4] = *b"VPZ1";
+pub const VPZ1_HEADER_BYTES: usize = 36;
+pub const PAR2_STRIDE_BYTES: usize = 256;
+pub const DEFAULT_ARCHIVE_DIR: &str = "data/archive";
+const MAX_FRAME_ORIG_BYTES: usize = 4 * 1024 * 1024;
+
+/// Compresses a raw `PAR1`/`PAR2` segment via bijective Stride-256 XOR-Delta + Zero-RLE.
+#[must_use]
+pub fn compress_par2_stride_zrle(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() / 2 + 16);
+    let mut i = 0_usize;
+    while i < raw.len() {
+        let d = if i >= PAR2_STRIDE_BYTES { raw[i] ^ raw[i - PAR2_STRIDE_BYTES] } else { raw[i] };
+        if d != 0 {
+            out.push(d);
+            i += 1;
+        } else {
+            let mut run = 1_usize;
+            while run < 255 && (i + run) < raw.len() {
+                let idx = i + run;
+                let next_d = if idx >= PAR2_STRIDE_BYTES { raw[idx] ^ raw[idx - PAR2_STRIDE_BYTES] } else { raw[idx] };
+                if next_d != 0 { break; }
+                run += 1;
+            }
+            out.push(0);
+            out.push(run as u8);
+            i += run;
+        }
+    }
+    out
+}
+
+/// Decompresses a `VPZ1` Stride-256 XOR-Delta + Zero-RLE payload to exact original length.
+///
+/// # Errors
+/// Returns `VortexError::ColumnarFormatCorrupted` on truncated run-length or size mismatch.
+pub fn decompress_par2_stride_zrle(comp: &[u8], expected_len: usize) -> Result<Vec<u8>, VortexError> {
+    if expected_len > MAX_FRAME_ORIG_BYTES {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    let mut out = Vec::with_capacity(expected_len);
+    let mut i = 0_usize;
+    while i < comp.len() {
+        let b = comp[i];
+        if b != 0 {
+            let prev = if out.len() >= PAR2_STRIDE_BYTES { out[out.len() - PAR2_STRIDE_BYTES] } else { 0 };
+            out.push(b ^ prev);
+            i += 1;
+        } else {
+            let Some(&run) = comp.get(i + 1) else {
+                return Err(VortexError::ColumnarFormatCorrupted);
+            };
+            if run == 0 || out.len().saturating_add(usize::from(run)) > expected_len {
+                return Err(VortexError::ColumnarFormatCorrupted);
+            }
+            for _ in 0..run {
+                let prev = if out.len() >= PAR2_STRIDE_BYTES { out[out.len() - PAR2_STRIDE_BYTES] } else { 0 };
+                out.push(prev);
+            }
+            i += 2;
+        }
+    }
+    if out.len() != expected_len {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    Ok(out)
+}
+
+/// Encodes one verified segment into a 36-byte header `VPZ1` frame with dual `FNV-1a` 64-bit checksums.
+///
+/// # Errors
+/// Returns `VortexError::ColumnarFormatCorrupted` if `raw` is empty or exceeds `MAX_FRAME_ORIG_BYTES`.
+pub fn encode_vpz1_frame(segment_seq: u64, raw: &[u8]) -> Result<Vec<u8>, VortexError> {
+    if raw.is_empty() || raw.len() > MAX_FRAME_ORIG_BYTES {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    let comp = compress_par2_stride_zrle(raw);
+    let orig_crc = ColumnarParquetBatch::compute_fnv1a64(raw);
+    let comp_crc = ColumnarParquetBatch::compute_fnv1a64(&comp);
+    let mut frame = Vec::with_capacity(VPZ1_HEADER_BYTES + comp.len());
+    frame.extend_from_slice(&VPZ1_MAGIC);
+    frame.extend_from_slice(&segment_seq.to_le_bytes());
+    frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&orig_crc.to_le_bytes());
+    frame.extend_from_slice(&comp_crc.to_le_bytes());
+    frame.extend_from_slice(&comp);
+    Ok(frame)
+}
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[must_use]
+#[allow(clippy::cast_sign_loss)]
+pub const fn utc_ymd_hour_from_ns(ts_ns: i64) -> (i32, u32, u32, u32) {
+    let secs = if ts_ns > 0 { ts_ns / 1_000_000_000 } else { 0 };
+    let days = secs.div_euclid(86_400);
+    let hour = (secs.rem_euclid(86_400) / 3_600) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 { y += 1; }
+    (y as i32, m, d, hour)
+}
+
+/// Decodes and verifies all `VPZ1` frames in a `.par2z` stream against both `FNV-1a` checksums.
+///
+/// # Errors
+/// Returns `VortexError::ColumnarFormatCorrupted` on magic, length or `FNV-1a` mismatch.
+pub fn decode_vpz1_stream(stream: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, VortexError> {
+    let mut pos = 0_usize;
+    let mut out = Vec::new();
+    while pos < stream.len() {
+        let Some(hdr) = stream.get(pos..pos + VPZ1_HEADER_BYTES) else {
+            return Err(VortexError::ColumnarFormatCorrupted);
+        };
+        if hdr[0..4] != VPZ1_MAGIC {
+            return Err(VortexError::ColumnarFormatCorrupted);
+        }
+        let seq = u64::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]]);
+        let orig_len = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
+        let comp_len = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]) as usize;
+        let orig_crc = u64::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23], hdr[24], hdr[25], hdr[26], hdr[27]]);
+        let comp_crc = u64::from_le_bytes([hdr[28], hdr[29], hdr[30], hdr[31], hdr[32], hdr[33], hdr[34], hdr[35]]);
+        let start = pos + VPZ1_HEADER_BYTES;
+        let Some(comp_slice) = stream.get(start..start.saturating_add(comp_len)) else {
+            return Err(VortexError::ColumnarFormatCorrupted);
+        };
+        if ColumnarParquetBatch::compute_fnv1a64(comp_slice) != comp_crc {
+            return Err(VortexError::ColumnarFormatCorrupted);
+        }
+        let raw = decompress_par2_stride_zrle(comp_slice, orig_len)?;
+        if ColumnarParquetBatch::compute_fnv1a64(&raw) != orig_crc {
+            return Err(VortexError::ColumnarFormatCorrupted);
+        }
+        out.push((seq, raw));
+        pos = start + comp_len;
+    }
+    Ok(out)
+}
+
+#[must_use]
+pub fn parse_segment_seq_from_path(path: &Path) -> u64 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|st| st.rsplit('_').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Archives one verified `.parquet` segment into `YYYY-MM-DD/vortex_par2_HH.par2z` before ring pruning.
+///
+/// # Errors
+/// Returns `VortexError` if segment verification or `.par2z` append fails.
+pub fn archive_parquet_segment_file(seg_path: &Path, archive_root: &Path) -> Result<PathBuf, VortexError> {
+    let (batch, _) = ColumnarParquetBatch::read_from_file(seg_path)?;
+    let raw = fs::read(seg_path).map_err(|_| VortexError::ColumnarIoFailure)?;
+    let ts_ns = batch.get_row(0).map_or(0, |r| r.ts_local_ns.0.max(r.ts_exchange_ns.0));
+    let (y, m, d, hh) = utc_ymd_hour_from_ns(ts_ns);
+    let day_dir = archive_root.join(format!("{y:04}-{m:02}-{d:02}"));
+    fs::create_dir_all(&day_dir).map_err(|_| VortexError::ColumnarIoFailure)?;
+    let target = day_dir.join(format!("vortex_par2_{hh:02}.par2z"));
+    let frame = encode_vpz1_frame(parse_segment_seq_from_path(seg_path), &raw)?;
+    let mut f = OpenOptions::new()
+        .create(true).append(true).open(&target)
+        .map_err(|_| VortexError::ColumnarIoFailure)?;
+    f.write_all(&frame).map_err(|_| VortexError::ColumnarIoFailure)?;
+    Ok(target)
+}
+
+/// Restores up to `max_segments` chronological segments from `.par2z` archives into `out_dir`.
+///
+/// # Errors
+/// Returns `VortexError` on I/O failure or `FNV-1a` frame corruption.
+pub fn restore_par2z_archive_to_dir(
+    archive_root: &Path, out_dir: &Path, max_segments: usize,
+) -> Result<usize, VortexError> {
+    if !archive_root.exists() || max_segments == 0 { return Ok(0); }
+    fs::create_dir_all(out_dir).map_err(|_| VortexError::ColumnarIoFailure)?;
+    let mut day_dirs: Vec<PathBuf> = fs::read_dir(archive_root)
+        .map_err(|_| VortexError::ColumnarIoFailure)?
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    day_dirs.sort();
+    let mut restored = 0_usize;
+    for d_dir in day_dirs {
+        let mut files: Vec<PathBuf> = fs::read_dir(&d_dir)
+            .map_err(|_| VortexError::ColumnarIoFailure)?
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("par2z"))
+            .collect();
+        files.sort();
+        for p_file in files {
+            let bytes = fs::read(&p_file).map_err(|_| VortexError::ColumnarIoFailure)?;
+            for (seq, raw) in decode_vpz1_stream(&bytes)? {
+                let id = if seq > 0 { seq } else { restored as u64 + 1 };
+                let dst = out_dir.join(format!("vortex_l2_segment_{id:09}.parquet"));
+                fs::write(&dst, &raw).map_err(|_| VortexError::ColumnarIoFailure)?;
+                restored += 1;
+                if restored >= max_segments { return Ok(restored); }
+            }
+        }
+    }
+    Ok(restored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forensic_parquet::{ColumnarMarketRow, MarketEventKind};
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
+    use crate::types::{LotQty, PriceTicks, Side, TimestampNs, APPROVED_SPECS};
+
+    #[test]
+    fn test_vpz1_lossless_par2_compression_and_multiday_restore() {
+        let root = std::env::temp_dir().join(format!("vortex_par2z_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let raw_dir = root.join("raw");
+        let arc_dir = root.join("arc");
+        let rst_dir = root.join("rst");
+        assert!(fs::create_dir_all(&raw_dir).is_ok());
+
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[1].symbol_id;
+        snap.ts_local_ns = TimestampNs(1_763_350_000_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(182_000), qty: LotQty(500) };
+        snap.asks[0] = BookLevel { price: PriceTicks(182_001), qty: LotQty(500) };
+        snap.mark_price = PriceTicks(182_000);
+
+        let mut batch = ColumnarParquetBatch::new();
+        for k in 0..64_i64 {
+            snap.sequence_id = (k + 1) as u64;
+            snap.bids[0].price = PriceTicks(182_000 + (k % 2));
+            let row = ColumnarMarketRow::from_lob_snapshot(&snap, MarketEventKind::L2BookSnapshot, Side::Bid, snap.mark_price, LotQty(500));
+            assert!(batch.push_row(&row).is_ok());
+        }
+        let seg_p = raw_dir.join("vortex_l2_segment_001234567.parquet");
+        assert!(batch.write_to_file(&seg_p).is_ok());
+        let orig_bytes = fs::read(&seg_p).unwrap_or_default();
+
+        let par2z_p = archive_parquet_segment_file(&seg_p, &arc_dir);
+        assert!(par2z_p.is_ok());
+        let comp_bytes = fs::read(par2z_p.unwrap_or_default()).unwrap_or_default();
+        assert!(comp_bytes.len() * 2 < orig_bytes.len());
+
+        let mut tampered = comp_bytes.clone();
+        let last_idx = tampered.len() - 1;
+        tampered[last_idx] ^= 0x55;
+        assert!(decode_vpz1_stream(&tampered).is_err());
+
+        assert_eq!(restore_par2z_archive_to_dir(&arc_dir, &rst_dir, 16), Ok(1));
+        let restored_bytes = fs::read(rst_dir.join("vortex_l2_segment_001234567.parquet")).unwrap_or_default();
+        assert_eq!(restored_bytes, orig_bytes);
+        let _ = fs::remove_dir_all(&root);
+    }
+}

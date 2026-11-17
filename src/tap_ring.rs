@@ -84,6 +84,9 @@ pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
         let expired_seq = parquet_seq - MAX_PARQUET_RING_FILES;
         let expired_path =
             data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
+        if expired_path.exists() {
+            let _ = crate::par2_archiver::archive_parquet_segment_file(&expired_path, &data_dir.join("archive"));
+        }
         let _ = fs::remove_file(&expired_path);
     }
     let legacy_lake = data_dir.join("lakehouse_par1");
@@ -423,5 +426,35 @@ mod tests {
         assert!(!seg1.exists());
         assert!(!lake_dir.exists());
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}
+
+#[cfg(test)]
+mod v49_tap_ring_archive_tests {
+    use super::*;
+    use crate::forensic_parquet::{ColumnarMarketRow, MarketEventKind};
+    use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
+    use crate::types::{LotQty, PriceTicks, Side, TimestampNs, APPROVED_SPECS};
+
+    #[test]
+    fn test_v49_prune_archives_to_par2z_before_delete() {
+        let dir = std::env::temp_dir().join(format!("vortex_prune_par2z_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let mut s = SymbolLobSnapshot::new_empty();
+        s.symbol_id = APPROVED_SPECS[0].symbol_id;
+        s.ts_local_ns = TimestampNs(1_763_350_000_000_000_000);
+        s.bids[0] = BookLevel { price: PriceTicks(650_000), qty: LotQty(100) };
+        s.asks[0] = BookLevel { price: PriceTicks(650_001), qty: LotQty(100) };
+        s.mark_price = PriceTicks(650_000);
+        let mut b = ColumnarParquetBatch::new();
+        assert!(b.push_row(&ColumnarMarketRow::from_lob_snapshot(&s, MarketEventKind::L2BookSnapshot, Side::Bid, s.mark_price, LotQty(100))).is_ok());
+        let seg1 = dir.join("vortex_l2_segment_000001.parquet");
+        assert!(b.write_to_file(&seg1).is_ok());
+        prune_expired_parquet_segment(&dir, MAX_PARQUET_RING_FILES + 1);
+        assert!(!seg1.exists());
+        let rst = dir.join("restored");
+        assert_eq!(crate::par2_archiver::restore_par2z_archive_to_dir(&dir.join("archive"), &rst, 8), Ok(1));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

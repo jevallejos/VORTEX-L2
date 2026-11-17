@@ -60,6 +60,8 @@ struct TapLiveState {
     active_fees: FeeSchedule,
     batch: Box<ColumnarParquetBatch>,
     vault_tx: Option<SyncSender<VaultIoCommand>>,
+    candle_aggs: Box<[vortex_rs::candle_store::SlotMultiTfAggregator; MAX_ACTIVE_PAIRS]>,
+    candle_tx: Option<SyncSender<vortex_rs::candle_store::Vkl1CandleRecord>>,
     last_ob_persist_ns: i64,
 }
 
@@ -102,6 +104,8 @@ impl TapLiveState {
             active_fees,
             batch: Box::<ColumnarParquetBatch>::default(),
             vault_tx,
+            candle_aggs: Box::new(vortex_rs::candle_store::SlotMultiTfAggregator::new_12_slot_array()),
+            candle_tx: enable_async_vault.then(|| { let (ctx, crx) = std::sync::mpsc::sync_channel::<vortex_rs::candle_store::Vkl1CandleRecord>(1024); thread::spawn(move || { let store = vortex_rs::candle_store::PerpetualCandleStore::default_store(); while let Ok(rec) = crx.recv() { let _ = store.append_or_update(&rec); } }); ctx }),
             last_ob_persist_ns: 0,
         };
         st.reset_session_preserving_plasticity();
@@ -164,6 +168,7 @@ impl TapLiveState {
         if ts_ns.saturating_sub(self.last_ob_persist_ns) < 60_000_000_000 {
             return;
         }
+        self.flush_active_vkl1_bars();
         if reload_vault_fees {
             self.set_active_fee_schedule(load_hud_fee_schedule());
         }
@@ -171,7 +176,10 @@ impl TapLiveState {
     }
 
     #[inline]
+    fn flush_active_vkl1_bars(&self) { let Some(ref ctx) = self.candle_tx else { return; }; for s in 0..MAX_ACTIVE_PAIRS { let s_u8 = u8::try_from(s).unwrap_or(0); for tf in vortex_rs::candle_store::CandleTimeframe::ALL.into_iter().skip(1) { if let Some(cur) = self.candle_aggs[s].active_candle(s_u8, tf) { let _ = ctx.try_send(cur); } } } }
+    fn record_vkl1_from_row(&mut self, row: &ColumnarMarketRow) { if self.candle_tx.is_none() { return; } let Some(s_idx) = APPROVED_SPECS.iter().position(|sp| sp.symbol_id == row.symbol_id) else { return; }; let is_tr = matches!(row.par2_kind, vortex_rs::forensic_parquet::Par2EventKind::PublicTradePrint); let is_lq = matches!(row.par2_kind, vortex_rs::forensic_parquet::Par2EventKind::LiquidationPrint); let tr_lots = if is_tr { row.lot_qty } else { LotQty(0) }; let lq_u16 = u16::try_from(row.lot_qty.0.clamp(0, 65_535)).unwrap_or(0); let lq_b = if is_lq && matches!(row.side, Side::Bid) { lq_u16 } else { 0 }; let lq_s = if is_lq && matches!(row.side, Side::Ask) { lq_u16 } else { 0 }; let closed_arr = self.candle_aggs[s_idx].ingest_snapshot(u8::try_from(s_idx).unwrap_or(0), &self.active_snaps[s_idx], tr_lots, false, lq_b, lq_s); if let Some(ref ctx) = self.candle_tx { for rec in closed_arr.into_iter().flatten() { let _ = ctx.try_send(rec); } } }
     fn push_par2_row(&mut self, row: &ColumnarMarketRow, writer: Option<&AsyncParquetRingWriter>) {
+        self.record_vkl1_from_row(row);
         if self.batch.push_row(row).is_err() {
             if let Some(w) = writer {
                 let _ = w.try_flush_and_clear(&mut self.batch);
@@ -518,8 +526,8 @@ fn warm_start_elliott_and_order_blocks(state: &mut TapLiveState) {
         let p5 = format!("/v5/market/kline?category=linear&symbol={sym}&interval=5&limit=300");
         let p1 = format!("/v5/market/kline?category=linear&symbol={sym}&interval=1&limit=240");
         let po = format!("/v5/market/open-interest?category=linear&symbol={sym}&intervalTime=5min&limit=200");
-        let k5 = fetch_bybit_public_json_keepalive(&mut conn, &p5);
-        let k1 = fetch_bybit_public_json_keepalive(&mut conn, &p1);
+        let c_store = vortex_rs::candle_store::PerpetualCandleStore::default_store(); let k5_net = fetch_bybit_public_json_keepalive(&mut conn, &p5); if let Some(ref j5) = k5_net { let _ = c_store.backfill_from_bybit_kline_json(s, vortex_rs::candle_store::CandleTimeframe::Min5, j5); } let k5 = k5_net.or_else(|| c_store.export_bybit_kline_bundle(s, vortex_rs::candle_store::CandleTimeframe::Min5, 300).ok());
+        let k1_net = fetch_bybit_public_json_keepalive(&mut conn, &p1); if let Some(ref j1) = k1_net { let _ = c_store.backfill_from_bybit_kline_json(s, vortex_rs::candle_store::CandleTimeframe::Min1, j1); } let k1 = k1_net.or_else(|| c_store.export_bybit_kline_bundle(s, vortex_rs::candle_store::CandleTimeframe::Min1, 240).ok());
         let oi = fetch_bybit_public_json_keepalive(&mut conn, &po);
         if state.wave_states[s].warm_start_from_bybit_bundle(spec, k5.as_ref(), k1.as_ref(), oi.as_ref()) > 0 {
             state.active_snaps[s].set_wave_observables(state.wave_states[s].observables());
