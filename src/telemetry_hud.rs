@@ -551,6 +551,21 @@ fn make_ascii_bar(pct: f64, width: usize) -> String {
 
 pub const V48_INCEPTION_UTC_DAY: i64 = 20_773;
 
+#[inline]
+#[must_use]
+pub fn classify_live_upl_color(net_scaled_bps: i64) -> &'static str {
+    let pct_10x_centi = ((net_scaled_bps as f64) / 10.0).round() as i64;
+    if pct_10x_centi >= 10 {
+        ANSI_GREEN
+    } else if pct_10x_centi >= 1 || (pct_10x_centi == 0 && net_scaled_bps >= 0) {
+        ANSI_SKY_BLUE
+    } else if pct_10x_centi >= -5 {
+        ANSI_ORANGE
+    } else {
+        ANSI_RED
+    }
+}
+
 pub fn render_live_hud(arena: &VortexShmArena) {
     let ts_now = now_epoch_ns();
     let now_ns = ts_now.0.max(0) as u64;
@@ -598,16 +613,19 @@ pub fn render_live_hud(arena: &VortexShmArena) {
         };
         let fnd_b = (snap.funding_rate_scaled_bps.raw() as f64) / 100.0;
         let wave_ob_col = format!("{w_short} {:03}/{:03} {:+4.1}b", snap.ob_bull_efficacy_pm, snap.ob_bear_efficacy_pm, fnd_b);
-        let (mut pyg_col, mut time_col, mut verd_col) = (
-            format!("{:>17}", "-"), format!("{:>13}", "-"), format!("{ANSI_GRAY}\u{26aa} NEUTRAL_WAIT  {ANSI_RESET}"),
-        );
+        let mut row_col = ANSI_GRAY;
+        let mut pyg_col = format!("{ANSI_GRAY}{:>17}{ANSI_RESET}", "-");
+        let mut time_col = format!("{:>13}", "-");
+        let mut verd_col = format!("{ANSI_GRAY}\u{26aa} NEUTRAL_WAIT  {ANSI_RESET}");
         if tel.state_code >= 3 && tel.avg_price_ticks > 0 {
             open_slots_count += 1;
+            row_col = ANSI_BLUE;
             let pos_side = if tel.side_code == 1 { Side::Ask } else { Side::Bid };
             let ref_px = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { tel.avg_price_ticks };
             let gross_bps = ((ref_px - tel.avg_price_ticks) * pos_side.sign_i64()).saturating_mul(1_000_000) / tel.avg_price_ticks.max(1);
-            let net_bps_f = ((gross_bps - fee_rt) as f64) / 100.0;
-            let upl_c = if net_bps_f >= 0.0 { ANSI_DARK_GREEN } else { ANSI_RED };
+            let net_sbps = gross_bps - fee_rt;
+            let net_bps_f = (net_sbps as f64) / 100.0;
+            let upl_c = classify_live_upl_color(net_sbps);
             pyg_col = format!("{upl_c}{:>+7.2}bp({:>+5.2}%){ANSI_RESET}", net_bps_f, net_bps_f / 10.0);
             let hold_s = if tel.resting_since_ns > 0 && now_ns >= tel.resting_since_ns { (now_ns - tel.resting_since_ns) / 1_000_000_000 } else { 0 };
             time_col = format!("{:>13}", format_position_duration(hold_s));
@@ -615,6 +633,7 @@ pub fn render_live_hud(arena: &VortexShmArena) {
             verd_col = format!("{ANSI_BLUE}\u{1f535} OPEN TP:{}t{ANSI_RESET}", if tel.tp_ticks > 0 { tel.tp_ticks } else { q_fl.0 });
         } else if tel.state_code == 1 || tel.state_code == 2 {
             queued_slots_count += 1;
+            row_col = ANSI_YELLOW;
             let q_s = if tel.resting_since_ns > 0 && now_ns >= tel.resting_since_ns { (now_ns - tel.resting_since_ns) / 1_000_000_000 } else { 0 };
             time_col = format!("{:>13}", format!("Q:{}s ({}L)", q_s, tel.queue_ahead_lots));
             verd_col = format!("{ANSI_YELLOW}\u{1f7e1} QUEUE_L1_WAIT {ANSI_RESET}");
@@ -623,8 +642,10 @@ pub fn render_live_hud(arena: &VortexShmArena) {
             let q_ok = spec.passes_quantum_ev_growth_gate(w_est, mid_px, snap.realized_vol_5m, ScaledBps((fee_rt * 17) / 10), 50, fees);
             let vc = LastVetoCode::from_code(tel.last_veto_code);
             if halt_active {
+                row_col = ANSI_RED;
                 verd_col = format!("{ANSI_RED}\u{1f534} HALT_LOCKED   {ANSI_RESET}");
             } else if drain_active {
+                row_col = ANSI_ORANGE;
                 verd_col = format!("{ANSI_ORANGE}\u{1f7e0} DRAIN_MODE    {ANSI_RESET}");
             } else if dg.is_hibernating() {
                 verd_col = if q_ok {
@@ -639,10 +660,21 @@ pub fn render_live_hud(arena: &VortexShmArena) {
                 match OrthogonalFactorState::evaluate_entry_signal_v46(
                     spec, &snap, &btc_snap, ScaledBps((fee_rt * 17) / 10), ScaledBps(fee_rt / 2), 50, fees, 0.0, beta_hud,
                 ) {
-                    SignalVerdict::SpoofingVeto => verd_col = format!("{ANSI_ORANGE}\u{1f7e0} SPOOF_VETO    {ANSI_RESET}"),
-                    SignalVerdict::AuthorizeMakerEntry { .. } if !q_ok => verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}"),
-                    SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => verd_col = format!("{ANSI_GREEN}\u{1f7e2} ARM_BID_L1    {ANSI_RESET}"),
-                    SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => verd_col = format!("{ANSI_RED}\u{1f534} ARM_ASK_L1    {ANSI_RESET}"),
+                    SignalVerdict::SpoofingVeto => {
+                        row_col = ANSI_ORANGE;
+                        verd_col = format!("{ANSI_ORANGE}\u{1f7e0} SPOOF_VETO    {ANSI_RESET}");
+                    }
+                    SignalVerdict::AuthorizeMakerEntry { .. } if !q_ok => {
+                        verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}");
+                    }
+                    SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. } => {
+                        row_col = ANSI_GREEN;
+                        verd_col = format!("{ANSI_GREEN}\u{1f7e2} ARM_BID_L1    {ANSI_RESET}");
+                    }
+                    SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. } => {
+                        row_col = ANSI_RED;
+                        verd_col = format!("{ANSI_RED}\u{1f534} ARM_ASK_L1    {ANSI_RESET}");
+                    }
                     SignalVerdict::NeutralNoAction => {
                         if !q_ok {
                             verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}");
@@ -653,10 +685,14 @@ pub fn render_live_hud(arena: &VortexShmArena) {
                 }
             }
         }
+        let sym_name = spec.symbol_id.name();
+        let seq_v = snap.sequence_id;
+        let ofi_v = snap.factor_ofi.get();
+        let tfi_v = snap.factor_tfi.get();
         sec_rows.push(format!(
-            "{s_idx:>5} \u{2502} {:<10} \u{2502} {} \u{2502} {time_col} \u{2502} {:>12} \u{2502} {:>7}.{bf:04} \u{2502} {:>7}.{af:04} \u{2502} {spr:>3} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {wave_ob_col:<20} \u{2502} {}",
-            spec.symbol_id.name(), pad_visible_right(&pyg_col, 17), snap.sequence_id, bw, aw,
-            snap.factor_ofi.get(), snap.factor_tfi.get(), pad_visible_right(&verd_col, 17)
+            "{row_col}{s_idx:>5}{ANSI_RESET} \u{2502} {row_col}{sym_name:<10}{ANSI_RESET} \u{2502} {} \u{2502} {row_col}{time_col}{ANSI_RESET} \u{2502} {row_col}{seq_v:>12}{ANSI_RESET} \u{2502} {row_col}{bw:>7}.{bf:04}{ANSI_RESET} \u{2502} {row_col}{aw:>7}.{af:04}{ANSI_RESET} \u{2502} {row_col}{spr:>3}{ANSI_RESET} \u{2502} {row_col}{ofi_v:>+6.2}{ANSI_RESET} \u{2502} {row_col}{tfi_v:>+6.2}{ANSI_RESET} \u{2502} {row_col}{wave_ob_col:<20}{ANSI_RESET} \u{2502} {}",
+            pad_visible_right(&pyg_col, 17),
+            pad_visible_right(&verd_col, 17)
         ));
     }
     let mode_badge = if halt_active { format!("{ANSI_RED}CATASTROPHIC_HALT{ANSI_RESET}") }
@@ -670,6 +706,24 @@ pub fn render_live_hud(arena: &VortexShmArena) {
         (dg.day_pnl_ppm() as f64) / 10_000.0, dg.phase.label(), (fee_rt as f64) / 100.0
     )];
     print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_ftr]);
+}
+
+#[cfg(test)]
+mod hud_color_v48_tests {
+    use super::*;
+
+    #[test]
+    fn test_v48_live_hud_upl_4band_colors() {
+        assert_eq!(classify_live_upl_color(100), ANSI_GREEN);     // +1.00bp -> +0.10% @10x
+        assert_eq!(classify_live_upl_color(836), ANSI_GREEN);     // +8.36bp -> +0.84% @10x
+        assert_eq!(classify_live_upl_color(90), ANSI_SKY_BLUE);   // +0.90bp -> +0.09% @10x
+        assert_eq!(classify_live_upl_color(10), ANSI_SKY_BLUE);   // +0.10bp -> +0.01% @10x
+        assert_eq!(classify_live_upl_color(0), ANSI_SKY_BLUE);    // +0.00bp -> +0.00% @10x
+        assert_eq!(classify_live_upl_color(-10), ANSI_ORANGE);    // -0.10bp -> -0.01% @10x
+        assert_eq!(classify_live_upl_color(-50), ANSI_ORANGE);    // -0.50bp -> -0.05% @10x
+        assert_eq!(classify_live_upl_color(-60), ANSI_RED);       // -0.60bp -> -0.06% @10x
+        assert_eq!(classify_live_upl_color(-1_200), ANSI_RED);    // -12.00bp -> -1.20% @10x
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
