@@ -400,7 +400,7 @@ pub fn rehydrate_daily_governor_from_vault(
 }
 
 #[must_use]
-pub fn build_closed_trade_vault_json(
+fn build_closed_trade_vault_json_v48_core(
     slot_idx: usize, summary: &ClosedTradeSummary, eng: &SlotExecutionEngine,
     entry_f: &SlotForensicEntrySnapshot, exit_snap: &SymbolLobSnapshot,
     ledger: &ParitySyncLedger, markout_curve: &MarkoutCurveBps,
@@ -1156,5 +1156,210 @@ mod tests {
         assert!(rep_green.gate1_ok && rep_green.gate2_ok && rep_green.gate3_ok && rep_green.gate4_ok);
         assert!(rep_green.all_green());
         let _ = fs::remove_file(&tmp_vault);
+    }
+}
+
+/// Cold analytical ex-ante net Expected Value (`ScaledBps`, `1 bp = 100`) without optimistic bias (Law IX).
+#[inline]
+#[must_use]
+pub fn compute_ex_ante_ev_scaled_bps(
+    eng: &SlotExecutionEngine,
+    snap: &SymbolLobSnapshot,
+) -> i64 {
+    let p_tkr_pm = eng.learned_taker_prob_pm.clamp(1, 950);
+    let p_mkr_pm = 1_000_i64.saturating_sub(p_tkr_pm);
+    let mkr_net_sbps = eng
+        .learned_mfe_bps
+        .saturating_sub(eng.active_fees.round_trip_maker_exit_bps().raw());
+    let sl_total_sbps =
+        PairSpec::elastic_server_sl_distance_bps_with_fees(snap.realized_vol_5m, eng.active_fees)
+            .raw()
+            .saturating_add(eng.active_fees.round_trip_taker_exit_bps().raw());
+    p_mkr_pm
+        .saturating_mul(mkr_net_sbps)
+        .saturating_sub(p_tkr_pm.saturating_mul(sl_total_sbps))
+        / 1_000
+}
+
+/// Off-thread `TRADE_CLOSE` JSONL builder stamping V4.9 mask, `zeta_tox`, `ev_ex_ante_bps`, WS RTT & FNV-1a.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub fn build_closed_trade_vault_json(
+    slot_idx: usize,
+    summary: &ClosedTradeSummary,
+    eng: &SlotExecutionEngine,
+    entry_f: &SlotForensicEntrySnapshot,
+    exit_snap: &SymbolLobSnapshot,
+    ledger: &ParitySyncLedger,
+    markout_curve: &crate::markout_tracker::MarkoutCurveBps,
+    lvr_5s_scaled_bps: i64,
+    ts_ns: TimestampNs,
+) -> String {
+    let base_str = build_closed_trade_vault_json_v48_core(
+        slot_idx,
+        summary,
+        eng,
+        entry_f,
+        exit_snap,
+        ledger,
+        markout_curve,
+        lvr_5s_scaled_bps,
+        ts_ns,
+    );
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&base_str) else {
+        return base_str;
+    };
+    let s_idx = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+    let c_rt = APPROVED_SPECS[s_idx].expected_round_trip_cost_bps_dynamic(
+        summary.entry_price.max(PriceTicks(1)),
+        eng.learned_taker_prob_pm,
+        eng.active_fees,
+    );
+    let z_tox = (crate::markout_tracker::glosten_milgrom_toxicity_zeta(*markout_curve, c_rt)
+        * 1_000.0)
+        .round()
+        / 1_000.0;
+    let ev_bps = (compute_ex_ante_ev_scaled_bps(eng, exit_snap) as f64) / 100.0;
+    let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
+    if let Some(obj) = val.as_object_mut() {
+        let _ = obj.remove("fnv1a64_hex");
+        obj.insert("telemetry_rev".to_string(), serde_json::json!("V4.9"));
+        obj.insert(
+            "markout_resolved_mask".to_string(),
+            serde_json::json!(markout_curve.resolved_mask),
+        );
+        obj.insert(
+            "initial_edge_bps".to_string(),
+            serde_json::json!((markout_curve.initial_edge_bps as f64) / 100.0),
+        );
+        obj.insert("zeta_tox".to_string(), serde_json::json!(z_tox));
+        obj.insert("ev_ex_ante_bps".to_string(), serde_json::json!(ev_bps));
+        obj.insert("ws_rtt_us".to_string(), serde_json::json!(ws_rtt_us));
+        obj.insert("ws_quota_rem".to_string(), serde_json::json!(ws_quota_rem));
+    }
+    let pre = val.to_string();
+    let fnv = crate::forensic_parquet::ColumnarParquetBatch::compute_fnv1a64(pre.as_bytes());
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "fnv1a64_hex".to_string(),
+            serde_json::Value::String(format!("0x{fnv:016X}")),
+        );
+    }
+    val.to_string()
+}
+
+/// Extended 5-horizon (`+250ms..+60s`) `TRADE_CLOSE` serializer with re-stamped FNV-1a 64-bit.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub fn build_closed_trade_vault_json_v49(
+    slot_idx: usize,
+    summary: &ClosedTradeSummary,
+    eng: &SlotExecutionEngine,
+    entry_f: &SlotForensicEntrySnapshot,
+    exit_snap: &SymbolLobSnapshot,
+    ledger: &ParitySyncLedger,
+    markout_5h: &crate::markout_tracker::MarkoutCurve5hBps,
+    lvr_5s_scaled_bps: i64,
+    ts_ns: TimestampNs,
+) -> String {
+    let m4 = markout_5h.to_legacy_4h();
+    let base_str = build_closed_trade_vault_json(
+        slot_idx,
+        summary,
+        eng,
+        entry_f,
+        exit_snap,
+        ledger,
+        &m4,
+        lvr_5s_scaled_bps,
+        ts_ns,
+    );
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&base_str) else {
+        return base_str;
+    };
+    let m5_f: [f64; crate::markout_tracker::MARKOUT_HORIZONS_V49] =
+        core::array::from_fn(|k| (markout_5h.samples_bps[k] as f64) / 100.0);
+    if let Some(obj) = val.as_object_mut() {
+        let _ = obj.remove("fnv1a64_hex");
+        obj.insert("markout_5h_bps".to_string(), serde_json::json!(m5_f));
+        obj.insert(
+            "markout_resolved_mask".to_string(),
+            serde_json::json!(markout_5h.resolved_mask),
+        );
+        obj.insert(
+            "peak_zeta_tox".to_string(),
+            serde_json::json!((f64::from(markout_5h.peak_zeta_tox_pm)) / 1_000.0),
+        );
+    }
+    let pre = val.to_string();
+    let fnv = crate::forensic_parquet::ColumnarParquetBatch::compute_fnv1a64(pre.as_bytes());
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "fnv1a64_hex".to_string(),
+            serde_json::Value::String(format!("0x{fnv:016X}")),
+        );
+    }
+    val.to_string()
+}
+
+#[cfg(test)]
+mod v49_hud_telemetry_tests {
+    use super::*;
+    use crate::execution_fsm::record_live_ws_pulse;
+    use crate::markout_tracker::MarkoutCurve5hBps;
+
+    #[test]
+    fn test_v49_closed_trade_vault_json_resolved_mask_zeta_ws_pulse_and_ev() {
+        record_live_ws_pulse(1_310, 97);
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.realized_vol_5m = ScaledBps(2_400);
+
+        let mut bad_eng = SlotExecutionEngine::new(1);
+        bad_eng.learned_mfe_bps = 647;
+        bad_eng.learned_taker_prob_pm = 220;
+        assert!(compute_ex_ante_ev_scaled_bps(&bad_eng, &snap) < 0);
+
+        let mut good_eng = SlotExecutionEngine::new(5);
+        good_eng.learned_mfe_bps = 1_350;
+        good_eng.learned_taker_prob_pm = 45;
+        assert!(compute_ex_ante_ev_scaled_bps(&good_eng, &snap) > 300);
+
+        let sum = ClosedTradeSummary {
+            side: Side::Ask,
+            closed_lots: LotQty(20),
+            entry_price: PriceTicks(7_279),
+            exit_price: PriceTicks(7_270),
+            gross_scaled_bps: ScaledBps(1_236),
+            fee_scaled_bps: ScaledBps(400),
+            net_scaled_bps: ScaledBps(836),
+            net_pnl_1e8: 1_218_040,
+            fee_1e8: 581_960,
+            legs_consolidated: 2,
+            is_maker_exit: true,
+            kind: ClosedTradeKind::MakerPassiveUnwind,
+        };
+        let m5 = MarkoutCurve5hBps {
+            samples_bps: [-35, -80, 140, 420, 910],
+            resolved_mask: 0x1F,
+            initial_edge_bps: 30,
+            peak_zeta_tox_pm: 185,
+        };
+        let ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let entry_f = SlotForensicEntrySnapshot::default();
+        let line = build_closed_trade_vault_json_v49(
+            5,
+            &sum,
+            &good_eng,
+            &entry_f,
+            &snap,
+            &ledger,
+            &m5,
+            140,
+            TimestampNs(1_794_920_000_000_000_000),
+        );
+        assert!(line.contains("\"telemetry_rev\":\"V4.9\""));
+        assert!(line.contains("\"markout_resolved_mask\":31"));
+        assert!(line.contains("\"markout_5h_bps\":[-0.35,-0.8,1.4,4.2,9.1]"));
+        assert!(line.contains("\"ws_rtt_us\":1310") && line.contains("\"fnv1a64_hex\":\"0x"));
     }
 }
