@@ -798,3 +798,113 @@ mod quantum_ev_v48_tests {
         ));
     }
 }
+
+impl PairSpec {
+    /// True iff `allocated_lots` can split into `Tranche 1 + Runner` above exchange leg minimum.
+    #[inline]
+    #[must_use]
+    pub const fn can_split_runner_legs(self, allocated_lots: LotQty, mid_price: PriceTicks) -> bool {
+        if allocated_lots.0 < 2 || mid_price.0 <= 0 {
+            return false;
+        }
+        let half_lots = LotQty(allocated_lots.0 / 2);
+        self.lot_notional_1e8(half_lots, mid_price) >= SPLIT_LEG_MIN_NOTIONAL_1E8
+    }
+
+    /// Continuous C1 single-lot asymmetry EV gate (`EV_1lot > 0` when Runner split is impossible).
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::manual_clamp,
+        clippy::suboptimal_flops,
+        clippy::too_many_arguments
+    )]
+    pub fn passes_single_lot_asymmetry_ev_gate(
+        self,
+        allocated_lots: LotQty,
+        mid_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+    ) -> bool {
+        const PHI: f64 = 1.618_033_988_749_895;
+        const INV_PHI: f64 = 0.618_033_988_749_895;
+        const INV_PHI2: f64 = 0.381_966_011_250_105;
+        const INV_PHI3: f64 = 0.236_067_977_499_790;
+
+        if allocated_lots.0 <= 0 || mid_price.0 <= 0 {
+            return false;
+        }
+        if self.can_split_runner_legs(allocated_lots, mid_price) {
+            return true;
+        }
+        let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) / 1_000.0;
+        let p_mkr = 1.0 - p_tkr;
+        let c_mkr_rt = fees.round_trip_maker_exit_bps().raw() as f64;
+        let c_tkr_rt = (fees.round_trip_taker_exit_bps().raw().max(100)) as f64;
+        let mfe_eff = (learned_mfe_bps.max(0) as f64) - c_mkr_rt;
+        if mfe_eff <= 10.0 {
+            return false;
+        }
+        let srv_sl =
+            Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
+        let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt;
+        let u_g = ((signed_geom.clamp(-1.0, 1.0) - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
+        let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
+        let (al_raw, op_raw) = match side {
+            Side::Bid => (ob_bull_pm, ob_bear_pm),
+            Side::Ask => (ob_bear_pm, ob_bull_pm),
+        };
+        let al_f = f64::from(al_raw.max(382));
+        let op_f = f64::from(op_raw.max(382));
+        let ob_ratio = (al_f / op_f).clamp(INV_PHI, PHI);
+        let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
+        let eff_tail_cost = (p_tkr * wald_sl_net) / (INV_PHI2 + q_struct);
+        (p_mkr * mfe_eff) > eff_tail_cost
+    }
+}
+
+#[cfg(test)]
+mod single_lot_ev_v49_tests {
+    use super::*;
+
+    #[test]
+    fn test_v49_single_lot_asymmetry_ev_blocks_eth18_preserves_eth15_16_and_divisible_pairs() {
+        let eth = APPROVED_SPECS[1];
+        let avax = APPROVED_SPECS[3];
+        let fees = FeeSchedule::VIP0_DEFAULT;
+
+        // Divisible multi-lot contracts (AVAX 18 lots @ 7.263 USDT) split into Runner legs.
+        assert!(avax.can_split_runner_legs(LotQty(18), PriceTicks(7_263)));
+        assert!(avax.passes_single_lot_asymmetry_ev_gate(
+            LotQty(18), PriceTicks(7_263), ScaledBps(2_206), 628, 50, 0.23, 742, 675, Side::Bid, fees,
+        ));
+
+        // Real ETH #18 LOSS (1 lot, geom_in = +0.09, vol5m = 17.25bp, mfe = 6.47bp, p_taker = 42pm) -> BLOCKED.
+        assert!(!eth.can_split_runner_legs(LotQty(1), PriceTicks(179_267)));
+        assert!(!eth.passes_single_lot_asymmetry_ev_gate(
+            LotQty(1), PriceTicks(179_267), ScaledBps(1_725), 647, 42, 0.09, 438, 415, Side::Bid, fees,
+        ));
+
+        // Real ETH #15 & #16 WINS (1 lot, strong book wall geom_in >= +0.96) -> AUTHORIZED.
+        assert!(eth.passes_single_lot_asymmetry_ev_gate(
+            LotQty(1), PriceTicks(182_033), ScaledBps(2_991), 670, 46, 0.96, 457, 471, Side::Bid, fees,
+        ));
+        assert!(eth.passes_single_lot_asymmetry_ev_gate(
+            LotQty(1), PriceTicks(183_268), ScaledBps(1_507), 670, 44, 0.99, 448, 471, Side::Bid, fees,
+        ));
+
+        // Self-learning tightening: elevated p_Taker (125pm) blocks marginal geom (+0.72), unlocks at 2 lots (~$145+ wallet).
+        assert!(!eth.passes_single_lot_asymmetry_ev_gate(
+            LotQty(1), PriceTicks(182_000), ScaledBps(2_500), 650, 125, 0.72, 460, 480, Side::Bid, fees,
+        ));
+        assert!(eth.passes_single_lot_asymmetry_ev_gate(
+            LotQty(2), PriceTicks(182_000), ScaledBps(2_500), 650, 125, 0.72, 460, 480, Side::Bid, fees,
+        ));
+    }
+}

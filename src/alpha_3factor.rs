@@ -935,3 +935,176 @@ mod v48_parkinson_vip_tests {
         assert!(vreb_2s.raw() > seed_vol.raw());
     }
 }
+
+/// Continuous C1 GEOM book-support surface & strict opposing `ImpulseWave3` veto (Law II & VI, V4.9).
+///
+/// # Errors
+/// Returns `LastVetoCode::MacroElliottContradiction` on opposing `ImpulseWave3` or `SpoofingVeto` on hollow book.
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_precision_loss,
+    clippy::manual_clamp,
+    clippy::suboptimal_flops
+)]
+pub fn passes_elastic_geom_and_macro_impulse_guard(
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    side: crate::types::Side,
+    spoof_density: f64,
+) -> Result<(), crate::lob_shm::LastVetoCode> {
+    const INV_PHI: f64 = 0.618_033_988_749_895;
+    const INV_PHI2: f64 = 0.381_966_011_250_105;
+    const INV_PHI3: f64 = 0.236_067_977_499_790;
+    const INV_PHI4: f64 = 0.145_898_033_750_315;
+
+    let dir_s = side.sign_f64();
+    let w_obs = snap.wave_observables();
+    let signed_macro = dir_s * w_obs.macro_phase.get();
+    if matches!(w_obs.regime, crate::wave_elliott::WaveRegime::ImpulseWave3)
+        && signed_macro < -INV_PHI
+    {
+        return Err(crate::lob_shm::LastVetoCode::MacroElliottContradiction);
+    }
+
+    let bull_pm = snap.ob_bull_efficacy_pm as f64;
+    let bear_pm = snap.ob_bear_efficacy_pm as f64;
+    let is_synthetic_neutral = matches!(w_obs.regime, crate::wave_elliott::WaveRegime::NeutralWarmup)
+        && bull_pm <= 0.0
+        && bear_pm <= 0.0
+        && spoof_density <= 1e-6
+        && w_obs.liq_imbalance.get().abs() <= 1e-6;
+    if is_synthetic_neutral {
+        return Ok(());
+    }
+
+    let (al_f, op_f) = match side {
+        crate::types::Side::Bid => (bull_pm, bear_pm),
+        crate::types::Side::Ask => (bear_pm, bull_pm),
+    };
+    let rho_ob = if al_f > 0.0 || op_f > 0.0 {
+        let a = al_f.max(382.0);
+        let b = op_f.max(382.0);
+        (a / (a + b)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    let h_sp = crate::wave_elliott::hermite_smoothstep_c1(spoof_density.clamp(0.0, 1.0), 0.05, 0.75);
+    let h_ob_adv = crate::wave_elliott::hermite_smoothstep_c1((1.0 - 2.0 * rho_ob).max(0.0), 0.0, 0.35);
+    let h_ob_fav = crate::wave_elliott::hermite_smoothstep_c1((2.0 * rho_ob - 1.0).max(0.0), 0.0, 0.35);
+    let liq_adv = (-dir_s * w_obs.liq_imbalance.get()).clamp(0.0, 1.0);
+    let h_liq = crate::wave_elliott::hermite_smoothstep_c1(liq_adv, 0.10, 0.80);
+
+    let req_geom = (INV_PHI4 + INV_PHI3 * h_sp + INV_PHI3 * h_ob_adv + INV_PHI2 * h_liq
+        - 0.5 * INV_PHI4 * h_ob_fav)
+        .clamp(0.05, INV_PHI);
+    let signed_geom = dir_s * snap.factor_geom.get();
+    if signed_geom < req_geom {
+        return Err(crate::lob_shm::LastVetoCode::SpoofingVeto);
+    }
+    Ok(())
+}
+
+/// Aborts a resting passive order when its supporting BBO wall evaporates with adverse OFI flip.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn should_abort_collapsed_resting_l1_wall(
+    spec: crate::types::PairSpec,
+    side: crate::types::Side,
+    entry_price: crate::types::PriceTicks,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    init_q_lots: crate::types::LotQty,
+) -> bool {
+    const INV_PHI: f64 = 0.618_033_988_749_895;
+    const INV_PHI2: f64 = 0.381_966_011_250_105;
+
+    let (bbo_px, live_q) = match side {
+        crate::types::Side::Bid => (snap.bids[0].price, snap.bids[0].qty),
+        crate::types::Side::Ask => (snap.asks[0].price, snap.asks[0].qty),
+    };
+    if bbo_px.0 <= 0 || bbo_px != entry_price {
+        return false;
+    }
+    let signed_ofi = side.sign_f64() * snap.factor_ofi.get();
+    if signed_ofi >= 0.0 {
+        return false;
+    }
+    let min_l1 = spec.min_resting_l1_lots(entry_price, snap.realized_vol_5m).0.max(1) as f64;
+    let init_f = (init_q_lots.0.max(0)) as f64;
+    let live_f = (live_q.0.max(0)) as f64;
+    live_f < INV_PHI * min_l1 || (init_f >= min_l1 && live_f < INV_PHI2 * init_f)
+}
+
+#[cfg(test)]
+mod v49_geom_macro_guard_tests {
+    use super::*;
+    use crate::lob_shm::{BookLevel, LastVetoCode, SymbolLobSnapshot};
+    use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, Side, APPROVED_SPECS};
+    use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+    #[test]
+    fn test_v49_elastic_geom_and_macro_guard_blocks_tao17_eth18_and_preserves_wins() {
+        // 1. Real TAO #17 LOSS (Ask into bullish ImpulseWave3 macro_phase = +0.90) -> VETOED.
+        let mut tao17 = SymbolLobSnapshot::new_empty();
+        tao17.factor_geom = BoundedScore::new_clamped(-0.21);
+        tao17.ob_bull_efficacy_pm = 459;
+        tao17.ob_bear_efficacy_pm = 464;
+        tao17.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.515),
+            macro_phase: BoundedScore::new_clamped(0.90),
+            oi_impulse: BoundedScore::new_clamped(0.08),
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(5_514),
+        });
+        assert_eq!(
+            passes_elastic_geom_and_macro_impulse_guard(&tao17, Side::Ask, 0.0),
+            Err(LastVetoCode::MacroElliottContradiction)
+        );
+
+        // 2. Real ETH #18 LOSS (Bid with hollow geom = +0.09 & adverse liq_imbalance = -0.67) -> VETOED.
+        let mut eth18 = SymbolLobSnapshot::new_empty();
+        eth18.factor_geom = BoundedScore::new_clamped(0.09);
+        eth18.ob_bull_efficacy_pm = 438;
+        eth18.ob_bear_efficacy_pm = 415;
+        eth18.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.696),
+            macro_phase: BoundedScore::new_clamped(0.45),
+            oi_impulse: BoundedScore::new_clamped(0.09),
+            liq_imbalance: BoundedScore::new_clamped(-0.67),
+            fib_proj_bps: ScaledBps(0),
+        });
+        assert_eq!(
+            passes_elastic_geom_and_macro_impulse_guard(&eth18, Side::Bid, 0.10),
+            Err(LastVetoCode::SpoofingVeto)
+        );
+
+        // 3. Real AVAX #5 WIN (Bid, geom = +0.23, aligned ImpulseWave3 +0.73, OB+ 742 > OB- 675) -> OK.
+        let mut avax5 = SymbolLobSnapshot::new_empty();
+        avax5.factor_geom = BoundedScore::new_clamped(0.23);
+        avax5.ob_bull_efficacy_pm = 742;
+        avax5.ob_bear_efficacy_pm = 675;
+        avax5.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.578),
+            macro_phase: BoundedScore::new_clamped(0.73),
+            oi_impulse: BoundedScore::new_clamped(0.01),
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(2_063),
+        });
+        assert!(passes_elastic_geom_and_macro_impulse_guard(&avax5, Side::Bid, 0.0).is_ok());
+
+        // 4. Collapsed resting L1 wall abort check (TAO 74 lots collapsing to 8 lots under OFI flip).
+        let mut q_snap = SymbolLobSnapshot::new_empty();
+        q_snap.realized_vol_5m = ScaledBps(1_809);
+        q_snap.asks[0] = BookLevel { price: PriceTicks(19_336), qty: LotQty(8) };
+        q_snap.factor_ofi = BoundedScore::new_clamped(0.35);
+        assert!(should_abort_collapsed_resting_l1_wall(
+            APPROVED_SPECS[4], Side::Ask, PriceTicks(19_336), &q_snap, LotQty(740),
+        ));
+    }
+}

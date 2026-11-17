@@ -1567,3 +1567,262 @@ mod v49_intra_trade_path_tests {
         assert_eq!(path_sum.samples[2].rel_sec, 2);
     }
 }
+
+/// Dimensionless C1 stagnation & 5-horizon (`+60s`) post-fill compression factor in `[0.0, 1.0]`.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::manual_clamp,
+    clippy::suboptimal_flops
+)]
+pub fn compute_stagnation_sl_compression_factor(
+    hold_ns: i64,
+    tau_mkt_ns: i64,
+    event_clock_mod: f64,
+    mfe_above_floor_sbps: i64,
+    signed_tfi: f64,
+    zeta_tox_5h: f64,
+) -> f64 {
+    const PHI_SQ: f64 = 2.618_033_988_749_895;
+    const INV_PHI: f64 = 0.618_033_988_749_895;
+    const INV_PHI3: f64 = 0.236_067_977_499_790;
+
+    if mfe_above_floor_sbps > 0 || hold_ns <= 0 {
+        return 0.0;
+    }
+    let kappa = event_clock_mod.clamp(INV_PHI, 1.618_033_988_749_895);
+    let tau_base_ns = (tau_mkt_ns.max(90_000_000_000)) as f64;
+    let tau_char_ns = ((INV_PHI3 * tau_base_ns) / kappa).max(15_000_000_000.0);
+    let tau_dim = (hold_ns as f64) / tau_char_ns;
+    let h_time = crate::wave_elliott::hermite_smoothstep_c1(tau_dim, INV_PHI, PHI_SQ);
+    let adv_shift = INV_PHI3 - signed_tfi.clamp(-1.0, 1.0);
+    let h_flow = crate::wave_elliott::hermite_smoothstep_c1(adv_shift, 0.0, INV_PHI3 + INV_PHI);
+    let s_stag = (h_time * h_flow).clamp(0.0, 1.0);
+    let h_tox = if signed_tfi < 0.0 {
+        crate::wave_elliott::hermite_smoothstep_c1(zeta_tox_5h, INV_PHI, PHI_SQ)
+    } else {
+        0.0
+    };
+    s_stag.max(h_tox)
+}
+
+impl SlotExecutionEngine {
+    /// Restores `learned_mfe_bps` if a `ServerMarkPriceStopLoss` closed with zero price discovery (Law II & V).
+    #[inline]
+    pub fn restore_mfe_if_zero_discovery_sl(
+        &mut self,
+        prev_learned_mfe_bps: i64,
+        summary: &ClosedTradeSummary,
+    ) {
+        let fee_rt_mkr = self.active_fees.round_trip_maker_exit_bps().raw();
+        if !crate::bayesian_governor::should_update_mfe_plasticity(
+            summary.is_maker_exit,
+            self.last_closed_mfe_bps,
+            fee_rt_mkr,
+        ) && self.learned_mfe_bps < prev_learned_mfe_bps
+        {
+            self.learned_mfe_bps = prev_learned_mfe_bps;
+        }
+    }
+
+    /// V4.9 unified post-fill toxicity (`5h +60s`) + dimensionless Zero-MFE stagnation evaluator.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::manual_clamp,
+        clippy::suboptimal_flops
+    )]
+    pub fn observe_post_fill_toxicity_and_wald_v49(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_signed_beta: f64,
+        markout_ring: &crate::markout_tracker::SlotMarkoutRing,
+        event_dilation: f64,
+    ) -> f64 {
+        const PHI_TX: f64 = 1.618_033_988_749_895;
+        const PHI_SQ_TX: f64 = 2.618_033_988_749_895;
+        const INV_PHI_TX: f64 = 0.618_033_988_749_895;
+        const INV_PHI2_TX: f64 = 0.381_966_011_250_105;
+
+        let zeta_v48 = self.observe_post_fill_toxicity_and_wald_v48(
+            snap,
+            btc_leader_snap,
+            epps_signed_beta,
+            markout_ring,
+            event_dilation,
+        );
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            peak_favorable_price,
+            opened_ts,
+            ..
+        } = self.state
+        else {
+            return zeta_v48;
+        };
+        if avg_price_ticks.0 <= 0 {
+            return zeta_v48;
+        }
+        let dt_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+        let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+        let c_rt = spec.expected_round_trip_cost_bps_dynamic(
+            avg_price_ticks,
+            self.learned_taker_prob_pm,
+            self.active_fees,
+        );
+        let tau_tick_bps = spec
+            .tick_to_price_scaled_bps(avg_price_ticks)
+            .unwrap_or(ScaledBps(50))
+            .raw();
+        let fee_mkr_floor =
+            ((INV_PHI2_TX * (self.active_fees.round_trip_maker_exit_bps().raw() as f64)).round()
+                as i64)
+                .max(tau_tick_bps);
+        let state_mfe = ((peak_favorable_price.0 - avg_price_ticks.0)
+            .saturating_mul(side.sign_i64())
+            .saturating_mul(1_000_000))
+            / avg_price_ticks.0.max(1);
+        let cur_mfe_bps = state_mfe.max(self.last_closed_mfe_bps);
+        let mfe_above_floor = cur_mfe_bps.saturating_sub(fee_mkr_floor);
+        if mfe_above_floor > 0 {
+            return zeta_v48;
+        }
+        let z_5h = if dt_ns >= 60_000_000_000 {
+            crate::markout_tracker::glosten_milgrom_toxicity_zeta_5h(
+                markout_ring.last_fill_curve_5h(),
+                c_rt,
+            )
+        } else {
+            markout_ring.active_fill_toxicity_zeta(opened_ts, c_rt)
+        };
+        let own_flow =
+            (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * side.sign_f64();
+        let tau_mkt_ns = self.intrinsic_tau_mkt_s.max(90).saturating_mul(1_000_000_000);
+        let comp = compute_stagnation_sl_compression_factor(
+            dt_ns,
+            tau_mkt_ns,
+            event_dilation,
+            mfe_above_floor,
+            own_flow,
+            z_5h,
+        );
+        if comp < INV_PHI2_TX {
+            return zeta_v48;
+        }
+        let zeta_eff = zeta_v48.max(INV_PHI_TX + (PHI_SQ_TX - INV_PHI_TX) * comp);
+        let (a_hold, b_unwind) =
+            crate::kinematic_surface::wald_sprt_boundaries_from_permille(self.learned_taker_prob_pm);
+        let jump = PHI_TX * comp * (1.0 + (-own_flow).max(0.0)) * b_unwind.abs();
+        self.wald_sprt.log_likelihood =
+            (self.wald_sprt.log_likelihood - jump).clamp(1.5 * b_unwind, a_hold);
+        self.wald_sprt.exhaustion_unwind_active = true;
+        let stag_pct = (48.0 + 34.0 * comp).round() as i64;
+        self.wald_sprt.contraction_pct = self.wald_sprt.contraction_pct.max(stag_pct).clamp(48, 82);
+        self.last_closed_wald_pct = self.last_closed_wald_pct.max(self.wald_sprt.contraction_pct);
+        self.latch_defensive_floor_if_needed(true);
+        zeta_eff
+    }
+
+    /// Unified V4.9 open-position step (`5h Toxicity + Zero-MFE Stagnation + Orthogonal MFE Guard`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_open_position_v49(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        gov: &OnlineAdaptiveGovernor,
+        ledger: &mut ParitySyncLedger,
+        epps_signed_beta: f64,
+        markout_ring: &crate::markout_tracker::SlotMarkoutRing,
+        event_dilation: f64,
+    ) -> Option<ClosedTradeSummary> {
+        let prev_mfe = self.learned_mfe_bps;
+        self.sync_governor_dynamics(gov);
+        let zeta_eff = self.observe_post_fill_toxicity_and_wald_v49(
+            snap,
+            btc_leader_snap,
+            epps_signed_beta,
+            markout_ring,
+            event_dilation,
+        );
+        if zeta_eff > 0.0 {
+            let _ = self.maybe_ratchet_sl_with_toxicity_v48(
+                snap,
+                btc_leader_snap,
+                epps_signed_beta,
+                zeta_eff,
+            );
+        }
+        let closed = self.step_open_position_with_beta(snap, btc_leader_snap, gov, ledger, epps_signed_beta);
+        if let Some(ref sum) = closed {
+            self.restore_mfe_if_zero_discovery_sl(prev_mfe, sum);
+        }
+        closed
+    }
+}
+
+#[cfg(test)]
+mod v49_stagnation_unwind_tests {
+    use super::*;
+    use crate::lob_shm::BookLevel;
+    use crate::markout_tracker::SlotMarkoutRing;
+    use crate::types::BoundedScore;
+
+    #[test]
+    fn test_v49_slow_bleed_tao17_stagnation_compresses_sl_over_65pct_and_preserves_mfe() {
+        let mut tao = SymbolLobSnapshot::new_empty();
+        tao.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao.ts_local_ns = TimestampNs(10_000_000_000);
+        tao.realized_vol_5m = ScaledBps(2_619);
+        tao.bids[0] = BookLevel { price: PriceTicks(19_335), qty: LotQty(300) };
+        tao.asks[0] = BookLevel { price: PriceTicks(19_336), qty: LotQty(300) };
+        tao.mark_price = PriceTicks(19_336);
+        tao.last_trade_price = PriceTicks(19_336);
+
+        let mut eng = SlotExecutionEngine::new(4);
+        eng.intrinsic_tau_mkt_s = 180;
+        eng.learned_mfe_bps = 680;
+        let v = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps(680),
+        };
+        assert!(eng.try_arm_maker_entry(&tao, v, LotQty(6)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(10_000_000_000)).is_ok());
+        let init_sl_dist = eng.last_eff_sl_ticks.0 - 19_336;
+
+        // Exact TAO #17 mild 15s markouts ([-0.51, -0.51, -0.51, -2.06] bps) where V4.8 stayed blind (< 0.618).
+        let mut ring = SlotMarkoutRing::new();
+        ring.arm_fill_probe(Side::Ask, PriceTicks(19_336), PriceTicks(19_336), TimestampNs(10_000_000_000));
+        ring.step_clock(PriceTicks(19_337), TimestampNs(10_300_000_000), 200);
+        ring.step_clock(PriceTicks(19_337), TimestampNs(11_200_000_000), 200);
+        ring.step_clock(PriceTicks(19_337), TimestampNs(16_000_000_000), 200);
+        ring.step_clock(PriceTicks(19_340), TimestampNs(25_500_000_000), 200);
+        assert!(eng.observe_post_fill_toxicity_and_wald_v48(&tao, &tao, 1.0, &ring, 1.0).abs() <= f64::EPSILON);
+
+        // At t = +105s (well before 327s), MFE == 0 & flow flipped bullish (+0.19 / +0.73) -> V4.9 compresses >65%.
+        tao.ts_local_ns = TimestampNs(115_000_000_000);
+        tao.bids[0] = BookLevel { price: PriceTicks(19_345), qty: LotQty(400) };
+        tao.asks[0] = BookLevel { price: PriceTicks(19_346), qty: LotQty(150) };
+        tao.mark_price = PriceTicks(19_345);
+        tao.last_trade_price = PriceTicks(19_345);
+        tao.factor_ofi = BoundedScore::new_clamped(0.19);
+        tao.factor_tfi = BoundedScore::new_clamped(0.73);
+
+        let z_v49 = eng.observe_post_fill_toxicity_and_wald_v49(&tao, &tao, 1.0, &ring, 1.0);
+        assert!(z_v49 > 1.80 && eng.wald_sprt.exhaustion_unwind_active);
+        assert!(eng.maybe_ratchet_sl_with_toxicity_v48(&tao, &tao, 1.0, z_v49).is_some());
+        let new_sl_dist = eng.last_eff_sl_ticks.0 - 19_336;
+        assert!(new_sl_dist * 100 <= init_sl_dist * 35);
+
+        // Simulate SL hit at compressed trigger: learned_mfe_bps MUST remain 680 (zero shrinkage).
+        let gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = ParitySyncLedger::new(6_502_850_000);
+        tao.ts_local_ns = TimestampNs(120_000_000_000);
+        tao.mark_price = PriceTicks(eng.last_eff_sl_ticks.0 + 1);
+        tao.last_trade_price = tao.mark_price;
+        let closed = eng.step_open_position_v49(&tao, &tao, &gov, &mut ledger, 1.0, &ring, 1.0);
+        assert!(closed.is_some());
+        assert_eq!(eng.learned_mfe_bps, 680);
+    }
+}

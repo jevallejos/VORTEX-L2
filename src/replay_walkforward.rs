@@ -336,7 +336,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 s_idx == 0, cur_snap.realized_vol_5m, ScaledBps(btc_snap.realized_vol_5m.0.max(2_500)),
                             );
                             if beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000)
-                                && gov.authorizes_adaptive_entry_v48(s_idx, side, eq_now, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta)
+                                && gov.authorizes_adaptive_entry_v49(s_idx, side, eq_now, daily_damper_pm, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok()
                             {
                                 engines[s_idx].sync_governor_for_side(&gov, side);
                                 if engines[s_idx].try_arm_maker_entry(&cur_snap, verdict, lots).is_ok()
@@ -359,7 +359,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 continue;
                             }
                             let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-                            if gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_err() {
+                            if gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, qty, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_err() {
                                 engines[s_idx].state = OrderLifecycleState::Idle;
                                 continue;
                             }
@@ -451,7 +451,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase_ticks,
                                 };
                                 let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-                                if moved_away && gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok() {
+                                if moved_away && gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, qty, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok() {
                                     if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&cur_snap, new_l1) {
                                         engines[s_idx].next_peg_allowed_ts_ns = cur_snap.ts_local_ns.0 + q_timers.repeg_cooldown_ns;
                                         engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, cur_snap.ts_local_ns);
@@ -494,7 +494,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                     let avg_d = avg_price_ticks.0.max(1);
                     engines[s_idx].last_closed_mfe_bps = ((peak_favorable_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_d;
                     engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0 - avg_price_ticks.0) * side.sign_i64()).saturating_mul(1_000_000) / avg_d;
-                    let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v48(&cur_snap, &btc_snap, epps_beta, &markout_rings[s_idx], evt_dil);
+                    let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v49(&cur_snap, &btc_snap, epps_beta, &markout_rings[s_idx], evt_dil);
 
                     if engines[s_idx].last_eff_sl_ticks.0 <= 0 { engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
                     let eff_sl_px = engines[s_idx].last_eff_sl_ticks;
@@ -833,7 +833,7 @@ pub mod omega_twin {
                             s_idx == 0, ev.snap.realized_vol_5m, ScaledBps(btc_snap.realized_vol_5m.0.max(2_500)),
                         );
                         if beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000)
-                            && self.gov.authorizes_adaptive_entry_v48(s_idx, side, eq_now, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta)
+                            && self.gov.authorizes_adaptive_entry_v49(s_idx, side, eq_now, daily_damper_pm, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok()
                         {
                             self.engines[s_idx].sync_governor_for_side(&self.gov, side);
                             let _ = self.engines[s_idx].try_arm_maker_entry(&ev.snap, verdict, lots);
@@ -845,7 +845,7 @@ pub mod omega_twin {
                     if block_new_entries { self.engines[s_idx].state = OrderLifecycleState::Idle; return; }
                     if now_ns.0.saturating_sub(submitted_ts.0) >= self.engines[s_idx].elastic_preflight_window_ns(ev.snap.realized_vol_5m) {
                         let mfe_s = ScaledBps(self.engines[s_idx].learned_mfe_bps);
-                        if self.gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
+                        if self.gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, match self.engines[s_idx].state { OrderLifecycleState::PlacingEntryMaker { qty: q, .. } => q, _ => LotQty(1) }, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
                             if let Ok((synced_px, _)) = self.engines[s_idx].sync_preflight_l1_entry_auto(&ev.snap) {
                                 self.entry_fifo[s_idx].submit_post_only(side, synced_px, qty, now_ns.0);
                                 let _ = self.engines[s_idx].on_entry_order_resting(now_ns);
@@ -910,7 +910,7 @@ pub mod omega_twin {
                                 Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase,
                             };
                             let mfe_s = ScaledBps(self.engines[s_idx].learned_mfe_bps);
-                            if moved_away && self.gov.confirm_preflight_kinematics_v48(s_idx, side, eq_now, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
+                            if moved_away && self.gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, match self.engines[s_idx].state { OrderLifecycleState::RestingEntryQueue { qty: q, .. } => q, _ => LotQty(1) }, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
                                 if let Ok(repeg_sl) = self.engines[s_idx].compute_repeg_sl_trigger(&ev.snap, new_l1) {
                                     self.engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);
                                     self.entry_fifo[s_idx].submit_post_only(side, new_l1, qty, now_ns.0);
@@ -960,7 +960,7 @@ pub mod omega_twin {
                     self.engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0 - avg_price_ticks.0) * d_sign).saturating_mul(1_000_000) / denom;
                     self.engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
                     self.engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
-                    let zeta_tox = self.engines[s_idx].observe_post_fill_toxicity_and_wald_v48(&ev.snap, &btc_snap, epps_beta, &self.markout_rings[s_idx], evt_dil);
+                    let zeta_tox = self.engines[s_idx].observe_post_fill_toxicity_and_wald_v49(&ev.snap, &btc_snap, epps_beta, &self.markout_rings[s_idx], evt_dil);
 
                     if self.engines[s_idx].last_eff_sl_ticks.0 <= 0 { self.engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
                     let eff_sl = self.engines[s_idx].last_eff_sl_ticks;
@@ -1329,5 +1329,31 @@ mod tests {
         assert_eq!(settle_crossed_funding_boundary(APPROVED_SPECS[3], Side::Ask, LotQty(20), PriceTicks(10_000), cut_ns - 10_000_000_000, &f_snap, &mut last_cut, &mut led), Some(400_000));
         assert_eq!(led.current_equity_1e8() - led.initial_equity_1e8, 400_000);
         assert!(settle_crossed_funding_boundary(APPROVED_SPECS[3], Side::Ask, LotQty(20), PriceTicks(10_000), cut_ns - 10_000_000_000, &f_snap, &mut last_cut, &mut led).is_none());
+    }
+}
+
+#[cfg(test)]
+mod v49_replay_twin_parity_tests {
+    use super::*;
+
+    #[test]
+    fn test_v49_digital_twin_blocks_tao17_macro_and_preserves_4arm_pareto() {
+        assert!(run_and_print_omega_chat6_twin_certification());
+        let gov = OnlineAdaptiveGovernor::new();
+        let mut s = SymbolLobSnapshot::new_empty();
+        s.symbol_id = APPROVED_SPECS[4].symbol_id;
+        s.realized_vol_5m = ScaledBps(2_600);
+        s.bids[0] = crate::lob_shm::BookLevel { price: PriceTicks(19_335), qty: LotQty(800) };
+        s.asks[0] = crate::lob_shm::BookLevel { price: PriceTicks(19_336), qty: LotQty(800) };
+        s.set_wave_observables(crate::wave_elliott::WaveObservables {
+            regime: crate::wave_elliott::WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: crate::wave_elliott::WaveObservables::encode_hurst(0.55),
+            macro_phase: crate::types::BoundedScore::new_clamped(0.90),
+            oi_impulse: crate::types::BoundedScore::ZERO,
+            liq_imbalance: crate::types::BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(5_500),
+        });
+        assert!(gov.authorizes_adaptive_entry_v49(4, Side::Ask, 6_502_850_000, 1_000, ScaledBps(594), &s, &s, 0.0, 1.0).is_err());
     }
 }

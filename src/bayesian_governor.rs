@@ -1137,3 +1137,252 @@ mod v48_governor_quantum_tests {
         assert!(lots_damped.0 < lots_full.0 && lots_damped.0 >= 2 && gov.portfolio_mean_eq_vol_bps() >= 1_200);
     }
 }
+
+/// Orthogonal MFE plasticity predicate: prevents zero-MFE Stop-Loss sweeps from shrinking future profit targets.
+#[inline]
+#[must_use]
+pub const fn should_update_mfe_plasticity(
+    is_maker_exit: bool,
+    observed_mfe_sbps: i64,
+    fee_rt_mkr_sbps: i64,
+) -> bool {
+    let floor_sbps = if fee_rt_mkr_sbps > 100 {
+        fee_rt_mkr_sbps
+    } else {
+        100
+    };
+    is_maker_exit || observed_mfe_sbps > floor_sbps
+}
+
+#[inline]
+#[must_use]
+fn clamp_ob_permille_u16(raw_pm: i64) -> u16 {
+    let bounded = if raw_pm <= 0 {
+        618
+    } else if raw_pm > 1_000 {
+        1_000
+    } else {
+        raw_pm
+    };
+    u16::try_from(bounded).unwrap_or(618)
+}
+
+impl OnlineAdaptiveGovernor {
+    /// Unified V4.9 entry gate returning allocated `LotQty` or exact `LastVetoCode` (`EV > 0` enforced).
+    ///
+    /// # Errors
+    /// Returns the causal `LastVetoCode` when quantum EV, `ImpulseWave3`, `GEOM` or single-lot asymmetry fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorizes_adaptive_entry_v49(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        daily_damper_permille: i64,
+        learned_mfe_bps: ScaledBps,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+    ) -> Result<LotQty, crate::lob_shm::LastVetoCode> {
+        use crate::lob_shm::LastVetoCode;
+
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Err(LastVetoCode::WarmupOrLock);
+        }
+        let entry_px = if candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0 {
+            side.select_entry_bbo_price(candidate_snap.bids[0].price, candidate_snap.asks[0].price)
+        } else {
+            candidate_snap.mark_price
+        };
+        if entry_px.0 <= 0 {
+            return Err(LastVetoCode::WarmupOrLock);
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let fees = self.active_fee_schedule();
+        let taker_pm = self.slot_taker_prob_permille(slot_idx, side);
+        if !spec.passes_quantum_ev_growth_gate(
+            wallet_usdt_1e8,
+            entry_px,
+            candidate_snap.realized_vol_5m,
+            learned_mfe_bps,
+            taker_pm,
+            fees,
+        ) {
+            return Err(LastVetoCode::QueueDepthOrOversizedLot);
+        }
+        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
+            candidate_snap,
+            side,
+            spoof_density,
+        )?;
+        let lots = self.compute_slot_entry_lots_v48(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            candidate_snap,
+            daily_damper_permille,
+        );
+        let signed_geom = side.sign_f64() * candidate_snap.factor_geom.get();
+        let bull_u16 = clamp_ob_permille_u16(candidate_snap.ob_bull_efficacy_pm);
+        let bear_u16 = clamp_ob_permille_u16(candidate_snap.ob_bear_efficacy_pm);
+        if !spec.passes_single_lot_asymmetry_ev_gate(
+            lots,
+            entry_px,
+            candidate_snap.realized_vol_5m,
+            learned_mfe_bps.raw(),
+            taker_pm,
+            signed_geom,
+            bull_u16,
+            bear_u16,
+            side,
+            fees,
+        ) {
+            return Err(LastVetoCode::QueueDepthOrOversizedLot);
+        }
+        if !self.authorizes_adaptive_entry_v48(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            learned_mfe_bps,
+            candidate_snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+        ) {
+            return Err(LastVetoCode::KinematicSurfaceOrCadence);
+        }
+        Ok(lots)
+    }
+
+    /// Unified V4.9 preflight confirmation re-verifying book support, macro wave & single-lot EV before wire send.
+    ///
+    /// # Errors
+    /// Returns `LastVetoCode` if BBO, `ImpulseWave3`, `GEOM`, single-lot EV or preflight kinematics decay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_preflight_kinematics_v49(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        allocated_lots: LotQty,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+    ) -> Result<(i64, i64), crate::lob_shm::LastVetoCode> {
+        use crate::lob_shm::LastVetoCode;
+
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Err(LastVetoCode::WarmupOrLock);
+        }
+        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+            return Err(LastVetoCode::WarmupOrLock);
+        };
+        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
+            snap,
+            side,
+            spoof_density,
+        )?;
+        let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        let spec = APPROVED_SPECS[slot_idx];
+        let signed_geom = side.sign_f64() * snap.factor_geom.get();
+        let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
+        let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
+        if !spec.passes_single_lot_asymmetry_ev_gate(
+            allocated_lots,
+            entry_px,
+            snap.realized_vol_5m,
+            learned_mfe_bps.raw(),
+            self.slot_taker_prob_permille(slot_idx, side),
+            signed_geom,
+            bull_u16,
+            bear_u16,
+            side,
+            self.active_fee_schedule(),
+        ) {
+            return Err(LastVetoCode::QueueDepthOrOversizedLot);
+        }
+        self.confirm_preflight_kinematics_v48(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            learned_mfe_bps,
+            snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+        )
+        .map_err(|_| LastVetoCode::PreflightDriftOrDecay)
+    }
+}
+
+#[cfg(test)]
+mod v49_governor_asymmetry_tests {
+    use super::*;
+    use crate::lob_shm::{BookLevel, LastVetoCode};
+    use crate::types::BoundedScore;
+    use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+    #[test]
+    fn test_v49_mfe_orthogonality_and_unified_governor_blocks_tao17_eth18() {
+        assert!(!should_update_mfe_plasticity(false, 0, 400));
+        assert!(!should_update_mfe_plasticity(false, 5, 400));
+        assert!(should_update_mfe_plasticity(true, 906, 400));
+        assert!(should_update_mfe_plasticity(false, 850, 400));
+
+        let gov = OnlineAdaptiveGovernor::new();
+        let t0 = 1_762_992_000_000_000_000_i64 + 14 * 3_600_000_000_000;
+        let w_65 = 6_502_850_000_i64;
+
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.ts_local_ns = TimestampNs(t0);
+        btc.realized_vol_5m = ScaledBps(3_000);
+        btc.bids[0] = BookLevel { price: PriceTicks(646_300), qty: LotQty(1_500) };
+        btc.asks[0] = BookLevel { price: PriceTicks(646_301), qty: LotQty(1_500) };
+        btc.refresh_deep_l1_l5_totals();
+        btc.factor_ofi = BoundedScore::new_clamped(-0.65);
+        btc.factor_tfi = BoundedScore::new_clamped(-0.70);
+        btc.factor_geom = BoundedScore::new_clamped(-0.60);
+
+        // TAO #17 Ask into bullish ImpulseWave3 (+0.90) -> MacroElliottContradiction.
+        let mut tao17 = btc;
+        tao17.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao17.realized_vol_5m = ScaledBps(2_600);
+        tao17.bids[0] = BookLevel { price: PriceTicks(19_335), qty: LotQty(900) };
+        tao17.asks[0] = BookLevel { price: PriceTicks(19_336), qty: LotQty(900) };
+        tao17.refresh_deep_l1_l5_totals();
+        tao17.factor_ofi = BoundedScore::new_clamped(-0.68);
+        tao17.factor_tfi = BoundedScore::new_clamped(-0.99);
+        tao17.factor_geom = BoundedScore::new_clamped(-0.45);
+        tao17.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.515),
+            macro_phase: BoundedScore::new_clamped(0.90),
+            oi_impulse: BoundedScore::new_clamped(0.08),
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(5_514),
+        });
+        assert_eq!(
+            gov.authorizes_adaptive_entry_v49(4, Side::Ask, w_65, 1_000, ScaledBps(594), &tao17, &btc, 0.0, 1.0),
+            Err(LastVetoCode::MacroElliottContradiction)
+        );
+
+        // ETH #18 Bid (1 lot, weak geom +0.09) -> QueueDepthOrOversizedLot / SpoofingVeto.
+        let mut eth18 = btc;
+        eth18.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth18.realized_vol_5m = ScaledBps(2_800);
+        eth18.bids[0] = BookLevel { price: PriceTicks(179_267), qty: LotQty(4_000) };
+        eth18.asks[0] = BookLevel { price: PriceTicks(179_268), qty: LotQty(4_000) };
+        eth18.refresh_deep_l1_l5_totals();
+        eth18.factor_ofi = BoundedScore::new_clamped(0.57);
+        eth18.factor_tfi = BoundedScore::new_clamped(0.93);
+        eth18.factor_geom = BoundedScore::new_clamped(0.09);
+        assert!(gov
+            .authorizes_adaptive_entry_v49(1, Side::Bid, w_65, 1_000, ScaledBps(647), &eth18, &eth18, 0.0, 1.0)
+            .is_err());
+    }
+}
