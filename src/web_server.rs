@@ -565,7 +565,9 @@ pub fn stream_sse_5hz_loop(
 
 fn handle_tcp_client(ctx: std::sync::Arc<VortexWebContext>, mut stream: std::net::TcpStream) {
     use std::io::{Read, Write};
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
     let _ = stream.set_nodelay(true);
     let Ok(cloned) = stream.try_clone() else { return };
     let mut reader = BufReader::new(cloned);
@@ -606,6 +608,8 @@ fn handle_tcp_client(ctx: std::sync::Arc<VortexWebContext>, mut stream: std::net
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(resp_body.as_bytes());
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 pub fn serve_observatory_blocking(
