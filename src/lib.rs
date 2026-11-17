@@ -24,6 +24,7 @@ pub mod telemetry_hud;
 pub mod types;
 pub mod candle_store;
 pub mod par2_archiver;
+pub mod web_server;
 pub mod vault_io;
 pub mod wave_elliott;
 pub mod ws_protocol;
