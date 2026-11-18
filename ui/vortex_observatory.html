@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta id="vortex-csrf-meta" name="vortex-csrf" content="__VORTEX_CSRF__">
-<title>VORTEX-OMEGA V5.0 — Institutional Observatory (SHM v15 / VKL1)</title>
+<title>VORTEX-OMEGA V5.1 — Institutional Observatory (SHM v15 / VKL1)</title>
 <script src="https://unpkg.com/lightweight-charts@5.0.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root{--bg:#070b12;--panel:#0d1421;--panel2:#121b2d;--brd:#1e2d47;--txt:#e2e8f0;--muted:#8899b0;--cyan:#38bdf8;--green:#22c55e;--gold:#facc15;--orange:#fb923c;--red:#ef4444;--mono:'JetBrains Mono','Cascadia Code',Consolas,monospace;}
@@ -45,13 +45,72 @@ table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px
 th,td{padding:4px 6px;border-bottom:1px solid #162238;text-align:right;white-space:nowrap}
 th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;z-index:2}
 td.l,th.l{text-align:left}
-tr.slot-row:hover,tr.trade-row:hover{background:#152238;cursor:pointer}
-tr.selected-row{background:#132a46}
-.band-GOLD_SURGE{color:var(--gold);font-weight:700}
-.band-GREEN_WIN{color:var(--green);font-weight:700}
-.band-CYAN_SCRATCH{color:var(--cyan)}
-.band-RED_HEAT{color:var(--red);font-weight:700}
-.band-IDLE{color:var(--muted)}
+tr.slot-row{transition:background .12s ease}
+tr.slot-row:hover,tr.trade-row:hover{background:#16243b;cursor:pointer}
+tr.slot-row.state-open{background:rgba(14,46,74,.42)}
+tr.slot-row.state-open td:first-child{box-shadow:inset 3px 0 0 var(--cyan)}
+tr.slot-row.state-queue{background:rgba(66,46,9,.34)}
+tr.slot-row.state-queue td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
+tr.slot-row.state-arm-bid{background:rgba(8,47,27,.34)}
+tr.slot-row.state-arm-bid td:first-child{box-shadow:inset 3px 0 0 var(--green)}
+tr.slot-row.state-arm-ask{background:rgba(61,14,20,.34)}
+tr.slot-row.state-arm-ask td:first-child{box-shadow:inset 3px 0 0 var(--red)}
+tr.selected-row{background:#163254!important}
+.slot-idx{display:inline-flex;align-items:center;gap:5px;font-weight:700;color:#cbd5e1}
+.sdot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot-open{background:var(--cyan);box-shadow:0 0 6px var(--cyan)}
+.dot-gold{background:var(--gold);box-shadow:0 0 6px var(--gold)}
+.dot-queue{background:var(--gold);box-shadow:0 0 5px var(--gold)}
+.dot-green{background:var(--green);box-shadow:0 0 5px var(--green)}
+.dot-red{background:var(--red);box-shadow:0 0 5px var(--red)}
+.dot-orange{background:var(--orange)}
+.dot-violet{background:#a78bfa}
+.dot-rose{background:#fb7185}
+.dot-cyan{background:#60a5fa}
+.dot-idle{background:#475569}
+.sym-lbl{font-weight:700;color:#f1f5f9;letter-spacing:.2px}
+.side-tag{margin-left:5px;padding:1px 4px;border-radius:3px;font-size:9px;font-weight:700}
+.side-bid{background:#082e1a;border:1px solid #16a34a;color:#4ade80}
+.side-ask{background:#340d12;border:1px solid #dc2626;color:#f87171}
+.band-GOLD_SURGE{color:var(--gold);font-weight:700;background:rgba(250,204,21,.10)}
+.band-GREEN_WIN{color:var(--green);font-weight:700;background:rgba(34,197,94,.10)}
+.band-CYAN_SCRATCH{color:var(--cyan);font-weight:600;background:rgba(56,189,248,.08)}
+.band-RED_HEAT{color:var(--red);font-weight:700;background:rgba(239,68,68,.12)}
+.band-QUEUE{color:var(--cyan);font-weight:700}
+.band-IDLE{color:#475569}
+.tm-open{color:#fde047;font-weight:700}
+.tm-queue{color:var(--cyan);font-weight:600}
+.tm-idle{color:#475569}
+.px-bid{color:#4ade80}
+.px-ask{color:#f87171}
+.spr-tight{color:var(--green)}
+.spr-mid{color:var(--gold);font-weight:600}
+.spr-wide{color:var(--orange);font-weight:700}
+.fl-pos-hi{color:#22c55e;font-weight:700}
+.fl-pos{color:#86efac}
+.fl-neu{color:#64748b}
+.fl-neg{color:#fca5a5}
+.fl-neg-hi{color:#ef4444;font-weight:700}
+.wv-badge{padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700;margin-right:4px}
+.wv-impu{background:#082f49;color:#38bdf8;border:1px solid #0369a1}
+.wv-clim{background:#332206;color:#facc15;border:1px solid #a16207}
+.wv-corr{background:#162033;color:#94a3b8;border:1px solid #334155}
+.wv-warm{background:#0f172a;color:#64748b;border:1px solid #1e293b}
+.ob-bull{color:#4ade80}.ob-bear{color:#f87171}.ob-hi{font-weight:700;text-decoration:underline}
+.fnd-pos{color:#38bdf8}.fnd-neg{color:#fb923c}.fnd-neu{color:#64748b}
+.vpill{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.2px;border:1px solid transparent}
+.vpill-open{background:#082f49;border-color:#0284c7;color:#38bdf8}
+.vpill-gold{background:#332206;border-color:#ca8a04;color:#facc15}
+.vpill-queue{background:#2e2105;border-color:#d97706;color:#fde047}
+.vpill-bid{background:#072816;border-color:#16a34a;color:#4ade80}
+.vpill-ask{background:#300b0f;border-color:#dc2626;color:#f87171}
+.vpill-ready{background:#071f12;border-color:#15803d;color:#86efac}
+.vpill-warn{background:#2b1206;border-color:#ea580c;color:#fb923c}
+.vpill-bad{background:#330808;border-color:#dc2626;color:#fca5a5}
+.vpill-struct{background:#1f1137;border-color:#7c3aed;color:#c4b5fd}
+.vpill-shield{background:#2a0c19;border-color:#be123c;color:#fda4af}
+.vpill-quant{background:#0f1d32;border-color:#2563eb;color:#93c5fd}
+.vpill-idle{background:#0b1322;border-color:#1e293b;color:#8899b0}
 .player-box{padding:8px;border-top:1px solid var(--brd);background:#090f1a}
 #path-canvas{width:100%;height:110px;display:block;background:#060a11;border:1px solid var(--brd);border-radius:4px;margin-top:5px}
 #lab-console{padding:6px 8px;font-family:var(--mono);font-size:10px;color:#93c5fd;background:#05080f;border-top:1px solid var(--brd);min-height:26px;white-space:pre-wrap}
@@ -62,7 +121,7 @@ tr.selected-row{background:#132a46}
 <body>
 <header class="topbar">
   <div class="brand">
-    <span>VORTEX-OMEGA V5.0 OBSERVATORY</span>
+    <span>VORTEX-OMEGA V5.1 OBSERVATORY</span>
     <span id="hdr-shm" class="pill warn">SHM v15: INIT</span>
     <span id="hdr-hb" class="pill">HB: -- ms | Resyncs: 0</span>
     <span id="hdr-rtt" class="pill">WS RTT: -- us</span>
@@ -349,17 +408,75 @@ function renderLiveState(st) {
   el("slots-summary").textContent = "Open: " + st.open_slots + "/6 | Queue: " + st.queued_slots;
 
   if (Array.isArray(st.slots)) {
+    const fmtDur = function(sec) {
+      const n = Math.max(0, Math.floor(Number(sec) || 0));
+      if (n < 60) return n + "s";
+      if (n < 3600) return Math.floor(n / 60) + "m " + String(n % 60).padStart(2, "0") + "s";
+      return Math.floor(n / 3600) + "h " + String(Math.floor((n % 3600) / 60)).padStart(2, "0") + "m";
+    };
+    const flCls = function(v) {
+      const x = Number(v) || 0;
+      if (x >= 0.35) return "fl-pos-hi";
+      if (x >= 0.08) return "fl-pos";
+      if (x <= -0.35) return "fl-neg-hi";
+      if (x <= -0.08) return "fl-neg";
+      return "fl-neu";
+    };
+    const waveHtml = function(wRaw) {
+      const w = String(wRaw || "Warm");
+      const u = w.toUpperCase();
+      if (u.indexOf("IMPU") >= 0) return "<span class='wv-badge wv-impu'>Impu</span>";
+      if (u.indexOf("CLIM") >= 0) return "<span class='wv-badge wv-clim'>Clim</span>";
+      if (u.indexOf("CORR") >= 0) return "<span class='wv-badge wv-corr'>Corr</span>";
+      return "<span class='wv-badge wv-warm'>Warm</span>";
+    };
+    const slotMeta = function(s) {
+      const vb = String(s.veto_badge || "").toUpperCase();
+      if (s.state_code >= 3) {
+        const gold = s.upl_band === "GOLD_SURGE";
+        const red = s.upl_band === "RED_HEAT";
+        return { row: " state-open", dot: red ? "dot-red" : (gold ? "dot-gold" : "dot-open"), pill: gold ? "vpill-gold" : "vpill-open" };
+      }
+      if (s.state_code >= 1) return { row: " state-queue", dot: "dot-queue", pill: "vpill-queue" };
+      if (vb.indexOf("HALT") >= 0) return { row: "", dot: "dot-red", pill: "vpill-bad" };
+      if (vb.indexOf("ARM_BID") >= 0 || vb.indexOf("AUTH_LONG") >= 0) return { row: " state-arm-bid", dot: "dot-green", pill: "vpill-bid" };
+      if (vb.indexOf("ARM_ASK") >= 0 || vb.indexOf("AUTH_SHORT") >= 0) return { row: " state-arm-ask", dot: "dot-red", pill: "vpill-ask" };
+      if (vb === "READY" || vb === "NONE_CLEAR") return { row: "", dot: "dot-green", pill: "vpill-ready" };
+      if (vb.indexOf("SPOOF") >= 0 || vb.indexOf("DRAIN") >= 0 || vb.indexOf("WARM") >= 0 || vb.indexOf("LOCK") >= 0) return { row: "", dot: "dot-orange", pill: "vpill-warn" };
+      if (vb.indexOf("MACRO") >= 0 || vb.indexOf("OB_WALL") >= 0) return { row: "", dot: "dot-violet", pill: "vpill-struct" };
+      if (vb.indexOf("SCAR") >= 0 || vb.indexOf("HWK") >= 0 || vb.indexOf("HAWKES") >= 0 || vb.indexOf("HEADW") >= 0 || vb.indexOf("DECAY") >= 0 || vb.indexOf("DRIFT") >= 0) return { row: "", dot: "dot-rose", pill: "vpill-shield" };
+      if (vb.indexOf("QUANTUM") >= 0 || vb.indexOf("LOT") >= 0 || vb.indexOf("Q_WALL") >= 0 || vb.indexOf("BETA") >= 0 || vb.indexOf("STAGGER") >= 0 || vb.indexOf("KIN") >= 0 || vb.indexOf("UTC") >= 0) return { row: "", dot: "dot-cyan", pill: "vpill-quant" };
+      return { row: "", dot: "dot-idle", pill: "vpill-idle" };
+    };
     el("slots-body").innerHTML = st.slots.map(function(s) {
+      const m = slotMeta(s);
       const selCls = s.symbol === VX.symbol ? " selected-row" : "";
-      const pyg = s.state_code >= 3 ? (sgn(s.upl_bps, 2) + "bp (" + sgn(s.upl_pct_10x, 2) + "%)") : "-";
-      const tCol = s.state_code >= 3 ? (s.hold_sec + "s") : (s.state_code >= 1 ? ("Q:" + s.hold_sec + "s (" + s.queue_ahead_lots + "L)") : "-");
-      const wob = s.wave_regime + " " + s.ob_bull_pm + "/" + s.ob_bear_pm + " " + sgn(s.funding_bps, 1) + "b";
-      return "<tr class='slot-row" + selCls + "' data-sym='" + s.symbol + "'>" +
-        "<td>" + s.slot_idx + "</td><td class='l'>" + s.symbol + "</td>" +
-        "<td class='band-" + s.upl_band + "'>" + pyg + "</td><td>" + tCol + "</td>" +
-        "<td>" + num(s.bid, 4) + "</td><td>" + num(s.ask, 4) + "</td><td>" + s.spread_ticks + "</td>" +
-        "<td>" + sgn(s.ofi, 2) + "</td><td>" + sgn(s.tfi, 2) + "</td><td>" + wob + "</td>" +
-        "<td class='l'>" + s.veto_badge + "</td></tr>";
+      const sdStr = String(s.side || "");
+      const sideHtml = s.state_code >= 1 && sdStr ? ("<span class='side-tag " + (sdStr === "Ask" ? "side-ask'>ASK" : "side-bid'>BID") + "</span>") : "";
+      const pygCls = s.state_code >= 3 ? ("band-" + (s.upl_band || "CYAN_SCRATCH")) : (s.state_code >= 1 ? "band-QUEUE" : "band-IDLE");
+      const pyg = s.state_code >= 3 ? (sgn(s.upl_bps, 2) + "bp (" + sgn(s.upl_pct_10x, 2) + "%)") : (s.state_code >= 1 ? "IN_QUEUE_L1" : "-");
+      const tCls = s.state_code >= 3 ? "tm-open" : (s.state_code >= 1 ? "tm-queue" : "tm-idle");
+      const tCol = s.state_code >= 3 ? fmtDur(s.hold_sec) : (s.state_code >= 1 ? ("Q:" + fmtDur(s.hold_sec) + " (" + s.queue_ahead_lots + "L)") : "-");
+      const spr = Number(s.spread_ticks) || 0;
+      const sprCls = spr <= 1 ? "spr-tight" : (spr <= 3 ? "spr-mid" : "spr-wide");
+      const obB = Number(s.ob_bull_pm) || 0, obA = Number(s.ob_bear_pm) || 0;
+      const fnd = Number(s.funding_bps) || 0;
+      const fndCls = fnd > 0.2 ? "fnd-pos" : (fnd < -0.2 ? "fnd-neg" : "fnd-neu");
+      const wob = waveHtml(s.wave_regime) +
+        "<span class='ob-bull" + (obB >= 600 ? " ob-hi" : "") + "'>" + obB + "</span>" +
+        "<span class='fl-neu'>/</span>" +
+        "<span class='ob-bear" + (obA >= 600 ? " ob-hi" : "") + "'>" + obA + "</span> " +
+        "<span class='" + fndCls + "'>" + sgn(fnd, 1) + "b</span>";
+      return "<tr class='slot-row" + m.row + selCls + "' data-sym='" + s.symbol + "'>" +
+        "<td><span class='slot-idx'><span class='sdot " + m.dot + "'></span>" + s.slot_idx + "</span></td>" +
+        "<td class='l'><span class='sym-lbl'>" + s.symbol + "</span>" + sideHtml + "</td>" +
+        "<td class='" + pygCls + "'>" + pyg + "</td><td class='" + tCls + "'>" + tCol + "</td>" +
+        "<td class='px-bid'>" + num(s.bid, 4) + "</td><td class='px-ask'>" + num(s.ask, 4) + "</td>" +
+        "<td class='" + sprCls + "'>" + spr + "</td>" +
+        "<td class='" + flCls(s.ofi) + "'>" + sgn(s.ofi, 2) + "</td>" +
+        "<td class='" + flCls(s.tfi) + "'>" + sgn(s.tfi, 2) + "</td>" +
+        "<td>" + wob + "</td>" +
+        "<td class='l'><span class='vpill " + m.pill + "'>" + (s.veto_badge || "IDLE") + "</span></td></tr>";
     }).join("");
   }
   syncSlotOverlays();
