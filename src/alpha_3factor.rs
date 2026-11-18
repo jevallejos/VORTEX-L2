@@ -484,10 +484,30 @@ impl OrthogonalFactorState {
         } else {
             0
         };
+        let w_entry = snap.wave_observables();
+        let (al_ob_pm, op_ob_pm) = match side {
+            Side::Bid => (snap.ob_bull_efficacy_pm, snap.ob_bear_efficacy_pm),
+            Side::Ask => (snap.ob_bear_efficacy_pm, snap.ob_bull_efficacy_pm),
+        };
+        if !passes_corrective_abc_fractal_guard_c1(side, w_entry, al_ob_pm, op_ob_pm) {
+            return SignalVerdict::NeutralNoAction;
+        }
         let raw_vol = snap.realized_vol_5m.raw() as f64;
         let learned_span = learned_mfe_bps.raw().max(0).saturating_add(learned_dir_edge_bps.raw().max(0));
         let eq_horizon = b3x_barrier.raw().saturating_mul(3).saturating_add(learned_span.saturating_mul(2)) as f64;
-        let eff_vol = if raw_vol < eq_horizon { (raw_vol * eq_horizon).sqrt() } else { raw_vol };
+        let eff_vol = if matches!(w_entry.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc) && raw_vol < eq_horizon {
+            let ob_tot = (al_ob_pm.max(382) + op_ob_pm.max(382)) as f64;
+            let rho_ob_v = if al_ob_pm > 0 || op_ob_pm > 0 { (al_ob_pm.max(382) as f64) / ob_tot } else { 0.50 };
+            let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob_v, 0.50, V45_INV_PHI);
+            let h_drag = crate::wave_elliott::hermite_smoothstep_c1(w_entry.hurst_exponent(), 0.50, V45_INV_PHI)
+                * (1.0 - V45_INV_PHI * s_ob);
+            let geom_mean = (raw_vol * eq_horizon).sqrt();
+            geom_mean - h_drag * (geom_mean - raw_vol).max(0.0)
+        } else if raw_vol < eq_horizon {
+            (raw_vol * eq_horizon).sqrt()
+        } else {
+            raw_vol
+        };
         let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
         let expected_excursion = ScaledBps(((composite.abs() * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
         if expected_excursion.raw() >= b3x_barrier.raw() {
@@ -964,6 +984,13 @@ pub fn passes_elastic_geom_and_macro_impulse_guard(
     {
         return Err(crate::lob_shm::LastVetoCode::MacroElliottContradiction);
     }
+    let (al_pm_i, op_pm_i) = match side {
+        crate::types::Side::Bid => (snap.ob_bull_efficacy_pm, snap.ob_bear_efficacy_pm),
+        crate::types::Side::Ask => (snap.ob_bear_efficacy_pm, snap.ob_bull_efficacy_pm),
+    };
+    if !passes_corrective_abc_fractal_guard_c1(side, w_obs, al_pm_i, op_pm_i) {
+        return Err(crate::lob_shm::LastVetoCode::MacroElliottContradiction);
+    }
 
     let bull_pm = snap.ob_bull_efficacy_pm as f64;
     let bear_pm = snap.ob_bear_efficacy_pm as f64;
@@ -1112,7 +1139,7 @@ mod v49_geom_macro_guard_tests {
         });
         assert_eq!(
             passes_elastic_geom_and_macro_impulse_guard(&eth18, Side::Bid, 0.10),
-            Err(LastVetoCode::SpoofingVeto)
+            Err(LastVetoCode::MacroElliottContradiction)
         );
 
         // 3. Real AVAX #5 WIN (Bid, geom = +0.23, aligned ImpulseWave3 +0.73, OB+ 742 > OB- 675) -> OK.
@@ -1139,5 +1166,60 @@ mod v49_geom_macro_guard_tests {
         assert!(should_abort_collapsed_resting_l1_wall(
             APPROVED_SPECS[4], Side::Ask, PriceTicks(19_336), &q_snap, LotQty(740),
         ));
+    }
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn passes_corrective_abc_fractal_guard_c1(
+    side: crate::types::Side,
+    wave: crate::wave_elliott::WaveObservables,
+    ob_align_pm: i64,
+    ob_opp_pm: i64,
+) -> bool {
+    const INV_PHI_C: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_C: f64 = 0.381_966_011_250_105;
+    const INV_PHI3_C: f64 = 0.236_067_977_499_79;
+    if !matches!(wave.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc) {
+        return true;
+    }
+    let aligned_macro = side.sign_f64() * wave.macro_phase.get();
+    let rho_ob = if ob_align_pm > 0 || ob_opp_pm > 0 {
+        let a = (ob_align_pm.max(382)) as f64;
+        let b = (ob_opp_pm.max(382)) as f64;
+        (a / (a + b)).clamp(0.0, 1.0)
+    } else {
+        0.50
+    };
+    let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob, INV_PHI2_C, INV_PHI_C);
+    let s_adv_macro = crate::wave_elliott::hermite_smoothstep_c1(-aligned_macro, 0.0, INV_PHI_C);
+    let macro_floor = -INV_PHI3_C * (0.50 + s_ob);
+    if aligned_macro < macro_floor {
+        return false;
+    }
+    let s_pos_m = crate::wave_elliott::hermite_smoothstep_c1(aligned_macro, INV_PHI3_C, INV_PHI_C); let h_crit = 0.50 + INV_PHI3_C * s_ob + 0.090_169_943_749_47 * s_pos_m - INV_PHI3_C * s_adv_macro;
+    wave.hurst_exponent() <= h_crit
+}
+
+#[cfg(test)]
+mod v51_f5_abc_fractal_and_1lot_ev_tests {
+    use super::*;
+    use crate::types::{passes_asymmetry_ev_gate_v51, APPROVED_SPECS};
+    use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+    #[test]
+    fn test_v51_f5_blocks_high_hurst_abc_losses_and_artificial_1lot_ev() {
+        let w_avax3 = WaveObservables {
+            regime: WaveRegime::CorrectiveAbc, climax_active: false, hurst: WaveObservables::encode_hurst(0.674),
+            macro_phase: BoundedScore::new_clamped(-0.10), oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO, fib_proj_bps: ScaledBps(0),
+        };
+        assert!(!passes_corrective_abc_fractal_guard_c1(Side::Ask, w_avax3, 490, 510));
+        let w_ob_backed = WaveObservables { hurst: WaveObservables::encode_hurst(0.575), macro_phase: BoundedScore::new_clamped(0.35), ..w_avax3 };
+        assert!(passes_corrective_abc_fractal_guard_c1(Side::Bid, w_ob_backed, 780, 420));
+        let eth = APPROVED_SPECS[1];
+        assert!(!passes_asymmetry_ev_gate_v51(eth, PriceTicks(179_961), LotQty(1), ScaledBps(560), ScaledBps(580), ScaledBps(1_850), 50, BoundedScore::new_clamped(0.55), FeeSchedule::VIP0_DEFAULT));
+        assert!(passes_asymmetry_ev_gate_v51(eth, PriceTicks(182_033), LotQty(1), ScaledBps(920), ScaledBps(820), ScaledBps(1_600), 45, BoundedScore::new_clamped(0.95), FeeSchedule::VIP0_DEFAULT));
     }
 }

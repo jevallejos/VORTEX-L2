@@ -880,32 +880,38 @@ impl PairSpec {
             let tail_shield = (1.0 + PHI * q_struct + (ob_ratio - 1.0).max(0.0)).max(INV_PHI);
             return (p_mkr * mfe_split_net) > ((p_tkr * wald_sl_net) / tail_shield);
         }
-        let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) / 1_000.0;
-        let p_mkr = 1.0 - p_tkr;
-        let c_mkr_rt = fees.round_trip_maker_exit_bps().raw() as f64;
-        let c_tkr_rt = (fees.round_trip_taker_exit_bps().raw().max(100)) as f64;
-        let eq_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0.saturating_mul(4));
-        let eq_sl = Self::elastic_server_sl_distance_bps_with_fees(eq_vol, fees).raw().max(100) as f64;
+        const PHI_SQ: f64 = 2.618_033_988_749_895;
+        const SQRT_5: f64 = PHI + INV_PHI;
+        let b3x_f = (self.three_x_friction_barrier_bps_dynamic(mid_price, taker_prob_pm, fees).raw().max(300)) as f64;
+        let eq_vol_f = (PHI_SQ * b3x_f).max(3_200.0);
+        let vol_f = (realized_vol_5m.raw().max(0)) as f64;
         let srv_sl = Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
         let g_clamped = signed_geom.clamp(-1.0, 1.0);
-        let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
-        let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
-        let vol_scale = 1.0 + h_vol * ((srv_sl / eq_sl) - 1.0).max(0.0);
-        let mfe_eff = (learned_mfe_bps.max(0) as f64) * vol_scale - c_mkr_rt;
-        if mfe_eff <= 10.0 {
-            return false;
-        }
-        let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt + INV_PHI2 * (raw_tick_bps.raw() as f64);
-        let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
+        let u_g = ((g_clamped - INV_PHI3) / (0.854_101_966_249_685 - INV_PHI3)).clamp(0.0, 1.0);
         let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
         let (al_raw, op_raw) = match side {
             Side::Bid => (ob_bull_pm, ob_bear_pm),
             Side::Ask => (ob_bear_pm, ob_bull_pm),
         };
         let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
-        let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
-        let eff_tail_cost = (p_tkr * wald_sl_net) / (INV_PHI + PHI * q_struct);
-        (p_mkr * mfe_eff) > eff_tail_cost
+        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio));
+        let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
+        let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
+        let mfe_f = (learned_mfe_bps.max(100)) as f64;
+        let diff_1m = vol_f / SQRT_5;
+        let vol_exp = if vol_f > eq_vol_f {
+            1.0 + h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
+        } else {
+            1.0 - INV_PHI3 * (1.0 - h_geom) * (1.0 - (vol_f / eq_vol_f).clamp(0.0, 1.0))
+        };
+        let eff_mfe = ScaledBps((mfe_f * vol_exp * (1.0 + INV_PHI3 * h_geom * ob_ratio)).round() as i64);
+        let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2)).round() as i64);
+        let c_rt_dyn = (self.expected_round_trip_cost_bps_dynamic(mid_price, taker_prob_pm, fees).raw().max(150)) as f64;
+        let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom))).round() as i64);
+        passes_asymmetry_ev_gate_v51(
+            self, mid_price, allocated_lots, dyn_target, eff_mfe,
+            diff_sl, taker_prob_pm, q_struct, fees,
+        )
     }
 }
 
@@ -950,4 +956,41 @@ mod single_lot_ev_v49_tests {
             LotQty(16), PriceTicks(7_316), ScaledBps(1_582), 726, 48, 0.17, 522, 478, Side::Ask, fees,
         ));
     }
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub fn passes_asymmetry_ev_gate_v51(
+    spec: PairSpec,
+    entry_px: PriceTicks,
+    allocated_lots: LotQty,
+    target_bps: ScaledBps,
+    learned_mfe_bps: ScaledBps,
+    sl_bps: ScaledBps,
+    taker_prob_pm: i64,
+    q_struct: BoundedScore,
+    fees: FeeSchedule,
+) -> bool {
+    const PHI_E: f64 = 1.618_033_988_749_895;
+    const INV_PHI_E: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_E: f64 = 0.381_966_011_250_105;
+    const INV_PHI3_E: f64 = 0.236_067_977_499_79;
+    if allocated_lots.0 <= 0 || entry_px.0 <= 0 { return false; }
+    let Ok(tau_tick) = spec.tick_to_price_scaled_bps(entry_px) else { return false; };
+    let p_t = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    let c_mkr = fees.round_trip_maker_exit_bps().raw() as f64;
+    let c_tkr = (fees.round_trip_taker_exit_bps().raw().max(50)) as f64;
+    let q_pos = q_struct.get().clamp(0.0, 1.0);
+    let cap_gross = (learned_mfe_bps.raw().max(0).min(target_bps.raw().max(0))) as f64;
+    let sl_all_in = (sl_bps.raw().max(0) as f64) + c_tkr + INV_PHI2_E * (tau_tick.raw() as f64);
+    if spec.can_split_runner_legs(allocated_lots, entry_px) {
+        let g_net = cap_gross * (1.0 + INV_PHI2_E * q_pos) - c_mkr;
+        let shield = 1.0 + PHI_E * q_pos;
+        return g_net > 10.0 && ((1.0 - p_t) * g_net) > ((p_t * sl_all_in) / shield);
+    }
+    let mkr_net = (INV_PHI_E + INV_PHI2_E * q_pos) * cap_gross - c_mkr;
+    let ev_1lot = (1.0 - p_t) * mkr_net - p_t * sl_all_in;
+    let min_edge = INV_PHI3_E * c_mkr.max(100.0);
+    mkr_net > min_edge && ev_1lot >= min_edge
 }
