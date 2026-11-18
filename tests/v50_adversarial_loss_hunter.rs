@@ -681,14 +681,21 @@ fn test_v501_wave4_win_wiper_catastrophic_tail_hunter() {
     let mut eng26_inv = eng26.clone();
     let _ = eng26_inv.step_open_position_v49(&s_sol26, &btc_crash, &gov, &mut led26, -1.10, &ring, 1.2);
     let inv_unshrunk = (7_437 - eng26_inv.last_eff_sl_ticks.0) == init_sol_sl;
-    let mut eng26_inv = eng26.clone();
-    let _ = eng26_inv.step_open_position_v49(&s_sol26, &btc_crash, &gov, &mut led26, -1.10, &ring, 1.2);
-    let inv_unshrunk = (7_437 - eng26_inv.last_eff_sl_ticks.0) == init_sol_sl;
     let _ = eng26.step_open_position_v49(&s_sol26, &btc_crash, &gov, &mut led26, 1.35, &ring, 1.2);
     let comp_sol_sl = 7_437 - eng26.last_eff_sl_ticks.0;
     let v26_shrink = ((init_sol_sl - comp_sol_sl) * 100) / init_sol_sl.max(1);
     println!("  [V26 BTC_CRASH_CONTAGION  ] LaggingSOL + BTC(-0.98) Beta=+1.35 -> SL={}t->{}t (Shrink={}%) -> SEALED", init_sol_sl, comp_sol_sl, v26_shrink);
     assert!(inv_unshrunk && v26_shrink >= 55);
+
+    // V28: Kaplan-Meier Right-Censored Scratch MFE Guard (Exact Live V5.0 TAO #1 19505t->19514t)
+    let mut eng28 = SlotExecutionEngine::new(4);
+    eng28.learned_mfe_bps = 594;
+    eng28.last_closed_mfe_bps = 461;
+    eng28.last_exit_sub_reason = vortex_rs::execution_fsm::ExitSubReason::AdverseScratchEscape;
+    let mut led28 = ParitySyncLedger::new(LIVE_WALLET_1E8);
+    let _ = eng28.finalize_close_with_lots(ClosedTradeKind::MakerPassiveUnwind, Side::Bid, PriceTicks(19_505), PriceTicks(19_514), LotQty(12), 1, None, TimestampNs(t0), &mut led28);
+    println!("  [V28 KAPLAN_MEIER_SCRATCH ] TAO#1 Scratch(+4.61bp) kept MFE={} (not shrunk to 578) -> SEALED", eng28.learned_mfe_bps);
+    assert_eq!(eng28.learned_mfe_bps, 594);
 
     // V27: Live Bybit 10001 SL-Rejection Amnesia Guard (Preserves tight SL & triggers P0-A Flatten)
     let shm27 = MappedShmRegion::ephemeral_self_test_path("v501_v27_sl_amnesia");
