@@ -12,18 +12,21 @@
 use crate::fee_cadence_beta::FeeSchedule;
 use crate::lob_shm::{SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
 use crate::types::{
-    LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, VortexError, APPROVED_SPECS,
-    SPLIT_LEG_MIN_NOTIONAL_1E8,
+    BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, VortexError,
+    APPROVED_SPECS, SPLIT_LEG_MIN_NOTIONAL_1E8,
 };
-use crate::wave_elliott::{CausalElliottWaveState, WaveRegime};
+use crate::wave_elliott::{CausalElliottWaveState, WaveObservables, WaveRegime};
 use crate::ws_protocol::parse_verified_avg_price_ticks;
 
 pub const OFFENSIVE_WIN_FLOOR_GROSS_BPS: i64 = 520;
 pub const MAX_CLOSE_RECONCILE_RETRIES: u8 = 4;
 
+const PHI: f64 = 1.618_033_988_749_895;
 const PHI_SQ: f64 = 2.618_033_988_749_895;
 const INV_PHI: f64 = 0.618_033_988_749_895;
 const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
+const INV_PHI_CUBE: f64 = 0.236_067_977_499_79;
+const INV_PHI_FIFTH: f64 = 0.090_169_943_749_47;
 const PHI_CONJ_DELTA_PM: f64 = 118.0;
 const SWING_RATIO_300S_15S_SQRT: f64 = 4.472_135_954_999_58;
 const MIN_VALID_UTC_EPOCH_NS: i64 = 1_577_836_800_000_000_000;
@@ -630,6 +633,38 @@ const fn pick_more_ambitious_tp(pos_side: Side, a: PriceTicks, b: PriceTicks) ->
     }
 }
 
+#[inline]
+#[must_use]
+fn hermite_s3_unit(x: f64, lo: f64, hi: f64) -> f64 {
+    if hi <= lo { return if x >= hi { 1.0 } else { 0.0 }; }
+    let u = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+#[inline]
+#[must_use]
+pub fn compute_reversible_defensive_state_c1(
+    cur_gross_bps: ScaledBps,
+    win_floor_bps: ScaledBps,
+    signed_flow_slow: BoundedScore,
+    taker_prob_pm: i64,
+    ir_x100: i64,
+    wave: WaveObservables,
+    side: Side,
+    prev_locked: bool,
+) -> (bool, bool) {
+    let aligned_phase = wave.macro_phase.get() * side.sign_f64();
+    let opposing_wave3_escape = matches!(wave.regime, WaveRegime::ImpulseWave3) && aligned_phase <= -INV_PHI;
+    if opposing_wave3_escape { return (true, true); }
+    if !prev_locked { return (false, false); }
+    let p_taker = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    let ir_pos = (ir_x100.clamp(0, 100) as f64) * 1e-2;
+    let phi_unlock = (INV_PHI_CUBE * (1.0 + PHI * p_taker) / (1.0 + INV_PHI * ir_pos)).clamp(INV_PHI_FIFTH, PHI);
+    let recov_s3 = hermite_s3_unit(cur_gross_bps.raw() as f64, 0.0, (win_floor_bps.raw().max(100)) as f64);
+    let eff_unlock = phi_unlock * (1.0 - INV_PHI_CUBE * recov_s3);
+    (signed_flow_slow.get() < eff_unlock, false)
+}
+
 #[must_use]
 pub fn compute_canonical_exit_quote_omega(
     ctx: &OpenExitContext,
@@ -644,77 +679,77 @@ pub fn compute_canonical_exit_quote_omega(
     let dir_s = ctx.side.sign_f64();
     let d_sign = ctx.side.sign_i64();
     let own_flow = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+    let signed_flow_slow = BoundedScore::new_clamped(kin.flow_ema_slow * dir_s);
+    let has_live_kin = kin.flow_ema_slow.abs() > 1e-9 || kin.flow_ema_fast.abs() > 1e-9;
+    let eff_flow_slow = if has_live_kin { signed_flow_slow.get() } else { own_flow };
     let (s_prop, flow_accel) = evaluate_shadow_runner_propulsion(ctx.side, snap, kin.flow_ema_fast, kin.flow_ema_slow);
     let bbo_exit_px = match ctx.side { Side::Bid => snap.asks[0].price, Side::Ask => snap.bids[0].price };
     let ref_px = if bbo_exit_px.0 > 0 { bbo_exit_px } else if snap.mark_price.0 > 0 { snap.mark_price } else { snap.last_trade_price };
     let avg_denom = ctx.avg_price_ticks.0.max(1);
     let cur_gross_bps = if ref_px.0 > 0 { ((ref_px.0 - ctx.avg_price_ticks.0).saturating_mul(d_sign).saturating_mul(1_000_000)) / avg_denom } else { 0 };
     let state_mfe = ((ctx.peak_favorable_price.0 - ctx.avg_price_ticks.0).saturating_mul(d_sign).saturating_mul(1_000_000)) / avg_denom;
-    let state_mae = ((ctx.worst_adverse_price.0 - ctx.avg_price_ticks.0).saturating_mul(d_sign).saturating_mul(1_000_000)) / avg_denom;
     let best_mfe_bps = ctx.last_closed_mfe_bps.max(state_mfe).max(cur_gross_bps);
-    let worst_mae_bps = ctx.last_closed_mae_bps.min(state_mae);
     let w_obs = snap.wave_observables();
-    let wave_def_mult = CausalElliottWaveState::evaluate_wave_entry_modulation(w_obs, ctx.side, own_flow).map_or(1_000, |m| m.def_horizon_permille_mult);
+    let wave_def_mult = CausalElliottWaveState::evaluate_wave_entry_modulation(w_obs, ctx.side, eff_flow_slow).map_or(1_000, |m| m.def_horizon_permille_mult);
     let aligned_fib_rem_bps = w_obs.fib_proj_bps.raw().saturating_mul(d_sign).max(0);
     let aligned_phase = w_obs.macro_phase.get() * dir_s;
     let hold_s = snap.ts_local_ns.0.saturating_sub(ctx.opened_ts.0).max(0) / 1_000_000_000;
     let tau_s = ctx.intrinsic_tau_mkt_s.max(90);
-    let wald_pct = if hold_s >= 20 && cur_gross_bps < fee_rt && own_flow < 0.05 {
-        ((((hold_s * 100) / tau_s).clamp(0, 120) / 4) + (((-own_flow).max(0.0) * 28.0).round() as i64)).clamp(0, 42)
+    let wald_pct = if hold_s >= 20 && cur_gross_bps < fee_rt && eff_flow_slow < 0.05 {
+        ((((hold_s * 100) / tau_s).clamp(0, 120) / 4) + (((-eff_flow_slow).max(0.0) * 28.0).round() as i64)).clamp(0, 42)
     } else { 0 };
     let climax_harvest = (w_obs.climax_active || w_obs.regime == WaveRegime::ClimaxExhaustion)
         && aligned_phase > 0.0 && (cur_gross_bps >= zero_loss_bps || best_mfe_bps >= win_floor_bps);
+    let (_, opposing_wave3_escape) = compute_reversible_defensive_state_c1(
+        ScaledBps(cur_gross_bps), ScaledBps(win_floor_bps), signed_flow_slow,
+        ctx.learned_taker_prob_pm, ctx.learned_ir_x100, w_obs, ctx.side, ctx.defensive_floor_locked,
+    );
     let eff_def_s = (((tau_s / 4).max(45) * wave_def_mult) / 1_000).clamp(30, 240);
     let sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(snap.realized_vol_5m, ctx.active_fees).raw();
     let gamma_pm = (220 + ctx.learned_ir_x100.clamp(-40, 80)).clamp(180, 300);
     let mae_trig_bps = -((sl_bps * gamma_pm) / 1_000).max(ctx.learned_ret_std_bps / 6).max(450);
-    let defensive_lock_active = ctx.defensive_floor_locked
-        || worst_mae_bps <= mae_trig_bps
-        || (hold_s >= eff_def_s && cur_gross_bps < win_floor_bps && own_flow < 0.12)
-        || climax_harvest;
+    let ir_norm = (ctx.learned_ir_x100.clamp(0, 100) as f64) * 1e-2;
+    let stag_flow_ceil = INV_PHI_CUBE * (1.0 - INV_PHI_SQ * ir_norm);
+    let live_deep_underwater = cur_gross_bps <= mae_trig_bps && eff_flow_slow < 0.0;
+    let time_stagnation = hold_s >= eff_def_s && cur_gross_bps < win_floor_bps && eff_flow_slow < stag_flow_ceil;
+    let defensive_lock_active = ctx.defensive_floor_locked || opposing_wave3_escape || live_deep_underwater || time_stagnation || climax_harvest;
     let eff_ratchet_bps = if best_mfe_bps >= (fee_rt * 139) / 100 {
         ctx.ratchet_locked_gross_bps.max(fee_rt + ((best_mfe_bps - fee_rt) * 72) / 100).max(win_floor_bps)
-    } else {
-        ctx.ratchet_locked_gross_bps
-    };
+    } else { ctx.ratchet_locked_gross_bps };
     let ratchet_pullback = eff_ratchet_bps >= win_floor_bps
-        && ((own_flow <= -0.12) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < 0.25));
+        && ((own_flow <= -0.5 * INV_PHI_CUBE) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < INV_PHI_CUBE));
     let shadow_crest_snap = best_mfe_bps >= fee_rt * 2 && cur_gross_bps >= zero_loss_bps && s_prop < 0.18 && flow_accel < -0.005;
-    if !ctx.tranche1_harvested && !defensive_lock_active && !ratchet_pullback && !shadow_crest_snap {
-        let urgency = if own_flow >= 0.45 { 0.50 } else { 0.65 };
-        let win1_px = enforce_maker_bbo_bound(
-            ctx.side, elastic_offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, fee_rt, snap.realized_vol_5m, urgency), snap,
-        );
+    if !ctx.tranche1_harvested && !ratchet_pullback && !shadow_crest_snap && !opposing_wave3_escape && !climax_harvest
+        && (!defensive_lock_active || (!ctx.defensive_floor_locked && signed_flow_slow.get() >= INV_PHI_FIFTH))
+    {
+        let raw_t1_px = if defensive_lock_active {
+            dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(zero_loss_bps))
+        } else {
+            let urgency = (INV_PHI - INV_PHI_FIFTH * own_flow.clamp(0.0, 1.0) * (1.0 + ir_norm)).clamp(0.50, INV_PHI);
+            elastic_offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, fee_rt, snap.realized_vol_5m, urgency)
+        };
+        let win1_px = enforce_maker_bbo_bound(ctx.side, raw_t1_px, snap);
         let eff_t1_pm = compute_wave_dynamic_t1_permille(ctx.learned_t1_permille, ctx.side, snap, kin.in_scar_debt);
         if let Some(t1_lots) = compute_tranche1_split_lots_core(ctx.slot_idx, ctx.open_lots, win1_px, eff_t1_pm) {
             return Some(CanonicalExitQuote {
                 role: ExitOrderRole::Tranche1Harvest50, target_price: win1_px, order_lots: t1_lots,
                 sub_reason: ExitSubReason::Tranche1Harvest50, vac_level: 1,
-                defensive_lock_active: false, urgent_close_repeg: false, cur_gross_bps, wald_pct,
+                defensive_lock_active, urgent_close_repeg: defensive_lock_active, cur_gross_bps, wald_pct,
             });
         }
     }
     let role = if ctx.tranche1_harvested { ExitOrderRole::LvdbsDeepSurf50 } else { ExitOrderRole::StandardMakerExit100 };
     if defensive_lock_active || ratchet_pullback || shadow_crest_snap {
-        let floor_bps = if climax_harvest || shadow_crest_snap {
+        let floor_bps = if climax_harvest || shadow_crest_snap || opposing_wave3_escape {
             cur_gross_bps.max(eff_ratchet_bps).max(zero_loss_bps)
-        } else if ratchet_pullback || eff_ratchet_bps >= win_floor_bps {
-            eff_ratchet_bps
-        } else {
-            zero_loss_bps
-        };
+        } else if ratchet_pullback || eff_ratchet_bps >= win_floor_bps { eff_ratchet_bps } else { zero_loss_bps };
         let target_price = enforce_maker_bbo_bound(
             ctx.side, dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(floor_bps.max(zero_loss_bps))), snap,
         );
-        let sub_reason = if climax_harvest {
-            ExitSubReason::ClimaxExhaustionHarvest
-        } else if shadow_crest_snap {
-            ExitSubReason::ShadowRunnerCrestHarvest
-        } else if eff_ratchet_bps >= win_floor_bps {
-            ExitSubReason::ConvexMfeRatchetLock
-        } else {
-            ExitSubReason::AdverseScratchEscape
-        };
+        let sub_reason = if climax_harvest { ExitSubReason::ClimaxExhaustionHarvest }
+            else if shadow_crest_snap { ExitSubReason::ShadowRunnerCrestHarvest }
+            else if eff_ratchet_bps >= win_floor_bps { ExitSubReason::ConvexMfeRatchetLock }
+            else { ExitSubReason::AdverseScratchEscape };
         return Some(CanonicalExitQuote {
             role, target_price, order_lots: ctx.open_lots, sub_reason, vac_level: 1,
             defensive_lock_active, urgent_close_repeg: true, cur_gross_bps, wald_pct,
@@ -754,9 +789,7 @@ pub fn compute_canonical_exit_quote_omega(
             ctx.side, ctx.avg_price_ticks,
             ScaledBps(cur_gross_bps.max(0).saturating_add(delta_sh).max(eff_ratchet_bps).clamp(win_floor_bps, max_fib_cap)),
         )
-    } else if within_float && s_prop >= 0.18 && ctx.active_exit_price != ctx.structural_tp_price {
-        ctx.active_exit_price
-    } else { PriceTicks(0) };
+    } else if within_float && s_prop >= 0.18 && ctx.active_exit_price != ctx.structural_tp_price { ctx.active_exit_price } else { PriceTicks(0) };
     let pre_fib_best = pick_more_ambitious_tp(ctx.side, base_tp, lvdbs_px);
     let combined_best = pick_more_ambitious_tp(ctx.side, pick_more_ambitious_tp(ctx.side, pre_fib_best, fib_px), sentinel_px);
     let fib_or_shadow_ext = (fib_px.0 > 0 || sentinel_px.0 > 0) && combined_best != pre_fib_best;
@@ -765,13 +798,9 @@ pub fn compute_canonical_exit_quote_omega(
         ctx.side, spec, ctx.avg_price_ticks, combined_best, ctx.active_fees,
     );
     let target_price = enforce_maker_bbo_bound(ctx.side, pick_more_ambitious_tp(ctx.side, min_win_px, ob_tp), snap);
-    let (vac_level, sub_reason) = if fib_or_shadow_ext {
-        (lvdbs_vac_level.max(3), ExitSubReason::FibonacciImpulseSurf)
-    } else if lvdbs_vac_level >= 2 {
-        (lvdbs_vac_level, ExitSubReason::LvdbsDeepVacuumSurf)
-    } else {
-        (1, ExitSubReason::StandardStructuralTp)
-    };
+    let (vac_level, sub_reason) = if fib_or_shadow_ext { (lvdbs_vac_level.max(3), ExitSubReason::FibonacciImpulseSurf) }
+        else if lvdbs_vac_level >= 2 { (lvdbs_vac_level, ExitSubReason::LvdbsDeepVacuumSurf) }
+        else { (1, ExitSubReason::StandardStructuralTp) };
     Some(CanonicalExitQuote {
         role, target_price, order_lots: ctx.open_lots, sub_reason, vac_level,
         defensive_lock_active: false, urgent_close_repeg: false, cur_gross_bps, wald_pct,
@@ -788,7 +817,6 @@ pub fn compute_canonical_exit_quote_core(ctx: &OpenExitContext, snap: &SymbolLob
 mod tests {
     use super::*;
     use crate::lob_shm::BookLevel;
-    use crate::types::BoundedScore;
 
     #[test]
     fn test_v46_exit_quoter_vip_rebate_zero_loss_floor_and_chandelier_profit_lock() {
@@ -797,11 +825,8 @@ mod tests {
         let z_vip0 = defensive_zero_loss_maker_exit_price_with_fees(Side::Bid, PriceTicks(759_000), vip0);
         let z_reb = defensive_zero_loss_maker_exit_price_with_fees(Side::Bid, PriceTicks(759_000), mm_rebate);
         assert!(z_reb.0 > 759_000 && z_reb.0 < z_vip0.0);
-
-        // Chandelier profit-lock SL requires > 7.50 bps under VIP-0, but locks net-green at +4.00 bps under MM rebate!
         assert!(!is_chandelier_profit_locked_sl_with_fees(Side::Bid, PriceTicks(10_000), PriceTicks(10_004), vip0));
         assert!(is_chandelier_profit_locked_sl_with_fees(Side::Bid, PriceTicks(10_000), PriceTicks(10_004), mm_rebate));
-
         let mut snap = SymbolLobSnapshot::new_empty();
         snap.symbol_id = APPROVED_SPECS[3].symbol_id;
         snap.realized_vol_5m = ScaledBps(7_000);
@@ -831,5 +856,52 @@ mod tests {
             last_closed_mfe_bps: 200, last_closed_mae_bps: 0, active_fees: mm_rebate, learned_taker_prob_pm: 50,
         };
         assert!(compute_canonical_exit_quote_core(&ctx, &s_ok).is_some_and(|q| q.urgent_close_repeg));
+    }
+
+    #[test]
+    fn test_v51_f2_reversible_unlock_runner_preservation_and_wave3_escape() {
+        let mut eth_s = SymbolLobSnapshot::new_empty();
+        eth_s.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth_s.ts_local_ns = TimestampNs(115_000_000_000);
+        eth_s.realized_vol_5m = ScaledBps(2_200);
+        eth_s.bids[0] = BookLevel { price: PriceTicks(179_618), qty: LotQty(620) };
+        eth_s.asks[0] = BookLevel { price: PriceTicks(179_619), qty: LotQty(210) };
+        eth_s.factor_ofi = BoundedScore::new_clamped(0.58);
+        eth_s.factor_tfi = BoundedScore::new_clamped(0.71);
+        let w3 = WaveObservables {
+            regime: WaveRegime::ImpulseWave3, climax_active: false, hurst: WaveObservables::encode_hurst(0.68),
+            macro_phase: BoundedScore::new_clamped(0.90), oi_impulse: BoundedScore::new_clamped(0.35),
+            liq_imbalance: BoundedScore::new_clamped(0.40), fib_proj_bps: ScaledBps(4_559),
+        };
+        eth_s.set_wave_observables(w3);
+        assert_eq!(compute_reversible_defensive_state_c1(ScaledBps(428), ScaledBps(520), BoundedScore::new_clamped(0.62), 50, 25, w3, Side::Bid, true), (false, false));
+        let eth_ctx = OpenExitContext {
+            slot_idx: 1, side: Side::Bid, avg_price_ticks: PriceTicks(179_542),
+            peak_favorable_price: PriceTicks(179_619), worst_adverse_price: PriceTicks(179_352),
+            initial_lots: LotQty(1), open_lots: LotQty(1), tranche1_harvested: false,
+            tranche1_lots: LotQty(0), tranche1_exit_price: PriceTicks(0), defensive_floor_locked: false,
+            active_exit_price: PriceTicks(180_200), structural_tp_price: PriceTicks(180_200),
+            resting_exit_price: PriceTicks(179_619), sl_trigger_price: PriceTicks(179_100),
+            opened_ts: TimestampNs(5_000_000_000), learned_mfe_bps: 650, learned_t1_permille: 500,
+            learned_ir_x100: 25, learned_ret_std_bps: 220, intrinsic_tau_mkt_s: 180,
+            last_eff_sl_ticks: PriceTicks(179_100), ratchet_locked_gross_bps: 0,
+            last_closed_mfe_bps: 0, last_closed_mae_bps: -1_058, active_fees: FeeSchedule::VIP0_DEFAULT, learned_taker_prob_pm: 50,
+        };
+        let kin_win = ShadowRunnerKinematics { flow_ema_fast: 0.66, flow_ema_slow: 0.62, in_scar_debt: false, chandelier_armed: false };
+        assert!(compute_canonical_exit_quote_omega(&eth_ctx, kin_win, &eth_s).is_some_and(|q| !q.defensive_lock_active && q.target_price.0 > 180_000));
+        let mut tao_ctx = eth_ctx;
+        tao_ctx.slot_idx = 4; tao_ctx.avg_price_ticks = PriceTicks(19_505); tao_ctx.peak_favorable_price = PriceTicks(19_514);
+        tao_ctx.worst_adverse_price = PriceTicks(19_495); tao_ctx.open_lots = LotQty(12); tao_ctx.initial_lots = LotQty(12);
+        let mut tao_s = eth_s;
+        tao_s.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao_s.bids[0] = BookLevel { price: PriceTicks(19_513), qty: LotQty(180) };
+        tao_s.asks[0] = BookLevel { price: PriceTicks(19_514), qty: LotQty(90) };
+        let mut tao_w = w3; tao_w.regime = WaveRegime::CorrectiveAbc; tao_s.set_wave_observables(tao_w);
+        let kin_mild = ShadowRunnerKinematics { flow_ema_fast: 0.16, flow_ema_slow: 0.12, in_scar_debt: false, chandelier_armed: false };
+        assert!(compute_canonical_exit_quote_omega(&tao_ctx, kin_mild, &tao_s).is_some_and(|q| q.role == ExitOrderRole::Tranche1Harvest50 && q.defensive_lock_active && q.order_lots.0 < 12));
+        let mut eth6_ctx = eth_ctx; eth6_ctx.side = Side::Ask; eth6_ctx.worst_adverse_price = PriceTicks(179_560); eth6_ctx.last_closed_mae_bps = -100;
+        eth_s.ts_local_ns = TimestampNs(25_000_000_000);
+        let kin_ask = ShadowRunnerKinematics { flow_ema_fast: 0.45, flow_ema_slow: 0.40, in_scar_debt: false, chandelier_armed: false };
+        assert!(compute_canonical_exit_quote_omega(&eth6_ctx, kin_ask, &eth_s).is_some_and(|q| q.defensive_lock_active && q.urgent_close_repeg));
     }
 }
