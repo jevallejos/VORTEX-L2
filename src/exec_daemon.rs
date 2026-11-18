@@ -423,7 +423,7 @@ pub fn step_12_slot_daemon_tick(
                 rt.last_l1_q_obs[s_idx] = next_obs;
                 if let Ok(tel) = arena.telemetry(s_idx) { tel.store_queue_ahead_lots(next_q); }
                 let mut q_shield = engines[s_idx].evaluate_resting_queue_shield_with_beta(side, rt.init_q_ahead[s_idx], next_q, opp_hit, &snap, &btc_snap, epps_beta);
-                if crate::alpha_3factor::should_abort_collapsed_resting_l1_wall(spec, side, entry_price, &snap, rt.init_q_ahead[s_idx]) { q_shield.abort_now = true; }
+                if crate::alpha_3factor::should_abort_collapsed_resting_l1_wall_dynamic(spec, side, entry_price, &snap, rt.init_q_ahead[s_idx], engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees) { q_shield.abort_now = true; }
                 if rt.slot_rpc_inflight[s_idx] { continue; }
                 let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
                 let total_chase_ns = now_ns.0.saturating_sub(entry_forensics[s_idx].armed_ts_ns);

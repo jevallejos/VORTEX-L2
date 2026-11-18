@@ -451,7 +451,7 @@ impl PairSpec {
     }
 
     #[inline] #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::too_many_arguments)]
     pub fn passes_l1_queue_depth_and_wall_guard_dynamic(
         self,
         entry_price: PriceTicks,
@@ -465,7 +465,10 @@ impl PairSpec {
         taker_prob_pm: i64,
         fees: crate::fee_cadence_beta::FeeSchedule,
     ) -> bool {
-        if own_l1_lots.0 <= 0 || entry_price.0 <= 0 || self.lot_notional_1e8(own_l1_lots, entry_price) < 2_400_000_000 { return false; }
+        let p_tkr_f = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+        let fee_ratio = ((self.expected_round_trip_cost_bps_dynamic(entry_price, taker_prob_pm, fees).raw().max(150) as f64) / 420.0).clamp(0.618_033_988_749_895, 1.618_033_988_749_895);
+        let elastic_l1_floor_1e8 = ((BYBIT_MIN_ORDER_NOTIONAL_1E8 as f64) * 2.618_033_988_749_895 * fee_ratio * (1.0 + 1.618_033_988_749_895 * p_tkr_f)).round() as i64;
+        if own_l1_lots.0 <= 0 || entry_price.0 <= 0 || self.lot_notional_1e8(own_l1_lots, entry_price) < elastic_l1_floor_1e8 { return false; }
         if own_deep_l1_l5_lots.0.max(own_l1_lots.0) < self.min_resting_l1_lots_dynamic(entry_price, realized_vol_5m, taker_prob_pm, fees).0 { return false; }
         let Ok(tau_tick) = self.tick_to_price_scaled_bps(entry_price) else { return false };
         let diffusion_ticks = (realized_vol_5m.0.max(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0) as f64) / (tau_tick.0.max(1) as f64);

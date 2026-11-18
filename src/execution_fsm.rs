@@ -307,8 +307,19 @@ impl SlotExecutionEngine {
             let cur_gross_bps = if ref_px.0 > 0 { ((ref_px.0 - avg_price_ticks.0).saturating_mul(side.sign_i64()).saturating_mul(1_000_000)) / avg_price_ticks.0.max(1) } else { 0 };
             let dir_s = side.sign_f64();
             let own_flow = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
-            let win_floor = compute_elastic_offensive_win_floor_bps(self.active_maker_rt_fee_bps(), snap.realized_vol_5m).raw();
-            if hold_s >= 3 && st.exhaustion_unwind_active && cur_gross_bps < -200 && own_flow < 0.15 && cur_gross_bps < win_floor {
+            let win_floor =
+                compute_elastic_offensive_win_floor_bps(self.active_maker_rt_fee_bps(), snap.realized_vol_5m).raw();
+            let hold_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0);
+            let (req_dip_sbps, req_hold_ns) =
+                self.elastic_defensive_latch_bounds(side, snap, btc_leader_snap, epps_signed_beta);
+            let flow_exhausted =
+                own_flow < -0.05 || (own_flow < 0.15 && cur_gross_bps <= (req_dip_sbps * 3) / 2);
+            if hold_ns >= req_hold_ns
+                && st.exhaustion_unwind_active
+                && cur_gross_bps < req_dip_sbps
+                && flow_exhausted
+                && cur_gross_bps < win_floor
+            {
                 self.latch_defensive_floor_if_needed(true);
             }
             if hold_s < 180 && cur_gross_bps >= 150 && own_flow >= 0.35 {
@@ -2012,5 +2023,48 @@ impl SlotExecutionEngine {
             self.last_obs_funding_cut_id = cur_cut;
         }
         self.pre_cut_funding_rate_sbps = snap.funding_rate_scaled_bps.0;
+    }
+}
+
+impl SlotExecutionEngine {
+    /// Continuous C1 defensive Zero-Loss latch bounds replacing legacy V4.0 `-200 sbps @ 3s` static scalar.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn elastic_defensive_latch_bounds(
+        &self,
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_signed_beta: f64,
+    ) -> (i64, i64) {
+        const PHI_L: f64 = 1.618_033_988_749_895;
+        const INV_PHI_L: f64 = 0.618_033_988_749_895;
+        const INV_PHI2_L: f64 = 0.381_966_011_250_105;
+
+        let fee_rt = (self.active_maker_rt_fee_bps().max(100)) as f64;
+        let p_tkr = (self.learned_taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+        let ir_mult = (1.0 + (self.learned_ir_x100.clamp(-60, 120) as f64) / 400.0).clamp(0.85, 1.30);
+        let vol_f = (snap.realized_vol_5m.raw().max(1_200)) as f64;
+        let calm_dip = (PHI_L * fee_rt)
+            .max(INV_PHI2_L * vol_f * (1.0 - PHI_L * p_tkr).max(0.35))
+            * ir_mult;
+        let tox_dip = (INV_PHI_L * fee_rt * (1.0 - p_tkr)).max(200.0);
+        let dir_s = side.sign_f64();
+        let own_fl = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
+        let btc_snr = if self.slot_idx == 0 {
+            0.0
+        } else {
+            epps_signed_beta.clamp(-PHI_L, PHI_L)
+                * OrthogonalFactorState::snr_composite_score(btc_leader_snap)
+                * dir_s
+        };
+        let adv_press = (-own_fl).max(0.0) + INV_PHI2_L * (-btc_snr - 0.15).max(0.0);
+        let h_tox = crate::wave_elliott::hermite_smoothstep_c1(adv_press, INV_PHI2_L, 0.854_101_966_249_685);
+        let eff_dip = calm_dip - h_tox * (calm_dip - tox_dip).max(0.0);
+        let base_hold_ns = ((INV_PHI_L * (self.intrinsic_tau_mkt_s.max(90) as f64) / 30.0) * 1e9)
+            .clamp(2_800_000_000.0, 7_500_000_000.0);
+        let eff_hold_ns = (base_hold_ns * (1.0 - 0.45 * h_tox)).round() as i64;
+        (-(eff_dip.round() as i64), eff_hold_ns)
     }
 }

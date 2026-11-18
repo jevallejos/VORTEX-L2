@@ -1015,6 +1015,31 @@ pub fn should_abort_collapsed_resting_l1_wall(
     snap: &crate::lob_shm::SymbolLobSnapshot,
     init_q_lots: crate::types::LotQty,
 ) -> bool {
+    should_abort_collapsed_resting_l1_wall_dynamic(
+        spec,
+        side,
+        entry_price,
+        snap,
+        init_q_lots,
+        50,
+        FeeSchedule::VIP0_DEFAULT,
+    )
+}
+
+/// Self-learning C1 resting L1 wall-collapse shield coupled to live `p_Taker` & VIP `FeeSchedule`.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn should_abort_collapsed_resting_l1_wall_dynamic(
+    spec: crate::types::PairSpec,
+    side: crate::types::Side,
+    entry_price: crate::types::PriceTicks,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    init_q_lots: crate::types::LotQty,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> bool {
+    const PHI: f64 = 1.618_033_988_749_895;
     const INV_PHI: f64 = 0.618_033_988_749_895;
     const INV_PHI2: f64 = 0.381_966_011_250_105;
 
@@ -1025,14 +1050,22 @@ pub fn should_abort_collapsed_resting_l1_wall(
     if bbo_px.0 <= 0 || bbo_px != entry_price {
         return false;
     }
+    let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    let ofi_gate = -(0.12 - 0.55 * (p_tkr - 0.05)).clamp(0.05, 0.18);
     let signed_ofi = side.sign_f64() * snap.factor_ofi.get();
-    if signed_ofi >= -0.12 {
+    if signed_ofi >= ofi_gate {
         return false;
     }
-    let min_l1 = spec.min_resting_l1_lots(entry_price, snap.realized_vol_5m).0.max(1) as f64;
+    let min_l1 = spec
+        .min_resting_l1_lots_dynamic(entry_price, snap.realized_vol_5m, taker_prob_pm, fees)
+        .0
+        .max(1) as f64;
+    let tox_shift = (1.0 + PHI * (p_tkr - 0.05)).clamp(0.85, PHI);
+    let keep_min = (INV_PHI * tox_shift).clamp(INV_PHI2, 0.85);
+    let keep_init = (INV_PHI2 * tox_shift).clamp(0.25, INV_PHI);
     let init_f = (init_q_lots.0.max(0)) as f64;
     let live_f = (live_q.0.max(0)) as f64;
-    live_f < INV_PHI * min_l1 || (init_f >= min_l1 && live_f < INV_PHI2 * init_f)
+    live_f < keep_min * min_l1 || (init_f >= min_l1 && live_f < keep_init * init_f)
 }
 
 #[cfg(test)]
