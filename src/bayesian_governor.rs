@@ -999,6 +999,7 @@ impl OnlineAdaptiveGovernor {
     /// V4.8 Kelly lot sizer coupled to the C1 daily boundary damper `m_day(t) in [618..=1_000] permille`.
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn compute_slot_entry_lots_v48(
         &self,
         slot_idx: usize,
@@ -1015,13 +1016,29 @@ impl OnlineAdaptiveGovernor {
             snap.mark_price
         };
         let cadence = self.slot_temporal_cadence_for_side(s_clamped, Some(side), snap);
-        let damper_c = daily_damper_permille.clamp(618, 1_000);
+        let storm_onset = (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 4).max(4_800) as f64;
+        let eq_v = self.eq_vol_5m_bps[s_clamped].max(1_200);
+        let cur_v = snap.realized_vol_5m.raw().max(1_200);
+        let h_storm = crate::wave_elliott::hermite_smoothstep_c1((eq_v as f64) / storm_onset, 1.0, 1.618_033_988_749_895);
+        let eff_kelly_vol = ScaledBps(if cur_v < eq_v && h_storm > 0.0 {
+            cur_v + (((eq_v - cur_v) as f64 * h_storm).round() as i64)
+        } else {
+            cur_v
+        });
+        let coil_damper_pm = if cur_v < eq_v && h_storm > 0.0 {
+            let rho_lull = 1.0 - (cur_v as f64) / (eq_v as f64);
+            let h_coil = h_storm * crate::wave_elliott::hermite_smoothstep_c1(rho_lull, 0.381_966_011_250_105, 0.763_932_022_500_210);
+            (1_000.0 - 382.0 * h_coil).round() as i64
+        } else {
+            1_000
+        };
+        let damper_c = ((daily_damper_permille.clamp(618, 1_000) * coil_damper_pm) / 1_000).clamp(618, 1_000);
         let eff_cadence_pm = ((cadence.kelly_lot_mult_permille * damper_c) / 1_000).clamp(550, 1_200);
         let (edge_bps, _, _) = self.slot_direction_diagnostics(s_clamped, side);
         spec.compute_risk_parity_kelly_lots_with_fees(
             wallet_usdt_1e8,
             entry_px,
-            snap.realized_vol_5m,
+            eff_kelly_vol,
             edge_bps,
             self.slot_information_ratio_x100(s_clamped, side),
             eff_cadence_pm,
@@ -1223,6 +1240,9 @@ impl OnlineAdaptiveGovernor {
         ) {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
+        if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, candidate_snap) {
+            return Err(LastVetoCode::KinematicSurfaceOrCadence);
+        }
         crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
             candidate_snap,
             side,
@@ -1292,12 +1312,18 @@ impl OnlineAdaptiveGovernor {
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
             return Err(LastVetoCode::WarmupOrLock);
         };
+        if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, snap) {
+            return Err(LastVetoCode::PreflightDriftOrDecay);
+        }
         crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
             snap,
             side,
             spoof_density,
         )?;
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        if !self.passes_elastic_preflight_l1_support(slot_idx, side, entry_px, snap) {
+            return Err(LastVetoCode::QueueDepthOrOversizedLot);
+        }
         let spec = APPROVED_SPECS[slot_idx];
         let signed_geom = side.sign_f64() * snap.factor_geom.get();
         let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
@@ -1396,5 +1422,85 @@ mod v49_governor_asymmetry_tests {
         assert!(gov
             .authorizes_adaptive_entry_v49(1, Side::Bid, w_65, 1_000, ScaledBps(647), &eth18, &eth18, 0.0, 1.0)
             .is_err());
+    }
+}
+
+impl OnlineAdaptiveGovernor {
+    /// Continuous C1 pre-funding cliff survival gate coupled to self-learned `tau_mkt`, `MFE`, `IR` & `p_Taker`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn passes_elastic_funding_cliff_guard(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+    ) -> bool {
+        const PHI_F: f64 = 1.618_033_988_749_895;
+        const INV_PHI_F: f64 = 0.618_033_988_749_895;
+        const INV_PHI2_F: f64 = 0.381_966_011_250_105;
+
+        if slot_idx >= MAX_ACTIVE_PAIRS || snap.ts_local_ns.0 < MIN_VALID_UTC_EPOCH_NS {
+            return true;
+        }
+        let adverse_fund_sbps = side.sign_i64().saturating_mul(snap.funding_rate_scaled_bps.0);
+        if adverse_fund_sbps <= 0 {
+            return true;
+        }
+        let rem_s = (28_800 - snap.ts_local_ns.0.div_euclid(1_000_000_000).rem_euclid(28_800)) as f64;
+        let tau_mkt_s = ((self.intrinsic_diffusion_clock_ns(slot_idx) as f64) * 1e-9).max(60.0);
+        let tau_hold_s = (INV_PHI2_F * tau_mkt_s).max(25.0);
+        let expected_fund_drag = (adverse_fund_sbps as f64) * (-rem_s / tau_hold_s).exp();
+        let p_tkr = (self.slot_taker_prob_permille(slot_idx, side).clamp(5, 950) as f64) * 1e-3;
+        let fee_rt = self.active_fee_schedule().round_trip_maker_exit_bps().raw() as f64;
+        let d = Self::dir_idx(side);
+        let ir_bonus = (self.ewma_net_bps_x100[slot_idx][d].max(0) as f64) * INV_PHI2_F;
+        let net_edge = ((learned_mfe_bps.raw().max(0) as f64 - fee_rt).max(0.0) + ir_bonus)
+            * (1.0 - p_tkr)
+            / PHI_F.powf(p_tkr * 4.0);
+        expected_fund_drag <= INV_PHI_F * net_edge
+    }
+}
+
+impl OnlineAdaptiveGovernor {
+    /// Elastic C1 preflight & re-peg L1 support floor scaled by self-learned `p_Taker` & `sqrt(sigma_5m / B_3x)`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn passes_elastic_preflight_l1_support(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        entry_px: PriceTicks,
+        snap: &SymbolLobSnapshot,
+    ) -> bool {
+        const PHI_L1: f64 = 1.618_033_988_749_895;
+        if slot_idx >= MAX_ACTIVE_PAIRS || entry_px.0 <= 0 {
+            return false;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let own_q = match side {
+            Side::Bid => snap.bids[0].qty,
+            Side::Ask => snap.asks[0].qty,
+        };
+        if own_q.0 <= 0 {
+            return false;
+        }
+        let fees = self.active_fee_schedule();
+        let p_pm = self.slot_taker_prob_permille(slot_idx, side);
+        let b3x = spec
+            .three_x_friction_barrier_bps_dynamic(entry_px, p_pm, fees)
+            .raw()
+            .max(150) as f64;
+        let vol_ratio = ((snap.realized_vol_5m.raw().max(150) as f64) / b3x)
+            .sqrt()
+            .clamp(1.0, PHI_L1 * PHI_L1);
+        let p_tkr = (p_pm.clamp(5, 950) as f64) * 1e-3;
+        let min_l1_1e8 = (crate::types::BYBIT_MIN_ORDER_NOTIONAL_1E8 as f64)
+            * PHI_L1
+            * (1.0 + PHI_L1 * p_tkr)
+            * vol_ratio;
+        (spec.lot_notional_1e8(own_q, entry_px) as f64) >= min_l1_1e8
     }
 }

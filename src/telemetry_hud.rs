@@ -1195,10 +1195,11 @@ pub fn compute_ex_ante_ev_scaled_bps(
     let mkr_net_sbps = eng
         .learned_mfe_bps
         .saturating_sub(eng.active_fees.round_trip_maker_exit_bps().raw());
-    let sl_total_sbps =
+    let raw_srv_sl =
         PairSpec::elastic_server_sl_distance_bps_with_fees(snap.realized_vol_5m, eng.active_fees)
-            .raw()
-            .saturating_add(eng.active_fees.round_trip_taker_exit_bps().raw());
+            .raw();
+    let sl_total_sbps = ((raw_srv_sl.saturating_mul(618)) / 1_000)
+        .saturating_add(eng.active_fees.round_trip_taker_exit_bps().raw());
     p_mkr_pm
         .saturating_mul(mkr_net_sbps)
         .saturating_sub(p_tkr_pm.saturating_mul(sl_total_sbps))

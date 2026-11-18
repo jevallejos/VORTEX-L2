@@ -840,6 +840,14 @@ impl PairSpec {
         if allocated_lots.0 <= 0 || mid_price.0 <= 0 {
             return false;
         }
+        let Ok(raw_tick_bps) = self.tick_to_price_scaled_bps(mid_price) else {
+            return false;
+        };
+        let p_tkr_lat = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+        let nyquist_tick_cap = (learned_mfe_bps.max(0) as f64) * (-PHI * p_tkr_lat).exp();
+        if (raw_tick_bps.raw() as f64) > nyquist_tick_cap {
+            return false;
+        }
         if self.can_split_runner_legs(allocated_lots, mid_price) {
             let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) / 1_000.0;
             let p_mkr = 1.0 - p_tkr;
@@ -865,7 +873,7 @@ impl PairSpec {
             if mfe_split_net <= 10.0 {
                 return false;
             }
-            let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt;
+            let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt + INV_PHI2 * (raw_tick_bps.raw() as f64);
             let tail_shield = (1.0 + PHI * q_struct + (ob_ratio - 1.0).max(0.0)).max(INV_PHI);
             return (p_mkr * mfe_split_net) > ((p_tkr * wald_sl_net) / tail_shield);
         }
@@ -884,7 +892,7 @@ impl PairSpec {
         if mfe_eff <= 10.0 {
             return false;
         }
-        let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt;
+        let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt + INV_PHI2 * (raw_tick_bps.raw() as f64);
         let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
         let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
         let (al_raw, op_raw) = match side {

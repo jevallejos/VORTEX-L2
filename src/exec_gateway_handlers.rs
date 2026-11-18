@@ -424,16 +424,11 @@ pub fn handle_gateway_event(
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             } else if rt.emergency_flatten_sl[slot_idx].is_none() {
                 let fallback_sl = rt.verified_exchange_sl[slot_idx];
-                if fallback_sl.0 > 0 {
+                if fallback_sl.0 > 0 && engines[slot_idx].last_eff_sl_ticks.0 <= 0 {
                     engines[slot_idx].last_eff_sl_ticks = fallback_sl;
-                    let fees = engines[slot_idx].active_fees;
-                    if let OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, sl_trigger_price: ref mut sl_p, .. } = engines[slot_idx].state {
-                        *sl_p = fallback_sl;
-                        engines[slot_idx].chandelier_profit_sl_armed =
-                            is_chandelier_profit_locked_sl_with_fees(side, avg_price_ticks, fallback_sl, fees);
-                    }
                 }
                 rt.sl_needs_sync[slot_idx] = true;
+                rt.sl_retry_after_ns[slot_idx] = now_ns.0 + 250_000_000;
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             }
         }
