@@ -58,6 +58,8 @@ pub struct ExecRuntimeState {
     pub markout_rings: [SlotMarkoutRing; MAX_ACTIVE_PAIRS],
     pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS], pub daily_gov: DailySessionGovernor, pub intra_rings: [crate::execution_fsm::SlotIntraTradeRing; MAX_ACTIVE_PAIRS], pub last_plasticity_audit_ns: i64, pub last_persisted_utc_day: i64,
     pub last_zeta_tox: [f64; MAX_ACTIVE_PAIRS],
+    pub geom_adv_since_ns: [i64; MAX_ACTIVE_PAIRS],
+    pub drain_flushed_once: bool,
     pub halt_locked: bool,
     pub drain_active: bool,
 }
@@ -89,6 +91,8 @@ impl ExecRuntimeState {
             markout_rings: [SlotMarkoutRing::new(); MAX_ACTIVE_PAIRS],
             last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS], daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8), intra_rings: [crate::execution_fsm::SlotIntraTradeRing::new(); MAX_ACTIVE_PAIRS], last_plasticity_audit_ns: 0, last_persisted_utc_day: -1,
             last_zeta_tox: [0.0; MAX_ACTIVE_PAIRS],
+            geom_adv_since_ns: [0; MAX_ACTIVE_PAIRS],
+            drain_flushed_once: false,
             halt_locked: false,
             drain_active: false,
         }
@@ -236,7 +240,7 @@ pub fn finalize_and_emit_live_close_with_markout(
     let hold_s = (now_ns.0.saturating_sub(engines[s_idx].last_opened_ts.0)).max(0) / 1_000_000_000;
     let Some(summary) = engines[s_idx].apply_verified_close_resolution(resolution, now_ns, ledger) else { return; };
     let non_punitive_exit = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
-    gov.observe_closed_trade_at_entry(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, non_punitive_exit, now_ns);
+    gov.observe_closed_trade_with_regime_v51(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, ScaledBps(engines[s_idx].last_closed_mfe_bps), non_punitive_exit, cached_snaps[s_idx].wave_observables(), 1.0, now_ns);
     arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
     dispatch_closed_trade_logs_v47(
         s_idx, &summary, &engines[s_idx], &entry_forensics[s_idx], &cached_snaps[s_idx],
