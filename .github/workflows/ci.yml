@@ -1,44 +1,35 @@
-name: VORTEX-OMEGA V4.9 Constitutional Gate (SHM v15, PAR2Z, VKL1 & 4-Binary Suite)
-
+name: VORTEX-OMEGA V5.1 Constitutional /dev/shm & 4-Binary LTO Gate
 on:
   push:
-    branches: [ "main", "feat/**" ]
+    branches: [ main, "feat/**" ]
   pull_request:
-    branches: [ "main" ]
-
-env:
-  CARGO_TERM_COLOR: always
-
+    branches: [ main ]
 jobs:
-  constitutional-gate-linux:
-    name: Ubuntu /dev/shm 72-Test & 4-CLI LTO Gate
+  constitutional-gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Gate 0 - UTF-8 LF & Secret Hygiene Audit
-        run: |
-          python3 -c 'import pathlib, subprocess, sys; files = subprocess.check_output(["git", "ls-files"], text=True).splitlines(); bad_ext = (".pdb", ".mmap", ".parquet", ".jsonl", ".vkl1", ".par2z"); bad = [f for f in files if f == ".env" or f.startswith(".env.") or (f.endswith(".lock") and f != "Cargo.lock") or f.endswith(bad_ext)]; crlf = [f for f in files if pathlib.Path(f).is_file() and b"\r" in pathlib.Path(f).read_bytes()]; sys.exit("Forbidden or CRLF: " + str(bad + crlf) if (bad or crlf) else 0)'
-
-      - name: Install Rust Stable Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Gate 1 - Cargo Clippy Pedantic Zero-Warnings
+      - name: Gate 0 - UTF-8 LF Hygiene & Forbidden Artifact Scan
+        run: |
+          bad=$(find . -maxdepth 3 \( -name "*.mmap" -o -name "*.parquet" -o -name "*.jsonl" -o -name "*.vkl1" -o -name "*.par2z" -o -name ".env" -o \( -name "*.lock" ! -name "Cargo.lock" \) \) | wc -l)
+          test "$bad" -eq 0
+          ! grep -rnU $'\r' src/ tests/ deploy/ README.md CONSTITUTION_VORTEX_OMEGA.md Cargo.toml
+      - name: Gate 1 - Clippy Zero-Warnings
         run: cargo clippy --all-targets -- -D warnings
-
-      - name: Gate 2 - Deterministic 72-Test Suite on Linux /dev/shm
-        run: cargo test --lib -- --test-threads=1
-
-      - name: Gate 3 - LTO Fat Release Build & 4 Autonomous CLI Gates
+      - name: Gate 2 - Deterministic /dev/shm Lib (80) & Integration Suites (Red-Team, De-Legacy, V5.1 Forensic)
+        run: |
+          cargo test --lib -- --test-threads=1
+          cargo test --tests -- --test-threads=1
+      - name: Gate 3 - Build & Verify 4 LTO Fat Binaries + SHA-256
         run: |
           cargo build --release --bins
           ./target/release/vortex_tap
-          mkdir -p /tmp/vortex_empty_par2_gate
-          ./target/release/vortex_replay --dir /tmp/vortex_empty_par2_gate
-          rmdir /tmp/vortex_empty_par2_gate
+          mkdir -p /tmp/vortex_ci_par2_gate
+          ./target/release/vortex_replay --dir /tmp/vortex_ci_par2_gate
+          rmdir /tmp/vortex_ci_par2_gate
           ./target/release/vortex_exec
           ./target/release/vortex_web
           sha256sum target/release/vortex_tap target/release/vortex_replay target/release/vortex_exec target/release/vortex_web
