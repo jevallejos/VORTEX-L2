@@ -522,12 +522,11 @@ impl PairSpec {
         let eff_notional_1e8 = if raw_notional < min_fl { min_fl } else if raw_notional > max_sl { max_sl } else { raw_notional };
         let min_exch = self.exchange_min_notional_lots(entry_price).0;
         if (one_lot_1e8 as i128) > eff_notional_1e8 {
-            let single = (eff_notional_1e8 / (one_lot_1e8 as i128)) as i64;
-            return LotQty(if single > min_exch { single } else { min_exch });
+            return LotQty(min_exch);
         }
         let raw_lots = ((eff_notional_1e8 + (one_lot_1e8 as i128) / 2) / (one_lot_1e8 as i128)) as i64;
         let bounded = if raw_lots < min_exch { min_exch } else { raw_lots };
-        if bounded <= 1 && min_exch == 1 && ((one_lot_1e8 * 2) as i128) > eff_notional_1e8 { return LotQty(1); }
+        if bounded <= 1 && min_exch == 1 && (one_lot_1e8 as i128) * 2 > eff_notional_1e8 { return LotQty(1); }
         let split_min = if bounded < 2 { 2 } else { bounded };
         LotQty(if (split_min & 1) != 0 { split_min + 1 } else { split_min })
     }
@@ -588,8 +587,12 @@ impl PairSpec {
         }
         while frac_digits < 8 { frac = frac.saturating_mul(10); frac_digits += 1; }
         let tick = self.tick_size_1e8 as i128;
-        let ticks = (whole.saturating_mul(100_000_000).saturating_add(frac) + (tick / 2)) / tick;
-        if ticks <= 0 { Err(VortexError::InvalidPriceOrTickSpec) } else { Ok(PriceTicks(ticks as i64)) }
+        let ticks = whole.saturating_mul(100_000_000).saturating_add(frac).saturating_add(tick / 2) / tick;
+        if ticks <= 0 || ticks > i128::from(i64::MAX) {
+            Err(VortexError::InvalidPriceOrTickSpec)
+        } else {
+            Ok(PriceTicks(ticks as i64))
+        }
     }
 
     #[must_use]
@@ -606,7 +609,8 @@ impl PairSpec {
         }
         while frac_digits < 8 { frac = frac.saturating_mul(10); frac_digits += 1; }
         let step = self.lot_step_1e8 as i128;
-        LotQty(((whole.saturating_mul(100_000_000).saturating_add(frac) + (step / 2)) / step) as i64)
+        let lots = whole.saturating_mul(100_000_000).saturating_add(frac).saturating_add(step / 2) / step;
+        if lots <= 0 || lots > i128::from(i64::MAX) { LotQty(0) } else { LotQty(lots as i64) }
     }
 }
 

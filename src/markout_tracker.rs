@@ -178,6 +178,7 @@ pub struct SlotMarkoutRing {
     write_idx: usize,
     last_fill_curve: MarkoutCurve5hBps,
     last_fill_t0_ns: i64,
+    last_maker_fee_bps: i64,
     ewma_lvr_5s_bps: i64,
     ewma_markout_15s_bps: i64,
     ewma_markout_60s_bps: i64,
@@ -211,6 +212,7 @@ impl SlotMarkoutRing {
                 peak_zeta_tox_pm: 0,
             },
             last_fill_t0_ns: 0,
+            last_maker_fee_bps: 200,
             ewma_lvr_5s_bps: 0,
             ewma_markout_15s_bps: 0,
             ewma_markout_60s_bps: 0,
@@ -318,7 +320,7 @@ impl SlotMarkoutRing {
         }
         let idx = self.write_idx % PROBE_RING_CAP;
         if self.probes[idx].active && self.probes[idx].is_abort_probe && self.probes[idx].tp_counted_15s {
-            Self::push_completed_abort(&self.probes[idx], 200, &mut self.completed_aborts, &mut self.abort_read_idx, &mut self.abort_write_idx);
+            Self::push_completed_abort(&self.probes[idx], self.last_maker_fee_bps.max(0), &mut self.completed_aborts, &mut self.abort_read_idx, &mut self.abort_write_idx);
         }
         self.write_idx = self.write_idx.wrapping_add(1);
         self.probes[idx] = PendingMarkoutProbe {
@@ -342,6 +344,7 @@ impl SlotMarkoutRing {
             return;
         }
         let fee_bar = maker_fee_bps.max(0);
+        self.last_maker_fee_bps = fee_bar;
         let rt_cost_est = ScaledBps((fee_bar.saturating_mul(2)).max(100));
         for slot in &mut self.probes {
             if !slot.active {
@@ -400,13 +403,30 @@ impl SlotMarkoutRing {
     #[inline]
     #[must_use]
     pub fn active_fill_toxicity_zeta(&self, opened_ts: TimestampNs, expected_rt_cost: ScaledBps) -> f64 {
+        let mut best_curve: Option<MarkoutCurve5hBps> = None;
+        let mut best_diff = i64::MAX;
         for slot in &self.probes {
-            if !slot.is_abort_probe && slot.ref_price.0 > 0 && (slot.t0_ns - opened_ts.0).abs() <= 2_000_000_000 {
-                return glosten_milgrom_toxicity_zeta(slot.curve.to_legacy_4h(), expected_rt_cost);
+            if slot.active && !slot.is_abort_probe && slot.ref_price.0 > 0 {
+                let diff = slot.t0_ns.saturating_sub(opened_ts.0).saturating_abs();
+                if diff <= 2_000_000_000 && diff < best_diff {
+                    best_diff = diff;
+                    best_curve = Some(slot.curve);
+                }
             }
         }
-        if (self.last_fill_t0_ns - opened_ts.0).abs() <= 2_000_000_000 {
-            return glosten_milgrom_toxicity_zeta(self.last_fill_curve.to_legacy_4h(), expected_rt_cost);
+        if let Some(c5) = best_curve {
+            return if (c5.resolved_mask & (1_u8 << 4)) != 0 {
+                glosten_milgrom_toxicity_zeta_5h(c5, expected_rt_cost)
+            } else {
+                glosten_milgrom_toxicity_zeta(c5.to_legacy_4h(), expected_rt_cost)
+            };
+        }
+        if self.last_fill_t0_ns > 0 && self.last_fill_t0_ns.saturating_sub(opened_ts.0).saturating_abs() <= 2_000_000_000 {
+            return if (self.last_fill_curve.resolved_mask & (1_u8 << 4)) != 0 {
+                glosten_milgrom_toxicity_zeta_5h(self.last_fill_curve, expected_rt_cost)
+            } else {
+                glosten_milgrom_toxicity_zeta(self.last_fill_curve.to_legacy_4h(), expected_rt_cost)
+            };
         }
         0.0
     }

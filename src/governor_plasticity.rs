@@ -263,6 +263,13 @@ impl GovernorPlasticityState {
             "scar_eq_vol_bps",
             &mut self.scar_eq_vol_bps,
         );
+        for row in &mut self.scar_eq_vol_bps {
+            for cell in row.iter_mut() {
+                if *cell != 0 {
+                    *cell = (*cell).clamp(1_200, 24_000);
+                }
+            }
+        }
     }
 }
 
@@ -401,6 +408,7 @@ pub struct DailySessionGovernor {
     pub day_open_equity_1e8: i64,
     pub day_realized_pnl_1e8: i64,
     pub day_peak_ppm: i64,
+    pub armed_goal_ppm: i64,
     pub learned_pos_day_ema_ppm: i64,
     pub day_closed_trades: u32,
     pub day_wins: u32,
@@ -426,6 +434,7 @@ impl DailySessionGovernor {
             day_open_equity_1e8: eq,
             day_realized_pnl_1e8: 0,
             day_peak_ppm: 0,
+            armed_goal_ppm: 0,
             learned_pos_day_ema_ppm: 6_283,
             day_closed_trades: 0,
             day_wins: 0,
@@ -477,6 +486,7 @@ impl DailySessionGovernor {
         self.day_open_equity_1e8 = clean_eq;
         self.day_realized_pnl_1e8 = 0;
         self.day_peak_ppm = 0;
+        self.armed_goal_ppm = 0;
         self.day_closed_trades = 0;
         self.day_wins = 0;
         self.day_losses = 0;
@@ -577,9 +587,15 @@ impl DailySessionGovernor {
             return self.phase;
         }
         let arm_ppm = self.elastic_goal_arm_ppm(sinking_reserve_bps_x100, fee_rt_bps, eq_vol_bps, port_ir_x100);
-        if self.day_peak_ppm >= arm_ppm {
+        if self.day_peak_ppm >= arm_ppm || matches!(self.phase, DailyShieldPhase::ProfitLockArmed) {
             self.phase = DailyShieldPhase::ProfitLockArmed;
-            let floor_ppm = self.locked_profit_floor_ppm(arm_ppm);
+            let eff_arm = if self.armed_goal_ppm > 0 {
+                self.armed_goal_ppm.min(arm_ppm)
+            } else {
+                arm_ppm.min(self.day_peak_ppm.max(3_883))
+            };
+            self.armed_goal_ppm = eff_arm;
+            let floor_ppm = self.locked_profit_floor_ppm(eff_arm);
             if (self.day_closed_trades >= 2 && cur_ppm <= floor_ppm)
                 || (cur_ppm >= floor_ppm && intraday_percentile < INV_PHI2_DAILY)
             {
@@ -605,7 +621,12 @@ impl DailySessionGovernor {
         let stop_ppm = self.elastic_loss_stop_ppm(sinking_reserve_bps_x100, fee_rt_bps);
         let arm_ppm = self.elastic_goal_arm_ppm(sinking_reserve_bps_x100, fee_rt_bps, eq_vol_bps, port_ir_x100);
         let active_floor = if matches!(self.phase, DailyShieldPhase::ProfitLockArmed) {
-            self.locked_profit_floor_ppm(arm_ppm)
+            let eff_arm = if self.armed_goal_ppm > 0 {
+                self.armed_goal_ppm.min(arm_ppm)
+            } else {
+                arm_ppm.min(self.day_peak_ppm.max(3_883))
+            };
+            self.locked_profit_floor_ppm(eff_arm)
         } else {
             stop_ppm
         };
@@ -625,6 +646,7 @@ impl DailySessionGovernor {
             "day_open_equity_1e8": self.day_open_equity_1e8,
             "day_realized_pnl_1e8": self.day_realized_pnl_1e8,
             "day_peak_ppm": self.day_peak_ppm,
+            "armed_goal_ppm": self.armed_goal_ppm,
             "learned_pos_day_ema_ppm": self.learned_pos_day_ema_ppm,
             "day_closed_trades": self.day_closed_trades,
             "day_wins": self.day_wins,
@@ -643,6 +665,7 @@ impl DailySessionGovernor {
         }
         if let Some(p) = val.get("day_realized_pnl_1e8").and_then(serde_json::Value::as_i64) { self.day_realized_pnl_1e8 = p; }
         if let Some(pk) = val.get("day_peak_ppm").and_then(serde_json::Value::as_i64) { self.day_peak_ppm = pk.max(0); }
+        if let Some(ag) = val.get("armed_goal_ppm").and_then(serde_json::Value::as_i64) { self.armed_goal_ppm = ag.max(0); }
         if let Some(em) = val.get("learned_pos_day_ema_ppm").and_then(serde_json::Value::as_i64) {
             self.learned_pos_day_ema_ppm = em.clamp(2_400, 35_000);
         }
@@ -651,6 +674,9 @@ impl DailySessionGovernor {
         if let Some(l) = val.get("day_losses").and_then(serde_json::Value::as_u64) { self.day_losses = l as u32; }
         if let Some(ph) = val.get("phase_code").and_then(serde_json::Value::as_u64) {
             self.phase = DailyShieldPhase::from_code((ph.min(255)) as u8);
+        }
+        if matches!(self.phase, DailyShieldPhase::ProfitLockArmed) && self.armed_goal_ppm <= 0 && self.day_peak_ppm > 0 {
+            self.armed_goal_ppm = self.day_peak_ppm.max(3_883);
         }
     }
 }

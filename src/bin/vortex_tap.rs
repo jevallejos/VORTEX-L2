@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.8 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 + Live VIP Fees).
+//! VORTEX-OMEGA V5.1 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 + Live VIP Fees).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -19,7 +19,9 @@ use vortex_rs::bybit_client::parse_decimal_to_scaled_i64;
 use vortex_rs::fee_cadence_beta::FeeSchedule;
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
 #[cfg(target_os = "linux")]
-use vortex_rs::http_ws_transport::{parse_endpoint_url, KeepAliveHttpConn};
+use vortex_rs::http_ws_transport::{
+    connect_ws_with_timeout, is_ws_timeout_err, parse_endpoint_url, KeepAliveHttpConn,
+};
 use vortex_rs::lob_shm::{
     classify_l2_sequence_transition, is_l2_seq_or_basis_anomaly, BookLevel, L2SeqDecision,
     MappedShmRegion, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS,
@@ -63,6 +65,7 @@ struct TapLiveState {
     candle_aggs: Box<[vortex_rs::candle_store::SlotMultiTfAggregator; MAX_ACTIVE_PAIRS]>,
     candle_tx: Option<SyncSender<vortex_rs::candle_store::Vkl1CandleRecord>>,
     last_ob_persist_ns: i64,
+    last_vkl1_1m_flush_ns: i64,
 }
 
 impl TapLiveState {
@@ -107,6 +110,7 @@ impl TapLiveState {
             candle_aggs: Box::new(vortex_rs::candle_store::SlotMultiTfAggregator::new_12_slot_array()),
             candle_tx: enable_async_vault.then(|| { let (ctx, crx) = std::sync::mpsc::sync_channel::<vortex_rs::candle_store::Vkl1CandleRecord>(1024); thread::spawn(move || { let store = vortex_rs::candle_store::PerpetualCandleStore::default_store(); while let Ok(rec) = crx.recv() { let _ = store.append_or_update(&rec); } }); ctx }),
             last_ob_persist_ns: 0,
+            last_vkl1_1m_flush_ns: 0,
         };
         st.reset_session_preserving_plasticity();
         st
@@ -165,6 +169,17 @@ impl TapLiveState {
 
     #[inline]
     fn maybe_run_60s_maintenance(&mut self, ts_ns: i64, reload_vault_fees: bool) {
+        if ts_ns.saturating_sub(self.last_vkl1_1m_flush_ns) >= 5_000_000_000 {
+            self.last_vkl1_1m_flush_ns = ts_ns;
+            if let Some(ref ctx) = self.candle_tx {
+                for s in 0..MAX_ACTIVE_PAIRS {
+                    let s_u8 = u8::try_from(s).unwrap_or(0);
+                    if let Some(cur) = self.candle_aggs[s].active_candle(s_u8, vortex_rs::candle_store::CandleTimeframe::Min1) {
+                        let _ = ctx.try_send(cur);
+                    }
+                }
+            }
+        }
         if ts_ns.saturating_sub(self.last_ob_persist_ns) < 60_000_000_000 {
             return;
         }
@@ -494,22 +509,6 @@ fn run_par2_shm_v15_self_check() -> Result<(), VortexError> {
 }
 
 #[cfg(target_os = "linux")]
-fn configure_ws_tcp_stream(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
-) {
-    let tcp_opt = match socket.get_mut() {
-        tungstenite::stream::MaybeTlsStream::Plain(s) => Some(s),
-        tungstenite::stream::MaybeTlsStream::NativeTls(tls) => Some(tls.get_mut()),
-        _ => None,
-    };
-    if let Some(tcp) = tcp_opt {
-        let _ = tcp.set_nodelay(true);
-        let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn fetch_bybit_public_json_keepalive(conn: &mut KeepAliveHttpConn, query_path: &str) -> Option<serde_json::Value> {
     let raw = conn.send_json_request("GET", query_path, &[], "")?;
     serde_json::from_slice(raw).ok()
@@ -555,14 +554,25 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, _writer: AsyncParquetRingWri
 #[cfg(target_os = "linux")]
 fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWriter) -> ! {
     let mut state = TapLiveState::new(true);
+    let mut last_warm_start_ns = 0_i64;
     loop {
         state.set_active_fee_schedule(load_hud_fee_schedule());
-        state.reset_session_preserving_plasticity();
-        warm_start_elliott_and_order_blocks(&mut state);
+        let boot_now = now_epoch_ns().0;
+        if last_warm_start_ns == 0 || boot_now.saturating_sub(last_warm_start_ns) >= 900_000_000_000 {
+            state.reset_session_preserving_plasticity();
+            warm_start_elliott_and_order_blocks(&mut state);
+            last_warm_start_ns = now_epoch_ns().0;
+        } else {
+            for s in 0..MAX_ACTIVE_PAIRS {
+                state.has_book_snapshot[s] = false;
+                state.active_snaps[s].bids = [BookLevel::default(); 50];
+                state.active_snaps[s].asks = [BookLevel::default(); 50];
+                state.factor_states[s].reset_l2_book_only();
+            }
+        }
         state.dispatch_ob_plasticity_async(now_epoch_ns().0);
 
-        if let Ok((mut socket, _)) = tungstenite::connect(BYBIT_PUBLIC_LINEAR_WS) {
-            configure_ws_tcp_stream(&mut socket);
+        if let Some(mut socket) = connect_ws_with_timeout(BYBIT_PUBLIC_LINEAR_WS, 10_000, 5_000) {
             let mut topics = Vec::with_capacity(MAX_ACTIVE_PAIRS * 4);
             for spec in &APPROVED_SPECS {
                 let sym = spec.symbol_id.name();
@@ -577,7 +587,20 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
                 continue;
             }
             let mut last_ping_ns = now_epoch_ns().0;
-            while let Ok(msg) = socket.read() {
+            loop {
+                let msg = match socket.read() {
+                    Ok(m) => m,
+                    Err(ref err) if is_ws_timeout_err(err) => {
+                        let local_ns = now_epoch_ns();
+                        arena.heartbeat_ns.store(local_ns.0 as u64, Ordering::Release);
+                        if socket.send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string())).is_err() {
+                            break;
+                        }
+                        last_ping_ns = local_ns.0;
+                        continue;
+                    }
+                    Err(_) => break,
+                };
                 let local_ns = now_epoch_ns();
                 arena.heartbeat_ns.store(local_ns.0 as u64, Ordering::Release);
                 if local_ns.0.saturating_sub(last_ping_ns) >= 15_000_000_000 {
@@ -616,7 +639,7 @@ fn main() -> ExitCode {
 
     println!("{sep}");
     println!(
-        "[VORTEX-TAP OMEGA V4.8] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
+        "[VORTEX-TAP OMEGA V5.1] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
         VORTEX_SHM_VERSION,
         shm_path.display()
     );
@@ -642,9 +665,10 @@ fn main() -> ExitCode {
 
     println!("{sep}");
     prune_expired_parquet_segment(Path::new("data"), 0);
-    let Ok(region) = MappedShmRegion::open_or_create(&shm_path, true) else {
+    let Ok(region) = MappedShmRegion::open_or_create(&shm_path, false) else {
         return ExitCode::FAILURE;
     };
+    region.arena().reset_lob_slots_only();
     let writer = AsyncParquetRingWriter::spawn(PathBuf::from("data"), true);
     run_live_bybit_ws_daemon(region.arena(), writer);
 }

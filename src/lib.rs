@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V4.8 Institutional Zero-Jitter Execution Core (24-Submodule Clean-Room Architecture).
+//! VORTEX-OMEGA V5.1 Institutional Zero-Jitter Execution Core (27-Submodule Clean-Room Architecture).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;
@@ -215,5 +215,91 @@ mod omega_v48_constitutional_gate {
         let z = eng.observe_post_fill_toxicity_and_wald_v48(&s3, &s3, 1.0, &ring, 1.2);
         assert!(eng.maybe_ratchet_sl_with_toxicity_v48(&s3, &s3, 1.0, z).is_some());
         assert!((8_200 - eng.last_eff_sl_ticks.0) * 100 <= init_dist * 35);
+    }
+
+    #[test]
+    fn test_v51_codebase_audit_regressions_end_to_end() {
+        use crate::bayesian_governor::OnlineAdaptiveGovernor;
+        use crate::governor_plasticity::{DailySessionGovernor, DailyShieldPhase};
+        use crate::http_ws_transport::parse_endpoint_url;
+        use crate::lob_shm::{BookLevel, MappedShmRegion, SlotTelemetrySnapshot, SymbolLobSnapshot};
+        use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, Side, TimestampNs, APPROVED_SPECS};
+        use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+        // 1. Fixed-point parser overflow (> i64::MAX ticks/lots) and half-up rounding guards
+        let sui = APPROVED_SPECS[5]; // tick_size_1e8 = 10_000
+        assert!(sui.parse_price_ticks("999999999999999999.9999").is_err());
+        assert_eq!(sui.parse_lot_qty("999999999999999999999"), LotQty(0));
+        assert_eq!(sui.parse_lot_qty("-50"), LotQty(0));
+        assert_eq!(sui.parse_price_ticks("0.72606"), Ok(PriceTicks(7_261)));
+
+        // 2. DailySessionGovernor monotonic ProfitLockArmed even if eq_vol_bps spikes mid-session
+        let w = 6_600_000_000_i64;
+        let mut dg = DailySessionGovernor::new(w);
+        let t_day = TimestampNs(1_794_787_200_000_000_000 + 3_600_000_000_000);
+        assert_eq!(
+            dg.observe_realized_cashflow(t_day, 72_000_000, true, true, false, w + 72_000_000, 380, 400, 3_000, 40),
+            DailyShieldPhase::ProfitLockArmed
+        );
+        assert_eq!(
+            dg.observe_realized_cashflow(TimestampNs(t_day.0 + 1_000_000_000), 1_000_000, true, true, false, w + 73_000_000, 380, 400, 18_000, 40),
+            DailyShieldPhase::ProfitLockArmed
+        );
+
+        // 3. OnlineAdaptiveGovernor V5.1 F6 chop fields survive scar JSON roundtrip
+        let w_abc = WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.46),
+            macro_phase: BoundedScore::new_clamped(0.25),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        };
+        let t0 = 1_800_000_000_000_000_000_i64;
+        let mut g1 = OnlineAdaptiveGovernor::new();
+        g1.observe_closed_trade_with_regime_v51(1, Side::Ask, PriceTicks(179_961), ScaledBps(-1_956), ScaledBps(0), false, w_abc, 1.0, TimestampNs(t0));
+        g1.observe_closed_trade_with_regime_v51(1, Side::Bid, PriceTicks(179_542), ScaledBps(-2_431), ScaledBps(0), false, w_abc, 1.0, TimestampNs(t0 + 60_000_000_000));
+        let mut eth_snap = SymbolLobSnapshot::new_empty();
+        eth_snap.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth_snap.ts_local_ns = TimestampNs(t0 + 180_000_000_000);
+        eth_snap.realized_vol_5m = ScaledBps(3_200);
+        eth_snap.bids[0] = BookLevel { price: PriceTicks(179_500), qty: LotQty(200) };
+        eth_snap.asks[0] = BookLevel { price: PriceTicks(179_501), qty: LotQty(200) };
+        eth_snap.set_wave_observables(w_abc);
+        assert!(!g1.passes_cross_side_abc_chop_shield(1, Side::Bid, &eth_snap));
+        let scar_json = g1.to_scar_snapshot_json(TimestampNs(t0 + 60_000_000_000));
+        let mut g2 = OnlineAdaptiveGovernor::new();
+        assert!(g2.apply_scar_snapshot_json(&scar_json).is_some());
+        assert!(!g2.passes_cross_side_abc_chop_shield(1, Side::Bid, &eth_snap));
+
+        // 4. ReadOnlyShmRegion & SeqLock bool byte sanitization
+        let shm_p = MappedShmRegion::ephemeral_self_test_path("v51_ro_san");
+        {
+            let rw = MappedShmRegion::open_or_create(&shm_p, true);
+            assert!(rw.is_ok());
+            if let Ok(ref reg) = rw {
+                let tel = SlotTelemetrySnapshot {
+                    tranche1_harvested: true,
+                    ..SlotTelemetrySnapshot::default()
+                };
+                if let Ok(cell) = reg.arena().telemetry(0) {
+                    cell.write_consistent(&tel);
+                }
+                let ro = MappedShmRegion::open_existing_read_only(&shm_p);
+                assert!(ro.is_ok());
+                if let Ok(ref ro_reg) = ro {
+                    let out = ro_reg.arena().read_telemetry(0, 4);
+                    assert!(out.is_ok_and(|t| t.tranche1_harvested));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&shm_p);
+
+        // 5. Endpoint URL parser supports wss://, ws://, and IPv6 bracketed hosts
+        let wss = parse_endpoint_url("wss://stream.bybit.com/v5/private");
+        assert!(wss.is_some_and(|e| e.use_tls && e.port == 443 && e.base_path == "/v5/private"));
+        let v6 = parse_endpoint_url("http://[::1]:8787/api/state");
+        assert!(v6.is_some_and(|e| !e.use_tls && e.host == "::1" && e.port == 8787 && e.host_header == "[::1]:8787"));
     }
 }

@@ -767,7 +767,9 @@ impl EventClockAlphaModulator {
         let dt_s = ((dt_ns as f64) * 1e-9).clamp(1e-6, 30.0);
         self.fast_ewma_events = self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
         self.eq_ewma_events = self.eq_ewma_events * (-dt_s / V45_EQ_RATE_TAU_SECS).exp() + 1.0;
-        let i_spoof = if ofi.get().abs() >= 0.35 && (ofi.get() * tfi.get()) < -0.05 { 1.0 } else { 0.0 };
+        let ofi_f = ofi.get();
+        let tfi_f = tfi.get();
+        let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05) || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08) { 1.0 } else { 0.0 };
         let alpha_sp = 1.0 - (-dt_s / V45_SPOOF_TAU_SECS).exp();
         self.spoof_density_ewma = ((1.0 - alpha_sp) * self.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
         self.virtual_clock_ns = self.virtual_clock_ns.saturating_add((((dt_ns as f64) * self.event_clock_dilation()).round() as i64).max(1));
@@ -1015,7 +1017,8 @@ pub fn passes_elastic_geom_and_macro_impulse_guard(
         0.5
     };
 
-    let h_sp = crate::wave_elliott::hermite_smoothstep_c1(spoof_density.clamp(0.0, 1.0), 0.05, 0.75);
+    let sp_clean = if spoof_density.is_finite() { spoof_density.clamp(0.0, 1.0) } else { 1.0 };
+    let h_sp = crate::wave_elliott::hermite_smoothstep_c1(sp_clean, 0.05, 0.75);
     let h_ob_adv = crate::wave_elliott::hermite_smoothstep_c1((1.0 - 2.0 * rho_ob).max(0.0), 0.0, 0.35);
     let h_ob_fav = crate::wave_elliott::hermite_smoothstep_c1((2.0 * rho_ob - 1.0).max(0.0), 0.0, 0.35);
     let liq_adv = (-dir_s * w_obs.liq_imbalance.get()).clamp(0.0, 1.0);
@@ -1025,7 +1028,7 @@ pub fn passes_elastic_geom_and_macro_impulse_guard(
         - 0.5 * INV_PHI4 * h_ob_fav)
         .clamp(0.05, INV_PHI);
     let signed_geom = dir_s * snap.factor_geom.get();
-    if signed_geom < req_geom {
+    if !signed_geom.is_finite() || signed_geom < req_geom {
         return Err(crate::lob_shm::LastVetoCode::SpoofingVeto);
     }
     Ok(())

@@ -75,6 +75,9 @@ pub fn evaluate_kinematic_surface_with_fees(
     snr_abs: f64,
     fees: FeeSchedule,
 ) -> Result<(i64, i64), &'static str> {
+    if !snr_abs.is_finite() || !signed_geom.is_finite() {
+        return Err("VETO_LOW_L2_GEOM_VACUUM (<min_geom)");
+    }
     let min_geom_floor = if snr_abs > 0.58 {
         (0.106 - (snr_abs - 0.58) * 0.85).clamp(0.02, 0.15)
     } else if snr_abs >= 0.50 {

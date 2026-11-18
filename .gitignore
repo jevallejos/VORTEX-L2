@@ -1,10 +1,16 @@
 /target
+/target_*
 **/*.rs.bk
 *.pdb
 *.mmap
 *.parquet
+*.vkl1
+*.par2z
+*.tmp
 .env
 data/*.jsonl
+data/candles/*.vkl1
+data/archive/*.par2z
 data/vault/*.jsonl
 data/vault/*.json
 data/vault/*.lock

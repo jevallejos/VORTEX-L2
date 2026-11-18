@@ -12,8 +12,7 @@ mkdir -p "$VAULT_DIR" "$VORTEX_DIR/bin" "$VORTEX_DIR/backups" "$VORTEX_DIR/data/
 echo "=== [0/6] COMPUERTA LEY IX: VERIFICACION DE MUESTRA ESTACIONARIA (>= 25/25 TIROS) ==="
 CLOSED_COUNT=0
 if [ -f "$FORENSIC_JSONL" ]; then
-  CLOSED_COUNT=$(grep -c '"event":"TRADE_CLOSE"' "$FORENSIC_JSONL" 2>/dev/null || true)
-  CLOSED_COUNT=${CLOSED_COUNT:-0}
+  CLOSED_COUNT=$(awk '/"event":"EPOCH_RESET"/{c=0; next} /"event":"TRADE_CLOSE"/{c++} END{print c+0}' "$FORENSIC_JSONL" 2>/dev/null || echo 0)
 fi
 if [ "$CLOSED_COUNT" -lt 25 ] && [ "${1:-}" != "--force-override-law9" ]; then
   echo "[BLOQUEADO POR LEY IX] Muestra actual en V4.8: ${CLOSED_COUNT}/25 tiros cerrados."
@@ -59,6 +58,7 @@ chmod +x "$VORTEX_DIR/deploy/prewarm_emas_bybit.py" "$VORTEX_DIR/deploy/install_
 source "$HOME/.cargo/env" 2>/dev/null || true
 nice -n 19 ionice -c 3 cargo clippy --all-targets -- -D warnings || exit 1
 nice -n 19 ionice -c 3 cargo test --lib -- --test-threads=1 || exit 1
+nice -n 19 ionice -c 3 cargo test --tests -- --test-threads=1 || exit 1
 nice -n 19 ionice -c 3 cargo build --release --bins || exit 1
 
 echo "=== [4/6] CERTIFICACION DE LAS 4 COMPUERTAS CLI Y UNIDADES SYSTEMD V4.9 ==="
@@ -127,10 +127,9 @@ fi
 sudo systemctl daemon-reload
 sudo systemctl enable vortex-tap.service vortex-exec.service vortex-web.service >/dev/null 2>&1 || true
 
-echo "=== [5/6] RECREACION LIMPIA SHM v15 + PREWARM + ARRANQUE 3 DEMONIOS ==="
+echo "=== [5/6] RECREACION LIMPIA SHM v15 + ARRANQUE 3 DEMONIOS ==="
 rm -f /dev/shm/vortex_lob.mmap
 rm -f "$VAULT_DIR/DRAIN_MODE.lock" "$VAULT_DIR/HALTED_ON_LOSS.lock"
-python3 "$VORTEX_DIR/deploy/prewarm_emas_bybit.py" || exit 1
 
 sudo systemctl start vortex-tap.service || exit 1
 echo "Hidratando SHM v15 + VKL1 (1s..1d) + Elliott C1 + [OB+, OB-]..."

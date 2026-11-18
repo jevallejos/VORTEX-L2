@@ -166,6 +166,10 @@ pub fn parse_endpoint_url(raw_url: &str) -> Option<ParsedEndpointUrl> {
     let trimmed = raw_url.trim().trim_end_matches('/');
     let (use_tls, rest, default_port) = if let Some(r) = trimmed.strip_prefix("https://") {
         (true, r, 443_u16)
+    } else if let Some(r) = trimmed.strip_prefix("wss://") {
+        (true, r, 443_u16)
+    } else if let Some(r) = trimmed.strip_prefix("ws://") {
+        (false, r, 80_u16)
     } else {
         let r = trimmed.strip_prefix("http://")?;
         (false, r, 80_u16)
@@ -177,21 +181,41 @@ pub fn parse_endpoint_url(raw_url: &str) -> Option<ParsedEndpointUrl> {
     if authority.is_empty() {
         return None;
     }
-    let (host_s, port) = match authority.rsplit_once(':') {
-        Some((h, p_str)) => {
-            let p = p_str.parse::<u16>().ok()?;
-            (h, p)
+    let (host, host_header, port) = if let Some(after_open) = authority.strip_prefix('[') {
+        let (ipv6_host, tail) = after_open.split_once(']')?;
+        if ipv6_host.is_empty() {
+            return None;
         }
-        None => (authority, default_port),
-    };
-    if host_s.is_empty() {
-        return None;
-    }
-    let host = host_s.to_string();
-    let host_header = if port == default_port {
-        host.clone()
+        let port = if tail.is_empty() {
+            default_port
+        } else {
+            let p_str = tail.strip_prefix(':')?;
+            p_str.parse::<u16>().ok()?
+        };
+        let hh = if port == default_port {
+            format!("[{ipv6_host}]")
+        } else {
+            format!("[{ipv6_host}]:{port}")
+        };
+        (ipv6_host.to_string(), hh, port)
     } else {
-        format!("{host}:{port}")
+        let (host_s, port) = match authority.rsplit_once(':') {
+            Some((h, p_str)) => {
+                let p = p_str.parse::<u16>().ok()?;
+                (h, p)
+            }
+            None => (authority, default_port),
+        };
+        if host_s.is_empty() {
+            return None;
+        }
+        let h = host_s.to_string();
+        let hh = if port == default_port {
+            h.clone()
+        } else {
+            format!("{h}:{port}")
+        };
+        (h, hh, port)
     };
     Some(ParsedEndpointUrl {
         use_tls,
@@ -200,6 +224,46 @@ pub fn parse_endpoint_url(raw_url: &str) -> Option<ParsedEndpointUrl> {
         port,
         base_path,
     })
+}
+
+fn connect_tcp_any_addr(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    for addr in addrs {
+        if let Ok(tcp) = TcpStream::connect_timeout(&addr, timeout) {
+            return Some(tcp);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn connect_ws_with_timeout(
+    ws_url: &str,
+    read_timeout_ms: u64,
+    write_timeout_ms: u64,
+) -> Option<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>> {
+    let ep = parse_endpoint_url(ws_url)?;
+    let tcp = connect_tcp_any_addr(ep.host.as_str(), ep.port, Duration::from_secs(3))?;
+    let _ = tcp.set_nodelay(true);
+    let _ = tcp.set_read_timeout(Some(Duration::from_millis(read_timeout_ms.max(50))));
+    let _ = tcp.set_write_timeout(Some(Duration::from_millis(write_timeout_ms.max(50))));
+    let (sock, _) = tungstenite::client_tls(ws_url, tcp).ok()?;
+    Some(sock)
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+#[must_use]
+pub fn is_ws_timeout_err(err: &tungstenite::Error) -> bool {
+    matches!(
+        err,
+        tungstenite::Error::Io(io_err)
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+    )
 }
 
 enum HttpTransportStream {
@@ -224,9 +288,7 @@ impl HttpTransportStream {
         if ep.use_tls {
             return None;
         }
-        let mut addrs = (ep.host.as_str(), ep.port).to_socket_addrs().ok()?;
-        let addr = addrs.next()?;
-        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+        let tcp = connect_tcp_any_addr(ep.host.as_str(), ep.port, Duration::from_secs(3))?;
         let _ = tcp.set_nodelay(true);
         let _ = tcp.set_read_timeout(Some(Duration::from_secs(4)));
         let _ = tcp.set_write_timeout(Some(Duration::from_secs(4)));
@@ -651,6 +713,12 @@ impl WsTradeTunnel {
             .authorizes_mutation(op, is_defensive_or_abort, now_ns)
     }
 
+    #[inline]
+    #[must_use]
+    pub const fn min_available_quota(&self, now_ns: i64) -> u16 {
+        self.rate_gov.min_available_tokens(now_ns)
+    }
+
     pub fn enable_with_url(&mut self, ws_url: String, api_key: &str, api_secret: &str) {
         self.enabled = cfg!(target_os = "linux");
         self.ws_url = ws_url;
@@ -686,19 +754,9 @@ impl WsTradeTunnel {
             return false;
         }
         self.next_reconnect_ns = now_ns.saturating_add(2_000_000_000);
-        let Ok((mut sock, _)) = tungstenite::connect(self.ws_url.as_str()) else {
+        let Some(mut sock) = connect_ws_with_timeout(self.ws_url.as_str(), 2_200, 2_000) else {
             return false;
         };
-        let tcp_opt = match sock.get_mut() {
-            tungstenite::stream::MaybeTlsStream::Plain(s) => Some(s),
-            tungstenite::stream::MaybeTlsStream::NativeTls(tls) => Some(tls.get_mut()),
-            _ => None,
-        };
-        if let Some(tcp) = tcp_opt {
-            let _ = tcp.set_nodelay(true);
-            let _ = tcp.set_read_timeout(Some(Duration::from_millis(2_200)));
-            let _ = tcp.set_write_timeout(Some(Duration::from_millis(2_000)));
-        }
         let exp_ms = (now_ns / 1_000_000).max(1) + 10_000;
         let sig = sign_bybit_v5_hmac_sha256(api_secret, &format!("GET/realtime{exp_ms}"));
         let auth_msg = serde_json::json!({
@@ -709,22 +767,37 @@ impl WsTradeTunnel {
         if sock.send(tungstenite::Message::Text(auth_msg)).is_err() {
             return false;
         }
-        if let Ok(tungstenite::Message::Text(reply)) = sock.read() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
-                let ok_auth = v.get("retCode").and_then(serde_json::Value::as_i64) == Some(0)
-                    || v.get("success").and_then(serde_json::Value::as_bool) == Some(true);
-                if ok_auth {
-                    println!(
-                        concat!(
-                            "{}\u{1f7e2} [BYBIT V5 WS TRADE TUNNEL] ",
-                            "Persistent {} armed (Atomic Amend).{}"
-                        ),
-                        ANSI_GREEN, self.ws_url, ANSI_RESET
-                    );
-                    self.last_ping_ns = now_ns;
-                    self.socket = Some(sock);
-                    return true;
+        for _ in 0..8 {
+            match sock.read() {
+                Ok(tungstenite::Message::Text(reply)) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
+                        let ok_auth = v.get("retCode").and_then(serde_json::Value::as_i64)
+                            == Some(0)
+                            || v.get("success").and_then(serde_json::Value::as_bool) == Some(true);
+                        if ok_auth {
+                            println!(
+                                concat!(
+                                    "{}\u{1f7e2} [BYBIT V5 WS TRADE TUNNEL] ",
+                                    "Persistent {} armed (Atomic Amend).{}"
+                                ),
+                                ANSI_GREEN, self.ws_url, ANSI_RESET
+                            );
+                            self.last_ping_ns = now_ns;
+                            self.socket = Some(sock);
+                            return true;
+                        }
+                        if v.get("op").and_then(serde_json::Value::as_str) == Some("auth") {
+                            return false;
+                        }
+                    }
                 }
+                Ok(tungstenite::Message::Ping(p)) => {
+                    if sock.send(tungstenite::Message::Pong(p)).is_err() {
+                        return false;
+                    }
+                }
+                Ok(tungstenite::Message::Close(_)) | Err(_) => return false,
+                Ok(_) => {}
             }
         }
         false
@@ -753,14 +826,21 @@ impl WsTradeTunnel {
         for _ in 0..4 {
             match sock.read() {
                 Ok(tungstenite::Message::Ping(p)) => {
-                    let _ = sock.send(tungstenite::Message::Pong(p));
+                    if sock.send(tungstenite::Message::Pong(p)).is_err() {
+                        closed = true;
+                        break;
+                    }
                 }
                 Ok(tungstenite::Message::Close(_)) => {
                     closed = true;
                     break;
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                Err(ref err) if is_ws_timeout_err(err) => break,
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
             }
         }
         Self::set_stream_read_timeout(&mut sock, 2_200);
@@ -823,10 +903,10 @@ impl WsTradeTunnel {
                     if let Some((rc, lim, rst, is_maint)) = parse_ws_trade_ack_frame(&txt, &req_id)
                     {
                         self.rate_gov.on_ack_headers(op, lim, rst);
+                        self.socket = Some(sock);
                         if is_maint {
                             return None;
                         }
-                        self.socket = Some(sock);
                         return Some(rc);
                     }
                 }

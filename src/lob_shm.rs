@@ -438,6 +438,20 @@ impl core::fmt::Debug for SlotTelemetryCell {
     }
 }
 
+#[inline]
+unsafe fn read_volatile_uninit_u64<T: Copy>(src: *const T) -> core::mem::MaybeUninit<T> {
+    let mut dst = core::mem::MaybeUninit::<T>::uninit();
+    let words = core::mem::size_of::<T>() / core::mem::size_of::<u64>();
+    let s_ptr = src.cast::<u64>();
+    let d_ptr = dst.as_mut_ptr().cast::<u64>();
+    for i in 0..words {
+        unsafe {
+            ptr::write(d_ptr.add(i), ptr::read_volatile(s_ptr.add(i)));
+        }
+    }
+    dst
+}
+
 impl SlotTelemetryCell {
     #[inline]
     pub fn store_queue_ahead_lots(&self, lots: LotQty) {
@@ -476,10 +490,16 @@ impl SlotTelemetryCell {
                 core::hint::spin_loop();
                 continue;
             }
-            let mut val = unsafe { ptr::read_volatile(self.payload.get()) };
+            let mut raw_uninit = unsafe { read_volatile_uninit_u64(self.payload.get()) };
             fence(Ordering::Acquire);
             let s2 = self.seq.load(Ordering::Acquire);
             if s1 == s2 {
+                let mut val = unsafe {
+                    let b_ptr = raw_uninit.as_mut_ptr().cast::<u8>();
+                    let off = core::mem::offset_of!(SlotTelemetrySnapshot, tranche1_harvested);
+                    *b_ptr.add(off) = u8::from(*b_ptr.add(off) != 0);
+                    raw_uninit.assume_init()
+                };
                 if val.state_code == 1 || val.state_code == 2 {
                     val.queue_ahead_lots = self.queue_ahead_atomic.load(Ordering::Relaxed);
                 }
@@ -528,10 +548,18 @@ impl SeqlockLobSlot {
                 core::hint::spin_loop();
                 continue;
             }
-            let snap = unsafe { ptr::read_volatile(self.payload.get()) };
+            let mut raw_uninit = unsafe { read_volatile_uninit_u64(self.payload.get()) };
             fence(Ordering::Acquire);
             let s2 = self.seq.load(Ordering::Acquire);
             if s1 == s2 {
+                let snap = unsafe {
+                    let b_ptr = raw_uninit.as_mut_ptr().cast::<u8>();
+                    let off_el = core::mem::offset_of!(SymbolLobSnapshot, is_eligible);
+                    let off_cl = core::mem::offset_of!(SymbolLobSnapshot, wave_climax_active);
+                    *b_ptr.add(off_el) = u8::from(*b_ptr.add(off_el) != 0);
+                    *b_ptr.add(off_cl) = u8::from(*b_ptr.add(off_cl) != 0);
+                    raw_uninit.assume_init()
+                };
                 return Ok(snap);
             }
         }
@@ -579,6 +607,78 @@ impl VortexShmArena {
         } else {
             Some((now.0.max(0) as u64).saturating_sub(hb))
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn as_read_only(&self) -> &ReadOnlyShmArena {
+        unsafe { &*(core::ptr::from_ref(self).cast::<ReadOnlyShmArena>()) }
+    }
+
+    pub fn reset_lob_slots_only(&self) {
+        let empty = SymbolLobSnapshot::new_empty();
+        for s in &self.slots {
+            s.write_snapshot(&empty);
+        }
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct ReadOnlyShmArena(VortexShmArena);
+
+impl ReadOnlyShmArena {
+    #[inline]
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.0.version
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn heartbeat_ns(&self) -> u64 {
+        self.0.heartbeat_ns.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn heartbeat_age_ns(&self, now: TimestampNs) -> Option<u64> {
+        self.0.heartbeat_age_ns(now)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn counters(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.0.exec_armed_count.load(Ordering::Relaxed),
+            self.0.exec_abort_count.load(Ordering::Relaxed),
+            self.0.exec_fill_count.load(Ordering::Relaxed),
+            self.0.exec_closed_count.load(Ordering::Relaxed),
+            self.0.tap_seq_resync_count.load(Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub fn read_slot(&self, slot_idx: usize, max_retries: usize) -> Result<SymbolLobSnapshot, VortexError> {
+        self.0.slot(slot_idx)?.read_snapshot(max_retries)
+    }
+
+    #[inline]
+    pub fn read_telemetry(&self, slot_idx: usize, max_retries: usize) -> Result<SlotTelemetrySnapshot, VortexError> {
+        Ok(self.0.telemetry(slot_idx)?.read_consistent_or_default(max_retries))
+    }
+}
+
+#[derive(Debug)]
+pub struct ReadOnlyShmRegion {
+    inner: MappedShmRegion,
+}
+
+impl ReadOnlyShmRegion {
+    #[inline]
+    #[must_use]
+    pub fn arena(&self) -> &ReadOnlyShmArena {
+        self.inner.arena().as_read_only()
     }
 }
 
@@ -679,7 +779,10 @@ impl MappedShmRegion {
         let reg = {
             use std::os::unix::io::AsRawFd;
             let raw = unsafe { mmap(ptr::null_mut(), arena_len, 3, 1, file.as_raw_fd(), 0) };
-            if raw.is_null() || (raw as usize) == usize::MAX {
+            if raw.is_null()
+                || (raw as usize) == usize::MAX
+                || !(raw as usize).is_multiple_of(core::mem::align_of::<VortexShmArena>())
+            {
                 return Err(VortexError::ColumnarIoFailure);
             }
             Self {
@@ -704,7 +807,12 @@ impl MappedShmRegion {
                 return Err(VortexError::ColumnarIoFailure);
             }
             let view = unsafe { MapViewOfFile(mh, 0x06, 0, 0, arena_len) };
-            if view.is_null() {
+            if view.is_null()
+                || !(view as usize).is_multiple_of(core::mem::align_of::<VortexShmArena>())
+            {
+                if !view.is_null() {
+                    let _ = unsafe { UnmapViewOfFile(view) };
+                }
                 let _ = unsafe { CloseHandle(mh) };
                 return Err(VortexError::ColumnarIoFailure);
             }
@@ -716,21 +824,33 @@ impl MappedShmRegion {
 
         unsafe {
             let cur_magic = ptr::read_volatile(ptr::addr_of!((*reg.ptr).magic));
+            fence(Ordering::Acquire);
             let cur_ver = ptr::read_volatile(ptr::addr_of!((*reg.ptr).version));
-            let need_init =
-                reset_zero || cur_magic != VORTEX_SHM_MAGIC || cur_ver != VORTEX_SHM_VERSION;
-            if need_init {
+            if cur_magic != VORTEX_SHM_MAGIC || cur_ver != VORTEX_SHM_VERSION {
                 ptr::write_bytes(reg.ptr, 0, 1);
                 ptr::write_volatile(ptr::addr_of_mut!((*reg.ptr).version), VORTEX_SHM_VERSION);
                 fence(Ordering::Release);
                 ptr::write_volatile(ptr::addr_of_mut!((*reg.ptr).magic), VORTEX_SHM_MAGIC);
                 fence(Ordering::Release);
+            } else if reset_zero {
+                let ar = &*reg.ptr;
+                ar.heartbeat_ns.store(0, Ordering::Release);
+                ar.exec_armed_count.store(0, Ordering::Release);
+                ar.exec_abort_count.store(0, Ordering::Release);
+                ar.exec_fill_count.store(0, Ordering::Release);
+                ar.exec_closed_count.store(0, Ordering::Release);
+                ar.tap_seq_resync_count.store(0, Ordering::Release);
+                ar.reset_lob_slots_only();
+                let empty_tel = SlotTelemetrySnapshot::default();
+                for t in &ar.telemetry_cells {
+                    t.write_consistent(&empty_tel);
+                }
             }
         }
         Ok(reg)
     }
 
-    pub fn open_existing_read_only(path: &Path) -> Result<Self, VortexError> {
+    pub fn open_existing_read_only(path: &Path) -> Result<ReadOnlyShmRegion, VortexError> {
         let arena_len = core::mem::size_of::<VortexShmArena>();
         let file = OpenOptions::new()
             .read(true)
@@ -745,7 +865,10 @@ impl MappedShmRegion {
         let reg = {
             use std::os::unix::io::AsRawFd;
             let raw = unsafe { mmap(ptr::null_mut(), arena_len, 1, 1, file.as_raw_fd(), 0) };
-            if raw.is_null() || (raw as usize) == usize::MAX {
+            if raw.is_null()
+                || (raw as usize) == usize::MAX
+                || !(raw as usize).is_multiple_of(core::mem::align_of::<VortexShmArena>())
+            {
                 return Err(VortexError::ColumnarIoFailure);
             }
             Self {
@@ -770,7 +893,12 @@ impl MappedShmRegion {
                 return Err(VortexError::ColumnarIoFailure);
             }
             let view = unsafe { MapViewOfFile(mh, 0x04, 0, 0, arena_len) };
-            if view.is_null() {
+            if view.is_null()
+                || !(view as usize).is_multiple_of(core::mem::align_of::<VortexShmArena>())
+            {
+                if !view.is_null() {
+                    let _ = unsafe { UnmapViewOfFile(view) };
+                }
                 let _ = unsafe { CloseHandle(mh) };
                 return Err(VortexError::ColumnarIoFailure);
             }
@@ -782,14 +910,14 @@ impl MappedShmRegion {
 
         let valid = unsafe {
             let mg = ptr::read_volatile(ptr::addr_of!((*reg.ptr).magic));
-            let vr = ptr::read_volatile(ptr::addr_of!((*reg.ptr).version));
             fence(Ordering::Acquire);
+            let vr = ptr::read_volatile(ptr::addr_of!((*reg.ptr).version));
             mg == VORTEX_SHM_MAGIC && vr == VORTEX_SHM_VERSION
         };
         if !valid {
             return Err(VortexError::ColumnarFormatCorrupted);
         }
-        Ok(reg)
+        Ok(ReadOnlyShmRegion { inner: reg })
     }
 
     #[inline]
@@ -940,8 +1068,7 @@ mod tests {
                         ..SlotTelemetrySnapshot::default()
                     });
                 }
-                if let Ok(tel_r) = r_only.arena().telemetry(2) {
-                    let ts = tel_r.read_consistent_or_default(4);
+                if let Ok(ts) = r_only.arena().read_telemetry(2, 4) {
                     assert_eq!(ts.state_code, 4);
                     assert_eq!(ts.open_lots, 12);
                     assert!(ts.tranche1_harvested);

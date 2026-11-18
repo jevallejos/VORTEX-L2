@@ -698,7 +698,7 @@ impl CausalOrderBlockEngine {
                 }
             }
             let (bull_pm, _) = self.plasticity.directional_efficacy_pm();
-            let eff_bull_pm = bull_pm.max(self.learned_efficacy_pm);
+            let eff_bull_pm = bull_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
             let dist = ((px.0 - z.high_ticks.0).saturating_mul(1_000_000)) / px.0.max(1);
             let sc = ((z.strength_pm as f64) * 1e-3)
                 * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI })
@@ -731,7 +731,7 @@ impl CausalOrderBlockEngine {
                 }
             }
             let (_, bear_pm) = self.plasticity.directional_efficacy_pm();
-            let eff_bear_pm = bear_pm.max(self.learned_efficacy_pm);
+            let eff_bear_pm = bear_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
             let dist = ((z.low_ticks.0 - px.0).saturating_mul(1_000_000)) / px.0.max(1);
             let sc = ((z.strength_pm as f64) * 1e-3)
                 * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI })
@@ -806,7 +806,8 @@ impl CausalOrderBlockEngine {
         let mut oi_pts = [(0_i64, 0_i64); 64];
         let mut oi_len = 0_usize;
         if let Some(rows) = oi_5m.and_then(|v| v.get("result")).and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) {
-            for item in rows.iter().rev().take(64) {
+            let take_n = rows.len().min(64);
+            for item in rows[..take_n].iter().rev() {
                 let ts = item.get("timestamp").and_then(serde_json::Value::as_str).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                 if let Some(of) = item.get("openInterest").and_then(serde_json::Value::as_str).and_then(|s| s.parse::<f64>().ok()) {
                     self.observe_open_interest(of);
@@ -815,9 +816,10 @@ impl CausalOrderBlockEngine {
                 }
             }
         }
-        let mut count = 0_usize;
+        let mut staged = Vec::new();
         for (is_5m, k_opt) in [(true, kline_5m), (false, kline_1m)] {
             let Some(rows) = k_opt.and_then(|v| v.get("result")).and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) else { continue };
+            let div_ms = if is_5m { 300_000_i64 } else { 60_000_i64 };
             for row in rows.iter().rev() {
                 let Some(arr) = row.as_array() else { continue };
                 if arr.len() < 7 { continue; }
@@ -829,14 +831,17 @@ impl CausalOrderBlockEngine {
                     spec.parse_price_ticks(arr[4].as_str().unwrap_or("")),
                 ) else { continue };
                 let mut bar_oi = self.last_oi_x100;
-                for i in 0..oi_len {
-                    if oi_pts[i].0 <= ts_ms { bar_oi = oi_pts[i].1; }
+                for &(o_ts, o_val) in &oi_pts[..oi_len] {
+                    if o_ts <= ts_ms { bar_oi = o_val; }
                 }
                 let turn_f = arr[6].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(100.0);
-                let div_ms = if is_5m { 300_000 } else { 60_000 };
-                self.ingest_closed_bar(spec, is_5m, ts_ms / div_ms, op, hi, lo, cl, (turn_f.max(1.0) * 1e8).round() as i64, bar_oi);
-                count += 1;
+                staged.push((ts_ms.saturating_add(div_ms), is_5m, ts_ms / div_ms, op, hi, lo, cl, (turn_f.max(1.0) * 1e8).round() as i64, bar_oi));
             }
+        }
+        staged.sort_by_key(|&(close_ms, is_5m, _, _, _, _, _, _, _)| (close_ms, !is_5m));
+        let count = staged.len();
+        for (_, is_5m, bucket_id, op, hi, lo, cl, turn_1e8, bar_oi) in staged {
+            self.ingest_closed_bar(spec, is_5m, bucket_id, op, hi, lo, cl, turn_1e8, bar_oi);
         }
         count
     }

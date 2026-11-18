@@ -334,6 +334,11 @@ impl BybitV5LiveClient {
         self.ws_trade.authorizes_mutation(op, is_defensive_or_abort, now_epoch_ns().0)
     }
 
+    #[must_use]
+    pub fn ws_min_available_quota(&self) -> u16 {
+        self.ws_trade.min_available_quota(now_epoch_ns().0)
+    }
+
     pub fn place_order_ws_or_rest(
         &mut self,
         spec: PairSpec,
@@ -553,6 +558,7 @@ impl BybitV5LiveClient {
             "price": px_str,
             "timeInForce": "PostOnly",
             "reduceOnly": reduce_only,
+            "positionIdx": 0,
         });
         if let Some(sl_t) = sl_price {
             if !reduce_only && sl_t.0 > 0 {
@@ -560,6 +566,7 @@ impl BybitV5LiveClient {
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("stopLoss".to_string(), serde_json::Value::String(sl_exact));
                     obj.insert("slTriggerBy".to_string(), serde_json::Value::String("MarkPrice".to_string()));
+                    obj.insert("tpslMode".to_string(), serde_json::Value::String("Full".to_string()));
                 }
             }
         }

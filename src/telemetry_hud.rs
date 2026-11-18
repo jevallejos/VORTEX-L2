@@ -574,12 +574,48 @@ pub fn classify_live_upl_color(net_scaled_bps: i64) -> &'static str {
     }
 }
 
-pub fn render_live_hud(arena: &VortexShmArena) {
+#[must_use]
+pub fn rehydrate_last_funding_cuts_from_vault() -> [i64; MAX_ACTIVE_PAIRS] {
+    let mut cuts = [0_i64; MAX_ACTIVE_PAIRS];
+    let Ok(file) = File::open(AI_FORENSIC_VAULT_PATH) else {
+        return cuts;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        match v.get("event").and_then(serde_json::Value::as_str) {
+            Some("EPOCH_RESET") => {
+                cuts = [0_i64; MAX_ACTIVE_PAIRS];
+            }
+            Some("FUNDING_SETTLEMENT") => {
+                let s_opt = v
+                    .get("slot_idx")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|u| u as usize)
+                    .filter(|&u| u < MAX_ACTIVE_PAIRS)
+                    .or_else(|| {
+                        v.get("symbol")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(slot_from_symbol_name)
+                    });
+                let cut_id = v.get("funding_cut_id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                if let Some(s_idx) = s_opt {
+                    if cut_id > cuts[s_idx] {
+                        cuts[s_idx] = cut_id;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    cuts
+}
+
+pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
     let ts_now = now_epoch_ns();
     let now_ns = ts_now.0.max(0) as u64;
-    let hb_ns = arena.heartbeat_ns.load(Ordering::Acquire);
+    let hb_ns = arena.heartbeat_ns();
     let hb_age_ms = if hb_ns > 0 && now_ns >= hb_ns { (now_ns - hb_ns) / 1_000_000 } else { 0 };
-    let resyncs = arena.tap_seq_resync_count.load(Ordering::Relaxed);
+    let (armed_c, abort_c, fill_c, closed_c, resyncs) = arena.counters();
     let drain_active = Path::new(DRAIN_LOCK_PATH).exists();
     let halt_active = Path::new(HALT_LOCK_PATH).exists();
     let fees = load_hud_fee_schedule();
@@ -594,8 +630,8 @@ pub fn render_live_hud(arena: &VortexShmArena) {
         DailyShieldPhase::HibernatingLossCap => ANSI_ORANGE,
     };
     let sec_title = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.0 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
-        arena.version
+        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.1 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
+        arena.version()
     )];
     let sec_hdr = vec![concat!(
         "SLOT  \u{2502} SYMBOL     \u{2502}   PyG UPL (%@10x) \u{2502} POSITION TIME \u{2502} ",
@@ -604,11 +640,11 @@ pub fn render_live_hud(arena: &VortexShmArena) {
     ).to_string()];
     let mut sec_rows = Vec::with_capacity(MAX_ACTIVE_PAIRS);
     let (mut open_slots_count, mut queued_slots_count) = (0_usize, 0_usize);
-    let btc_snap = arena.slot(0).and_then(|s| s.read_snapshot(4)).unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
+    let btc_snap = arena.read_slot(0, 4).unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
     for s_idx in 0..MAX_ACTIVE_PAIRS {
         let spec = APPROVED_SPECS[s_idx];
-        let snap = arena.slot(s_idx).and_then(|s| s.read_snapshot(4)).unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
-        let tel = arena.telemetry(s_idx).map(|t| t.read_consistent_or_default(4)).unwrap_or_default();
+        let snap = arena.read_slot(s_idx, 4).unwrap_or_else(|_| SymbolLobSnapshot::new_empty());
+        let tel = arena.read_telemetry(s_idx, 4).unwrap_or_default();
         let (bw, bf) = spec.format_price_usdt_parts(snap.bids[0].price);
         let (aw, af) = spec.format_price_usdt_parts(snap.asks[0].price);
         let spr = (snap.asks[0].price.0 - snap.bids[0].price.0).max(0);
@@ -708,9 +744,7 @@ pub fn render_live_hud(arena: &VortexShmArena) {
         else if dg.is_hibernating() { format!("{dg_col}{}{ANSI_RESET}", dg.phase.label()) }
         else { format!("{ANSI_GREEN}ACTIVE_200HZ{ANSI_RESET}") };
     let sec_ftr = vec![format!(
-        "  Mode: {mode_badge} \u{2502} Open:{open_slots_count}/6 Q:{queued_slots_count} \u{2502} Arm:{} Abr:{} Fil:{} Cls:{} \u{2502} Day:{dg_col}{:+.2}%{ANSI_RESET} ({}) \u{2502} FeeRT:{:.2}bp",
-        arena.exec_armed_count.load(Ordering::Relaxed), arena.exec_abort_count.load(Ordering::Relaxed),
-        arena.exec_fill_count.load(Ordering::Relaxed), arena.exec_closed_count.load(Ordering::Relaxed),
+        "  Mode: {mode_badge} \u{2502} Open:{open_slots_count}/6 Q:{queued_slots_count} \u{2502} Arm:{armed_c} Abr:{abort_c} Fil:{fill_c} Cls:{closed_c} \u{2502} Day:{dg_col}{:+.2}%{ANSI_RESET} ({}) \u{2502} FeeRT:{:.2}bp",
         (dg.day_pnl_ppm() as f64) / 10_000.0, dg.phase.label(), (fee_rt as f64) / 100.0
     )];
     print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_ftr]);

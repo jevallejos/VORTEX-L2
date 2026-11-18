@@ -19,7 +19,7 @@ jobs:
           ! grep -rnU $'\r' src/ tests/ deploy/ README.md CONSTITUTION_VORTEX_OMEGA.md Cargo.toml
       - name: Gate 1 - Clippy Zero-Warnings
         run: cargo clippy --all-targets -- -D warnings
-      - name: Gate 2 - Deterministic /dev/shm Lib (80) & Integration Suites (Red-Team, De-Legacy, V5.1 Forensic)
+      - name: Gate 2 - Deterministic /dev/shm Lib (81) & Integration Suites (Red-Team, De-Legacy, V5.1 Forensic)
         run: |
           cargo test --lib -- --test-threads=1
           cargo test --tests -- --test-threads=1

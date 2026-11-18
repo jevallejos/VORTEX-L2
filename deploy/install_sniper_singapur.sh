@@ -7,6 +7,7 @@ chmod +x /home/ubuntu/vortex-rs/deploy/prewarm_emas_bybit.py
 
 nice -n 19 ionice -c 3 cargo clippy --all-targets -- -D warnings
 nice -n 19 ionice -c 3 cargo test --lib -- --test-threads=1
+nice -n 19 ionice -c 3 cargo test --tests -- --test-threads=1
 nice -n 19 ionice -c 3 cargo build --release --bins
 
 ./target/release/vortex_tap
@@ -22,4 +23,4 @@ install -m 0755 target/release/vortex_exec /home/ubuntu/vortex-rs/bin/vortex_exe
 install -m 0755 target/release/vortex_web /home/ubuntu/vortex-rs/bin/vortex_web
 sudo install -m 0644 /home/ubuntu/vortex-rs/deploy/vortex-web.service /etc/systemd/system/vortex-web.service
 sudo systemctl daemon-reload
-echo "[OK] VORTEX-OMEGA V4.9 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."
+echo "[OK] VORTEX-OMEGA V5.1 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."

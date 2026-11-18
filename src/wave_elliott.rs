@@ -722,7 +722,34 @@ impl CausalElliottWaveState {
         oi_5m: Option<&serde_json::Value>,
     ) -> usize {
         let mut total = 0_usize;
-        if let Some(k5) = kline_5m { total += self.ingest_kline_bundle(spec, k5); }
+        let first_1m_ms = kline_1m
+            .and_then(|v| v.get("result"))
+            .and_then(|r| r.get("list"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.last())
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(i64::MAX);
+        if let Some(k5) = kline_5m {
+            if let Some(rows) = k5.get("result").and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) {
+                for row in rows.iter().rev() {
+                    let Some(arr) = row.as_array() else { continue };
+                    if arr.len() < 5 { continue; }
+                    let ts_ms = arr[0].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    if ts_ms >= first_1m_ms { continue; }
+                    let (Some(hi), Some(lo), Some(cl)) = (
+                        arr[2].as_str().and_then(|s| spec.parse_price_ticks(s).ok()),
+                        arr[3].as_str().and_then(|s| spec.parse_price_ticks(s).ok()),
+                        arr[4].as_str().and_then(|s| spec.parse_price_ticks(s).ok()),
+                    ) else { continue };
+                    let vol_est = ScaledBps((((hi.0 - lo.0).abs().saturating_mul(1_000_000)) / cl.0.max(1)).max(2_500));
+                    let _ = self.observe_price_tick(spec, cl, ts_ms.saturating_mul(1_000_000), vol_est);
+                    total += 1;
+                }
+            }
+        }
         if let Some(k1) = kline_1m { total += self.ingest_kline_bundle(spec, k1); }
         if let Some(rows) = oi_5m.and_then(|v| v.get("result")).and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) {
             for item in rows.iter().rev() {
@@ -735,6 +762,9 @@ impl CausalElliottWaveState {
     }
 
     pub fn evaluate_wave_entry_modulation(obs: WaveObservables, side: Side, btc_signed_snr: f64) -> Result<WaveEntryModulation, &'static str> {
+        if !btc_signed_snr.is_finite() {
+            return Err("VETO_WAVE_NAN_BTC_SNR");
+        }
         let signed_phase = obs.macro_phase.get() * side.sign_f64();
         if obs.climax_active && signed_phase > 0.0 {
             return Err("VETO_WAVE5_LIQ_CLIMAX_EXHAUSTION");

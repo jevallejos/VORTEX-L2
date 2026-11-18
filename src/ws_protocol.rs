@@ -426,8 +426,13 @@ impl Vip0WsRateGovernor {
 
     #[inline]
     #[must_use]
-    pub const fn limit_per_sec(&self, op: WsMutationOp) -> i64 {
-        self.learned_limit_per_sec[op as usize]
+    pub const fn min_available_tokens(&self, now_ns: i64) -> u16 {
+        let a0 = self.available_tokens(WsMutationOp::Create, now_ns);
+        let a1 = self.available_tokens(WsMutationOp::Amend, now_ns);
+        let a2 = self.available_tokens(WsMutationOp::Cancel, now_ns);
+        let m01 = if a0 < a1 { a0 } else { a1 };
+        let m = if m01 < a2 { m01 } else { a2 };
+        if m <= 0 { 0 } else if m > 1_000 { 1_000 } else { m as u16 }
     }
 
     #[inline]
@@ -465,6 +470,12 @@ impl Vip0WsRateGovernor {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn limit_per_sec(&self, op: WsMutationOp) -> i64 {
+        self.learned_limit_per_sec[op as usize]
+    }
+
+    #[inline]
     pub fn on_ack_headers(&mut self, op: WsMutationOp, limit_status: Option<i64>, reset_ts_ms: Option<i64>) {
         let idx = op as usize;
         self.inflight[idx] = (self.inflight[idx] - 1).max(0);
@@ -481,7 +492,12 @@ impl Vip0WsRateGovernor {
             self.srv_remaining[idx] = (self.srv_remaining[idx] - 1).max(0);
         }
         if let Some(rst_ms) = reset_ts_ms {
-            self.reset_ts_ns[idx] = rst_ms.saturating_mul(1_000_000);
+            let srv_ns = rst_ms.saturating_mul(1_000_000);
+            if self.srv_remaining[idx] <= 0 {
+                self.reset_ts_ns[idx] = self.reset_ts_ns[idx].max(srv_ns);
+            } else {
+                self.reset_ts_ns[idx] = srv_ns;
+            }
         }
     }
 }

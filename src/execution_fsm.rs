@@ -276,10 +276,15 @@ impl SlotExecutionEngine {
         let dir_s = side.sign_f64();
         let phi_self = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * dir_s;
         let (m_skew, _) = compute_stoikov_microprice_skew(side, snap);
-        let beta_btc = epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP);
+        let beta_btc = if epps_signed_beta.is_finite() {
+            epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP)
+        } else {
+            0.0
+        };
         let btc_aligned = OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s;
         let y_ev = if self.slot_idx == 0 { 0.70 * phi_self + 0.30 * m_skew } else { 0.50 * phi_self + 0.20 * m_skew + 0.30 * beta_btc * btc_aligned };
-        self.wald_sprt.log_likelihood = (self.wald_sprt.log_likelihood + 0.963_932_022_500_210_3 * (y_ev - 0.140_983_005_625_052_5) * dt_s).clamp(1.5 * b_unwind, a_hold);
+        let prev_ll = if self.wald_sprt.log_likelihood.is_finite() { self.wald_sprt.log_likelihood } else { 0.0 };
+        self.wald_sprt.log_likelihood = (prev_ll + 0.963_932_022_500_210_3 * (y_ev - 0.140_983_005_625_052_5) * dt_s).clamp(1.5 * b_unwind, a_hold);
         if self.wald_sprt.log_likelihood <= b_unwind {
             let excess = ((b_unwind - self.wald_sprt.log_likelihood) / b_unwind.abs().max(1e-6)).max(0.0);
             let btc_drag = if self.slot_idx > 0 { (-beta_btc * btc_aligned - 0.20).max(0.0) } else { 0.0 };
@@ -538,8 +543,14 @@ impl SlotExecutionEngine {
 
     pub fn sync_to_shm_telemetry(&self, arena: &VortexShmArena) {
         let Ok(tel) = arena.telemetry(self.slot_idx) else { return; };
+        let prev_vc = tel.read_consistent_or_default(2).last_veto_code;
         let snap = match self.state {
-            OrderLifecycleState::Idle => SlotTelemetrySnapshot { state_code: 0, lvdbs_surfs: self.lvdbs_deep_surfs_count, ..SlotTelemetrySnapshot::default() },
+            OrderLifecycleState::Idle => SlotTelemetrySnapshot {
+                state_code: 0,
+                last_veto_code: prev_vc,
+                lvdbs_surfs: self.lvdbs_deep_surfs_count,
+                ..SlotTelemetrySnapshot::default()
+            },
             OrderLifecycleState::PlacingEntryMaker { side, entry_price, qty, sl_trigger_price, submitted_ts, .. } => SlotTelemetrySnapshot {
                 state_code: 1, side_code: side as u64, entry_ticks: entry_price.0, avg_price_ticks: entry_price.0,
                 sl_ticks: sl_trigger_price.0, initial_lots: qty.0, lvdbs_surfs: self.lvdbs_deep_surfs_count,
@@ -723,12 +734,16 @@ impl SlotExecutionEngine {
         };
         let pk_init = if peak_price.0 > 0 { peak_price } else { verified_avg_price };
         let wr_init = if worst_price.0 > 0 { worst_price } else { verified_avg_price };
+        let avg_d = verified_avg_price.0.max(1);
         self.last_opened_ts = opened_ts;
         self.last_eff_sl_ticks = sl_t;
         self.open_vol_5m_bps = snap.realized_vol_5m;
         self.ratchet_locked_gross_bps = 0;
         self.last_closed_peak_ticks = pk_init;
         self.last_closed_worst_ticks = wr_init;
+        self.last_closed_mfe_bps = ((pk_init.0 - verified_avg_price.0).saturating_mul(side.sign_i64()).saturating_mul(1_000_000)) / avg_d;
+        self.last_closed_mae_bps = ((wr_init.0 - verified_avg_price.0).saturating_mul(side.sign_i64()).saturating_mul(1_000_000)) / avg_d;
+        self.last_closed_wald_pct = 0;
         self.tranche1_harvests_count = u64::from(t1_done);
         self.lvdbs_deep_surfs_count = 0;
         self.exit_peg_attempts = 0;
@@ -877,12 +892,15 @@ impl SlotExecutionEngine {
     }
 
     pub fn apply_verified_close_resolution(&mut self, resolution: VerifiedCloseResolution, closed_ts: TimestampNs, ledger: &mut ParitySyncLedger) -> Option<ClosedTradeSummary> {
-        let OrderLifecycleState::PositionOpenMakerExit { side, .. } = self.state else { return None; };
+        let OrderLifecycleState::PositionOpenMakerExit { side, tranche1_harvested, tranche1_lots, tranche1_exit_price, .. } = self.state else { return None; };
         self.last_exit_sub_reason = resolution.sub_reason;
         if matches!(resolution.kind, ClosedTradeKind::MakerPassiveUnwind)
             && matches!(resolution.sub_reason, ExitSubReason::LvdbsDeepVacuumSurf | ExitSubReason::FibonacciImpulseSurf | ExitSubReason::ShadowRunnerCrestHarvest)
         {
             self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
+        }
+        if resolution.exchange_closed_pnl_1e8.is_none() && tranche1_harvested && tranche1_lots.0 > 0 && tranche1_exit_price.0 > 0 {
+            return self.finalize_open_position_close(resolution.kind, resolution.verified_exit_price, closed_ts, ledger);
         }
         Some(self.finalize_close_with_lots(
             resolution.kind, side, resolution.verified_entry_price, resolution.verified_exit_price,
@@ -1241,7 +1259,7 @@ impl SlotExecutionEngine {
         const PHI_SQ_TX: f64 = 2.618_033_988_749_895;
         const INV_PHI_TX: f64 = 0.618_033_988_749_895;
         let base_ratchet = self.maybe_ratchet_chandelier_or_wald_sl_with_beta(snap, btc_leader_snap, epps_signed_beta);
-        if self.chandelier_profit_sl_armed || zeta_tox < INV_PHI_TX {
+        if self.chandelier_profit_sl_armed || !zeta_tox.is_finite() || zeta_tox < INV_PHI_TX {
             return base_ratchet;
         }
         let OrderLifecycleState::PositionOpenMakerExit {

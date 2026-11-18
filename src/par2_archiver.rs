@@ -130,6 +130,9 @@ pub fn decode_vpz1_stream(stream: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, VortexEr
     let mut out = Vec::new();
     while pos < stream.len() {
         let Some(hdr) = stream.get(pos..pos + VPZ1_HEADER_BYTES) else {
+            if !out.is_empty() && stream[pos..].starts_with(&VPZ1_MAGIC[..stream.len().saturating_sub(pos).min(4)]) {
+                break;
+            }
             return Err(VortexError::ColumnarFormatCorrupted);
         };
         if hdr[0..4] != VPZ1_MAGIC {
@@ -142,6 +145,9 @@ pub fn decode_vpz1_stream(stream: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, VortexEr
         let comp_crc = u64::from_le_bytes([hdr[28], hdr[29], hdr[30], hdr[31], hdr[32], hdr[33], hdr[34], hdr[35]]);
         let start = pos + VPZ1_HEADER_BYTES;
         let Some(comp_slice) = stream.get(start..start.saturating_add(comp_len)) else {
+            if !out.is_empty() {
+                break;
+            }
             return Err(VortexError::ColumnarFormatCorrupted);
         };
         if ColumnarParquetBatch::compute_fnv1a64(comp_slice) != comp_crc {

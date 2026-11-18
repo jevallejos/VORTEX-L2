@@ -184,11 +184,16 @@ impl OnlineAdaptiveGovernor {
             return dst_scaled;
         }
         let rem_8h = snap.ts_local_ns.0.div_euclid(1_000_000_000).rem_euclid(28_800);
-        let rem_to_cut_s = (28_800 - rem_8h) as f64;
+        let rem_to_cut_s = if snap.next_funding_ts_ns.0 > snap.ts_local_ns.0 {
+            ((snap.next_funding_ts_ns.0 - snap.ts_local_ns.0) / 1_000_000_000).max(1) as f64
+        } else {
+            (28_800 - rem_8h) as f64
+        };
+        let near_live_cut = rem_to_cut_s <= 150.0 || rem_8h >= 28_650 || rem_8h <= 45;
         let tau_hold_s =
             (0.381_966_011_250_105 * ((self.intrinsic_diffusion_clock_ns(slot_idx) as f64) * 1e-9)).max(60.0);
         let exp_fund_drag = ((-carry_bps).max(0) as f64) * (-rem_to_cut_s / (4.0 * tau_hold_s)).exp();
-        if dst_scaled.intraday_percentile >= 0.48 && !(rem_8h >= 28_650 || rem_8h <= 45) {
+        if dst_scaled.intraday_percentile >= 0.48 && !near_live_cut {
             let h_drag = crate::wave_elliott::hermite_smoothstep_c1(
                 exp_fund_drag,
                 0.05 * (fee_rt as f64),
@@ -502,7 +507,7 @@ impl OnlineAdaptiveGovernor {
         }
         if self.sl_streak[slot_idx][d] >= 1 && self.cum_net_bps_x100[slot_idx][d] <= -(fee_rt * 11) {
             let slot_cd = self.directional_cooldown_until_ns[slot_idx][d];
-            let debt_mult = c_clamp_i64((-self.cum_net_bps_x100[slot_idx][d]) / fee_rt, 2, 16);
+            let debt_mult = c_clamp_i64(self.cum_net_bps_x100[slot_idx][d].saturating_neg() / fee_rt, 2, 16);
             let deep_q_ns = (tau_ns.saturating_mul(debt_mult).saturating_mul(c_min_u32(self.sl_streak[slot_idx][d], 4) as i64)) / 2;
             if check_ts_ns <= 0 || slot_cd <= 0 || check_ts_ns < slot_cd.saturating_add(deep_q_ns) {
                 return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
@@ -516,9 +521,9 @@ impl OnlineAdaptiveGovernor {
                     return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
                 }
             }
-            let sym_net = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
+            let sym_net = self.cum_net_bps_x100[slot_idx][0].saturating_add(self.cum_net_bps_x100[slot_idx][1]);
             if sym_net <= -(fee_rt * 6) && self.global_dir_debt_bps_x100[d] <= -(fee_rt * 25) && self.cum_net_bps_x100[slot_idx][d] <= 0 {
-                let glob_mult = c_clamp_i64((-self.global_dir_debt_bps_x100[d]) / (fee_rt * 4), 4, 16);
+                let glob_mult = c_clamp_i64(self.global_dir_debt_bps_x100[d].saturating_neg() / (fee_rt * 4), 4, 16);
                 if check_ts_ns <= 0 || glob_cd <= 0 || check_ts_ns < glob_cd.saturating_add(tau_ns.saturating_mul(glob_mult)) {
                     return Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION");
                 }
@@ -561,10 +566,10 @@ impl OnlineAdaptiveGovernor {
         let adv_sl = !is_maker_exit && net_scaled_bps.raw() < 0;
         let eff_mfe = mfe_opt.unwrap_or(ScaledBps(fee_rt));
         self.plasticity.observe_exit_outcome_with_mfe(slot_idx, side, adv_sl, eff_mfe, ts_ns.0, self.eq_vol_5m_bps[slot_idx]);
-        let prev_mean = self.ewma_net_bps_x100[slot_idx][d];
+        let prev_mean = self.ewma_net_bps_x100[slot_idx][d].clamp(-100_000, 100_000);
         let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
-        self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d] * 80 + diff.saturating_mul(diff).min(25_000_000) * 20) / 100).max(2_500);
-        self.ewma_net_bps_x100[slot_idx][d] = (prev_mean * 75 + net_scaled_bps.raw() * 25) / 100;
+        self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d].clamp(100, 100_000_000) * 80 + diff.saturating_mul(diff).min(25_000_000) * 20) / 100).max(2_500);
+        self.ewma_net_bps_x100[slot_idx][d] = ((prev_mean * 75 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 25) / 100).clamp(-100_000, 100_000);
         self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 60), fee_rt * 60);
         self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 75), fee_rt * 30);
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
@@ -705,6 +710,9 @@ impl OnlineAdaptiveGovernor {
             "global_dir_debt_bps_x100": self.global_dir_debt_bps_x100,
             "global_dir_sl_streak": self.global_dir_sl_streak, "global_dir_win_streak": self.global_dir_win_streak,
             "global_dir_cooldown_until_ns": self.global_dir_cooldown_until_ns, "last_global_win_dir": self.last_global_win_dir,
+            "cross_chop_cooldown_until_ns": self.cross_chop_cooldown_until_ns,
+            "abc_chop_last_sl_ts_ns": self.abc_chop_last_sl_ts_ns,
+            "abc_chop_sl_score_pm": self.abc_chop_sl_score_pm,
         });
         if let Some(map) = val.as_object_mut() { self.plasticity.write_to_scar_json_map(map); }
         val
@@ -719,12 +727,21 @@ impl OnlineAdaptiveGovernor {
         let min_fl = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 2;
         if let Some(eq_arr) = val.get("eq_vol_5m_bps").and_then(serde_json::Value::as_array) {
             for (s, cell) in eq_arr.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
-                if let Some(n) = cell.as_i64() { if n > 0 { self.eq_vol_5m_bps[s] = n.max(min_fl); } }
+                if let Some(n) = cell.as_i64() { if n > 0 { self.eq_vol_5m_bps[s] = n.clamp(min_fl, 24_000); } }
             }
         }
         extract_matrix_i64_12x2(val, "cum_net_bps_x100", &mut self.cum_net_bps_x100);
         extract_matrix_u32_12x2(val, "sl_streak", &mut self.sl_streak);
         extract_matrix_u32_12x2(val, "win_streak", &mut self.win_streak);
+        for s in 0..MAX_ACTIVE_PAIRS {
+            for d in 0..2 {
+                self.ewma_net_bps_x100[s][d] = self.ewma_net_bps_x100[s][d].clamp(-100_000, 100_000);
+                self.ewma_var_bps2[s][d] = self.ewma_var_bps2[s][d].clamp(2_500, 100_000_000);
+                self.cum_net_bps_x100[s][d] = self.cum_net_bps_x100[s][d].clamp(-100_000, 100_000);
+                self.sl_streak[s][d] = self.sl_streak[s][d].min(4);
+                self.win_streak[s][d] = self.win_streak[s][d].min(16);
+            }
+        }
         extract_matrix_i64_12x2(val, "directional_cooldown_until_ns", &mut self.directional_cooldown_until_ns);
         extract_matrix_i64_12x2(val, "wave_anchor_px_1e4", &mut self.wave_anchor_px_1e4);
         self.wave_anchor_ts_ns = [[0; 2]; MAX_ACTIVE_PAIRS];
@@ -738,7 +755,7 @@ impl OnlineAdaptiveGovernor {
             }
         }
         if let Some(a) = val.get("global_dir_debt_bps_x100").and_then(serde_json::Value::as_array) {
-            for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_i64() { self.global_dir_debt_bps_x100[d] = n; } }
+            for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_i64() { self.global_dir_debt_bps_x100[d] = n.clamp(-200_000, 200_000); } }
         }
         if let Some(a) = val.get("global_dir_sl_streak").and_then(serde_json::Value::as_array) {
             for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_u64() { self.global_dir_sl_streak[d] = n.min(4) as u32; } }
@@ -750,6 +767,14 @@ impl OnlineAdaptiveGovernor {
             for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_i64() { self.global_dir_cooldown_until_ns[d] = n; } }
         }
         if let Some(ld) = val.get("last_global_win_dir").and_then(serde_json::Value::as_u64) { self.last_global_win_dir = ld.min(255) as u8; }
+        self.cross_chop_cooldown_until_ns = [0; MAX_ACTIVE_PAIRS];
+        if let Some(cc) = val.get("cross_chop_cooldown_until_ns").and_then(serde_json::Value::as_array) {
+            for (s, c) in cc.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
+                if let Some(n) = c.as_i64() { self.cross_chop_cooldown_until_ns[s] = n.max(0); }
+            }
+        }
+        self.abc_chop_last_sl_ts_ns = val.get("abc_chop_last_sl_ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0).max(0);
+        self.abc_chop_sl_score_pm = val.get("abc_chop_sl_score_pm").and_then(serde_json::Value::as_i64).unwrap_or(0).clamp(0, 1_000);
         self.plasticity.apply_from_scar_json(val);
         Some(TimestampNs(snap_ts))
     }
@@ -793,10 +818,12 @@ impl OnlineAdaptiveGovernor {
         if !spec.passes_oversized_lot_conviction_guard_with_vol_and_fees(
             wallet_usdt_1e8, entry_px, candidate_snap.realized_vol_5m, cand_comp, in_local_scar, fees,
         ) { return false; }
+        if !spoof_density.is_finite() || !epps_signed_beta.is_finite() { return false; }
         let Ok((e_kin, base_e_min)) = self.evaluate_kinematic_energy_surface(slot_idx, side, self_drift_bps, self_ext_bps, signed_geom, cand_comp) else { return false; };
         let cadence = self.slot_temporal_cadence_for_side(slot_idx, Some(side), candidate_snap);
         let fee_rt = self.active_maker_rt_fee_bps();
-        if e_kin < (base_e_min + cadence.kin_energy_min_delta_bps).clamp(fee_rt / 5, (fee_rt * 4) / 5) { return false; }
+        let scar_rt = fee_rt.max(400);
+        if e_kin < (base_e_min + cadence.kin_energy_min_delta_bps).clamp(fee_rt / 5, (scar_rt * 4) / 5) { return false; }
         let sl_s = self.sl_streak[slot_idx][d] as f64;
         let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
@@ -1514,7 +1541,11 @@ impl OnlineAdaptiveGovernor {
         if adverse_fund_sbps <= 0 {
             return true;
         }
-        let rem_s = (28_800 - snap.ts_local_ns.0.div_euclid(1_000_000_000).rem_euclid(28_800)) as f64;
+        let rem_s = if snap.next_funding_ts_ns.0 > snap.ts_local_ns.0 {
+            ((snap.next_funding_ts_ns.0 - snap.ts_local_ns.0) / 1_000_000_000).max(1) as f64
+        } else {
+            (28_800 - snap.ts_local_ns.0.div_euclid(1_000_000_000).rem_euclid(28_800)) as f64
+        };
         let tau_mkt_s = ((self.intrinsic_diffusion_clock_ns(slot_idx) as f64) * 1e-9).max(60.0);
         let tau_hold_s = (INV_PHI2_F * tau_mkt_s).max(25.0);
         let expected_fund_drag = (adverse_fund_sbps as f64) * (-rem_s / tau_hold_s).exp();
@@ -1596,7 +1627,7 @@ impl OnlineAdaptiveGovernor {
         }
         if matches!(w.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc)
             && self.abc_chop_last_sl_ts_ns > 0
-            && snap.ts_local_ns.0 > self.abc_chop_last_sl_ts_ns
+            && snap.ts_local_ns.0 >= self.abc_chop_last_sl_ts_ns
         {
             let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx) as f64;
             let chop_lvl = (self.abc_chop_sl_score_pm.clamp(0, 1_000) as f64) * 1e-3;

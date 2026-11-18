@@ -82,12 +82,16 @@ const VETOED_CANDIDATES: [VetoedCandidate; 3] = [
 pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
     if parquet_seq > MAX_PARQUET_RING_FILES {
         let expired_seq = parquet_seq - MAX_PARQUET_RING_FILES;
-        let expired_path =
-            data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
-        if expired_path.exists() {
-            let _ = crate::par2_archiver::archive_parquet_segment_file(&expired_path, &data_dir.join("archive"));
+        for cand in [
+            data_dir.join(format!("vortex_l2_segment_{expired_seq:06}.parquet")),
+            data_dir.join(format!("vortex_l2_segment_{expired_seq:09}.parquet")),
+        ] {
+            if cand.exists()
+                && crate::par2_archiver::archive_parquet_segment_file(&cand, &data_dir.join("archive")).is_ok()
+            {
+                let _ = fs::remove_file(&cand);
+            }
         }
-        let _ = fs::remove_file(&expired_path);
     }
     let legacy_lake = data_dir.join("lakehouse_par1");
     if legacy_lake.exists() {
@@ -329,11 +333,9 @@ pub fn inspect_live_shm_readonly(shm_path: &Path) {
             .unwrap_or(0);
         let mut live_slots = 0_usize;
         for idx in 0..MAX_ACTIVE_PAIRS {
-            if let Ok(slot) = arena.slot(idx) {
-                if let Ok(sn) = slot.read_snapshot(2) {
-                    if sn.sequence_id > 0 {
-                        live_slots += 1;
-                    }
+            if let Ok(sn) = arena.read_slot(idx, 2) {
+                if sn.sequence_id > 0 {
+                    live_slots += 1;
                 }
             }
         }
@@ -379,12 +381,10 @@ mod tests {
         let ro = MappedShmRegion::open_existing_read_only(&live_shm);
         assert!(ro.is_ok());
         if let Ok(r_check) = ro {
-            if let Ok(s0) = r_check.arena().slot(0) {
-                let snap_after = s0.read_snapshot(4);
-                assert!(snap_after.is_ok());
-                if let Ok(sn) = snap_after {
-                    assert_eq!(sn.sequence_id, 888_777);
-                }
+            let snap_after = r_check.arena().read_slot(0, 4);
+            assert!(snap_after.is_ok());
+            if let Ok(sn) = snap_after {
+                assert_eq!(sn.sequence_id, 888_777);
             }
         }
         let _ = fs::remove_file(&live_shm);

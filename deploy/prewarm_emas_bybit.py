@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VORTEX-OMEGA V4.8 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
+"""VORTEX-OMEGA V5.1 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
 import json
 import math
 import os
@@ -59,6 +59,18 @@ def main() -> int:
     fast_arr = [0] * 12
     slow_arr = [0] * 12
     vol_arr = [4_800] * 12
+    if out_path.is_file():
+        try:
+            prev = json.loads(out_path.read_text(encoding="utf-8"))
+            pf = prev.get("ewma_fast_px_1e4", [])
+            ps = prev.get("ewma_slow_px_1e4", [])
+            pv = prev.get("eq_vol_5m_bps", [])
+            if len(pf) == 12 and len(ps) == 12 and len(pv) == 12:
+                fast_arr = [max(0, int(x)) for x in pf]
+                slow_arr = [max(0, int(x)) for x in ps]
+                vol_arr = [max(1_200, min(24_000, int(x))) for x in pv]
+        except Exception:
+            pass
     hydrated = 0
     a_fast = 1.0 - math.exp(-60.0 / 20.0)
     a_slow = 1.0 - math.exp(-60.0 / 300.0)
@@ -90,7 +102,8 @@ def main() -> int:
         hydrated += 1
 
     if hydrated == 0:
-        return 0
+        print("[PREWARM V5.1 WARN] 0/12 pares hidratados desde Bybit REST.")
+        return 1
     now_ns = time.time_ns()
     payload = {
         "event": "EMA_PREWARM_V43",
@@ -99,10 +112,14 @@ def main() -> int:
         "ewma_slow_px_1e4": slow_arr,
         "eq_vol_5m_bps": vol_arr,
     }
-    tmp_path = out_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp_path = out_path.parent / f".vortex_ema_prewarm.{os.getpid()}.tmp"
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    with open(tmp_path, "wb") as fh:
+        fh.write(encoded)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp_path, out_path)
-    print(f"[PREWARM V4.8 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
+    print(f"[PREWARM V5.1 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
     return 0
 
 

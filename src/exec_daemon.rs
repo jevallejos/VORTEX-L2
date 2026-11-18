@@ -257,6 +257,7 @@ pub fn can_stage_same_direction_entry(
                     let (stagger_ns, req_cushion_bps) = elastic_same_side_stagger_bounds(eng.intrinsic_tau_mkt_s, snap.realized_vol_5m, b3x, eng.active_fees.round_trip_maker_exit_bps().raw());
                     if now_ns.0.saturating_sub(opened_ts.0) < stagger_ns { return false; }
                     let ref_px = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { match s { Side::Bid => snap.bids[0].price.0, Side::Ask => snap.asks[0].price.0 } };
+                    if ref_px <= 0 { return false; }
                     let cur_gross_bps = ((ref_px - avg_price_ticks.0) * s.sign_i64()).saturating_mul(1_000_000) / avg_price_ticks.0.max(1);
                     if cur_gross_bps < req_cushion_bps && !eng.chandelier_profit_sl_armed { return false; }
                 }
@@ -345,6 +346,14 @@ pub fn step_12_slot_daemon_tick(
     let block_new_entries = rt.halt_locked || rt.drain_active || rt.daily_gov.is_hibernating();
 
     for s_idx in 0..MAX_ACTIVE_PAIRS {
+        if rt.slot_rpc_inflight[s_idx]
+            && rt.slot_rpc_sent_ns[s_idx] > 0
+            && now_ns.0.saturating_sub(rt.slot_rpc_sent_ns[s_idx]) >= 15_000_000_000
+        {
+            rt.slot_rpc_inflight[s_idx] = false;
+            rt.abort_cmd_inflight[s_idx] = false;
+            engines[s_idx].next_peg_allowed_ts_ns = 0;
+        }
         let spec = APPROVED_SPECS[s_idx];
         let snap = cached_snaps[s_idx];
         if snap.sequence_id == 0 { continue; }
@@ -403,6 +412,7 @@ pub fn step_12_slot_daemon_tick(
                 if let Some(gw) = gateway {
                     if gw.try_send(GatewayCommand::PlaceEntry { slot_idx: s_idx, side, entry_price: synced_entry_px, qty, sl_price: synced_sl_px }) {
                         rt.slot_rpc_inflight[s_idx] = true;
+                        rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
                     }
                 } else {
                     let _ = engines[s_idx].on_entry_order_resting(now_ns);
@@ -454,6 +464,7 @@ pub fn step_12_slot_daemon_tick(
                     if let Some(gw) = gateway {
                         if !rt.abort_cmd_inflight[s_idx] && gw.try_send(GatewayCommand::AbortEntry { slot_idx: s_idx, side, aborted_price: entry_price, sl_hint: sl_trigger_price }) {
                             rt.slot_rpc_inflight[s_idx] = true;
+                            rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
                             rt.abort_cmd_inflight[s_idx] = true;
                         }
                     } else {
@@ -473,7 +484,7 @@ pub fn step_12_slot_daemon_tick(
                         if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&snap, new_l1) {
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + q_timers.repeg_cooldown_ns;
                             if let Some(gw) = gateway {
-                                if gw.try_send(GatewayCommand::RepegEntry { slot_idx: s_idx, side, new_price: new_l1, qty, new_sl_price: repeg_sl }) { rt.slot_rpc_inflight[s_idx] = true; continue; }
+                                if gw.try_send(GatewayCommand::RepegEntry { slot_idx: s_idx, side, new_price: new_l1, qty, new_sl_price: repeg_sl }) { rt.slot_rpc_inflight[s_idx] = true; rt.slot_rpc_sent_ns[s_idx] = now_ns.0; continue; }
                             } else {
                                 engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);
                                 engines[s_idx].sync_to_shm_telemetry(arena);
@@ -486,7 +497,7 @@ pub fn step_12_slot_daemon_tick(
                     if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns && now_ns.0.saturating_sub(*last_rest_dispatch_ns) >= 55_000_000 {
                         *last_rest_dispatch_ns = now_ns.0;
                         engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_200_000_000;
-                        if gw.try_send(GatewayCommand::PollEntryFill { slot_idx: s_idx, sl_hint: sl_trigger_price }) { rt.slot_rpc_inflight[s_idx] = true; }
+                        if gw.try_send(GatewayCommand::PollEntryFill { slot_idx: s_idx, sl_hint: sl_trigger_price }) { rt.slot_rpc_inflight[s_idx] = true; rt.slot_rpc_sent_ns[s_idx] = now_ns.0; }
                     }
                 } else {
                     let bbo_crossed = match side { Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0, Side::Ask => snap.bids[0].price.0 >= entry_price.0 };
@@ -523,8 +534,12 @@ pub fn step_12_slot_daemon_tick(
                     let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v49(&snap, &btc_snap, epps_beta, &rt.markout_rings[s_idx], evt_dil); rt.last_zeta_tox[s_idx] = zeta_tox;
                     if engines[s_idx].last_eff_sl_ticks.0 <= 0 { engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
                     let (unverified_sl_breach, eff_sl_now) = should_trigger_live_emergency_flatten(rt, s_idx, side, engines[s_idx].last_eff_sl_ticks, &snap);
-                    if unverified_sl_breach && !rt.slot_rpc_inflight[s_idx] {
-                        if gw.try_send(GatewayCommand::EmergencyFlattenSlot { slot_idx: s_idx, open_side: side, open_lots, backup_sl: eff_sl_now }) { rt.slot_rpc_inflight[s_idx] = true; }
+                    if unverified_sl_breach && !rt.slot_rpc_inflight[s_idx] && now_ns.0 >= rt.sl_retry_after_ns[s_idx] {
+                        if gw.try_send(GatewayCommand::EmergencyFlattenSlot { slot_idx: s_idx, open_side: side, open_lots, backup_sl: eff_sl_now }) {
+                            rt.slot_rpc_inflight[s_idx] = true;
+                            rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
+                            rt.sl_retry_after_ns[s_idx] = now_ns.0 + 250_000_000;
+                        }
                         engines[s_idx].sync_to_shm_telemetry(arena);
                         continue;
                     }
@@ -535,7 +550,7 @@ pub fn step_12_slot_daemon_tick(
                         if let Some(safe_sl) = select_safe_live_sl_ticks_with_fees(side, avg_price_ticks, rt.verified_exchange_sl[s_idx], engines[s_idx].last_eff_sl_ticks, &snap, engines[s_idx].active_fees) {
                             let keep_tighter = match side { Side::Bid => safe_sl.0 > engines[s_idx].last_eff_sl_ticks.0, Side::Ask => engines[s_idx].last_eff_sl_ticks.0 == 0 || safe_sl.0 < engines[s_idx].last_eff_sl_ticks.0 };
                             if keep_tighter { engines[s_idx].last_eff_sl_ticks = safe_sl; }
-                            if gw.try_send(GatewayCommand::EnforceStopLoss { slot_idx: s_idx, sl_price: safe_sl }) { rt.slot_rpc_inflight[s_idx] = true; rt.sl_retry_after_ns[s_idx] = now_ns.0 + 1_200_000_000; }
+                            if gw.try_send(GatewayCommand::EnforceStopLoss { slot_idx: s_idx, sl_price: safe_sl }) { rt.slot_rpc_inflight[s_idx] = true; rt.slot_rpc_sent_ns[s_idx] = now_ns.0; rt.sl_retry_after_ns[s_idx] = now_ns.0 + 1_200_000_000; }
                         } else { rt.sl_needs_sync[s_idx] = false; }
                     }
                     if let Some(quote) = engines[s_idx].compute_canonical_exit_quote(&snap) {
@@ -550,6 +565,7 @@ pub fn step_12_slot_daemon_tick(
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + next_sync_delay_ns;
                             if gw.try_send(GatewayCommand::SyncOpenSlot { slot_idx: s_idx, side, target_px: quote.target_price, target_lots: quote.order_lots, defensive_lock: quote.urgent_close_repeg, cur_gross_bps: quote.cur_gross_bps, vac_level: quote.vac_level, opened_ts_ns: opened_ts.0, tranche1_harvested, fees: engines[s_idx].active_fees }) {
                                 rt.slot_rpc_inflight[s_idx] = true;
+                                rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
                             }
                         }
                     }
@@ -656,7 +672,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     let mut cached_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
     let mut entry_forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
     let mut last_seq = [0_u64; MAX_ACTIVE_PAIRS];
-    let mut last_funding_cut = [0_i64; MAX_ACTIVE_PAIRS];
+    let mut last_funding_cut = crate::telemetry_hud::rehydrate_last_funding_cuts_from_vault();
 
     let boot_ns = now_epoch_ns();
     let startup_hs = run_daemon_startup_handshake(live_capital, boot_ns);
@@ -986,8 +1002,8 @@ mod v49_daemon_ev_guard_tests {
     fn test_v49_daemon_vetoes_tao17_and_eth18_at_200hz() {
         let shm_p = MappedShmRegion::ephemeral_self_test_path("v49_ev_daemon");
         let Ok(reg) = MappedShmRegion::open_or_create(&shm_p, true) else { return };
-        let (tg_tx, _) = mpsc::sync_channel::<String>(8);
-        let (v_tx, _) = mpsc::sync_channel::<VaultIoCommand>(8);
+        let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(8);
+        let (v_tx, _v_rx) = mpsc::sync_channel::<VaultIoCommand>(8);
         let mut rt = ExecRuntimeState::new();
         rt.wallet_1e8 = 6_502_850_000;
         let mut rest_ns = 0_i64;
@@ -1215,11 +1231,12 @@ pub fn evaluate_elastic_spoof_geom_abort_v51(
         return false;
     }
     let p_t = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
-    let sp = spoof_density.clamp(0.0, 1.0);
-    let kappa = event_dilation.clamp(INV_PHI_S, PHI_S);
+    let sp = if spoof_density.is_finite() { spoof_density.clamp(0.0, 1.0) } else { 1.0 };
+    let kappa = if event_dilation.is_finite() { event_dilation.clamp(INV_PHI_S, PHI_S) } else { PHI_S };
+    let clean_armed_g = if armed_geom_raw.is_finite() { armed_geom_raw } else { 0.0 };
     let arm_rtt_ns = (if ws_rtt_us > 0 { u64::from(ws_rtt_us) } else { 25_000 }).clamp(15_000, 100_000) as f64 * 1_000.0;
     let tau_arm_ns = ((PHI_S * arm_rtt_ns * (1.0 - INV_PHI2_S * p_t)) / kappa).round() as i64;
-    let g_in = (armed_geom_raw * dir_s).max(0.0);
+    let g_in = (clean_armed_g * dir_s).max(0.0);
     let s_rug = crate::wave_elliott::hermite_smoothstep_c1(g_in - signed_geom, INV_PHI2_S, 1.0 - INV_PHI4_S);
     let psi_geom = (-signed_geom) * (1.0 + PHI_S * s_rug);
     let s_fl = crate::wave_elliott::hermite_smoothstep_c1(signed_flow_slow.get(), 0.0, INV_PHI_S);
@@ -1266,7 +1283,7 @@ pub fn evaluate_toxic_sweep_velocity_abort_v51(
     if (init_q_ahead.0 as f64) < PHI_W * (min_l1 as f64) { return false; }
     let p_t = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
     let rtt_ns = (if ws_rtt_us > 0 { u64::from(ws_rtt_us) } else { 75_000 }).clamp(20_000, 200_000) as f64 * 1_000.0;
-    let kappa = event_dilation.clamp(INV_PHI_W, PHI_W);
+    let kappa = if event_dilation.is_finite() { event_dilation.clamp(INV_PHI_W, PHI_W) } else { PHI_W };
     let tau_sweep_ns = ((PHI_CUBE_W * rtt_ns * (1.0 + INV_PHI_W * (1.0 - p_t))) / kappa).round() as i64;
     if elapsed_ns > tau_sweep_ns { return false; }
     let rem_ratio = (cur_q_ahead.0.max(0) as f64) / (init_q_ahead.0 as f64);

@@ -256,6 +256,7 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
                 item.get("cumExecQty").and_then(|v| v.as_str()).unwrap_or("0"),
             );
             let link_s = item.get("orderLinkId").and_then(|v| v.as_str()).unwrap_or("");
+            let mut matches_active_entry = link_s.is_empty();
             if !link_s.is_empty() {
                 let (rk, tk) = match status {
                     "Filled" => (WsOrderRank::Terminal, WsTerminalKind::Filled),
@@ -271,13 +272,16 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
                 if let Ok(mut trks) = global_ws_trackers().lock() {
                     let tr = &mut trks[slot_idx];
                     if tr.entry_link_id == link_s {
+                        matches_active_entry = true;
                         tr.entry_lattice = tr.entry_lattice.join(inc);
                     } else if tr.exit_link_id == link_s {
                         tr.exit_lattice = tr.exit_lattice.join(inc);
+                    } else if tr.entry_link_id.is_empty() {
+                        matches_active_entry = true;
                     }
                 }
             }
-            if !reduce_only && matches!(status, "Cancelled" | "Rejected" | "Deactivated") && cum_exec_q.0 <= 0 {
+            if !reduce_only && matches_active_entry && matches!(status, "Cancelled" | "Rejected" | "Deactivated") && cum_exec_q.0 <= 0 {
                 let _ = evt_tx.try_send(GatewayEvent::WsEntryOrderTerminated { slot_idx });
             }
         }
@@ -471,6 +475,7 @@ pub fn process_gateway_command(
         GatewayCommand::EmergencyFlattenSlot { slot_idx, open_side, open_lots, backup_sl } => {
             let spec = APPROVED_SPECS[slot_idx];
             let sym = spec.symbol_id.name();
+            let recent_start_ms = ((crate::types::now_epoch_ns().0 / 1_000_000) - 3_600_000).max(0);
             if backup_sl.0 > 0 {
                 let _ = client.set_position_trading_stop(spec, backup_sl);
             }
@@ -478,7 +483,7 @@ pub fn process_gateway_command(
             let (eff_side, eff_lots) = match client.query_open_position_verified(sym) {
                 Some((false, ..)) => {
                     if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
-                    let closed_pnl_payload = client.query_closed_pnl_raw(sym, 0);
+                    let closed_pnl_payload = client.query_closed_pnl_raw(sym, recent_start_ms);
                     let _ = evt_tx.try_send(GatewayEvent::SlotClosedDetected { slot_idx, vac_level: 1, closed_pnl_payload });
                     return;
                 }
@@ -494,12 +499,10 @@ pub fn process_gateway_command(
             } else {
                 String::new()
             };
-            if client.authorizes_ws_mutation(WsMutationOp::Create, true) {
-                let _ = client.flatten_position_market_ioc(spec, eff_side, eff_lots, &flat_link);
-            }
+            let _ = client.flatten_position_market_ioc(spec, eff_side, eff_lots, &flat_link);
             if let Some((false, ..)) = client.query_open_position_verified(sym) {
                 if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
-                let closed_pnl_payload = client.query_closed_pnl_raw(sym, 0);
+                let closed_pnl_payload = client.query_closed_pnl_raw(sym, recent_start_ms);
                 let _ = evt_tx.try_send(GatewayEvent::SlotClosedDetected { slot_idx, vac_level: 1, closed_pnl_payload });
             } else {
                 let _ = evt_tx.try_send(GatewayEvent::StopLossSynced { slot_idx, sl_price: backup_sl, verified: false });
@@ -528,7 +531,7 @@ pub fn process_gateway_command(
                 if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
                 let _ = client.cancel_all_symbol_orders(sym);
                 let opened_ms = (opened_ts_ns / 1_000_000).max(0);
-                let start_ms = if tranche1_harvested { opened_ms.saturating_sub(86_400_000) } else { opened_ms.saturating_sub(5_000) };
+                let start_ms = opened_ms.saturating_sub(5_000);
                 let closed_pnl_payload = client.query_closed_pnl_raw(sym, start_ms);
                 let _ = evt_tx.try_send(GatewayEvent::SlotClosedDetected { slot_idx, vac_level, closed_pnl_payload });
                 return;
@@ -622,7 +625,7 @@ fn spawn_private_ws_listener(_evt_tx: SyncSender<GatewayEvent>) {}
 #[cfg(target_os = "linux")]
 fn spawn_private_ws_listener(evt_tx: SyncSender<GatewayEvent>) {
     use crate::execution_fsm::sign_bybit_v5_hmac_sha256;
-    use crate::http_ws_transport::load_dotenv_map;
+    use crate::http_ws_transport::{connect_ws_with_timeout, is_ws_timeout_err, load_dotenv_map};
     use crate::types::now_epoch_ns;
 
     let env_map = load_dotenv_map();
@@ -634,29 +637,46 @@ fn spawn_private_ws_listener(evt_tx: SyncSender<GatewayEvent>) {
         .cloned()
         .unwrap_or_else(|| "wss://stream.bybit.com/v5/private".to_string());
     thread::spawn(move || loop {
-        if let Ok((mut socket, _)) = tungstenite::connect(ws_url.as_str()) {
-            let tcp_opt = match socket.get_mut() {
-                tungstenite::stream::MaybeTlsStream::Plain(s) => Some(s),
-                tungstenite::stream::MaybeTlsStream::NativeTls(tls) => Some(tls.get_mut()),
-                _ => None,
-            };
-            if let Some(tcp) = tcp_opt {
-                let _ = tcp.set_nodelay(true);
-                let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
-                let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
-            }
+        if let Some(mut socket) = connect_ws_with_timeout(ws_url.as_str(), 4_000, 5_000) {
             let expires_ms = (now_epoch_ns().0 / 1_000_000).max(1) + 10_000;
             let sig = sign_bybit_v5_hmac_sha256(&api_secret, &format!("GET/realtime{expires_ms}"));
             let auth_msg = serde_json::json!({ "op": "auth", "args": [api_key, expires_ms, sig] }).to_string();
+            if socket.send(tungstenite::Message::Text(auth_msg)).is_err() {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            let mut authed = false;
+            for _ in 0..8 {
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(reply)) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
+                            if v.get("retCode").and_then(serde_json::Value::as_i64) == Some(0)
+                                || v.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+                            {
+                                authed = true;
+                                break;
+                            }
+                            if v.get("op").and_then(serde_json::Value::as_str) == Some("auth") {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(tungstenite::Message::Ping(p)) => {
+                        if socket.send(tungstenite::Message::Pong(p)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
             let sub_msg = "{\"op\":\"subscribe\",\"args\":[\"position\",\"wallet\",\"order\"]}".to_string();
-            if socket.send(tungstenite::Message::Text(auth_msg)).is_err()
-                || socket.send(tungstenite::Message::Text(sub_msg)).is_err()
-            {
+            if !authed || socket.send(tungstenite::Message::Text(sub_msg)).is_err() {
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
             let mut last_ping_ns = now_epoch_ns().0;
-            while let Ok(msg) = socket.read() {
+            loop {
                 let now_ns = now_epoch_ns().0;
                 if now_ns.saturating_sub(last_ping_ns) >= 15_000_000_000 {
                     if socket.send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string())).is_err() {
@@ -664,13 +684,22 @@ fn spawn_private_ws_listener(evt_tx: SyncSender<GatewayEvent>) {
                     }
                     last_ping_ns = now_ns;
                 }
-                match msg {
-                    tungstenite::Message::Text(t) => parse_ws_private_frame(&t, &evt_tx),
-                    tungstenite::Message::Ping(p) => { let _ = socket.send(tungstenite::Message::Pong(p)); }
-                    tungstenite::Message::Close(_) => break,
-                    _ => {}
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(t)) => parse_ws_private_frame(&t, &evt_tx),
+                    Ok(tungstenite::Message::Ping(p)) => {
+                        if socket.send(tungstenite::Message::Pong(p)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(ref err) if is_ws_timeout_err(err) => {}
+                    Err(_) => break,
                 }
             }
+        }
+        if matches!(evt_tx.try_send(GatewayEvent::WalletUpdated { wallet_1e8: 0 }), Err(mpsc::TrySendError::Disconnected(_))) {
+            break;
         }
         thread::sleep(Duration::from_millis(500));
     });
@@ -699,14 +728,20 @@ impl BybitAsyncGateway {
                             cmd,
                             GatewayCommand::PlaceEntry { .. }
                                 | GatewayCommand::RepegEntry { .. }
-                                | GatewayCommand::EnforceStopLoss { .. }
+                                | GatewayCommand::AbortEntry { .. }
+                                | GatewayCommand::SyncOpenSlot { .. }
+                                | GatewayCommand::EmergencyFlattenSlot { .. }
                         );
                         let t0 = crate::types::now_epoch_ns().0;
                         process_gateway_command(&mut client, cmd, &evt_tx);
                         let t1 = crate::types::now_epoch_ns().0;
                         if is_mut {
                             let dt_us = (t1.saturating_sub(t0) / 1_000).clamp(1, 5_000_000);
-                            crate::execution_fsm::record_live_ws_pulse(u32::try_from(dt_us).unwrap_or(1_000), 100);
+                            let quota_rem = client.ws_min_available_quota();
+                            crate::execution_fsm::record_live_ws_pulse(
+                                u32::try_from(dt_us).unwrap_or(1_000),
+                                quota_rem,
+                            );
                         }
                         if t1.saturating_sub(last_hb_ns) >= 8_000_000_000 {
                             client.maintain_ws_trade_heartbeat();

@@ -8,5 +8,5 @@
 
 ## Constitutional Verification Gates
 - `cargo clippy --all-targets -- -D warnings` (`0` warnings)
-- `cargo test --lib -- --test-threads=1` (`80/80` unit tests)
+- `cargo test --lib -- --test-threads=1` (`81/81` unit tests)
 - `cargo test --tests -- --test-threads=1` (`28/28` Red-Team + `500` MC + `D1..D5` De-Legacy + `V5.1` Forensic Counterfactual Suite + `SCAR-LOCK 63/63` + `OOS 520`)

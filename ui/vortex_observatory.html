@@ -247,6 +247,27 @@ const VX = {
 };
 
 function el(id) { return document.getElementById(id); }
+function esc(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+function symPrec(sym) {
+  if (sym === "BTCUSDT") return 1;
+  if (sym === "ETHUSDT" || sym === "SOLUSDT" || sym === "TAOUSDT" || sym === "LTCUSDT") return 2;
+  if (sym === "AVAXUSDT" || sym === "ORDIUSDT" || sym === "LINKUSDT" || sym === "NEARUSDT") return 3;
+  return 4;
+}
+function applyCandlePriceFormat(sym) {
+  if (!VX.candleSeries) return;
+  const p = symPrec(sym);
+  try {
+    VX.candleSeries.applyOptions({ priceFormat: { type: "price", precision: p, minMove: Math.pow(10, -p) } });
+  } catch (_) {}
+}
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n.toFixed(d) : (0).toFixed(d); }
 function sgn(v, d) { const n = Number(v) || 0; return (n >= 0 ? "+" : "") + n.toFixed(d); }
 function showToast(msg) {
@@ -284,7 +305,8 @@ function initCharts() {
   VX.chartMain = LWC.createChart(mBox, Object.assign({ width: mBox.clientWidth || 720, height: 315 }, baseCfg));
   VX.chartSub = LWC.createChart(sBox, Object.assign({ width: sBox.clientWidth || 720, height: 115 }, baseCfg));
   VX.candleSeries = addCompatSeries(VX.chartMain, "candle", {
-    upColor: "#22c55e", downColor: "#ef4444", borderVisible: false, wickUpColor: "#22c55e", wickDownColor: "#ef4444"
+    upColor: "#22c55e", downColor: "#ef4444", borderVisible: false, wickUpColor: "#22c55e", wickDownColor: "#ef4444",
+    priceFormat: { type: "price", precision: symPrec(VX.symbol), minMove: Math.pow(10, -symPrec(VX.symbol)) }
   });
   VX.ofiSeries = addCompatSeries(VX.chartSub, "hist", { priceFormat: { type: "price", precision: 2, minMove: 0.01 } });
   VX.tfiSeries = addCompatSeries(VX.chartSub, "line", { color: "#38bdf8", lineWidth: 2 });
@@ -342,6 +364,7 @@ function syncSlotOverlays() {
 
 async function loadCandles() {
   try {
+    applyCandlePriceFormat(VX.symbol);
     const r = await fetch("/api/candles?symbol=" + encodeURIComponent(VX.symbol) + "&tf=" + encodeURIComponent(VX.tf) + "&limit=320");
     if (!r.ok) return;
     const j = await r.json();
@@ -388,10 +411,10 @@ function renderLiveState(st) {
   else { modeEl.textContent = "ACTIVE_200HZ"; modeEl.className = "pill ok"; }
 
   const sm = st.semaphore_4_4 || {};
-  setSemPill("sem-1", sm.oos_520_ok, "OOS520");
-  setSemPill("sem-2", sm.vault_70_ok, "Vault70");
-  setSemPill("sem-3", sm.maker_80_ok, "Mkr80%");
-  setSemPill("sem-4", sm.sample_25_ok, "25Tiros");
+  setSemPill("sem-1", sm.oos_520_ok, "50Tiros/12d");
+  setSemPill("sem-2", sm.vault_70_ok, "PF/Vault70");
+  setSemPill("sem-3", sm.maker_80_ok, "Mkr82%");
+  setSemPill("sem-4", sm.sample_25_ok, "Escudo2d");
   setSemPill("sem-score", sm.passed === 4, (sm.passed || 0) + "/4");
 
   const lg = st.ledger || {}, ds = st.daily_shield || {}, ct = st.counters || {};
@@ -467,16 +490,16 @@ function renderLiveState(st) {
         "<span class='fl-neu'>/</span>" +
         "<span class='ob-bear" + (obA >= 600 ? " ob-hi" : "") + "'>" + obA + "</span> " +
         "<span class='" + fndCls + "'>" + sgn(fnd, 1) + "b</span>";
-      return "<tr class='slot-row" + m.row + selCls + "' data-sym='" + s.symbol + "'>" +
-        "<td><span class='slot-idx'><span class='sdot " + m.dot + "'></span>" + s.slot_idx + "</span></td>" +
-        "<td class='l'><span class='sym-lbl'>" + s.symbol + "</span>" + sideHtml + "</td>" +
+      return "<tr class='slot-row" + m.row + selCls + "' data-sym='" + esc(s.symbol) + "'>" +
+        "<td><span class='slot-idx'><span class='sdot " + m.dot + "'></span>" + Number(s.slot_idx || 0) + "</span></td>" +
+        "<td class='l'><span class='sym-lbl'>" + esc(s.symbol) + "</span>" + sideHtml + "</td>" +
         "<td class='" + pygCls + "'>" + pyg + "</td><td class='" + tCls + "'>" + tCol + "</td>" +
         "<td class='px-bid'>" + num(s.bid, 4) + "</td><td class='px-ask'>" + num(s.ask, 4) + "</td>" +
         "<td class='" + sprCls + "'>" + spr + "</td>" +
         "<td class='" + flCls(s.ofi) + "'>" + sgn(s.ofi, 2) + "</td>" +
         "<td class='" + flCls(s.tfi) + "'>" + sgn(s.tfi, 2) + "</td>" +
         "<td>" + wob + "</td>" +
-        "<td class='l'><span class='vpill " + m.pill + "'>" + (s.veto_badge || "IDLE") + "</span></td></tr>";
+        "<td class='l'><span class='vpill " + m.pill + "'>" + esc(s.veto_badge || "IDLE") + "</span></td></tr>";
     }).join("");
   }
   syncSlotOverlays();
@@ -510,6 +533,20 @@ async function copyTextSafe(txt) {
   document.body.removeChild(ta);
 }
 
+function extractPathSamples(p) {
+  if (!p) return [];
+  if (Array.isArray(p.samples) && p.samples.length > 0) return p.samples;
+  if (Array.isArray(p.samples_1hz)) {
+    return p.samples_1hz.map(function(r) {
+      if (Array.isArray(r) && r.length >= 8) {
+        return { rel_sec: r[0], mid_delta_sbps: r[1], tp_delta_sbps: r[2], sl_delta_sbps: r[3], ofi_pm: r[4], tfi_pm: r[5], wald_shrink_pm: r[6], zeta_tox_pm: r[7] };
+      }
+      return r || {};
+    });
+  }
+  return [];
+}
+
 function drawPositionPathCanvas(cursorIdx) {
   const cv = el("path-canvas");
   if (!cv) return;
@@ -519,7 +556,7 @@ function drawPositionPathCanvas(cursorIdx) {
   g.fillStyle = "#060a11";
   g.fillRect(0, 0, w, h);
   const p = VX.activePath;
-  const samples = p && Array.isArray(p.samples) ? p.samples : [];
+  const samples = extractPathSamples(p);
   if (samples.length === 0) {
     g.fillStyle = "#8899b0";
     g.font = "11px Consolas, monospace";
@@ -570,7 +607,7 @@ async function loadPositionPath(tradeId) {
     if (!r.ok) return;
     const j = await r.json();
     VX.activePath = j.found ? j.path : null;
-    const samples = VX.activePath && Array.isArray(VX.activePath.samples) ? VX.activePath.samples : [];
+    const samples = extractPathSamples(VX.activePath);
     const sl = el("path-slider");
     sl.max = String(Math.max(0, samples.length - 1));
     sl.value = String(Math.max(0, samples.length - 1));
@@ -598,16 +635,16 @@ async function loadTradesAndAborts() {
         loadPositionPath(VX.selectedTradeId);
       }
       el("trades-body").innerHTML = VX.trades.map(function(t) {
-        const tid = t.trade_id || 0;
+        const tid = Number(t.trade_id) || 0;
         const nb = Number(t.net_bps) || 0;
         const cls = nb >= 1.0 ? "band-GREEN_WIN" : (nb >= -0.5 ? "band-CYAN_SCRATCH" : "band-RED_HEAT");
         const sel = tid === VX.selectedTradeId ? " selected-row" : "";
         return "<tr class='trade-row" + sel + "' data-tid='" + tid + "'>" +
-          "<td>#" + tid + "</td><td class='l'>" + (t.symbol || "") + "</td><td>" + (t.side || "") + "</td>" +
+          "<td>#" + tid + "</td><td class='l'>" + esc(t.symbol || "") + "</td><td>" + esc(t.side || "") + "</td>" +
           "<td class='" + cls + "'>" + sgn(nb, 2) + "</td>" +
           "<td>" + sgn(t.mfe_bps, 1) + "/" + sgn(t.mae_bps, 1) + "</td>" +
           "<td>" + Math.round((Number(t.hold_ms) || 0) / 1000) + "s</td>" +
-          "<td class='l'>" + (t.exit_sub_reason || "MakerExit") + "</td></tr>";
+          "<td class='l'>" + esc(t.exit_sub_reason || "MakerExit") + "</td></tr>";
       }).join("");
     }
     const ra = await fetch("/api/aborts?limit=80");
@@ -615,7 +652,7 @@ async function loadTradesAndAborts() {
       const ja = await ra.json();
       const sp = Array.isArray(ja.shield_precision) ? ja.shield_precision : [];
       el("aborts-prec-body").innerHTML = sp.length > 0 ? sp.map(function(row) {
-        return "<tr><td class='l'>" + row.veto + "</td><td>" + row.tp + "</td><td>" + row.total + "</td><td>" + num(row.precision_pct, 1) + "%</td></tr>";
+        return "<tr><td class='l'>" + esc(row.veto) + "</td><td>" + Number(row.tp || 0) + "</td><td>" + Number(row.total || 0) + "</td><td>" + num(row.precision_pct, 1) + "%</td></tr>";
       }).join("") : "<tr><td class='l' colspan='4'>Sin abortos resueltos aun</td></tr>";
     }
   } catch (_) {}

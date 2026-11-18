@@ -500,10 +500,12 @@ pub fn reconcile_closed_pnl_core(
     if list.is_empty() { return ClosedPnlQueryOutcome::PendingIndexerRetry; }
     let spec = APPROVED_SPECS[ctx.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
     let expected_sym = spec.symbol_id.name();
-    let min_ms = if ctx.opened_ts.0 >= MIN_VALID_UTC_EPOCH_NS { (ctx.opened_ts.0 / 1_000_000).saturating_sub(5_000) } else { 0 };
+    let expected_lots = if ctx.tranche1_harvested { ctx.initial_lots.0.max(ctx.open_lots.0).max(1) } else { ctx.open_lots.0.max(1) };
+    let min_ms = if ctx.opened_ts.0 >= MIN_VALID_UTC_EPOCH_NS { (ctx.opened_ts.0 / 1_000_000).saturating_sub(1_500) } else { 0 };
     let (mut acc_lots, mut w_en, mut w_ex, mut w_lots, mut sum_pnl, mut has_pnl, mut legs_count, mut saw_mkt_sl) =
         (0_i64, 0_i128, 0_i128, 0_i128, 0_i64, false, 0_u32, false);
     for row in list {
+        if acc_lots >= expected_lots { break; }
         let r_sym = row.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
         if !r_sym.is_empty() && r_sym != expected_sym { continue; }
         let upd_ms = row.get("updatedTime").or_else(|| row.get("createdTime"))
@@ -530,7 +532,6 @@ pub fn reconcile_closed_pnl_core(
         }
     }
     if legs_count == 0 { return ClosedPnlQueryOutcome::PendingIndexerRetry; }
-    let expected_lots = if ctx.tranche1_harvested { ctx.initial_lots.0.max(ctx.open_lots.0).max(1) } else { ctx.open_lots.0.max(1) };
     if !allow_partial_lot_coverage && acc_lots > 0 && acc_lots * 100 < expected_lots * 95 {
         return ClosedPnlQueryOutcome::PendingIndexerRetry;
     }
@@ -700,7 +701,7 @@ pub fn compute_canonical_exit_quote_omega(
     } else { 0 };
     let climax_harvest = (w_obs.climax_active || w_obs.regime == WaveRegime::ClimaxExhaustion)
         && aligned_phase > 0.0 && (cur_gross_bps >= zero_loss_bps || best_mfe_bps >= win_floor_bps);
-    let (_, opposing_wave3_escape) = compute_reversible_defensive_state_c1(
+    let (still_locked, opposing_wave3_escape) = compute_reversible_defensive_state_c1(
         ScaledBps(cur_gross_bps), ScaledBps(win_floor_bps), signed_flow_slow,
         ctx.learned_taker_prob_pm, ctx.learned_ir_x100, w_obs, ctx.side, ctx.defensive_floor_locked,
     );
@@ -712,7 +713,7 @@ pub fn compute_canonical_exit_quote_omega(
     let stag_flow_ceil = INV_PHI_CUBE * (1.0 - INV_PHI_SQ * ir_norm);
     let live_deep_underwater = cur_gross_bps <= mae_trig_bps && eff_flow_slow < 0.0;
     let time_stagnation = hold_s >= eff_def_s && cur_gross_bps < win_floor_bps && eff_flow_slow < stag_flow_ceil;
-    let defensive_lock_active = ctx.defensive_floor_locked || opposing_wave3_escape || live_deep_underwater || time_stagnation || climax_harvest;
+    let defensive_lock_active = still_locked || opposing_wave3_escape || live_deep_underwater || time_stagnation || climax_harvest;
     let eff_ratchet_bps = if best_mfe_bps >= (fee_rt * 139) / 100 {
         ctx.ratchet_locked_gross_bps.max(fee_rt + ((best_mfe_bps - fee_rt) * 72) / 100).max(win_floor_bps)
     } else { ctx.ratchet_locked_gross_bps };
@@ -720,7 +721,7 @@ pub fn compute_canonical_exit_quote_omega(
         && ((own_flow <= -0.5 * INV_PHI_CUBE) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < INV_PHI_CUBE));
     let shadow_crest_snap = best_mfe_bps >= fee_rt * 2 && cur_gross_bps >= zero_loss_bps && s_prop < 0.18 && flow_accel < -0.005;
     if !ctx.tranche1_harvested && !ratchet_pullback && !shadow_crest_snap && !opposing_wave3_escape && !climax_harvest
-        && (!defensive_lock_active || (!ctx.defensive_floor_locked && signed_flow_slow.get() >= INV_PHI_FIFTH))
+        && (!defensive_lock_active || (!still_locked && signed_flow_slow.get() >= INV_PHI_FIFTH))
     {
         let raw_t1_px = if defensive_lock_active {
             dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(zero_loss_bps))
@@ -889,6 +890,25 @@ mod tests {
         };
         let kin_win = ShadowRunnerKinematics { flow_ema_fast: 0.66, flow_ema_slow: 0.62, in_scar_debt: false, chandelier_armed: false };
         assert!(compute_canonical_exit_quote_omega(&eth_ctx, kin_win, &eth_s).is_some_and(|q| !q.defensive_lock_active && q.target_price.0 > 180_000));
+        let mut eth_latched = eth_ctx;
+        eth_latched.defensive_floor_locked = true;
+        assert!(compute_canonical_exit_quote_omega(&eth_latched, kin_win, &eth_s).is_some_and(|q| !q.defensive_lock_active && q.target_price.0 > 180_000));
+        let pnl_json = serde_json::json!({
+            "retCode": 0,
+            "result": { "list": [
+                { "symbol": "ETHUSDT", "closedSize": "0.01", "avgEntryPrice": "1795.42", "avgExitPrice": "1802.00", "closedPnl": "0.0615", "orderType": "Limit", "updatedTime": "1800000010000" },
+                { "symbol": "ETHUSDT", "closedSize": "0.01", "avgEntryPrice": "1790.00", "avgExitPrice": "1794.00", "closedPnl": "0.0350", "orderType": "Limit", "updatedTime": "1800000009500" }
+            ]}
+        });
+        let mut rec_ctx = eth_ctx;
+        rec_ctx.opened_ts = TimestampNs(1_800_000_009_000_000_000);
+        match reconcile_closed_pnl_core(&rec_ctx, &pnl_json, 1, false) {
+            ClosedPnlQueryOutcome::Verified(v) => {
+                assert_eq!(v.closed_lots, LotQty(1));
+                assert_eq!(v.exchange_closed_pnl_1e8, Some(6_150_000));
+            }
+            other => assert_eq!(other, ClosedPnlQueryOutcome::PendingIndexerRetry, "unexpected outcome"),
+        }
         let mut tao_ctx = eth_ctx;
         tao_ctx.slot_idx = 4; tao_ctx.avg_price_ticks = PriceTicks(19_505); tao_ctx.peak_favorable_price = PriceTicks(19_514);
         tao_ctx.worst_adverse_price = PriceTicks(19_495); tao_ctx.open_lots = LotQty(12); tao_ctx.initial_lots = LotQty(12);
