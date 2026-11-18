@@ -9,7 +9,7 @@
 use crate::alpha_3factor::OrthogonalFactorState;
 use crate::fee_cadence_beta::{BetaBinomialTakerPrior, FeeSchedule};
 use crate::lob_shm::{SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
-use crate::types::Side;
+use crate::types::{ScaledBps, Side};
 
 const INV_PHI_PM: i64 = 618;
 const INV_PHI2_PM: i64 = 382;
@@ -191,6 +191,8 @@ impl GovernorPlasticityState {
             self.shadow_credits[slot_idx][d] = 0;
             self.scar_ts_ns[slot_idx][d] = now_ns;
             self.scar_eq_vol_bps[slot_idx][d] = cur_eq_vol_bps.max(1_200);
+            self.taker_priors[slot_idx][d].obs_alpha_x1000 =
+                (self.taker_priors[slot_idx][d].obs_alpha_x1000.saturating_mul(INV_PHI_PM)) / 1_000;
             true
         } else {
             self.shadow_credits[slot_idx][d] = next_c;
@@ -682,5 +684,88 @@ mod daily_shield_v48_tests {
         let day2_ns = TimestampNs(day1_ns.0 + UTC_DAY_SPAN_NS);
         assert!(dg.sync_utc_day(day2_ns, eq0 + 44_000_000));
         assert!(!dg.is_hibernating() && dg.phase == DailyShieldPhase::ActiveHunting);
+    }
+}
+
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn observe_outcome_surprise_weighted(
+    prior: &mut BetaBinomialTakerPrior,
+    adverse_sl: bool,
+    mfe_bps: ScaledBps,
+    fee_rt_mkr: ScaledBps,
+) -> i64 {
+    const PHI_S: f64 = 1.618_033_988_749_895;
+    const INV_PHI2_S: f64 = 0.381_966_011_250_105;
+    let p_t = (prior.posterior_permille().clamp(20, 450) as f64) * 1e-3;
+    let fee_f = (fee_rt_mkr.raw().max(100)) as f64;
+    let s3_zero = crate::wave_elliott::hermite_smoothstep_c1(
+        fee_f - (mfe_bps.raw().max(0) as f64),
+        0.0,
+        fee_f,
+    );
+    if adverse_sl {
+        let s_rec = crate::wave_elliott::hermite_smoothstep_c1(
+            (prior.obs_alpha_x1000.max(0) as f64) * 1e-3,
+            0.25,
+            1.25,
+        );
+        let gamma_eff = (960 - (236.0 * (1.0 - p_t) * s3_zero * (0.50 + 0.50 * s_rec)).floor() as i64).clamp(724, 960);
+        let shock_mult = 1.0 + INV_PHI2_S * (1.0 - p_t) * s3_zero * (1.0 + PHI_S * s_rec);
+        let delta_a = (1_000.0 * shock_mult).round() as i64;
+        prior.obs_alpha_x1000 = ((prior.obs_alpha_x1000.saturating_mul(960)) / 1_000).saturating_add(delta_a);
+        prior.obs_beta_x1000 = (prior.obs_beta_x1000.saturating_mul(gamma_eff)) / 1_000;
+    } else {
+        prior.obs_alpha_x1000 = (prior.obs_alpha_x1000.saturating_mul(960)) / 1_000;
+        prior.obs_beta_x1000 = ((prior.obs_beta_x1000.saturating_mul(960)) / 1_000).saturating_add(1_000);
+    }
+    prior.posterior_permille()
+}
+
+impl GovernorPlasticityState {
+    #[inline]
+    pub fn observe_exit_outcome_with_mfe(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        is_adverse_taker_sl: bool,
+        mfe_bps: ScaledBps,
+        ts_ns: i64,
+        eq_vol_bps: i64,
+    ) {
+        if slot_idx >= MAX_ACTIVE_PAIRS { return; }
+        let d = Self::dir_idx(side);
+        let fee_rt = ScaledBps(self.maker_round_trip_fee_bps());
+        let _ = observe_outcome_surprise_weighted(&mut self.taker_priors[slot_idx][d], is_adverse_taker_sl, mfe_bps, fee_rt);
+        if is_adverse_taker_sl {
+            self.scar_ts_ns[slot_idx][d] = ts_ns;
+            self.scar_eq_vol_bps[slot_idx][d] = eq_vol_bps.max(1_200);
+            self.shadow_credits[slot_idx][d] = 0;
+            self.last_credit_ts_ns[slot_idx][d] = ts_ns;
+        } else {
+            self.shadow_credits[slot_idx][d] = 0;
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn observe_sympathetic_chop_coupling(
+        &mut self,
+        slot_idx: usize,
+        closed_side: Side,
+        mfe_bps: ScaledBps,
+    ) {
+        const INV_PHI_S: f64 = 0.618_033_988_749_895;
+        if slot_idx >= MAX_ACTIVE_PAIRS { return; }
+        let fee_f = (self.maker_round_trip_fee_bps().max(100)) as f64;
+        let s_z = crate::wave_elliott::hermite_smoothstep_c1(fee_f - (mfe_bps.raw().max(0) as f64), 0.0, fee_f);
+        if s_z <= 1e-6 { return; }
+        let opp_d = 1 - Self::dir_idx(closed_side);
+        let opp_pr = &mut self.taker_priors[slot_idx][opp_d];
+        let p_opp = (opp_pr.posterior_permille().clamp(20, 450) as f64) * 1e-3;
+        let sym_a = (1_000.0 * INV_PHI_S * (1.0 - p_opp) * s_z).round() as i64;
+        let sym_g = (960 - (146.0 * (1.0 - p_opp) * s_z).floor() as i64).clamp(814, 960);
+        opp_pr.obs_alpha_x1000 = ((opp_pr.obs_alpha_x1000.saturating_mul(960)) / 1_000).saturating_add(sym_a);
+        opp_pr.obs_beta_x1000 = (opp_pr.obs_beta_x1000.saturating_mul(sym_g)) / 1_000;
     }
 }

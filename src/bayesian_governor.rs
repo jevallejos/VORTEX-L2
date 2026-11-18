@@ -10,7 +10,7 @@ use std::sync::mpsc::SyncSender;
 
 use crate::alpha_3factor::OrthogonalFactorState;
 use crate::fee_cadence_beta::{evaluate_utc_dst_and_live_funding_cadence, FeeSchedule};
-use crate::governor_plasticity::GovernorPlasticityState;
+pub use crate::governor_plasticity::{observe_outcome_surprise_weighted, GovernorPlasticityState};
 use crate::kinematic_surface::{
     audit_unified_63_losses_and_2160_manifold, c_clamp_i64, c_max_i64, c_min_i64, c_min_u32,
     evaluate_kinematic_surface_with_fees, evaluate_preflight_hysteresis_with_fees,
@@ -82,6 +82,9 @@ pub struct OnlineAdaptiveGovernor {
     abort_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     abort_anchor_px_1e4: [[i64; 2]; MAX_ACTIVE_PAIRS],
     abort_last_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    cross_chop_cooldown_until_ns: [i64; MAX_ACTIVE_PAIRS],
+    abc_chop_last_sl_ts_ns: i64,
+    abc_chop_sl_score_pm: i64,
     entry_warmup_until_ns: i64,
     plasticity: GovernorPlasticityState,
 }
@@ -117,6 +120,9 @@ impl OnlineAdaptiveGovernor {
             abort_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             abort_anchor_px_1e4: [[i64::MIN; 2]; MAX_ACTIVE_PAIRS],
             abort_last_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
+            cross_chop_cooldown_until_ns: [0; MAX_ACTIVE_PAIRS],
+            abc_chop_last_sl_ts_ns: 0,
+            abc_chop_sl_score_pm: 0,
             entry_warmup_until_ns: 0,
             plasticity: GovernorPlasticityState::new(),
         }
@@ -538,14 +544,23 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    #[inline]
     pub fn observe_closed_trade_at_entry(
         &mut self, slot_idx: usize, side: Side, entry_price: PriceTicks, net_scaled_bps: ScaledBps, is_maker_exit: bool, ts_ns: TimestampNs,
+    ) {
+        self.observe_closed_trade_core(slot_idx, side, entry_price, net_scaled_bps, None, is_maker_exit, ts_ns);
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn observe_closed_trade_core(
+        &mut self, slot_idx: usize, side: Side, entry_price: PriceTicks, net_scaled_bps: ScaledBps, mfe_opt: Option<ScaledBps>, is_maker_exit: bool, ts_ns: TimestampNs,
     ) {
         if slot_idx >= MAX_ACTIVE_PAIRS { return; }
         let d = Self::dir_idx(side);
         let fee_rt = self.active_maker_rt_fee_bps();
-        self.plasticity.observe_exit_outcome(slot_idx, side, !is_maker_exit && net_scaled_bps.raw() < 0, ts_ns.0, self.eq_vol_5m_bps[slot_idx]);
+        let adv_sl = !is_maker_exit && net_scaled_bps.raw() < 0;
+        let eff_mfe = mfe_opt.unwrap_or(ScaledBps(fee_rt));
+        self.plasticity.observe_exit_outcome_with_mfe(slot_idx, side, adv_sl, eff_mfe, ts_ns.0, self.eq_vol_5m_bps[slot_idx]);
         let prev_mean = self.ewma_net_bps_x100[slot_idx][d];
         let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
         self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d] * 80 + diff.saturating_mul(diff).min(25_000_000) * 20) / 100).max(2_500);
@@ -756,7 +771,7 @@ impl OnlineAdaptiveGovernor {
         let entry_px = if candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0 {
             side.select_entry_bbo_price(candidate_snap.bids[0].price, candidate_snap.asks[0].price)
         } else { candidate_snap.mark_price };
-        if entry_px.0 <= 0 || self.audit_historical_entry_veto(slot_idx, side, entry_px.0, candidate_snap.ts_local_ns.0).is_some() { return false; }
+        if entry_px.0 <= 0 || self.audit_historical_entry_veto(slot_idx, side, entry_px.0, candidate_snap.ts_local_ns.0).is_some() || !self.passes_cross_side_abc_chop_shield(slot_idx, side, candidate_snap) { return false; }
         let d = Self::dir_idx(side);
         let spec = APPROVED_SPECS[slot_idx];
         let fees = self.active_fee_schedule();
@@ -862,6 +877,7 @@ impl OnlineAdaptiveGovernor {
         if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08) || (ofi.abs() > 0.55 && tfi.abs() < 0.08) { return Err("VETO_PREFLIGHT_SPOOFING"); }
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         if let Some(veto) = self.audit_historical_entry_veto(slot_idx, side, entry_px.0, snap.ts_local_ns.0) { return Err(veto); }
+        if !self.passes_cross_side_abc_chop_shield(slot_idx, side, snap) { return Err("VETO_CROSS_SIDE_ABC_CHOP_COOLDOWN"); }
         let dir_s = side.sign_f64();
         if (ofi * dir_s) < 0.08 { return Err("VETO_PREFLIGHT_OFI_DECAY"); }
         let signed_snr = OrthogonalFactorState::adaptive_snr_from_snapshot(snap, spoof_density).get() * dir_s;
@@ -1552,5 +1568,143 @@ impl OnlineAdaptiveGovernor {
             * (1.0 + PHI_L1 * p_tkr)
             * vol_ratio;
         (spec.lot_notional_1e8(own_q, entry_px) as f64) >= min_l1_1e8
+    }
+}
+
+impl OnlineAdaptiveGovernor {
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn passes_cross_side_abc_chop_shield(&self, slot_idx: usize, side: Side, snap: &SymbolLobSnapshot) -> bool {
+        const PHI_C: f64 = 1.618_033_988_749_895;
+        const INV_PHI_C: f64 = 0.618_033_988_749_895;
+        const INV_PHI2_C: f64 = 0.381_966_011_250_105;
+        if slot_idx >= MAX_ACTIVE_PAIRS || snap.ts_local_ns.0 <= 0 { return true; }
+        let w = snap.wave_observables();
+        let aligned_macro = w.macro_phase.get() * side.sign_f64();
+        if matches!(w.regime, crate::wave_elliott::WaveRegime::ImpulseWave3) && aligned_macro >= INV_PHI2_C {
+            return true;
+        }
+        let is_chop_reg = matches!(
+            w.regime,
+            crate::wave_elliott::WaveRegime::CorrectiveAbc
+                | crate::wave_elliott::WaveRegime::CorrectiveWave4
+                | crate::wave_elliott::WaveRegime::ClimaxExhaustion
+        );
+        if is_chop_reg && snap.ts_local_ns.0 < self.cross_chop_cooldown_until_ns[slot_idx] {
+            return false;
+        }
+        if matches!(w.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc)
+            && self.abc_chop_last_sl_ts_ns > 0
+            && snap.ts_local_ns.0 > self.abc_chop_last_sl_ts_ns
+        {
+            let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx) as f64;
+            let chop_lvl = (self.abc_chop_sl_score_pm.clamp(0, 1_000) as f64) * 1e-3;
+            let port_win_ns = (PHI_C * tau_ns * (1.0 + PHI_C * chop_lvl)).round() as i64;
+            if snap.ts_local_ns.0.saturating_sub(self.abc_chop_last_sl_ts_ns) < port_win_ns {
+                let (al_pm, op_pm) = match side {
+                    Side::Bid => (snap.ob_bull_efficacy_pm, snap.ob_bear_efficacy_pm),
+                    Side::Ask => (snap.ob_bear_efficacy_pm, snap.ob_bull_efficacy_pm),
+                };
+                let rho_ob = if al_pm > 0 || op_pm > 0 {
+                    (al_pm.max(382) as f64) / ((al_pm.max(382) + op_pm.max(382)) as f64)
+                } else {
+                    0.50
+                };
+                if rho_ob < INV_PHI_C { return false; }
+            }
+        }
+        true
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+    pub fn observe_closed_trade_with_regime_v51(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        entry_price: PriceTicks,
+        net_scaled_bps: ScaledBps,
+        mfe_scaled_bps: ScaledBps,
+        is_maker_exit: bool,
+        wave: crate::wave_elliott::WaveObservables,
+        event_dilation: f64,
+        ts_ns: TimestampNs,
+    ) {
+        const PHI_C: f64 = 1.618_033_988_749_895;
+        const INV_PHI_C: f64 = 0.618_033_988_749_895;
+        if slot_idx >= MAX_ACTIVE_PAIRS { return; }
+        self.observe_closed_trade_core(slot_idx, side, entry_price, net_scaled_bps, Some(mfe_scaled_bps), is_maker_exit, ts_ns);
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let adv_sl = !is_maker_exit && net_scaled_bps.raw() < 0;
+        let is_abc = matches!(
+            wave.regime,
+            crate::wave_elliott::WaveRegime::CorrectiveAbc | crate::wave_elliott::WaveRegime::CorrectiveWave4
+        );
+        if adv_sl && is_abc {
+            let fee_f = (fee_rt.max(100)) as f64;
+            let s_zero = crate::wave_elliott::hermite_smoothstep_c1(fee_f - (mfe_scaled_bps.raw().max(0) as f64), 0.0, fee_f);
+            if s_zero > 1e-6 {
+                self.plasticity.observe_sympathetic_chop_coupling(slot_idx, side, mfe_scaled_bps);
+                let kappa = event_dilation.clamp(INV_PHI_C, PHI_C);
+                let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx) as f64;
+                let p_opp = (self.slot_taker_prob_permille(slot_idx, side.opposite()).clamp(5, 950) as f64) * 1e-3;
+                let dt_opp = (((INV_PHI_C * tau_ns) / kappa) * (1.0 + PHI_C * p_opp)).round() as i64;
+                if ts_ns.0 > 0 {
+                    self.cross_chop_cooldown_until_ns[slot_idx] = self.cross_chop_cooldown_until_ns[slot_idx].max(ts_ns.0.saturating_add(dt_opp));
+                    self.abc_chop_last_sl_ts_ns = self.abc_chop_last_sl_ts_ns.max(ts_ns.0);
+                }
+                let shock_pm = (INV_PHI_C * 1_000.0 * s_zero).round() as i64;
+                self.abc_chop_sl_score_pm = ((self.abc_chop_sl_score_pm * 618) / 1_000 + shock_pm).clamp(0, 1_000);
+            }
+        } else if is_maker_exit && net_scaled_bps.raw() >= fee_rt / 4 {
+            self.abc_chop_sl_score_pm = (self.abc_chop_sl_score_pm * 618) / 1_000;
+        }
+    }
+}
+
+#[cfg(test)]
+mod v51_f6_plasticity_chop_tests {
+    use super::*;
+    use crate::fee_cadence_beta::BetaBinomialTakerPrior;
+    use crate::kinematic_surface::UNIFIED_LOSS_LAB_COUNT;
+    use crate::lob_shm::BookLevel;
+    use crate::types::BoundedScore;
+    use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+    #[test]
+    fn test_v51_f6_surprise_weighted_taker_prior_and_cross_side_abc_cooldown() {
+        assert_eq!(OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold(), (UNIFIED_LOSS_LAB_COUNT, 2_160));
+        let mut pr = BetaBinomialTakerPrior::new_seeded(5);
+        let pm1 = observe_outcome_surprise_weighted(&mut pr, true, ScaledBps(0), ScaledBps(400));
+        let pm2 = observe_outcome_surprise_weighted(&mut pr, true, ScaledBps(0), ScaledBps(400));
+        assert!((110..120).contains(&pm1) && pm2 >= 180);
+
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let t0 = 1_795_000_000_000_000_000_i64;
+        let w_abc = WaveObservables {
+            regime: WaveRegime::CorrectiveAbc, climax_active: false, hurst: WaveObservables::encode_hurst(0.46),
+            macro_phase: BoundedScore::new_clamped(0.25), oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO, fib_proj_bps: ScaledBps(0),
+        };
+        gov.observe_closed_trade_with_regime_v51(3, Side::Ask, PriceTicks(7_156), ScaledBps(-2_008), ScaledBps(139), false, w_abc, 1.0, TimestampNs(t0));
+        assert!(gov.slot_taker_prob_permille(3, Side::Ask) >= 100 && gov.slot_taker_prob_permille(3, Side::Bid) >= 65);
+        gov.observe_closed_trade_with_regime_v51(1, Side::Ask, PriceTicks(179_961), ScaledBps(-1_956), ScaledBps(0), false, w_abc, 1.0, TimestampNs(t0 + 60_000_000_000));
+        gov.observe_closed_trade_with_regime_v51(1, Side::Bid, PriceTicks(179_542), ScaledBps(-2_431), ScaledBps(0), false, w_abc, 1.0, TimestampNs(t0 + 120_000_000_000));
+        assert!(gov.slot_taker_prob_permille(1, Side::Bid) >= 135);
+
+        let mut tao = SymbolLobSnapshot::new_empty();
+        tao.symbol_id = APPROVED_SPECS[4].symbol_id;
+        tao.ts_local_ns = TimestampNs(t0 + 540_000_000_000);
+        tao.realized_vol_5m = ScaledBps(3_200);
+        tao.bids[0] = BookLevel { price: PriceTicks(19_691), qty: LotQty(450) };
+        tao.asks[0] = BookLevel { price: PriceTicks(19_692), qty: LotQty(320) };
+        tao.refresh_deep_l1_l5_totals();
+        tao.set_wave_observables(w_abc);
+        assert!(!gov.passes_cross_side_abc_chop_shield(4, Side::Bid, &tao));
+        let mut w_brk = w_abc;
+        w_brk.regime = WaveRegime::ImpulseWave3;
+        w_brk.macro_phase = BoundedScore::new_clamped(0.75);
+        tao.set_wave_observables(w_brk);
+        assert!(gov.passes_cross_side_abc_chop_shield(4, Side::Bid, &tao));
     }
 }
