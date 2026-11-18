@@ -162,6 +162,9 @@ pub struct SlotExecutionEngine {
     pub last_flow_sample_ts_ns: i64,
     pub in_slot_scar_debt: bool,
     pub chandelier_profit_sl_armed: bool,
+    pub last_obs_funding_cut_id: i64,
+    pub pre_cut_funding_rate_sbps: i64,
+    pub accrued_adverse_funding_sbps: i64,
     pub hawkes_tracker: HawkesQueueTracker,
     pub wald_sprt: WaldSprtState,
 }
@@ -183,6 +186,7 @@ impl SlotExecutionEngine {
             last_opened_ts: TimestampNs(0), next_peg_allowed_ts_ns: 0, exit_peg_attempts: 0,
             close_reconcile_retries: 0, flow_ema_fast: 0.0, flow_ema_slow: 0.0,
             last_flow_sample_ts_ns: 0, in_slot_scar_debt: false, chandelier_profit_sl_armed: false,
+            last_obs_funding_cut_id: 0, pre_cut_funding_rate_sbps: 0, accrued_adverse_funding_sbps: 0,
             hawkes_tracker: HawkesQueueTracker::new(), wald_sprt: WaldSprtState::new(),
         }
     }
@@ -331,6 +335,7 @@ impl SlotExecutionEngine {
 
     #[inline]
     pub fn observe_open_flow_kinematics(&mut self, snap: &SymbolLobSnapshot) {
+        self.observe_open_funding_cut_step(snap);
         let raw_flow = 0.50 * snap.factor_ofi.get() + 0.38 * snap.factor_tfi.get() + 0.12 * snap.factor_geom.get();
         let ts_ns = snap.ts_local_ns.0;
         if self.last_flow_sample_ts_ns <= 0 || ts_ns <= self.last_flow_sample_ts_ns
@@ -443,10 +448,15 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, sl_trigger_price: cur_sl, opened_ts, .. } = self.state else { return None; };
         if avg_price_ticks.0 <= 0 { return None; }
         let fee_rt = self.active_maker_rt_fee_bps();
-        if self.last_closed_mfe_bps >= (fee_rt * 13) / 10 { return None; }
+        let ref_m_px = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { avg_price_ticks.0 };
+        let cur_g_sbps = ((ref_m_px - avg_price_ticks.0).saturating_mul(side.sign_i64()).saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        let tau_t_sbps = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)].tick_to_price_scaled_bps(avg_price_ticks).unwrap_or(ScaledBps(50)).raw();
+        let retained_mfe = compute_c1_retained_mfe_bps(self.last_closed_mfe_bps, cur_g_sbps, fee_rt, self.learned_taker_prob_pm, tau_t_sbps, self.chandelier_profit_sl_armed);
+        if retained_mfe >= (fee_rt * 13) / 10 { return None; }
         let hold_s = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0) / 1_000_000_000;
+        let sl_ref_vol = if self.open_vol_5m_bps.0 > 0 && self.open_vol_5m_bps.0 < snap.realized_vol_5m.0 { self.open_vol_5m_bps } else { snap.realized_vol_5m };
         let contracted_bps = if hold_s >= 3 && self.wald_sprt.exhaustion_unwind_active {
-            let (comp_bps, eff_gamma) = compute_wald_v2_contracted_sl_bps_with_fees(snap.realized_vol_5m, &self.wald_sprt, self.active_fees);
+            let (comp_bps, eff_gamma) = compute_wald_v2_contracted_sl_bps_with_fees(sl_ref_vol, &self.wald_sprt, self.active_fees);
             self.last_closed_wald_pct = self.last_closed_wald_pct.max(eff_gamma);
             comp_bps
         } else {
@@ -460,7 +470,7 @@ impl SlotExecutionEngine {
                 beta_c * (OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s)
             };
             if own_flow >= -0.05 && btc_snr >= -0.20 { return None; }
-            let base_sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(snap.realized_vol_5m, self.active_fees).raw();
+            let base_sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(sl_ref_vol, self.active_fees).raw();
             let btc_headwind = if self.slot_idx > 0 && btc_snr < -0.25 { ((-btc_snr - 0.25) * 20.0).round() as i64 } else { 0 };
             let eff_wald_pct = (self.last_closed_wald_pct + btc_headwind).clamp(12, 42);
             ((base_sl_bps * (100 - eff_wald_pct)) / 100).max(fee_rt * 9)
@@ -543,7 +553,7 @@ impl SlotExecutionEngine {
         let sl_trigger_price = self.compute_fill_or_adopt_sl_ticks_for_slot(side, entry_price, snap)?;
         self.open_vol_5m_bps = snap.realized_vol_5m;
         self.hawkes_tracker.reset();
-        self.wald_sprt.reset();
+        self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side, entry_price, qty: LotQty(qty.0.max(1)),
             target_excursion: target_excursion_scaled_bps, sl_trigger_price, submitted_ts: snap.ts_local_ns,
@@ -621,7 +631,8 @@ impl SlotExecutionEngine {
             let vol_raw = self.open_vol_5m_bps.raw();
             let max_single_cap = fee_rt * 12;
             let vol_unit_cap = if vol_raw > 0 { ((vol_raw * 62) / 100).clamp(min_win_gross + 15, max_single_cap) } else { (fee_rt * 9) / 4 };
-            let mfe_cap = self.learned_mfe_bps.clamp(min_win_gross + 15, max_single_cap);
+            let phi_mfe = ((1.618_033_988_749_895 * (self.learned_mfe_bps as f64)).round() as i64).max(self.learned_mfe_bps);
+            let mfe_cap = phi_mfe.clamp(min_win_gross + 15, max_single_cap);
             target_excursion.raw().min(mfe_cap.min(vol_unit_cap)).max(min_win_gross)
         };
         let structural_tp_price = dynamic_maker_floor_price(side, eff_entry_px, ScaledBps(tp_bps));
@@ -647,7 +658,7 @@ impl SlotExecutionEngine {
         self.last_flow_sample_ts_ns = 0;
         self.chandelier_profit_sl_armed = false;
         self.hawkes_tracker.reset();
-        self.wald_sprt.reset();
+        self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
         self.state = OrderLifecycleState::PositionOpenMakerExit {
             side, entry_price: eff_entry_px, avg_price_ticks: eff_entry_px,
             peak_favorable_price: eff_entry_px, worst_adverse_price: eff_entry_px,
@@ -699,7 +710,7 @@ impl SlotExecutionEngine {
         self.last_flow_sample_ts_ns = 0;
         self.chandelier_profit_sl_armed = is_chandelier_profit_locked_sl_with_fees(side, verified_avg_price, sl_t, self.active_fees);
         self.hawkes_tracker.reset();
-        self.wald_sprt.reset();
+        self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
         self.state = OrderLifecycleState::PositionOpenMakerExit {
             side, entry_price: verified_avg_price, avg_price_ticks: verified_avg_price,
             peak_favorable_price: pk_init, worst_adverse_price: wr_init,
@@ -852,7 +863,17 @@ impl SlotExecutionEngine {
 
     #[must_use]
     pub fn compute_canonical_exit_quote(&self, snap: &SymbolLobSnapshot) -> Option<CanonicalExitQuote> {
-        compute_canonical_exit_quote_omega(&self.open_exit_context()?, self.shadow_runner_kinematics(), snap)
+        let ctx = self.open_exit_context()?;
+        let mut quote = compute_canonical_exit_quote_omega(&ctx, self.shadow_runner_kinematics(), snap)?;
+        let adv_f_sbps = self.accrued_open_adverse_funding_sbps(snap);
+        if adv_f_sbps > 0 {
+            let f_fl = defensive_zero_loss_maker_exit_price_with_funding(ctx.side, ctx.avg_price_ticks, self.active_fees, adv_f_sbps);
+            quote.target_price = match ctx.side {
+                Side::Bid => PriceTicks(quote.target_price.0.max(f_fl.0)),
+                Side::Ask => PriceTicks(quote.target_price.0.min(f_fl.0).max(1)),
+            };
+        }
+        Some(quote)
     }
 
     pub fn finalize_close_with_lots(
@@ -880,13 +901,13 @@ impl SlotExecutionEngine {
         };
         self.fold_price_into_excursions(side, entry_price, exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, net_scaled_bps);
-        { let m_obs = self.last_closed_mfe_bps.max(gross_scaled_bps.raw()); if crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
+        { let m_obs = self.last_closed_mfe_bps.max(gross_scaled_bps.raw()); let km_uncensored = !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape) || m_obs >= self.learned_mfe_bps; if km_uncensored && crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100);
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
         self.last_flow_sample_ts_ns = 0;
         self.hawkes_tracker.reset();
-        self.wald_sprt.reset();
+        self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
         self.state = OrderLifecycleState::Idle;
         ClosedTradeSummary {
             kind, side, entry_price, exit_price, closed_lots: eff_lots,
@@ -924,13 +945,13 @@ impl SlotExecutionEngine {
         self.fold_price_into_excursions(side, avg_price_ticks, tranche1_exit_price);
         self.fold_price_into_excursions(side, avg_price_ticks, leg2_exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, ScaledBps(net_bps));
-        { let m_obs = self.last_closed_mfe_bps.max(gross_bps); if crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
+        { let m_obs = self.last_closed_mfe_bps.max(gross_bps); let km_uncensored = !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape) || m_obs >= self.learned_mfe_bps; if km_uncensored && crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100);
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
         self.last_flow_sample_ts_ns = 0;
         self.hawkes_tracker.reset();
-        self.wald_sprt.reset();
+        self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
         self.state = OrderLifecycleState::Idle;
         Some(ClosedTradeSummary {
             kind: leg2_kind, side, entry_price: avg_price_ticks, exit_price: PriceTicks(avg_exit_ticks),
@@ -1201,7 +1222,8 @@ impl SlotExecutionEngine {
         let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
         let c_rt = spec.expected_round_trip_cost_bps_dynamic(avg_price_ticks, self.learned_taker_prob_pm, self.active_fees).raw();
         let tau_tick = spec.tick_to_price_scaled_bps(avg_price_ticks).unwrap_or(ScaledBps(50)).raw();
-        let base_sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(snap.realized_vol_5m, self.active_fees).raw();
+        let sl_ref_vol = if self.open_vol_5m_bps.0 > 0 && self.open_vol_5m_bps.0 < snap.realized_vol_5m.0 { self.open_vol_5m_bps } else { snap.realized_vol_5m };
+        let base_sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(sl_ref_vol, self.active_fees).raw();
         let wald_sl_bps = ((base_sl_bps * 52) / 100).max(c_rt * 4);
         let floor_sl_bps = ((PHI_SQ_TX * (c_rt as f64)).round() as i64).max(tau_tick.saturating_mul(4));
         let s3 = crate::wave_elliott::hermite_smoothstep_c1(zeta_tox, INV_PHI_TX, PHI_SQ_TX);
@@ -1682,7 +1704,10 @@ impl SlotExecutionEngine {
             .saturating_mul(1_000_000))
             / avg_price_ticks.0.max(1);
         let cur_mfe_bps = state_mfe.max(self.last_closed_mfe_bps);
-        let mfe_above_floor = cur_mfe_bps.saturating_sub(fee_mkr_floor);
+        let ref_now_px = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { avg_price_ticks.0 };
+        let cur_gross_sbps = ((ref_now_px - avg_price_ticks.0).saturating_mul(side.sign_i64()).saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
+        let retained_mfe_bps = compute_c1_retained_mfe_bps(cur_mfe_bps, cur_gross_sbps, fee_mkr_floor, self.learned_taker_prob_pm, tau_tick_bps, self.chandelier_profit_sl_armed);
+        let mfe_above_floor = retained_mfe_bps.saturating_sub(fee_mkr_floor);
         if mfe_above_floor > 0 {
             return zeta_v48;
         }
@@ -1694,17 +1719,74 @@ impl SlotExecutionEngine {
         } else {
             markout_ring.active_fill_toxicity_zeta(opened_ts, c_rt)
         };
-        let own_flow =
+        let raw_own_flow =
             (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * side.sign_f64();
+        let btc_flow = if self.slot_idx == 0 {
+            0.0
+        } else {
+            epps_signed_beta.clamp(-PHI_TX, PHI_TX)
+                * ((0.55 * btc_leader_snap.factor_ofi.get() + 0.45 * btc_leader_snap.factor_tfi.get())
+                    * side.sign_f64())
+        };
+        let own_flow = raw_own_flow
+            .min(INV_PHI_TX * raw_own_flow + INV_PHI2_TX * btc_flow)
+            .clamp(-1.0, 1.0);
         let tau_mkt_ns = self.intrinsic_tau_mkt_s.max(90).saturating_mul(1_000_000_000);
-        let comp = compute_stagnation_sl_compression_factor(
+        let eval_ice_ns = self.intrinsic_toxicity_eval_ns(avg_price_ticks, snap.realized_vol_5m, event_dilation);
+        let ice_comp = if !self.chandelier_profit_sl_armed && cur_gross_sbps < 0 && dt_ns >= eval_ice_ns {
+            let open_v = (self.open_vol_5m_bps.raw().max(1_200)) as f64;
+            let c_rt_f = (c_rt.raw().max(250)) as f64;
+            let d0 = (PHI_SQ_TX * c_rt_f).max(INV_PHI2_TX * open_v);
+            let d1 = (PHI_TX * PHI_SQ_TX * c_rt_f).max(INV_PHI_TX * open_v).max(d0 + 250.0);
+            let h_px = crate::wave_elliott::hermite_smoothstep_c1((-cur_gross_sbps) as f64, d0, d1);
+            let h_tm = crate::wave_elliott::hermite_smoothstep_c1((dt_ns as f64) / (eval_ice_ns.max(1) as f64), PHI_TX, PHI_TX * PHI_SQ_TX);
+            (h_px * h_tm).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let lead_contagion_comp = if self.slot_idx > 0
+            && !self.chandelier_profit_sl_armed
+            && cur_gross_sbps < 0
+            && dt_ns >= eval_ice_ns
+        {
+            let vol_own_f = (snap.realized_vol_5m.raw().max(1_200)) as f64;
+            let vol_btc_f = (btc_leader_snap.realized_vol_5m.raw().max(1_200)) as f64;
+            let vol_surge = (vol_btc_f / vol_own_f).sqrt().clamp(INV_PHI_TX, PHI_TX);
+            let p_tkr_f = (self.learned_taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+            let s_lead = (-btc_flow) * vol_surge * (1.0 + PHI_TX * p_tkr_f);
+            let h_lead = crate::wave_elliott::hermite_smoothstep_c1(s_lead, INV_PHI_TX, PHI_TX);
+            let h_lag = 1.0
+                - crate::wave_elliott::hermite_smoothstep_c1(
+                    raw_own_flow,
+                    -INV_PHI2_TX,
+                    INV_PHI2_TX,
+                );
+            let h_under = crate::wave_elliott::hermite_smoothstep_c1(
+                (-cur_gross_sbps as f64) / (fee_mkr_floor.max(100) as f64),
+                INV_PHI2_TX,
+                1.0,
+            );
+            (h_lead * h_lag * h_under).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let comp = ice_comp.max(lead_contagion_comp).max(compute_stagnation_sl_compression_factor(
             dt_ns,
             tau_mkt_ns,
             event_dilation,
             mfe_above_floor,
             own_flow,
-            z_5h.max(if dt_ns >= 25_000_000_000 && own_flow < -INV_PHI2_TX { PHI_SQ_TX * crate::wave_elliott::hermite_smoothstep_c1(-own_flow, INV_PHI2_TX, 0.92) } else { 0.0 }),
-        );
+            z_5h.max({
+                let eval_ns = self.intrinsic_toxicity_eval_ns(avg_price_ticks, snap.realized_vol_5m, event_dilation);
+                if dt_ns >= eval_ns && cur_gross_sbps < 0 && own_flow < -INV_PHI2_TX {
+                    let h_fl = crate::wave_elliott::hermite_smoothstep_c1(-own_flow, INV_PHI2_TX, 1.0 - INV_PHI2_TX * INV_PHI2_TX);
+                    let h_dd = crate::wave_elliott::hermite_smoothstep_c1((-cur_gross_sbps as f64) / (fee_mkr_floor.max(100) as f64), INV_PHI2_TX, PHI_TX);
+                    PHI_SQ_TX * h_fl * h_dd
+                } else {
+                    0.0
+                }
+            }),
+        ));
         if comp < INV_PHI2_TX {
             return zeta_v48;
         }
@@ -1821,5 +1903,114 @@ mod v49_stagnation_unwind_tests {
         let closed = eng.step_open_position_v49(&tao, &tao, &gov, &mut ledger, 1.0, &ring, 1.0);
         assert!(closed.is_some());
         assert_eq!(eng.learned_mfe_bps, 680);
+    }
+}
+
+/// Continuous C1 retained MFE shield: preserves 100% of MFE while `cur_gross >= 0`, decaying smoothly underwater.
+#[inline]
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops
+)]
+pub fn compute_c1_retained_mfe_bps(
+    observed_mfe_sbps: i64,
+    cur_gross_sbps: i64,
+    fee_rt_mkr_sbps: i64,
+    taker_prob_pm: i64,
+    tau_tick_sbps: i64,
+    chandelier_armed: bool,
+) -> i64 {
+    const PHI_R: f64 = 1.618_033_988_749_895;
+    const INV_PHI_R: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_R: f64 = 0.381_966_011_250_105;
+
+    if observed_mfe_sbps <= 0 || cur_gross_sbps >= 0 || chandelier_armed {
+        return observed_mfe_sbps;
+    }
+    let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    let tol_sbps = (INV_PHI_R * (fee_rt_mkr_sbps.max(100) as f64) * (1.0 - PHI_R * p_tkr).max(0.25))
+        .max(tau_tick_sbps.max(10) as f64);
+    let u_under = ((-cur_gross_sbps) as f64) / tol_sbps;
+    let h_give = crate::wave_elliott::hermite_smoothstep_c1(u_under, INV_PHI2_R, 1.0);
+    ((observed_mfe_sbps as f64) * (1.0 - h_give)).round() as i64
+}
+
+/// Funding-adjusted Zero-Loss Maker floor covering round-trip Maker fees plus settled adverse funding.
+#[inline]
+#[must_use]
+pub fn defensive_zero_loss_maker_exit_price_with_funding(
+    side: Side,
+    avg_price_ticks: PriceTicks,
+    fees: FeeSchedule,
+    adverse_funding_sbps: i64,
+) -> PriceTicks {
+    let base = defensive_zero_loss_maker_exit_price_with_fees(side, avg_price_ticks, fees);
+    if adverse_funding_sbps <= 0 || avg_price_ticks.0 <= 0 {
+        return base;
+    }
+    let extra = (avg_price_ticks.0.saturating_mul(adverse_funding_sbps) + 999_999) / 1_000_000;
+    match side {
+        Side::Bid => PriceTicks(base.0.saturating_add(extra)),
+        Side::Ask => PriceTicks((base.0 - extra).max(1)),
+    }
+}
+
+impl SlotExecutionEngine {
+    /// Endogenously computes settled adverse 8h funding (`ScaledBps`) accrued since `opened_ts`.
+    #[inline]
+    #[must_use]
+    pub const fn accrued_open_adverse_funding_sbps(&self, snap: &SymbolLobSnapshot) -> i64 {
+        const MIN_UTC_NS: i64 = 1_577_836_800_000_000_000;
+        const CUT_8H_NS: i64 = 28_800_000_000_000;
+        let OrderLifecycleState::PositionOpenMakerExit { side, opened_ts, .. } = self.state else {
+            return 0;
+        };
+        if opened_ts.0 < MIN_UTC_NS || snap.ts_local_ns.0 <= opened_ts.0 {
+            return 0;
+        }
+        let cuts = snap.ts_local_ns.0.div_euclid(CUT_8H_NS) - opened_ts.0.div_euclid(CUT_8H_NS);
+        if cuts <= 0 {
+            return 0;
+        }
+        let adv_rate = side.sign_i64().saturating_mul(snap.funding_rate_scaled_bps.0);
+        let fallback = if adv_rate <= 0 { 0 } else { adv_rate.saturating_mul(if cuts > 3 { 3 } else { cuts }) };
+        if self.accrued_adverse_funding_sbps > fallback { self.accrued_adverse_funding_sbps } else { fallback }
+    }
+}
+
+impl SlotExecutionEngine {
+    /// Captures pre-boundary funding rate at 200Hz so post-settlement Bybit rate resets never erase paid funding.
+    #[inline]
+    pub fn observe_open_funding_cut_step(&mut self, snap: &SymbolLobSnapshot) {
+        const MIN_UTC_NS: i64 = 1_577_836_800_000_000_000;
+        const CUT_8H_NS: i64 = 28_800_000_000_000;
+        let OrderLifecycleState::PositionOpenMakerExit { side, opened_ts, .. } = self.state else {
+            return;
+        };
+        if opened_ts.0 < MIN_UTC_NS || snap.ts_local_ns.0 < opened_ts.0 {
+            return;
+        }
+        let cur_cut = snap.ts_local_ns.0.div_euclid(CUT_8H_NS);
+        if self.last_obs_funding_cut_id <= 0 {
+            self.last_obs_funding_cut_id = opened_ts.0.div_euclid(CUT_8H_NS);
+            self.pre_cut_funding_rate_sbps = snap.funding_rate_scaled_bps.0;
+        }
+        if cur_cut > self.last_obs_funding_cut_id {
+            let eff_rate = if self.pre_cut_funding_rate_sbps != 0 {
+                self.pre_cut_funding_rate_sbps
+            } else {
+                snap.funding_rate_scaled_bps.0
+            };
+            let adv = side.sign_i64().saturating_mul(eff_rate);
+            if adv > 0 {
+                let spans = (cur_cut - self.last_obs_funding_cut_id).clamp(1, 3);
+                self.accrued_adverse_funding_sbps =
+                    self.accrued_adverse_funding_sbps.saturating_add(adv.saturating_mul(spans));
+            }
+            self.last_obs_funding_cut_id = cur_cut;
+        }
+        self.pre_cut_funding_rate_sbps = snap.funding_rate_scaled_bps.0;
     }
 }

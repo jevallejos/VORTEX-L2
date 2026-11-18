@@ -511,8 +511,7 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
                     let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v49(&snap, &btc_snap, epps_beta, &rt.markout_rings[s_idx], evt_dil); rt.last_zeta_tox[s_idx] = zeta_tox;
                     if engines[s_idx].last_eff_sl_ticks.0 <= 0 { engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
-                    let eff_sl_now = engines[s_idx].last_eff_sl_ticks;
-                    let unverified_sl_breach = rt.verified_exchange_sl[s_idx].0 <= 0 && match side { Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_now.0, Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_now.0 };
+                    let (unverified_sl_breach, eff_sl_now) = should_trigger_live_emergency_flatten(rt, s_idx, side, engines[s_idx].last_eff_sl_ticks, &snap);
                     if unverified_sl_breach && !rt.slot_rpc_inflight[s_idx] {
                         if gw.try_send(GatewayCommand::EmergencyFlattenSlot { slot_idx: s_idx, open_side: side, open_lots, backup_sl: eff_sl_now }) { rt.slot_rpc_inflight[s_idx] = true; }
                         engines[s_idx].sync_to_shm_telemetry(arena);
@@ -523,7 +522,8 @@ pub fn step_12_slot_daemon_tick(
                     }
                     if rt.sl_needs_sync[s_idx] && !rt.slot_rpc_inflight[s_idx] && now_ns.0 >= rt.sl_retry_after_ns[s_idx] {
                         if let Some(safe_sl) = select_safe_live_sl_ticks_with_fees(side, avg_price_ticks, rt.verified_exchange_sl[s_idx], engines[s_idx].last_eff_sl_ticks, &snap, engines[s_idx].active_fees) {
-                            engines[s_idx].last_eff_sl_ticks = safe_sl;
+                            let keep_tighter = match side { Side::Bid => safe_sl.0 > engines[s_idx].last_eff_sl_ticks.0, Side::Ask => engines[s_idx].last_eff_sl_ticks.0 == 0 || safe_sl.0 < engines[s_idx].last_eff_sl_ticks.0 };
+                            if keep_tighter { engines[s_idx].last_eff_sl_ticks = safe_sl; }
                             if gw.try_send(GatewayCommand::EnforceStopLoss { slot_idx: s_idx, sl_price: safe_sl }) { rt.slot_rpc_inflight[s_idx] = true; rt.sl_retry_after_ns[s_idx] = now_ns.0 + 1_200_000_000; }
                         } else { rt.sl_needs_sync[s_idx] = false; }
                     }
@@ -606,7 +606,7 @@ pub fn step_12_slot_daemon_tick(
                     let lots = gov.compute_slot_entry_lots_v48(s_idx, side, rt.wallet_1e8, &snap, daily_damper_pm);
                     let risk_ppm = slot_position_risk_ppm_with_fees(spec, rt.wallet_1e8, cand_px, lots, snap.realized_vol_5m, fees);
                     let beta_x1000 = rt.epps_trackers[s_idx].correlated_beta_x1000(s_idx == 0, snap.realized_vol_5m, btc_vol);
-                    if !beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
+                    if !beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000) || !passes_elastic_daily_tail_risk_budget(s_idx, side, risk_ppm, rt.wallet_1e8, &rt.daily_gov, ledger.sinking_fund_reserve_bps_x100, engines, cached_snaps, gov) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
                     if let Err(v49_veto) = gov.authorizes_adaptive_entry_v49(s_idx, side, rt.wallet_1e8, daily_damper_pm, mfe_s, &snap, &btc_snap, spoof_d, epps_beta) {
                         let veto_c = if gov.audit_historical_entry_veto(s_idx, side, cand_px.0, snap.ts_local_ns.0).is_some() { LastVetoCode::ScarCooldownOrContagion } else { v49_veto };
                         publish_slot_veto_code(arena, s_idx, veto_c);
@@ -1022,4 +1022,105 @@ mod v49_daemon_ev_guard_tests {
         }
         let _ = std::fs::remove_file(&shm_p);
     }
+}
+
+/// P0-A predicate: dispatches `EmergencyFlattenSlot` on `BreachEmergencyFlatten` even when `verified_exchange_sl > 0`.
+#[inline]
+#[must_use]
+pub fn should_trigger_live_emergency_flatten(
+    rt: &ExecRuntimeState,
+    slot_idx: usize,
+    side: Side,
+    fallback_eff_sl: PriceTicks,
+    snap: &SymbolLobSnapshot,
+) -> (bool, PriceTicks) {
+    if let Some(backup_sl) = rt.emergency_flatten_sl[slot_idx] {
+        return (true, backup_sl);
+    }
+    let v_sl = rt.verified_exchange_sl[slot_idx];
+    if v_sl.0 <= 0 {
+        let unv = match side {
+            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= fallback_eff_sl.0,
+            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= fallback_eff_sl.0,
+        };
+        return (unv, fallback_eff_sl);
+    }
+    if fallback_eff_sl.0 > 0 {
+        let cushion_t = ((fallback_eff_sl.0.saturating_mul(153)) / 1_000_000).max(2);
+        let last_px = if snap.last_trade_price.0 > 0 { snap.last_trade_price.0 } else { snap.mark_price.0 };
+        let gap_through = match side {
+            Side::Bid => fallback_eff_sl.0 >= v_sl.0.saturating_add(cushion_t * 2) && snap.mark_price.0 > 0 && snap.mark_price.0 <= fallback_eff_sl.0.saturating_sub(cushion_t) && last_px <= fallback_eff_sl.0.saturating_sub(cushion_t),
+            Side::Ask => v_sl.0 >= fallback_eff_sl.0.saturating_add(cushion_t * 2) && snap.mark_price.0 >= fallback_eff_sl.0.saturating_add(cushion_t) && last_px >= fallback_eff_sl.0.saturating_add(cushion_t),
+        };
+        if gap_through { return (true, fallback_eff_sl); }
+    }
+    (false, fallback_eff_sl)
+}
+
+/// Elastic C1 daily tail-risk envelope: bounds multi-slot exposure by `DailySessionGovernor`, `p_Taker` & `Chandelier`.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+pub fn passes_elastic_daily_tail_risk_budget(
+    cand_slot: usize,
+    cand_side: Side,
+    cand_risk_ppm: i64,
+    wallet_1e8: i64,
+    daily_gov: &DailySessionGovernor,
+    sinking_reserve_bps_x100: i64,
+    engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+    gov: &OnlineAdaptiveGovernor,
+) -> bool {
+    const PHI_D: f64 = 1.618_033_988_749_895;
+    const INV_PHI_D: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_D: f64 = 0.381_966_011_250_105;
+
+    let fees = gov.active_fee_schedule();
+    let stop_abs_ppm = daily_gov
+        .elastic_loss_stop_ppm(sinking_reserve_bps_x100, gov.active_maker_rt_fee_bps())
+        .abs()
+        .max(3_883) as f64;
+    let used_loss_ppm = (-daily_gov.day_pnl_ppm()).max(0) as f64;
+    let rem_budget_ppm = (stop_abs_ppm - used_loss_ppm).max(0.0);
+
+    let eff_tail = |s_i: usize, sd: Side, r_ppm: i64| -> f64 {
+        let p_tkr = (gov.slot_taker_prob_permille(s_i, sd).clamp(5, 950) as f64) * 1e-3;
+        let h_t = crate::wave_elliott::hermite_smoothstep_c1(p_tkr, 0.04, 0.25);
+        (r_ppm.max(0) as f64) * (INV_PHI_D + INV_PHI2_D * h_t)
+    };
+
+    let mut open_tail_ppm = 0.0_f64;
+    let mut unhedged_count = 0_usize;
+    for s_idx in 0..MAX_ACTIVE_PAIRS {
+        if s_idx == cand_slot {
+            continue;
+        }
+        let active_opt = match engines[s_idx].state {
+            OrderLifecycleState::Idle => None,
+            OrderLifecycleState::PlacingEntryMaker { side, entry_price, qty, .. }
+            | OrderLifecycleState::RestingEntryQueue { side, entry_price, qty, .. } => {
+                Some((side, entry_price, qty, false))
+            }
+            OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, open_lots, .. } => {
+                Some((side, avg_price_ticks, open_lots, engines[s_idx].chandelier_profit_sl_armed))
+            }
+        };
+        if let Some((sd, px, lots, chand_locked)) = active_opt {
+            if !chand_locked {
+                let r_ppm = slot_position_risk_ppm_with_fees(
+                    APPROVED_SPECS[s_idx],
+                    wallet_1e8,
+                    px,
+                    lots,
+                    cached_snaps[s_idx].realized_vol_5m,
+                    fees,
+                );
+                open_tail_ppm += eff_tail(s_idx, sd, r_ppm);
+                unhedged_count += 1;
+            }
+        }
+    }
+    let cand_tail_ppm = eff_tail(cand_slot, cand_side, cand_risk_ppm);
+    let cluster_env = PHI_D / (1.0 + INV_PHI_D * (unhedged_count as f64));
+    (open_tail_ppm + cand_tail_ppm) <= cluster_env * rem_budget_ppm
 }
