@@ -659,7 +659,7 @@ pub fn compute_reversible_defensive_state_c1(
     if !prev_locked { return (false, false); }
     let p_taker = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
     let ir_pos = (ir_x100.clamp(0, 100) as f64) * 1e-2;
-    let phi_unlock = (INV_PHI_CUBE * (1.0 + PHI * p_taker) / (1.0 + INV_PHI * ir_pos)).clamp(INV_PHI_FIFTH, PHI);
+    let phi_unlock = (INV_PHI * (1.0 + INV_PHI_SQ * p_taker) / (1.0 + INV_PHI_CUBE * ir_pos)).clamp(INV_PHI_SQ, PHI);
     let recov_s3 = hermite_s3_unit(cur_gross_bps.raw() as f64, 0.0, (win_floor_bps.raw().max(100)) as f64);
     let eff_unlock = phi_unlock * (1.0 - INV_PHI_CUBE * recov_s3);
     (signed_flow_slow.get() < eff_unlock, false)

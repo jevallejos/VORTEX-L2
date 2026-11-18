@@ -298,6 +298,7 @@ impl SlotExecutionEngine {
         &mut self, snap: &SymbolLobSnapshot, btc_leader_snap: &SymbolLobSnapshot, epps_signed_beta: f64,
     ) -> WaldSprtState {
         let OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, opened_ts, .. } = self.state else { return self.wald_sprt; };
+        self.observe_open_flow_kinematics(snap);
         let st = self.step_wald_sprt_v2_permille_with_beta(side, snap, btc_leader_snap, epps_signed_beta);
         self.last_closed_wald_pct = self.last_closed_wald_pct.max(st.contraction_pct);
         if avg_price_ticks.0 > 0 {
@@ -355,7 +356,10 @@ impl SlotExecutionEngine {
         self.observe_open_funding_cut_step(snap);
         let raw_flow = BoundedScore::new_clamped(0.50 * snap.factor_ofi.get() + 0.38 * snap.factor_tfi.get() + 0.12 * snap.factor_geom.get());
         let ts_ns = snap.ts_local_ns.0;
-        if self.last_flow_sample_ts_ns <= 0 || ts_ns <= self.last_flow_sample_ts_ns
+        if self.last_flow_sample_ts_ns > 0 && ts_ns == self.last_flow_sample_ts_ns {
+            return;
+        }
+        if self.last_flow_sample_ts_ns <= 0 || ts_ns < self.last_flow_sample_ts_ns
             || ts_ns.saturating_sub(self.last_flow_sample_ts_ns) > FLOW_CONTIGUOUS_GAP_MAX_NS
         {
             self.flow_ema_fast = raw_flow.get();
@@ -2104,10 +2108,11 @@ pub fn step_intrinsic_slow_flow_ema(
     const INV_PHI_F: f64 = 0.618_033_988_749_895;
     const INV_PHI3_F: f64 = 0.236_067_977_499_79;
     if dt_ns <= 0 { return prev_ema; }
+    const INV_PHI6_F: f64 = 0.055_728_090_000_84;
     let kappa = event_dilation.clamp(INV_PHI_F, PHI_F);
-    let tau_s = (tau_mkt_s.clamp(90, 360) as f64) / 24.0;
+    let tau_s = (tau_mkt_s.clamp(90, 360) as f64) * INV_PHI6_F;
     let rtt_s = ((ws_rtt_us.clamp(1_000, 500_000) as f64) * 1e-6) * PHI_F;
-    let tau_flow_s = ((INV_PHI3_F * tau_s) / kappa + rtt_s).clamp(0.45, 4.50);
+    let tau_flow_s = ((INV_PHI3_F * tau_s) / kappa + rtt_s).clamp(INV_PHI3_F, PHI_F * PHI_F + PHI_F);
     let dt_s = ((dt_ns as f64) * 1e-9).clamp(0.000_5, 2.0);
     let alpha = (1.0 - (-dt_s / tau_flow_s).exp()).clamp(0.000_5, 1.0);
     BoundedScore::new_clamped(prev_ema.get() + alpha * (inst_flow.get() - prev_ema.get()))
@@ -2135,7 +2140,7 @@ mod v51_f2_fsm_unlock_tests {
         record_live_ws_pulse(75_000, 100);
         let cd_full = compute_adaptive_repeg_cooldown_ns(75_000, 100);
         let cd_low_q = compute_adaptive_repeg_cooldown_ns(75_000, 15);
-        assert!(cd_full >= 150_000_000 && cd_full <= 250_000_000 && cd_low_q > cd_full);
+        assert!((150_000_000..=250_000_000).contains(&cd_full) && cd_low_q > cd_full);
         let gov = OnlineAdaptiveGovernor::new();
         let mut ledger = ParitySyncLedger::new(6_482_040_000);
         let mut eth = SymbolLobSnapshot::new_empty();
