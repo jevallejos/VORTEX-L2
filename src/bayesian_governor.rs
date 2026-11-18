@@ -826,7 +826,7 @@ impl OnlineAdaptiveGovernor {
         ) { return Err("VETO_PREFLIGHT_OVERSIZED_LOT"); }
         let signed_geom = snap.factor_geom.get() * dir_s;
         let (own_q, opp_q) = match side { Side::Bid => (best_bid.qty.0, best_ask.qty.0), Side::Ask => (best_ask.qty.0, best_bid.qty.0) };
-        let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(if signed_snr >= 0.68 && own_q >= opp_q { -0.06 } else { 0.00 }, 0.06);
+        let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(if signed_snr >= 0.68 && own_q >= opp_q { 0.00 } else { 0.02 }, 0.06);
         if signed_geom < min_pre_geom { return Err("VETO_PREFLIGHT_GEOM_REVERSAL"); }
         let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
         let btc_snr = if slot_idx == 0 {
@@ -869,7 +869,19 @@ impl OnlineAdaptiveGovernor {
         &mut self, scar_path: &std::path::Path, red_loss_path: &std::path::Path, session_vault_path: Option<&std::path::Path>,
     ) -> (i64, usize) {
         use std::io::BufRead;
-        let mut snap_ts_ns = 0_i64;
+        let mut epoch_reset_ts_ns = 0_i64;
+        if let Some(vp) = session_vault_path {
+            if let Ok(vf) = std::fs::File::open(vp) {
+                for ln in std::io::BufReader::new(vf).lines().map_while(Result::ok) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ln) {
+                        if v.get("event").and_then(serde_json::Value::as_str) == Some("EPOCH_RESET") {
+                            epoch_reset_ts_ns = epoch_reset_ts_ns.max(v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0));
+                        }
+                    }
+                }
+            }
+        }
+        let mut snap_ts_ns = epoch_reset_ts_ns;
         if let Ok(s_file) = std::fs::File::open(scar_path) {
             let mut latest_snap: Option<serde_json::Value> = None;
             for line in std::io::BufReader::new(s_file).lines().map_while(Result::ok) {
@@ -877,7 +889,7 @@ impl OnlineAdaptiveGovernor {
                     if val.get("event").and_then(serde_json::Value::as_str) == Some("GOV_SCAR_SNAPSHOT") { latest_snap = Some(val); }
                 }
             }
-            if let Some(ref sv) = latest_snap { if let Some(restored) = self.apply_scar_snapshot_json(sv) { snap_ts_ns = restored.0; } }
+            if let Some(ref sv) = latest_snap { if sv.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0) >= epoch_reset_ts_ns { if let Some(restored) = self.apply_scar_snapshot_json(sv) { snap_ts_ns = snap_ts_ns.max(restored.0); } } }
         }
         let mut dedup: std::collections::BTreeMap<ScarEventKey, ScarEventPayload> = std::collections::BTreeMap::new();
         let mut paths = [scar_path, red_loss_path, scar_path];

@@ -880,7 +880,7 @@ impl SlotExecutionEngine {
         };
         self.fold_price_into_excursions(side, entry_price, exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, net_scaled_bps);
-        self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_scaled_bps.raw()));
+        { let m_obs = self.last_closed_mfe_bps.max(gross_scaled_bps.raw()); if crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100);
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
@@ -924,7 +924,7 @@ impl SlotExecutionEngine {
         self.fold_price_into_excursions(side, avg_price_ticks, tranche1_exit_price);
         self.fold_price_into_excursions(side, avg_price_ticks, leg2_exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, ScaledBps(net_bps));
-        self.observe_mfe_sample(self.last_closed_mfe_bps.max(gross_bps));
+        { let m_obs = self.last_closed_mfe_bps.max(gross_bps); if crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
         self.cooldown_until_ns = TimestampNs(closed_ts.0 + (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100);
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
@@ -1591,7 +1591,7 @@ pub fn compute_stagnation_sl_compression_factor(
         return 0.0;
     }
     let kappa = event_clock_mod.clamp(INV_PHI, 1.618_033_988_749_895);
-    let tau_base_ns = (tau_mkt_ns.max(90_000_000_000)) as f64;
+    let tau_base_ns = (tau_mkt_ns.clamp(90_000_000_000, 180_000_000_000)) as f64;
     let tau_char_ns = ((INV_PHI3 * tau_base_ns) / kappa).max(15_000_000_000.0);
     let tau_dim = (hold_ns as f64) / tau_char_ns;
     let h_time = crate::wave_elliott::hermite_smoothstep_c1(tau_dim, INV_PHI, PHI_SQ);
@@ -1676,10 +1676,7 @@ impl SlotExecutionEngine {
             .tick_to_price_scaled_bps(avg_price_ticks)
             .unwrap_or(ScaledBps(50))
             .raw();
-        let fee_mkr_floor =
-            ((INV_PHI2_TX * (self.active_fees.round_trip_maker_exit_bps().raw() as f64)).round()
-                as i64)
-                .max(tau_tick_bps);
+        let fee_mkr_floor = self.active_maker_rt_fee_bps().max(tau_tick_bps);
         let state_mfe = ((peak_favorable_price.0 - avg_price_ticks.0)
             .saturating_mul(side.sign_i64())
             .saturating_mul(1_000_000))
@@ -1706,7 +1703,7 @@ impl SlotExecutionEngine {
             event_dilation,
             mfe_above_floor,
             own_flow,
-            z_5h,
+            z_5h.max(if dt_ns >= 25_000_000_000 && own_flow < -INV_PHI2_TX { PHI_SQ_TX * crate::wave_elliott::hermite_smoothstep_c1(-own_flow, INV_PHI2_TX, 0.92) } else { 0.0 }),
         );
         if comp < INV_PHI2_TX {
             return zeta_v48;

@@ -461,10 +461,10 @@ impl OrthogonalFactorState {
             return SignalVerdict::NeutralNoAction;
         }
         let side = if composite > 0.0 {
-            if ofi <= 0.15 || tfi <= 0.12 || geom < -0.05 { return SignalVerdict::NeutralNoAction; }
+            if ofi <= 0.15 || tfi <= 0.12 || geom < 0.0 { return SignalVerdict::NeutralNoAction; }
             Side::Bid
         } else {
-            if ofi >= -0.15 || tfi >= -0.12 || geom > 0.05 { return SignalVerdict::NeutralNoAction; }
+            if ofi >= -0.15 || tfi >= -0.12 || geom > 0.0 { return SignalVerdict::NeutralNoAction; }
             Side::Ask
         };
         let dir_sign = side.sign_f64();
@@ -1026,7 +1026,7 @@ pub fn should_abort_collapsed_resting_l1_wall(
         return false;
     }
     let signed_ofi = side.sign_f64() * snap.factor_ofi.get();
-    if signed_ofi >= 0.0 {
+    if signed_ofi >= -0.12 {
         return false;
     }
     let min_l1 = spec.min_resting_l1_lots(entry_price, snap.realized_vol_5m).0.max(1) as f64;

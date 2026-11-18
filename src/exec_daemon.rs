@@ -335,7 +335,7 @@ pub fn step_12_slot_daemon_tick(
         let _ = vault_tx.try_send(VaultIoCommand::SaveDailyGovernor { ts_ns: now_ns.0, state: rt.daily_gov });
         if rt.daily_gov.is_hibernating() || prev_phase.label().starts_with("SLEEP") {
             let _ = tg_tx.try_send(format!(
-                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V4.8 DAILY SHIELD] Transicion UTC: {} -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.0 DAILY SHIELD] Transicion UTC: {} -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                 prev_phase.label(), cur_phase.label(),
                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
@@ -435,8 +435,9 @@ pub fn step_12_slot_daemon_tick(
                 let headwind_erosion = s_idx > 0 && elapsed_ns >= q_timers.headwind_abort_ns && q_eroded && (btc_aligned < -0.02 || flow_imp < 0.38);
                 let macro_bad = elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard(side, &snap);
                 let ob_bad = elapsed_ns >= q_timers.macro_abort_ns && !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
-                if block_new_entries || !instruments.is_slot_tradable(s_idx) || elapsed_ns >= (max_chase_ns * 3) / 4 || total_chase_ns >= max_chase_ns || (elapsed_ns >= 25_000_000 && q_shield.abort_now) || headwind_erosion || macro_bad || ob_bad || flow_imp <= -0.42 {
-                    let abort_veto = if block_new_entries { LastVetoCode::WarmupOrLock } else if macro_bad { LastVetoCode::MacroElliottContradiction } else if ob_bad { LastVetoCode::OpposingOrderBlockWall } else if headwind_erosion { LastVetoCode::BtcLeadLagHeadwind } else { LastVetoCode::HawkesStoikovQueueAbort };
+                let geom_flip = elapsed_ns >= 150_000_000 && (snap.factor_geom.get() * side.sign_f64()) < -0.05;
+                if block_new_entries || !instruments.is_slot_tradable(s_idx) || elapsed_ns >= (max_chase_ns * 3) / 4 || total_chase_ns >= max_chase_ns || (elapsed_ns >= 25_000_000 && q_shield.abort_now) || headwind_erosion || macro_bad || ob_bad || geom_flip || flow_imp <= -0.42 {
+                    let abort_veto = if block_new_entries { LastVetoCode::WarmupOrLock } else if macro_bad { LastVetoCode::MacroElliottContradiction } else if ob_bad { LastVetoCode::OpposingOrderBlockWall } else if geom_flip { LastVetoCode::SpoofingVeto } else if headwind_erosion { LastVetoCode::BtcLeadLagHeadwind } else { LastVetoCode::HawkesStoikovQueueAbort };
                     rt.last_abort_veto[s_idx] = abort_veto;
                     publish_slot_veto_code(arena, s_idx, abort_veto);
                     if let Some(gw) = gateway {
@@ -446,7 +447,7 @@ pub fn step_12_slot_daemon_tick(
                         }
                     } else {
                         gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
-                        rt.markout_rings[s_idx].arm_abort_probe(side, entry_price, abort_veto, now_ns);
+                        rt.markout_rings[s_idx].arm_abort_probe_v49(side, entry_price, abort_veto, TimestampNs(entry_forensics[s_idx].armed_ts_ns.max(1)), now_ns, rt.init_q_ahead[s_idx], rt.cur_q_ahead[s_idx]);
                         engines[s_idx].state = OrderLifecycleState::Idle;
                         engines[s_idx].sync_to_shm_telemetry(arena);
                     }
@@ -508,7 +509,7 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].last_closed_mae_bps = ((worst_adverse_price.0 - avg_price_ticks.0) * d_sign).saturating_mul(1_000_000) / denom;
                     engines[s_idx].last_closed_peak_ticks = peak_favorable_price;
                     engines[s_idx].last_closed_worst_ticks = worst_adverse_price;
-                    let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v49(&snap, &btc_snap, epps_beta, &rt.markout_rings[s_idx], evt_dil);
+                    let zeta_tox = engines[s_idx].observe_post_fill_toxicity_and_wald_v49(&snap, &btc_snap, epps_beta, &rt.markout_rings[s_idx], evt_dil); rt.last_zeta_tox[s_idx] = zeta_tox;
                     if engines[s_idx].last_eff_sl_ticks.0 <= 0 { engines[s_idx].last_eff_sl_ticks = sl_trigger_price; }
                     let eff_sl_now = engines[s_idx].last_eff_sl_ticks;
                     let unverified_sl_breach = rt.verified_exchange_sl[s_idx].0 <= 0 && match side { Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_now.0, Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_now.0 };
@@ -653,6 +654,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         eng.sync_governor_dynamics(&gov);
     }
 
+    arena.exec_armed_count.store(0, Ordering::Release); arena.exec_abort_count.store(0, Ordering::Release); arena.exec_fill_count.store(0, Ordering::Release);
     rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
     SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
     let prewarmed_slots = gov.load_ema_prewarm_file(boot_ns);
@@ -660,7 +662,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         let warmup_ns = if prewarmed_slots >= MAX_ACTIVE_PAIRS { 15_000_000_000_i64 } else { 75_000_000_000_i64 };
         gov.set_entry_warmup_until_ns(boot_ns.0.saturating_add(warmup_ns));
         println!(
-            "{ANSI_GREEN}\u{1f7e2} [EMA PREWARM V4.8] Hydrated {prewarmed_slots}/12 slots | Live L2 stabilize: {}s | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
+            "{ANSI_GREEN}\u{1f7e2} [EMA PREWARM V5.0] Hydrated {prewarmed_slots}/12 slots | Live L2 stabilize: {}s | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
             warmup_ns / 1_000_000_000,
             (startup_hs.fee_schedule.maker_fee_bps.raw() as f64) / 100.0,
             (startup_hs.fee_schedule.taker_fee_bps.raw() as f64) / 100.0
@@ -679,7 +681,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     let mut last_handshake_refresh_ns = boot_ns.0;
     let mut last_rest_dispatch_ns = 0_i64;
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V4.8 200.0 Hz ARMED] Elastic Daily Shield + Quantum EV + Toxic Unwind + 8h Funding.{ANSI_RESET}"
+        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V5.0 200.0 Hz ARMED] Elastic Daily Shield + Quantum EV + Toxic Unwind + 8h Funding.{ANSI_RESET}"
     );
 
     loop {
@@ -758,7 +760,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         );
         let any_inflight = rt.slot_rpc_inflight.iter().any(|&b| b);
         if rt.drain_active && open_count == 0 && pending_entry_count == 0 && !any_inflight {
-            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V4.8 DRAIN COMPLETE] 0 open positions verified (Wallet == Equity).".to_string());
+            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V5.0 DRAIN COMPLETE] 0 open positions verified (Wallet == Equity).".to_string());
             let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
             if vault_tx.send(VaultIoCommand::FlushBarrier(ack_tx)).is_ok() {
                 let _ = ack_rx.recv_timeout(Duration::from_secs(2));
@@ -779,7 +781,7 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
     if args.iter().any(|a| a == "--live") {
         match MappedShmRegion::open_existing_read_only(&shm_path) {
             Ok(reg) => render_live_hud(reg.arena()),
-            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V4.8 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
+            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V5.0 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
         }
         return ExitCode::SUCCESS;
     }
@@ -789,7 +791,7 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
     }
     let (oos_trades, maker_ratio, pf, cum_usdt, drift) = run_oos_520_certification_suite();
     let sep = "=".repeat(80);
-    println!("{sep}\n[VORTEX-EXEC OMEGA V4.8] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
+    println!("{sep}\n[VORTEX-EXEC OMEGA V5.0] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> OOS Closed Trades Verified : {oos_trades} (Gate >= 500){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Maker Exit Ratio           : {maker_ratio:.2}% (Gate >= 80.00%){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Net Profit Factor (PostFee): {pf:.2} (Gate >= 1.35){ANSI_RESET}");

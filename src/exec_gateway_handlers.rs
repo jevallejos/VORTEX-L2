@@ -57,6 +57,7 @@ pub struct ExecRuntimeState {
     pub spoof_clocks: [EventClockAlphaModulator; MAX_ACTIVE_PAIRS],
     pub markout_rings: [SlotMarkoutRing; MAX_ACTIVE_PAIRS],
     pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS], pub daily_gov: DailySessionGovernor, pub intra_rings: [crate::execution_fsm::SlotIntraTradeRing; MAX_ACTIVE_PAIRS], pub last_plasticity_audit_ns: i64, pub last_persisted_utc_day: i64,
+    pub last_zeta_tox: [f64; MAX_ACTIVE_PAIRS],
     pub halt_locked: bool,
     pub drain_active: bool,
 }
@@ -87,6 +88,7 @@ impl ExecRuntimeState {
             spoof_clocks: [EventClockAlphaModulator::new(); MAX_ACTIVE_PAIRS],
             markout_rings: [SlotMarkoutRing::new(); MAX_ACTIVE_PAIRS],
             last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS], daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8), intra_rings: [crate::execution_fsm::SlotIntraTradeRing::new(); MAX_ACTIVE_PAIRS], last_plasticity_audit_ns: 0, last_persisted_utc_day: -1,
+            last_zeta_tox: [0.0; MAX_ACTIVE_PAIRS],
             halt_locked: false,
             drain_active: false,
         }
@@ -358,7 +360,7 @@ pub fn handle_gateway_event(
                 } else {
                     LastVetoCode::HawkesStoikovQueueAbort
                 };
-                rt.markout_rings[slot_idx].arm_abort_probe(side, aborted_price, veto, now_ns);
+                rt.markout_rings[slot_idx].arm_abort_probe_v49(side, aborted_price, veto, TimestampNs(entry_forensics[slot_idx].armed_ts_ns.max(1)), now_ns, rt.init_q_ahead[slot_idx], rt.cur_q_ahead[slot_idx]);
                 rt.last_abort_veto[slot_idx] = LastVetoCode::None;
                 engines[slot_idx].state = OrderLifecycleState::Idle;
                 arena.exec_abort_count.fetch_add(1, Ordering::Relaxed);
@@ -379,7 +381,7 @@ pub fn handle_gateway_event(
                     } else {
                         LastVetoCode::HawkesStoikovQueueAbort
                     };
-                    rt.markout_rings[slot_idx].arm_abort_probe(side, entry_price, veto, now_ns);
+                    rt.markout_rings[slot_idx].arm_abort_probe_v49(side, entry_price, veto, TimestampNs(entry_forensics[slot_idx].armed_ts_ns.max(1)), now_ns, rt.init_q_ahead[slot_idx], rt.cur_q_ahead[slot_idx]);
                     rt.last_abort_veto[slot_idx] = LastVetoCode::None;
                     arena.exec_abort_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -540,7 +542,7 @@ pub fn handle_gateway_event(
                         });
                         if new_phase != prev_phase && matches!(new_phase, DailyShieldPhase::ProfitLockArmed | DailyShieldPhase::HibernatingProfitLocked | DailyShieldPhase::HibernatingLossCap) {
                             let _ = tg_tx.try_send(format!(
-                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V4.8 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.0 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                                 new_phase.label(),
                                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
@@ -628,7 +630,7 @@ pub fn bootstrap_live_adopt_if_enabled(
             };
             engines[s_idx].sync_to_shm_telemetry(arena);
             println!(
-                "{}\u{1f7e2} [VORTEX-OMEGA V4.8 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
+                "{}\u{1f7e2} [VORTEX-OMEGA V5.0 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
                 ANSI_GREEN, s_idx, sym_name, side_p, sz_s, bybit_avg_t.0, sl_t.0, sl_ok, t1_done, ANSI_RESET
             );
         }
@@ -1070,8 +1072,9 @@ impl ExecRuntimeState {
                     engines[s_idx].learned_taker_prob_pm,
                     engines[s_idx].active_fees,
                 );
-                self.markout_rings[s_idx].active_fill_toxicity_zeta(opened_ts, c_rt)
+                self.markout_rings[s_idx].active_fill_toxicity_zeta(opened_ts, c_rt).max(self.last_zeta_tox[s_idx])
             } else {
+                self.last_zeta_tox[s_idx] = 0.0;
                 0.0
             };
             self.intra_rings[s_idx].observe_200hz_tick(&engines[s_idx], &cached_snaps[s_idx], z_tox);

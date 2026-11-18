@@ -215,7 +215,7 @@ pub fn record_and_notify_entry_fill(
     );
     let _ = tg_tx.try_send(format!(
         concat!(
-            "\u{1f7e1} [VORTEX-OMEGA V4.8 {}]\n",
+            "\u{1f7e1} [VORTEX-OMEGA V5.0 {}]\n",
             "\u{2022} Par y Lado : {} ({:?}) | Lote: {}\n",
             "\u{2022} Entrada L1 : {}.{:04} USDT ({}t) | Cola: {} ms\n",
             "\u{2022} Techos/SL  : WIN Floor: {}.{:04} USDT | SL: {}.{:04} USDT\n",
@@ -277,7 +277,7 @@ pub fn format_telegram_close_message(
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
-            "{} [VORTEX-OMEGA V4.8 {} #{} \u{2014} {:?}]\n",
+            "{} [VORTEX-OMEGA V5.0 {} #{} \u{2014} {:?}]\n",
             "- Ganancia : {:+.2}% @10x | {:+.4} USDT\n",
             "- Par y Lado : {} ({:?}) qty={} ({}L) | Maker: {}\n",
             "- Precios    : {}.{:04} -> {}.{:04} USDT ({}t -> {}t)\n",
@@ -309,6 +309,13 @@ pub fn rehydrate_shadow_ledger(
         for line in BufReader::new(file).lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             match v.get("event").and_then(serde_json::Value::as_str) {
+                Some("EPOCH_RESET") => {
+                    let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
+                    *ledger = ParitySyncLedger::new(eq_a);
+                    ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
+                    l3_vault_count = 0;
+                    funding_rows = 0;
+                }
                 Some("TRADE_CLOSE") => {
                     l3_vault_count += 1;
                     let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -341,7 +348,7 @@ pub fn rehydrate_shadow_ledger(
     ledger.closed_trades_count = l3_vault_count;
     arena.exec_closed_count.store(l3_vault_count, Ordering::Release);
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V4.8] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns}){ANSI_RESET}",
+        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.0] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns}){ANSI_RESET}",
         (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
         (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
     );
@@ -367,6 +374,7 @@ pub fn rehydrate_daily_governor_from_vault(
             let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
             if DailySessionGovernor::utc_day_from_ns(TimestampNs(ts)) != cur_day { continue; }
             match v.get("event").and_then(serde_json::Value::as_str) {
+                Some("EPOCH_RESET") => { day_deltas.clear(); sum_today_1e8 = 0; }
                 Some("TRADE_CLOSE") => {
                     let pnl = v.get("net_pnl_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let net_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
@@ -432,7 +440,7 @@ fn build_closed_trade_vault_json_v48_core(
         (markout_curve.samples_bps[2] as f64) / 100.0, (markout_curve.samples_bps[3] as f64) / 100.0,
     ];
     let mut base_val = serde_json::json!({
-        "event": "TRADE_CLOSE", "schema": "V4.8", "trade_id": ledger.closed_trades_count,
+        "event": "TRADE_CLOSE", "schema": "V5.0", "trade_id": ledger.closed_trades_count,
         "armed_ts_ns": entry_f.armed_ts_ns, "opened_ts_ns": eng.last_opened_ts.0, "ts_ns": ts_ns.0,
         "queue_wait_ms": q_wait_ms, "hold_ms": hold_ms, "symbol": sym, "slot_idx": slot_idx, "side": side_str,
         "closed_lots": summary.closed_lots.0, "legs_consolidated": summary.legs_consolidated,
@@ -586,7 +594,7 @@ pub fn render_live_hud(arena: &VortexShmArena) {
         DailyShieldPhase::HibernatingLossCap => ANSI_ORANGE,
     };
     let sec_title = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V4.8 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
+        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.0 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
         arena.version
     )];
     let sec_hdr = vec![concat!(
@@ -786,8 +794,16 @@ pub fn evaluate_capital_scaling_semaphore(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
-            let is_v48 = v.get("schema").and_then(serde_json::Value::as_str) == Some("V4.8");
+            let is_v48 = matches!(v.get("schema").and_then(serde_json::Value::as_str), Some("V4.8" | "V4.9" | "V5.0"));
             match v.get("event").and_then(serde_json::Value::as_str) {
+                Some("EPOCH_RESET") => {
+                    v48_trades = 0; v48_maker_closes = 0; v48_profit_1e8 = 0; v48_loss_1e8 = 0; catastrophic_breaches = 0;
+                    v48_days_set.clear(); day_events.clear();
+                    if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY { v48_days_set.insert(live_dg.utc_day_idx); }
+                    let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
+                    sim_ledger = ParitySyncLedger::new(eq_a);
+                    sim_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
+                }
                 Some("TRADE_CLOSE") => {
                     let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("UNKNOWN");
                     let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
@@ -883,7 +899,7 @@ pub fn render_capital_scaling_semaphore(
         rep.v48_trades,
         g1_pct
     );
-    let g1_c3 = format!("Dias UTC V4.8: {:>2}/12 dias", rep.v48_days);
+    let g1_c3 = format!("Dias UTC V5.0: {:>2}/12 dias", rep.v48_days);
 
     let w_pct = ((rep.wallet_usdt / 67.0) * 100.0).clamp(0.0, 100.0);
     let g2_c2 = format!(
@@ -900,7 +916,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.2}", rep.pf_v48)
     };
     let v70_txt = if rep.vault_70_ok { "Vault>12.5b OK" } else { "Vault<=12.5b" };
-    let g2_c3 = format!("PF V4.8: {pf_txt:<12} | {v70_txt}");
+    let g2_c3 = format!("PF V5.0: {pf_txt:<12} | {v70_txt}");
 
     let mkr_ref = if rep.v48_trades >= 10 { rep.v48_mkr_pct } else { rep.global_mkr_pct };
     let g3_pct = ((mkr_ref / 82.0) * 100.0).clamp(0.0, 100.0);
@@ -912,7 +928,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.1}% ({}/{}t)", rep.v48_mkr_pct, rep.v48_maker_closes, rep.v48_trades)
     };
     let g3_c3 = format!(
-        "V4.8 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
+        "V5.0 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
         rep.parity_drift_1e8,
         usize::from(rep.halt_active)
     );
@@ -947,10 +963,10 @@ pub fn render_capital_scaling_semaphore(
         )
     };
     let sec_hdr = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V4.8 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
+        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.0 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
     )];
     let sec_gates = vec![
-        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V4.8", g1_c2, g1_c3),
+        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.0", g1_c2, g1_c3),
         fmt_gate(2, rep.gate2_ok, "EN PROGRESO", "Expectativa & Cap.", g2_c2, g2_c3),
         fmt_gate(3, rep.gate3_ok, g3_tag, "Ejecucion Maker", g3_c2, g3_c3),
         fmt_gate(4, rep.gate4_ok, "EN PROGRESO", "Resiliencia Escudo", g4_c2, g4_c3),
@@ -980,6 +996,14 @@ pub fn render_trades_and_executive_dashboard() {
         for line in BufReader::new(file).lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             match v.get("event").and_then(serde_json::Value::as_str) {
+                Some("EPOCH_RESET") => {
+                    rows_out.clear();
+                    total = 0; wins = 0; partials = 0; scratches = 0; losses = 0; maker_closes = 0;
+                    cum_gross = 0.0; cum_fee = 0.0; cum_net = 0.0; sum_mfe = 0.0; sum_mae = 0.0; sum_hold_s = 0.0; sum_cashflow_1e8 = 0;
+                    let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
+                    dash_ledger = ParitySyncLedger::new(eq_a);
+                    dash_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
+                }
                 Some("FUNDING_SETTLEMENT") => {
                     let f_1e8 = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let n_1e8 = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
@@ -1023,7 +1047,7 @@ pub fn render_trades_and_executive_dashboard() {
         }
     }
     if rows_out.is_empty() {
-        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V4.8...{ANSI_RESET}"));
+        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.0...{ANSI_RESET}"));
     }
     let mut live_client = BybitV5LiveClient::from_env_if_enabled(true);
     let fb_w = (DEFAULT_WALLET_EQUITY_1E8 as f64) / 100_000_000.0;
@@ -1053,7 +1077,7 @@ pub fn render_trades_and_executive_dashboard() {
     let parity_drift_1e8 = (dash_ledger.cumulative_net_pnl_1e8 - sum_cashflow_1e8).abs();
     let halt_active = Path::new(HALT_LOCK_PATH).exists();
 
-    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V4.8 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
+    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.0 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
     let sec_kpi = vec![
         fmt_3col(
             format!("Wallet: {w_usdt:.4} USDT (Eq: {eq_usdt:.4} | Avail: {av_usdt:.4})"),
@@ -1139,7 +1163,7 @@ mod tests {
                 (true, 4.5, 950_000_i64)
             };
             let row = serde_json::json!({
-                "event": "TRADE_CLOSE", "schema": "V4.8", "ts_ns": ts_ns,
+                "event": "TRADE_CLOSE", "schema": "V5.0", "ts_ns": ts_ns,
                 "symbol": "AVAXUSDT", "side": "Bid", "entry_ticks": 8200, "exit_ticks": 8207,
                 "net_bps": net_bps, "fee_bps": if is_mkr { 4.0 } else { 7.5 },
                 "net_pnl_1e8": pnl_1e8, "fee_1e8": 750_000, "maker_exit": is_mkr
@@ -1223,7 +1247,7 @@ pub fn build_closed_trade_vault_json(
     let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
     if let Some(obj) = val.as_object_mut() {
         let _ = obj.remove("fnv1a64_hex");
-        obj.insert("telemetry_rev".to_string(), serde_json::json!("V4.9"));
+        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.0"));
         obj.insert(
             "markout_resolved_mask".to_string(),
             serde_json::json!(markout_curve.resolved_mask),
@@ -1357,7 +1381,7 @@ mod v49_hud_telemetry_tests {
             140,
             TimestampNs(1_794_920_000_000_000_000),
         );
-        assert!(line.contains("\"telemetry_rev\":\"V4.9\""));
+        assert!(line.contains("\"telemetry_rev\":\"V5.0\""));
         assert!(line.contains("\"markout_resolved_mask\":31"));
         assert!(line.contains("\"markout_5h_bps\":[-0.35,-0.8,1.4,4.2,9.1]"));
         assert!(line.contains("\"ws_rtt_us\":1310") && line.contains("\"fnv1a64_hex\":\"0x"));

@@ -841,7 +841,33 @@ impl PairSpec {
             return false;
         }
         if self.can_split_runner_legs(allocated_lots, mid_price) {
-            return true;
+            let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) / 1_000.0;
+            let p_mkr = 1.0 - p_tkr;
+            let c_mkr_rt = fees.round_trip_maker_exit_bps().raw() as f64;
+            let c_tkr_rt = (fees.round_trip_taker_exit_bps().raw().max(100)) as f64;
+            let eq_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0.saturating_mul(4));
+            let eq_sl = Self::elastic_server_sl_distance_bps_with_fees(eq_vol, fees).raw().max(100) as f64;
+            let srv_sl = Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
+            let g_clamped = signed_geom.clamp(-1.0, 1.0);
+            let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
+            let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
+            let (al_raw, op_raw) = match side {
+                Side::Bid => (ob_bull_pm, ob_bear_pm),
+                Side::Ask => (ob_bear_pm, ob_bull_pm),
+            };
+            let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
+            let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
+            let learned_f = (learned_mfe_bps.max(0) as f64) * (srv_sl / eq_sl).max(1.0);
+            let diff_cap = INV_PHI2 * (realized_vol_5m.raw().max(0) as f64);
+            let base_mfe = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
+            let runner_gain = 1.0 + INV_PHI2 * h_geom + INV_PHI3 * (ob_ratio - 1.0);
+            let mfe_split_net = base_mfe * runner_gain - c_mkr_rt;
+            if mfe_split_net <= 10.0 {
+                return false;
+            }
+            let wald_sl_net = INV_PHI * srv_sl + c_tkr_rt;
+            let tail_shield = (1.0 + PHI * q_struct + (ob_ratio - 1.0).max(0.0)).max(INV_PHI);
+            return (p_mkr * mfe_split_net) > ((p_tkr * wald_sl_net) / tail_shield);
         }
         let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) / 1_000.0;
         let p_mkr = 1.0 - p_tkr;
@@ -908,6 +934,9 @@ mod single_lot_ev_v49_tests {
         ));
         assert!(eth.passes_single_lot_asymmetry_ev_gate(
             LotQty(2), PriceTicks(182_000), ScaledBps(2_500), 650, 125, 0.72, 460, 480, Side::Bid, fees,
+        ));
+        assert!(!APPROVED_SPECS[5].passes_single_lot_asymmetry_ev_gate(
+            LotQty(16), PriceTicks(7_316), ScaledBps(1_582), 726, 48, 0.17, 522, 478, Side::Ask, fees,
         ));
     }
 }

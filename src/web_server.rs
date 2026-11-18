@@ -224,6 +224,12 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
     let (mut total, mut wins, mut scratches, mut losses, mut mkr_cnt, mut ws_rtt_us) = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_u64);
     for v in read_jsonl_rows(&ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl")) {
         match v.get("event").and_then(serde_json::Value::as_str) {
+            Some("EPOCH_RESET") => {
+                let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
+                ledger = ParitySyncLedger::new(eq_a);
+                ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
+                total = 0; wins = 0; scratches = 0; losses = 0; mkr_cnt = 0; ws_rtt_us = 0;
+            }
             Some("FUNDING_SETTLEMENT") => {
                 let f = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let n = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
@@ -317,6 +323,7 @@ pub fn query_recent_trades_json(ctx: &VortexWebContext, limit: usize) -> serde_j
     let mut closes = Vec::new();
     let mut seq_id = 0_u64;
     for mut v in read_jsonl_rows(&ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl")) {
+        if v.get("event").and_then(serde_json::Value::as_str) == Some("EPOCH_RESET") { closes.clear(); seq_id = 0; continue; }
         if v.get("event").and_then(serde_json::Value::as_str) == Some("TRADE_CLOSE") {
             seq_id += 1;
             if let Some(obj) = v.as_object_mut() { obj.entry("trade_id").or_insert_with(|| serde_json::json!(seq_id)); }
@@ -377,7 +384,7 @@ pub fn build_markdown_360_clip(ctx: &VortexWebContext, trade_id: Option<u64>) ->
     let ds = &st["daily_shield"];
     let sm = &st["semaphore_4_4"];
     let mut out = String::with_capacity(2_048);
-    out.push_str("### VORTEX-OMEGA V4.9 — Snapshot Ejecutivo 360 (Loopback Read-Only)\n");
+    out.push_str("### VORTEX-OMEGA V5.0 — Snapshot Ejecutivo 360 (Loopback Read-Only)\n");
     let _ = writeln!(
         out,
         "- **SHM v{}**: online={} | HB={} ms | Resyncs={} | WS_RTT={} us | Open={}/6 | Q={}",
