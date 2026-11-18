@@ -148,6 +148,7 @@ impl OnlineAdaptiveGovernor {
     }
 
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn slot_temporal_cadence_for_side(
         &self,
         slot_idx: usize,
@@ -166,16 +167,48 @@ impl OnlineAdaptiveGovernor {
             Some(s) if snap.funding_rate_scaled_bps.0 != 0 => -s.sign_i64().saturating_mul(snap.funding_rate_scaled_bps.0),
             _ => 0,
         };
-        if carry_bps > 0 { return dst_live; }
+        let scale_e = |e_raw: i64| -> i64 { (e_raw.saturating_mul(fee_rt)) / 400 };
+        let dst_scaled = TemporalCadenceModulation {
+            intraday_percentile: dst_live.intraday_percentile,
+            snr_threshold_delta: dst_live.snr_threshold_delta,
+            kin_energy_min_delta_bps: scale_e(dst_live.kin_energy_min_delta_bps),
+            kelly_lot_mult_permille: dst_live.kelly_lot_mult_permille,
+        };
+        if carry_bps > 0 {
+            return dst_scaled;
+        }
         let rem_8h = snap.ts_local_ns.0.div_euclid(1_000_000_000).rem_euclid(28_800);
-        if carry_bps == 0 && dst_live.intraday_percentile >= 0.48 && !(rem_8h >= 28_650 || rem_8h <= 45) {
-            return dst_live;
+        let rem_to_cut_s = (28_800 - rem_8h) as f64;
+        let tau_hold_s =
+            (0.381_966_011_250_105 * ((self.intrinsic_diffusion_clock_ns(slot_idx) as f64) * 1e-9)).max(60.0);
+        let exp_fund_drag = ((-carry_bps).max(0) as f64) * (-rem_to_cut_s / (4.0 * tau_hold_s)).exp();
+        if dst_scaled.intraday_percentile >= 0.48 && !(rem_8h >= 28_650 || rem_8h <= 45) {
+            let h_drag = crate::wave_elliott::hermite_smoothstep_c1(
+                exp_fund_drag,
+                0.05 * (fee_rt as f64),
+                0.381_966_011_250_105 * (fee_rt as f64),
+            );
+            if h_drag <= 1e-6 {
+                return dst_scaled;
+            }
+            let base_e = scale_e(base_utc.kin_energy_min_delta_bps);
+            return TemporalCadenceModulation {
+                intraday_percentile: dst_scaled.intraday_percentile,
+                snr_threshold_delta: dst_scaled.snr_threshold_delta
+                    + h_drag * (base_utc.snr_threshold_delta - dst_scaled.snr_threshold_delta).max(0.0),
+                kin_energy_min_delta_bps: dst_scaled.kin_energy_min_delta_bps
+                    + (((base_e - dst_scaled.kin_energy_min_delta_bps).max(0) as f64 * h_drag).round() as i64),
+                kelly_lot_mult_permille: dst_scaled.kelly_lot_mult_permille
+                    - (((dst_scaled.kelly_lot_mult_permille - base_utc.kelly_lot_mult_permille).max(0) as f64
+                        * h_drag)
+                        .round() as i64),
+            };
         }
         TemporalCadenceModulation {
-            intraday_percentile: dst_live.intraday_percentile,
-            snr_threshold_delta: dst_live.snr_threshold_delta.max(base_utc.snr_threshold_delta),
-            kin_energy_min_delta_bps: dst_live.kin_energy_min_delta_bps.max(base_utc.kin_energy_min_delta_bps),
-            kelly_lot_mult_permille: dst_live.kelly_lot_mult_permille.min(base_utc.kelly_lot_mult_permille),
+            intraday_percentile: dst_scaled.intraday_percentile,
+            snr_threshold_delta: dst_scaled.snr_threshold_delta.max(base_utc.snr_threshold_delta),
+            kin_energy_min_delta_bps: dst_scaled.kin_energy_min_delta_bps.max(scale_e(base_utc.kin_energy_min_delta_bps)),
+            kelly_lot_mult_permille: dst_scaled.kelly_lot_mult_permille.min(base_utc.kelly_lot_mult_permille),
         }
     }
 
@@ -505,6 +538,7 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn observe_closed_trade_at_entry(
         &mut self, slot_idx: usize, side: Side, entry_price: PriceTicks, net_scaled_bps: ScaledBps, is_maker_exit: bool, ts_ns: TimestampNs,
     ) {
@@ -528,9 +562,25 @@ impl OnlineAdaptiveGovernor {
             self.wave_anchor_px_1e4[slot_idx][d] = 0;
             self.wave_anchor_ts_ns[slot_idx][d] = 0;
             if ts_ns.0 > 0 { self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add((tau_ns / 2).saturating_mul(1_i64 << s.min(4))); }
-            let gs = self.global_dir_sl_streak[d].saturating_add(1).min(4);
-            self.global_dir_sl_streak[d] = gs;
-            if ts_ns.0 > 0 { self.global_dir_cooldown_until_ns[d] = ts_ns.0.saturating_add(((tau_ns * 3) / 5).saturating_mul(i64::from(gs))); }
+            let loss_sev = ((-net_scaled_bps.raw()).max(0) as f64) / (fee_rt.max(100) as f64);
+            let h_glob = crate::wave_elliott::hermite_smoothstep_c1(
+                loss_sev,
+                2.618_033_988_749_895,
+                6.854_101_966_249_685,
+            );
+            if loss_sev >= 4.236_067_977_499_79 {
+                let gs = self.global_dir_sl_streak[d].saturating_add(1).min(4);
+                self.global_dir_sl_streak[d] = gs;
+                if ts_ns.0 > 0 {
+                    let g_cd = (((((tau_ns * 3) / 5).saturating_mul(i64::from(gs))) as f64) * h_glob).round() as i64;
+                    self.global_dir_cooldown_until_ns[d] =
+                        self.global_dir_cooldown_until_ns[d].max(ts_ns.0.saturating_add(g_cd));
+                }
+            } else if h_glob > 0.0 && ts_ns.0 > 0 {
+                let mild_cd = ((((tau_ns * 3) / 5) as f64) * h_glob).round() as i64;
+                self.global_dir_cooldown_until_ns[d] =
+                    self.global_dir_cooldown_until_ns[d].max(ts_ns.0.saturating_add(mild_cd));
+            }
         } else if net_scaled_bps.raw() < fee_rt / 4 {
             if ts_ns.0 > 0 {
                 let scratch_cd = ts_ns.0.saturating_add((tau_ns * (120 - ir_x100 / 2)) / 360);
