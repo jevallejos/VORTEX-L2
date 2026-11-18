@@ -1708,3 +1708,79 @@ mod v51_f6_plasticity_chop_tests {
         assert!(gov.passes_cross_side_abc_chop_shield(4, Side::Bid, &tao));
     }
 }
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_elastic_l1_patience_ns_v51(
+    tau_mkt_s: i64,
+    event_dilation: f64,
+    hawkes_lambda_ratio: f64,
+    signed_flow_slow: crate::types::BoundedScore,
+) -> i64 {
+    const PHI_P: f64 = 1.618_033_988_749_895;
+    const PHI_CUBE_P: f64 = 4.236_067_977_499_79;
+    const INV_PHI_P: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_P: f64 = 0.381_966_011_250_105;
+    const INV_PHI3_P: f64 = 0.236_067_977_499_79;
+    const INV_PHI6_P: f64 = 0.055_728_090_000_84;
+
+    let tau_s = (tau_mkt_s.clamp(60, 900)) as f64;
+    let kappa = event_dilation.clamp(INV_PHI_P, PHI_P);
+    let lam_sqrt = hawkes_lambda_ratio.clamp(INV_PHI2_P, PHI_CUBE_P * PHI_P).sqrt();
+    let fl = signed_flow_slow.get();
+    let s_pos = crate::wave_elliott::hermite_smoothstep_c1(fl, 0.0, INV_PHI_P);
+    let s_neg = crate::wave_elliott::hermite_smoothstep_c1(-fl, 0.0, INV_PHI_P);
+    let flow_mult = (1.0 + INV_PHI_P * s_pos - INV_PHI2_P * s_neg).max(INV_PHI3_P);
+    let patience_s = (INV_PHI6_P * tau_s * flow_mult) / (kappa * lam_sqrt);
+    (patience_s * 1_000_000_000.0).round() as i64
+}
+
+impl OnlineAdaptiveGovernor {
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn elastic_resting_l1_patience_ns_v51(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        realized_vol_5m: ScaledBps,
+        event_dilation: f64,
+        hawkes_lambda_ratio: f64,
+        signed_flow_slow: crate::types::BoundedScore,
+    ) -> i64 {
+        const PHI_P: f64 = 1.618_033_988_749_895;
+        const INV_PHI_P: f64 = 0.618_033_988_749_895;
+        const INV_PHI2_P: f64 = 0.381_966_011_250_105;
+        const INV_PHI3_P: f64 = 0.236_067_977_499_79;
+        let s_c = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+        let tau_mkt_s = (self.intrinsic_diffusion_clock_ns(s_c) / 1_000_000_000).max(60);
+        let base_ns = compute_elastic_l1_patience_ns_v51(tau_mkt_s, event_dilation, hawkes_lambda_ratio, signed_flow_slow) as f64;
+        let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
+        let eq_v = self.eq_vol_5m_bps[s_c].max(min_v * 2) as f64;
+        let cur_v = (realized_vol_5m.raw().max(min_v)) as f64;
+        let vol_scale = (eq_v / cur_v).sqrt().clamp(INV_PHI_P, PHI_P);
+        let p_tkr = (self.slot_taker_prob_permille(s_c, side).clamp(5, 950) as f64) * 1e-3;
+        let ir_norm = (self.slot_information_ratio_x100(s_c, side).clamp(-50, 100) as f64) * 1e-2;
+        let learn_mult = ((1.0 - INV_PHI2_P * p_tkr) * (1.0 + INV_PHI3_P * ir_norm)).clamp(INV_PHI2_P, PHI_P);
+        (base_ns * vol_scale * learn_mult).round() as i64
+    }
+}
+
+#[cfg(test)]
+mod v51_f4_elastic_patience_tests {
+    use super::*;
+    use crate::types::BoundedScore;
+
+    #[test]
+    fn test_v51_f4_elastic_l1_patience_expands_on_aligned_flow_and_contracts_on_hawkes_burst() {
+        let gov = OnlineAdaptiveGovernor::new();
+        let pat_aligned = gov.elastic_resting_l1_patience_ns_v51(
+            4, Side::Bid, ScaledBps(2_800), 1.0, 1.0, BoundedScore::new_clamped(0.55),
+        );
+        let pat_toxic = gov.elastic_resting_l1_patience_ns_v51(
+            4, Side::Bid, ScaledBps(6_500), 1.5, 4.0, BoundedScore::new_clamped(-0.48),
+        );
+        assert!(pat_aligned >= 10_000_000_000 && pat_toxic <= 5_000_000_000 && pat_aligned > pat_toxic * 2);
+    }
+}

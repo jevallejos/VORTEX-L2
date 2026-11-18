@@ -1089,7 +1089,13 @@ pub fn should_abort_collapsed_resting_l1_wall_dynamic(
         .max(1) as f64;
     let tox_shift = (1.0 + PHI * (p_tkr - 0.05)).clamp(0.85, PHI);
     let keep_min = (INV_PHI * tox_shift).clamp(INV_PHI2, 0.85);
-    let keep_init = (INV_PHI2 * tox_shift).clamp(0.25, INV_PHI);
+    let signed_tfi = side.sign_f64() * snap.factor_tfi.get();
+    let s_tfi_fav = if signed_ofi > -INV_PHI {
+        crate::wave_elliott::hermite_smoothstep_c1(signed_tfi, INV_PHI2, INV_PHI)
+    } else {
+        0.0
+    };
+    let keep_init = ((INV_PHI2 * tox_shift).clamp(0.25, INV_PHI)) * (1.0 - 0.854_101_966_249_685 * s_tfi_fav);
     let init_f = (init_q_lots.0.max(0)) as f64;
     let live_f = (live_q.0.max(0)) as f64;
     live_f < keep_min * min_l1 || (init_f >= min_l1 && live_f < keep_init * init_f)
@@ -1221,5 +1227,70 @@ mod v51_f5_abc_fractal_and_1lot_ev_tests {
         let eth = APPROVED_SPECS[1];
         assert!(!passes_asymmetry_ev_gate_v51(eth, PriceTicks(179_961), LotQty(1), ScaledBps(560), ScaledBps(580), ScaledBps(1_850), 50, BoundedScore::new_clamped(0.55), FeeSchedule::VIP0_DEFAULT));
         assert!(passes_asymmetry_ev_gate_v51(eth, PriceTicks(182_033), LotQty(1), ScaledBps(920), ScaledBps(820), ScaledBps(1_600), 45, BoundedScore::new_clamped(0.95), FeeSchedule::VIP0_DEFAULT));
+    }
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub fn should_abort_l1_cancellation_collapse_v51(
+    spec: PairSpec,
+    side: Side,
+    prev_l1_qty: LotQty,
+    cur_l1_qty: LotQty,
+    opp_trade_lots: LotQty,
+    bbo_px: PriceTicks,
+    signed_flow_slow: BoundedScore,
+    fees: FeeSchedule,
+) -> bool {
+    const INV_PHI_Q: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_Q: f64 = 0.381_966_011_250_105;
+    const INV_PHI3_Q: f64 = 0.236_067_977_499_79;
+    const INV_PHI5_Q: f64 = 0.090_169_943_749_47;
+    let _ = side;
+    if bbo_px.0 <= 0 || prev_l1_qty.0 <= cur_l1_qty.0 || prev_l1_qty.0 <= 0 {
+        return false;
+    }
+    let drop_lots = prev_l1_qty.0.saturating_sub(cur_l1_qty.0.max(0));
+    let consumed_by_trades = opp_trade_lots.0.max(0).min(drop_lots);
+    let pure_cancel_lots = drop_lots.saturating_sub(consumed_by_trades);
+    if pure_cancel_lots <= 0 {
+        return false;
+    }
+    let rho_cancel = (pure_cancel_lots as f64) / (prev_l1_qty.0.max(1) as f64);
+    let fl = signed_flow_slow.get();
+    let s_fav = crate::wave_elliott::hermite_smoothstep_c1(fl, 0.0, INV_PHI_Q);
+    let s_adv = crate::wave_elliott::hermite_smoothstep_c1(-fl, 0.0, INV_PHI_Q);
+    let cancel_thresh = INV_PHI2_Q * (1.0 + INV_PHI_Q * s_fav - INV_PHI2_Q * s_adv);
+    if rho_cancel < cancel_thresh {
+        return false;
+    }
+    let min_l1 = spec
+        .min_resting_l1_lots_dynamic(bbo_px, ScaledBps::MIN_REQUIRED_VOL_5M_BPS, 50, fees)
+        .0
+        .max(1);
+    let wall_thin = cur_l1_qty.0 < min_l1 || cur_l1_qty.0.saturating_mul(1_000) < prev_l1_qty.0.saturating_mul(618);
+    let s_sev = crate::wave_elliott::hermite_smoothstep_c1(rho_cancel, INV_PHI2_Q, 0.854_101_966_249_685);
+    let flow_ceil = -INV_PHI5_Q + INV_PHI3_Q * s_sev;
+    wall_thin && fl < flow_ceil
+}
+
+#[cfg(test)]
+mod v51_f4_l1_depletion_vs_cancel_tests {
+    use super::*;
+    use crate::types::APPROVED_SPECS;
+
+    #[test]
+    fn test_v51_f4_separates_fifo_trade_consumption_from_whale_cancellation() {
+        let tao = APPROVED_SPECS[4];
+        let fees = FeeSchedule::VIP0_DEFAULT;
+        assert!(!should_abort_l1_cancellation_collapse_v51(
+            tao, Side::Bid, LotQty(797), LotQty(118), LotQty(650),
+            PriceTicks(19_505), BoundedScore::new_clamped(0.42), fees,
+        ));
+        assert!(should_abort_l1_cancellation_collapse_v51(
+            tao, Side::Bid, LotQty(797), LotQty(118), LotQty(12),
+            PriceTicks(19_505), BoundedScore::new_clamped(-0.18), fees,
+        ));
     }
 }
