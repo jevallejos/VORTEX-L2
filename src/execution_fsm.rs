@@ -637,7 +637,7 @@ impl SlotExecutionEngine {
         if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
             side,
             snap,
-            self.open_vol_5m_bps.raw(),
+            snap.realized_vol_5m.raw(),
             self.learned_taker_prob_pm,
             self.active_fees,
         )
@@ -656,7 +656,7 @@ impl SlotExecutionEngine {
                 snap,
                 self.hawkes_tracker.spoof_density_ewma,
                 self.learned_taker_prob_pm,
-                self.open_vol_5m_bps.raw(),
+                snap.realized_vol_5m.raw(),
                 self.active_fees,
             )
         {
@@ -1667,6 +1667,8 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PositionOpenMakerExit {
             side,
             avg_price_ticks,
+            active_exit_price,
+            resting_exit_price,
             sl_trigger_price,
             opened_ts,
             ..
@@ -1692,7 +1694,11 @@ impl SlotExecutionEngine {
             let v = ((px - avg_price_ticks.0).saturating_mul(sgn).saturating_mul(1_000_000)) / denom;
             v.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
         };
-        let tp_px = if self.wald_sprt.exhaustion_unwind_active {
+        let tp_px = if resting_exit_price.0 > 0 {
+            resting_exit_price.0
+        } else if active_exit_price.0 > 0 {
+            active_exit_price.0
+        } else if self.wald_sprt.exhaustion_unwind_active {
             crate::exit_quoter::defensive_zero_loss_maker_exit_price_with_fees(
                 side,
                 avg_price_ticks,

@@ -699,8 +699,15 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
                 } else {
                     format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}")
                 };
-            } else if vc == LastVetoCode::WarmupOrLock {
-                verd_col = format!("{ANSI_GRAY}\u{26aa} WARMUP_LOCK   {ANSI_RESET}");
+            } else if vc != LastVetoCode::None {
+                if !q_ok {
+                    verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}");
+                } else if vc == LastVetoCode::SpoofingVeto {
+                    row_col = ANSI_ORANGE;
+                    verd_col = format!("{ANSI_ORANGE}\u{1f7e0} SPOOF_VETO    {ANSI_RESET}");
+                } else {
+                    verd_col = format!("{ANSI_GRAY}\u{26aa} {:<14}{ANSI_RESET}", format_veto_badge(vc));
+                }
             } else {
                 let beta_hud = OrthogonalFactorState::epps_btc_lead_lag_beta(s_idx, &snap, &btc_snap);
                 match OrthogonalFactorState::evaluate_entry_signal_v46(
@@ -724,8 +731,6 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
                     SignalVerdict::NeutralNoAction => {
                         if !q_ok {
                             verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}");
-                        } else if vc != LastVetoCode::None {
-                            verd_col = format!("{ANSI_GRAY}\u{26aa} {:<14}{ANSI_RESET}", format_veto_badge(vc));
                         }
                     }
                 }
@@ -832,7 +837,7 @@ pub fn evaluate_capital_scaling_semaphore(
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
             let is_v48 = matches!(
                 v.get("schema").and_then(serde_json::Value::as_str),
-                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2")
+                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3")
             );
             match v.get("event").and_then(serde_json::Value::as_str) {
                 Some("EPOCH_RESET") => {
@@ -938,7 +943,7 @@ pub fn render_capital_scaling_semaphore(
         rep.v48_trades,
         g1_pct
     );
-    let g1_c3 = format!("Dias UTC V5.0: {:>2}/12 dias", rep.v48_days);
+    let g1_c3 = format!("Dias UTC V5.3: {:>2}/12 dias", rep.v48_days);
 
     let w_pct = ((rep.wallet_usdt / 67.0) * 100.0).clamp(0.0, 100.0);
     let g2_c2 = format!(
@@ -955,7 +960,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.2}", rep.pf_v48)
     };
     let v70_txt = if rep.vault_70_ok { "Vault>12.5b OK" } else { "Vault<=12.5b" };
-    let g2_c3 = format!("PF V5.0: {pf_txt:<12} | {v70_txt}");
+    let g2_c3 = format!("PF V5.3: {pf_txt:<12} | {v70_txt}");
 
     let mkr_ref = if rep.v48_trades >= 10 { rep.v48_mkr_pct } else { rep.global_mkr_pct };
     let g3_pct = ((mkr_ref / 82.0) * 100.0).clamp(0.0, 100.0);
@@ -967,7 +972,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.1}% ({}/{}t)", rep.v48_mkr_pct, rep.v48_maker_closes, rep.v48_trades)
     };
     let g3_c3 = format!(
-        "V5.0 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
+        "V5.3 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
         rep.parity_drift_1e8,
         usize::from(rep.halt_active)
     );

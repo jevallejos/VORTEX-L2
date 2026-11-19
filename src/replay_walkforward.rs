@@ -227,6 +227,11 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
             gov.set_active_fee_schedule(cached_fees);
         }
         let _ = CausalOrderBlockEngine::load_plasticity_array_from_path(&mut ob_engines, Path::new(OB_PLASTICITY_VAULT_PATH));
+        let _ = crate::vault_io::rehydrate_epps_trackers_from_audit_path(
+            &mut epps_trackers,
+            Path::new(crate::vault_io::PLASTICITY_AUDIT_VAULT_PATH),
+            crate::types::now_epoch_ns(),
+        );
         for eng in &mut engines { eng.sync_governor_dynamics(&gov); }
         SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
     }
@@ -239,6 +244,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
     let mut exit_role_latch = [ExitOrderRole::None; MAX_ACTIVE_PAIRS];
     let mut init_q_ahead = [LotQty(0); MAX_ACTIVE_PAIRS];
     let mut armed_ts_latch = [0_i64; MAX_ACTIVE_PAIRS];
+    let mut queue_flow_ema = [0.0_f64; MAX_ACTIVE_PAIRS];
     let mut first_ring_ts_ns = 0_i64;
     let require_ring_warmup = files.len() >= 64;
 
@@ -341,6 +347,17 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 s_idx == 0, cur_snap.realized_vol_5m, ScaledBps(btc_snap.realized_vol_5m.0.max(2_500)),
                             );
                             if beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000)
+                                && crate::exec_daemon::passes_elastic_daily_tail_risk_budget(
+                                    s_idx,
+                                    side,
+                                    risk_ppm,
+                                    eq_now,
+                                    &daily_gov,
+                                    ledger.sinking_fund_reserve_bps_x100,
+                                    &engines,
+                                    &snaps,
+                                    &gov,
+                                )
                                 && gov.authorizes_adaptive_entry_v49(s_idx, side, eq_now, daily_damper_pm, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok()
                             {
                                 engines[s_idx].sync_governor_for_side(&gov, side);
@@ -348,6 +365,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. })
                                 {
                                     armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
+                                    queue_flow_ema[s_idx] = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
                                     entry_fifo[s_idx].reset();
                                 }
                             }
@@ -373,6 +391,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 continue;
                             };
                             armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
+                            queue_flow_ema[s_idx] = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
                             entry_fifo[s_idx].submit_post_only(side, synced_px, qty, cur_snap.ts_local_ns);
                             rep.armed += 1;
                         }
@@ -424,8 +443,18 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             let q_timers = elastic_resting_queue_timers_ns(base_chase_ns);
                             let total_chase_ns = cur_snap.ts_local_ns.0.saturating_sub(armed_ts_latch[s_idx]);
                             let at_l1 = match side { Side::Bid => cur_snap.bids[0].price == entry_price, Side::Ask => cur_snap.asks[0].price == entry_price };
-                            let flow_imp = (0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get()) * side.sign_f64();
-                            let signed_slow = crate::types::BoundedScore::new_clamped(flow_imp);
+                            let raw_flow = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
+                            let flow_imp = raw_flow * side.sign_f64();
+                            queue_flow_ema[s_idx] = crate::execution_fsm::step_intrinsic_slow_flow_ema(
+                                crate::types::BoundedScore::new_clamped(queue_flow_ema[s_idx]),
+                                crate::types::BoundedScore::new_clamped(raw_flow),
+                                5_000_000,
+                                engines[s_idx].intrinsic_tau_mkt_s,
+                                evt_dil,
+                                75_000,
+                            )
+                            .get();
+                            let signed_slow = crate::types::BoundedScore::new_clamped(queue_flow_ema[s_idx] * side.sign_f64());
                             let dt_s = ((elapsed_ns.max(5_000_000) as f64) * 1e-9).max(0.05);
                             let consumed_q = init_q_ahead[s_idx].0.saturating_sub(queue_ahead_qty.0).max(0);
                             let hwk_lam = evt_dil * (1.0 + 1.618_033_988_749_895 * ((consumed_q as f64) / ((init_q_ahead[s_idx].0.max(1) as f64) * dt_s))).clamp(0.382, 6.854);
@@ -448,7 +477,13 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             let chase_expired = (!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
                             let dq_abort = block_new_entries || fast_sweep || headwind_erosion || macro_contradiction
                                 || (elapsed_ns >= 25_000_000 && at_l1 && crate::kinematic_surface::check_queue_depletion_velocity_abort_with_spoof(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap, spoof_d))
-                                || flow_imp <= -0.48;
+                                || crate::exec_daemon::should_abort_queue_on_adverse_flow_c1(
+                                    flow_imp,
+                                    queue_flow_ema[s_idx] * side.sign_f64(),
+                                    engines[s_idx].learned_taker_prob_pm,
+                                    engines[s_idx].learned_ir_x100,
+                                    spoof_d,
+                                );
                             if chase_expired || dq_abort {
                                 gov.observe_entry_abort(s_idx, side, entry_price, cur_snap.ts_local_ns);
                                 let veto_c = if block_new_entries { LastVetoCode::WarmupOrLock } else { LastVetoCode::HawkesStoikovQueueAbort };
@@ -487,6 +522,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&cur_snap, new_l1) {
                                         engines[s_idx].next_peg_allowed_ts_ns = cur_snap.ts_local_ns.0 + q_timers.repeg_cooldown_ns;
                                         engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, cur_snap.ts_local_ns);
+                                        queue_flow_ema[s_idx] = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
                                         entry_fifo[s_idx].submit_post_only(side, new_l1, qty, cur_snap.ts_local_ns);
                                     }
                                 }
@@ -598,7 +634,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                         let peg_ready = preempt || cur_snap.ts_local_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns;
                         if rest_tp.0 == 0 || rest_q != quote.order_lots
                             || (peg_ready && should_repeg_resting_exit_tp(
-                                spec, side, avg_price_ticks, rest_tp, rest_q, quote.target_price,
+                                spec, side, mid_now, rest_tp, rest_q, quote.target_price,
                                 quote.order_lots, quote.urgent_close_repeg, quote.cur_gross_bps, engines[s_idx].active_fees,
                             ))
                         {
@@ -871,6 +907,17 @@ pub mod omega_twin {
                             s_idx == 0, ev.snap.realized_vol_5m, ScaledBps(btc_snap.realized_vol_5m.0.max(2_500)),
                         );
                         if beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000)
+                            && crate::exec_daemon::passes_elastic_daily_tail_risk_budget(
+                                s_idx,
+                                side,
+                                risk_ppm,
+                                eq_now,
+                                &self.daily_gov,
+                                self.ledger.sinking_fund_reserve_bps_x100,
+                                &self.engines,
+                                &self.cached_snaps,
+                                &self.gov,
+                            )
                             && self.gov.authorizes_adaptive_entry_v49(s_idx, side, eq_now, daily_damper_pm, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok()
                         {
                             self.engines[s_idx].sync_governor_for_side(&self.gov, side);
@@ -1308,7 +1355,7 @@ pub mod omega_twin {
         let ab = run_quadruple_omega_ablation_suite();
         let twin = run_omega_digital_twin_walk_forward_lab();
 
-        let sec_title = vec![format!("{ANSI_SKY_BLUE}[VORTEX-REPLAY OMEGA V4.8] 4-ARM PARETO ABLATION & 1:1 PAR2 DIGITAL TWIN GATE{ANSI_RESET}")];
+        let sec_title = vec![format!("{ANSI_SKY_BLUE}[VORTEX-REPLAY OMEGA V5.3] 4-ARM PARETO ABLATION & 1:1 PAR2 DIGITAL TWIN GATE{ANSI_RESET}")];
         let sec_fifo = vec![format!("  {ANSI_GREEN}200k FIFO Queue Sim{ANSI_RESET}: {ev_per_sec} ev/s | Passive Fills: {fills} | PostOnly Rejects: {rejects}")];
         let sec_arms = vec![
             format!("  MODEL A   (Baseline Fixed L1)      : {:>+8.2} bps net", (ab.arm_a_baseline_net_bps_x100 as f64) / 100.0),

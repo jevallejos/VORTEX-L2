@@ -536,7 +536,7 @@ pub fn build_markdown_360_clip(ctx: &VortexWebContext, trade_id: Option<u64>) ->
     let ds = &st["daily_shield"];
     let sm = &st["semaphore_4_4"];
     let mut out = String::with_capacity(2_048);
-    out.push_str("### VORTEX-OMEGA V5.2 — Snapshot Ejecutivo 360 (Loopback Read-Only)\n");
+    out.push_str("### VORTEX-OMEGA V5.2 \u{2014} Snapshot Ejecutivo 360 (Loopback Read-Only)\n");
     let _ = writeln!(
         out,
         "- **SHM v{}**: online={} | HB={} ms | Resyncs={} | WS_RTT={} us | Open={}/6 | Q={}",

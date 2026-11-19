@@ -71,6 +71,8 @@ pub struct OrthogonalFactorState {
     ofi_neg_slow: f64,
     tfi_buy_accum: f64,
     tfi_sell_accum: f64,
+    learned_l1_depth_lots: f64,
+    learned_trade_lots: f64,
     spoof_density_ewma: f64,
     last_ofi: BoundedScore,
     last_tfi: BoundedScore,
@@ -106,6 +108,8 @@ impl OrthogonalFactorState {
             ofi_neg_slow: 1.0,
             tfi_buy_accum: 1.0,
             tfi_sell_accum: 1.0,
+            learned_l1_depth_lots: 0.0,
+            learned_trade_lots: 0.0,
             spoof_density_ewma: 0.0,
             last_ofi: BoundedScore::ZERO,
             last_tfi: BoundedScore::ZERO,
@@ -136,6 +140,7 @@ impl OrthogonalFactorState {
         self.ofi_neg_med = 1.0;
         self.ofi_pos_slow = 1.0;
         self.ofi_neg_slow = 1.0;
+        self.learned_l1_depth_lots = 0.0;
         self.last_ofi = BoundedScore::ZERO;
         self.last_geom = BoundedScore::ZERO;
     }
@@ -157,6 +162,17 @@ impl OrthogonalFactorState {
             }
             _ => (1.0, 0.25),
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn tfi_endogenous_prior_lots(&self, snap: &SymbolLobSnapshot, floor_lots: f64) -> f64 {
+        if snap.bids[0].qty.0 <= 0 && snap.asks[0].qty.0 <= 0 {
+            return 1e-6;
+        }
+        ((INV_PHI_FOURTH * self.learned_l1_depth_lots + INV_PHI_CUBE * self.learned_trade_lots)
+            * (1.0 + INV_PHI * self.spoof_density_ewma))
+            .max(PHI * floor_lots)
     }
 
     #[inline]
@@ -270,6 +286,14 @@ impl OrthogonalFactorState {
             self.ofi_pos_fast = init_lots; self.ofi_neg_fast = init_lots;
             self.ofi_pos_med = init_lots; self.ofi_neg_med = init_lots;
             self.ofi_pos_slow = init_lots; self.ofi_neg_slow = init_lots;
+            let (b0, a0) = (snap.bids[0].price.0, snap.asks[0].price.0);
+            if b0 > 0 && a0 > 0 {
+                self.learned_l1_depth_lots =
+                    (snap.bids[0].qty.0.min(snap.asks[0].qty.0).max(0) as f64).max(init_lots);
+                if self.learned_trade_lots <= 0.0 {
+                    self.learned_trade_lots = init_lots;
+                }
+            }
             self.last_l2_ts_ns = snap.ts_local_ns.0;
             if self.last_tfi_ts_ns <= 0 {
                 self.last_tfi_ts_ns = snap.ts_local_ns.0;
@@ -277,7 +301,11 @@ impl OrthogonalFactorState {
                 self.tfi_sell_accum = init_lots;
             } else {
                 self.decay_tfi_to_clock(snap.ts_local_ns.0, floor_lots);
-                self.last_tfi = BoundedScore::new_clamped((self.tfi_buy_accum - self.tfi_sell_accum) / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6));
+                let tfi_prior = self.tfi_endogenous_prior_lots(snap, floor_lots);
+                self.last_tfi = BoundedScore::new_clamped(
+                    (self.tfi_buy_accum - self.tfi_sell_accum)
+                        / (self.tfi_buy_accum + self.tfi_sell_accum + tfi_prior),
+                );
             }
             self.last_ofi = BoundedScore::ZERO;
             self.last_geom = Self::compute_book_geometry(snap);
@@ -355,8 +383,19 @@ impl OrthogonalFactorState {
         let m_sc = (self.ofi_pos_med - self.ofi_neg_med) / (self.ofi_pos_med + self.ofi_neg_med + 1e-6);
         let s_sc = (self.ofi_pos_slow - self.ofi_neg_slow) / (self.ofi_pos_slow + self.ofi_neg_slow + 1e-6);
         self.last_ofi = BoundedScore::new_clamped(0.50 * f_sc + 0.32 * m_sc + 0.18 * s_sc);
+        if dt_s > 0.0 {
+            let thin_bbo = snap.bids[0].qty.0.min(snap.asks[0].qty.0).max(0) as f64;
+            let tau_l1_s = V45_EQ_RATE_TAU_SECS * (1.0 + PHI * self.spoof_density_ewma);
+            let alpha_l1 = 1.0 - (-dt_s / tau_l1_s).exp();
+            self.learned_l1_depth_lots =
+                (1.0 - alpha_l1) * self.learned_l1_depth_lots + alpha_l1 * thin_bbo;
+        }
         self.decay_tfi_to_clock(ts_now, floor_lots);
-        self.last_tfi = BoundedScore::new_clamped((self.tfi_buy_accum - self.tfi_sell_accum) / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6));
+        let tfi_prior = self.tfi_endogenous_prior_lots(snap, floor_lots);
+        self.last_tfi = BoundedScore::new_clamped(
+            (self.tfi_buy_accum - self.tfi_sell_accum)
+                / (self.tfi_buy_accum + self.tfi_sell_accum + tfi_prior),
+        );
         self.last_geom = Self::compute_book_geometry(snap);
         if dt_s > 0.0 {
             let ofi_f = self.last_ofi.get();
@@ -376,7 +415,16 @@ impl OrthogonalFactorState {
 
     pub fn on_trade_print(&mut self, side: Side, qty: LotQty, snap: &mut SymbolLobSnapshot) {
         let q = (qty.0.max(0)) as f64;
-        let (_, floor_lots) = Self::flow_prior_bounds(snap);
+        let (init_lots, floor_lots) = Self::flow_prior_bounds(snap);
+        if q > 0.0 {
+            let alpha_tr = INV_PHI_FOURTH;
+            let base_tr = if self.learned_trade_lots > 0.0 {
+                self.learned_trade_lots
+            } else {
+                init_lots
+            };
+            self.learned_trade_lots = (1.0 - alpha_tr) * base_tr + alpha_tr * q;
+        }
         self.decay_tfi_to_clock(snap.ts_local_ns.0, floor_lots);
         match side {
             Side::Bid => {
@@ -388,7 +436,11 @@ impl OrthogonalFactorState {
                 snap.cum_sell_trade_lots = LotQty(snap.cum_sell_trade_lots.0.saturating_add(qty.0));
             }
         }
-        self.last_tfi = BoundedScore::new_clamped((self.tfi_buy_accum - self.tfi_sell_accum) / (self.tfi_buy_accum + self.tfi_sell_accum + 1e-6));
+        let tfi_prior = self.tfi_endogenous_prior_lots(snap, floor_lots);
+        self.last_tfi = BoundedScore::new_clamped(
+            (self.tfi_buy_accum - self.tfi_sell_accum)
+                / (self.tfi_buy_accum + self.tfi_sell_accum + tfi_prior),
+        );
         snap.factor_tfi = self.last_tfi;
     }
 
@@ -1602,5 +1654,40 @@ mod v51_f4_l1_depletion_vs_cancel_tests {
             tao, Side::Bid, LotQty(797), LotQty(118), LotQty(12),
             PriceTicks(19_505), BoundedScore::new_clamped(-0.18), fees,
         ));
+    }
+
+    #[test]
+    fn test_h1_endogenous_dirichlet_laplace_tfi_prior_spoof_immunity_and_reset() {
+        let mut st = OrthogonalFactorState::new();
+        let empty = SymbolLobSnapshot::new_empty();
+        assert!((st.tfi_endogenous_prior_lots(&empty, 1.0) - 1e-6).abs() < 1e-12);
+
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[3].symbol_id;
+        snap.ts_local_ns = TimestampNs(1_000_000_000);
+        for i in 0..5 {
+            snap.bids[i] = BookLevel { price: PriceTicks(8_200 - i as i64), qty: LotQty(1_200) };
+            snap.asks[i] = BookLevel { price: PriceTicks(8_201 + i as i64), qty: LotQty(1_200) };
+        }
+        st.on_l2_book_update(&mut snap);
+        assert!(st.learned_l1_depth_lots >= 1_200.0);
+        // Dust 1-lot print on deep L1 book must not trigger a spurious TFI spike
+        st.on_trade_print(Side::Bid, LotQty(1), &mut snap);
+        assert!(snap.factor_tfi.get().abs() < 0.05);
+
+        // One-sided spoof wall on Bid must not inflate learned_l1_depth_lots past thin Ask BBO
+        snap.ts_local_ns = TimestampNs(5_000_000_000);
+        snap.bids[0].qty = LotQty(80_000);
+        snap.asks[0].qty = LotQty(900);
+        st.on_l2_book_update(&mut snap);
+        assert!(st.learned_l1_depth_lots <= 1_200.0);
+
+        st.on_trade_print(Side::Bid, LotQty(600), &mut snap);
+        let tr_saved = st.learned_trade_lots;
+        st.reset_l2_book_only();
+        assert!(st.learned_l1_depth_lots.abs() < 1e-12);
+        assert!((st.learned_trade_lots - tr_saved).abs() < 1e-12);
+        st.reset();
+        assert!(st.learned_trade_lots.abs() < 1e-12);
     }
 }

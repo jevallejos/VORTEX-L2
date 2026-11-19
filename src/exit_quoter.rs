@@ -534,8 +534,8 @@ pub fn reconcile_closed_pnl_core(
     let expected_sym = spec.symbol_id.name();
     let expected_lots = if ctx.tranche1_harvested { ctx.initial_lots.0.max(ctx.open_lots.0).max(1) } else { ctx.open_lots.0.max(1) };
     let min_ms = if ctx.opened_ts.0 >= MIN_VALID_UTC_EPOCH_NS { (ctx.opened_ts.0 / 1_000_000).saturating_sub(1_500) } else { 0 };
-    let (mut acc_lots, mut w_en, mut w_ex, mut w_lots, mut sum_pnl, mut has_pnl, mut legs_count, mut saw_mkt_sl) =
-        (0_i64, 0_i128, 0_i128, 0_i128, 0_i64, false, 0_u32, false);
+    let (mut acc_lots, mut w_en, mut w_ex, mut w_lots, mut sum_pnl, mut has_pnl, mut legs_count, mut saw_mkt_sl, mut saw_limit_exit) =
+        (0_i64, 0_i128, 0_i128, 0_i128, 0_i64, false, 0_u32, false, false);
     for row in list {
         if acc_lots >= expected_lots { break; }
         let r_sym = row.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -554,6 +554,9 @@ pub fn reconcile_closed_pnl_core(
         let exec_t = row.get("execType").and_then(serde_json::Value::as_str).unwrap_or("");
         if ord_t.eq_ignore_ascii_case("Market") || exec_t.eq_ignore_ascii_case("BustTrade") || exec_t.eq_ignore_ascii_case("AdlTrade") {
             saw_mkt_sl = true;
+        }
+        if ord_t.eq_ignore_ascii_case("Limit") {
+            saw_limit_exit = true;
         }
         let eff_q = q_lots.0.max(1);
         if q_lots.0 > 0 { acc_lots = acc_lots.saturating_add(q_lots.0); }
@@ -586,7 +589,25 @@ pub fn reconcile_closed_pnl_core(
         ((verified_exit_price.0 - verified_entry_price.0).saturating_mul(ctx.side.sign_i64()).saturating_mul(1_000_000))
             / verified_entry_price.0.max(1) - rt_mkr
     };
-    let kind = if saw_mkt_sl || est_net_bps <= -150 { ClosedTradeKind::ServerMarkPriceStopLoss } else { ClosedTradeKind::MakerPassiveUnwind };
+    let kind = if saw_mkt_sl {
+        ClosedTradeKind::ServerMarkPriceStopLoss
+    } else if saw_limit_exit {
+        ClosedTradeKind::MakerPassiveUnwind
+    } else {
+        let sl_ref = PairSpec::elastic_server_sl_distance_bps_with_fees(
+            ScaledBps(ctx.learned_ret_std_bps.max(1_200)),
+            ctx.active_fees,
+        )
+        .raw() as f64;
+        let endo_tkr_cut = -((PHI * (ctx.active_fees.round_trip_taker_exit_bps().raw().max(50) as f64))
+            .max(INV_PHI_SQ * sl_ref)
+            .round() as i64);
+        if est_net_bps <= endo_tkr_cut {
+            ClosedTradeKind::ServerMarkPriceStopLoss
+        } else {
+            ClosedTradeKind::MakerPassiveUnwind
+        }
+    };
     let sub_reason = match kind {
         ClosedTradeKind::ServerMarkPriceStopLoss => {
             if est_net_bps > 0 || is_chandelier_profit_locked_sl_with_fees(ctx.side, verified_entry_price, verified_exit_price, ctx.active_fees) {
@@ -781,7 +802,9 @@ pub fn compute_canonical_exit_quote_omega_v52(
     let wald_pct = ((100.0 * INV_PHI * hermite_s3_unit(INV_PHI - p_cont, 0.0, INV_PHI_SQ)).round() as i64).clamp(0, 62);
     let sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(snap.realized_vol_5m, ctx.active_fees).raw();
     let gamma_pm = (220 + ctx.learned_ir_x100.clamp(-40, 80)).clamp(180, 300);
-    let mae_trig_bps = -((sl_bps * gamma_pm) / 1_000).max(ctx.learned_ret_std_bps / 6).max(450);
+    let mae_trig_bps = -((sl_bps * gamma_pm) / 1_000)
+        .max(ctx.learned_ret_std_bps / 6)
+        .max((PHI * c_mkr_scale).round() as i64);
     let ir_norm = (ctx.learned_ir_x100.clamp(0, 100) as f64) * 1e-2;
     let stag_flow_ceil = INV_PHI_CUBE * (1.0 - INV_PHI_SQ * ir_norm);
     let live_deep_underwater = cur_gross_bps <= mae_trig_bps && eff_flow_slow < 0.0;
@@ -853,12 +876,26 @@ pub fn compute_canonical_exit_quote_omega_v52(
         } else {
             0.0
         };
-        let chi_stress = s_wave3_stress.max(s_stag_stress).max(s_wald_deep_stress);
         let state_mae = ((ctx.worst_adverse_price.0 - ctx.avg_price_ticks.0)
             .saturating_mul(d_sign)
             .saturating_mul(1_000_000))
             / avg_denom;
         let worst_mae_bps = ctx.last_closed_mae_bps.min(state_mae).min(cur_gross_bps);
+        let s_bounce_bailout = if worst_mae_bps <= mae_trig_bps && cur_gross_bps > worst_mae_bps {
+            hermite_s3_unit(hold_s_f, INV_PHI * tau_wave3_s, def_horizon_s)
+                * hermite_s3_unit(
+                    (cur_gross_bps - worst_mae_bps) as f64,
+                    INV_PHI_SQ * c_mkr_scale,
+                    PHI * c_mkr_scale,
+                )
+                * hermite_s3_unit(INV_PHI_SQ - p_cont, 0.0, INV_PHI_FOURTH)
+        } else {
+            0.0
+        };
+        let chi_stress = s_wave3_stress
+            .max(s_stag_stress)
+            .max(s_wald_deep_stress)
+            .max(s_bounce_bailout);
         let trapped_or_underwater = cur_gross_bps < 0 || worst_mae_bps < 0;
         let maker_bailout_active = trapped_or_underwater
             && cur_gross_bps < zero_loss_bps
@@ -910,7 +947,10 @@ pub fn compute_canonical_exit_quote_omega_v52(
     let s_run = if ctx.tranche1_harvested {
         hermite_s3_unit(own_flow.max(s_prop), INV_PHI_FIFTH, INV_PHI_SQ)
     } else {
-        hermite_s3_unit(own_flow, INV_PHI, 1.0 - INV_PHI_FOURTH)
+        let p_tkr_r = (ctx.learned_taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+        let run_lo = (INV_PHI_SQ * (1.0 + PHI * p_tkr_r - INV_PHI_CUBE * ir_norm))
+            .clamp(INV_PHI_CUBE, INV_PHI);
+        hermite_s3_unit(own_flow.max(s_prop), run_lo, 1.0 - INV_PHI_FOURTH)
     };
     let runner2_px = if lvdbs_vac_level < 2 && s_run > 1e-6 {
         let sigma_1m = vol_f / 2.236_067_977_499_79;
@@ -1078,5 +1118,82 @@ mod tests {
         eth_s.ts_local_ns = TimestampNs(25_000_000_000);
         let kin_ask = ShadowRunnerKinematics { flow_ema_fast: 0.45, flow_ema_slow: 0.40, in_scar_debt: false, chandelier_armed: false };
         assert!(compute_canonical_exit_quote_omega(&eth6_ctx, kin_ask, &eth_s).is_some_and(|q| q.defensive_lock_active && q.urgent_close_repeg));
+    }
+
+    #[test]
+    fn test_h2_h5_h6b_limit_bailout_reconcile_deadcat_bounce_and_adaptive_s_run() {
+        let base_ctx = OpenExitContext {
+            slot_idx: 1, side: Side::Bid, avg_price_ticks: PriceTicks(180_000),
+            peak_favorable_price: PriceTicks(180_010), worst_adverse_price: PriceTicks(178_200),
+            initial_lots: LotQty(1), open_lots: LotQty(1), tranche1_harvested: false,
+            tranche1_lots: LotQty(0), tranche1_exit_price: PriceTicks(0), defensive_floor_locked: true,
+            active_exit_price: PriceTicks(180_080), structural_tp_price: PriceTicks(180_100),
+            resting_exit_price: PriceTicks(180_080), sl_trigger_price: PriceTicks(177_500),
+            opened_ts: TimestampNs(1_800_000_009_000_000_000), learned_mfe_bps: 720, learned_t1_permille: 500,
+            learned_ir_x100: 35, learned_ret_std_bps: 1_500, intrinsic_tau_mkt_s: 120,
+            last_eff_sl_ticks: PriceTicks(177_500), ratchet_locked_gross_bps: 0,
+            last_closed_mfe_bps: 60, last_closed_mae_bps: -1_000, active_fees: FeeSchedule::VIP0_DEFAULT,
+            learned_taker_prob_pm: 45,
+        };
+        // H2: Limit order with negative PnL (-3.20 bps) is ALWAYS MakerPassiveUnwind (never SL)
+        let limit_loss_json = serde_json::json!({
+            "retCode": 0,
+            "result": { "list": [{
+                "symbol": "ETHUSDT", "closedSize": "0.01", "avgEntryPrice": "1800.00",
+                "avgExitPrice": "1799.50", "closedPnl": "-0.0058", "orderType": "Limit",
+                "updatedTime": "1800000010000"
+            }]}
+        });
+        assert!(matches!(
+            reconcile_closed_pnl_core(&base_ctx, &limit_loss_json, 1, false),
+            ClosedPnlQueryOutcome::Verified(v)
+                if v.kind == ClosedTradeKind::MakerPassiveUnwind && v.sub_reason == ExitSubReason::AdverseScratchEscape
+        ));
+
+        // H5: Dead-cat bounce with exhausted Wald SPRT keeps maker_bailout_active engaged at BBO
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[1].symbol_id;
+        snap.ts_local_ns = TimestampNs(1_800_000_045_000_000_000);
+        snap.realized_vol_5m = ScaledBps(2_200);
+        snap.bids[0] = BookLevel { price: PriceTicks(179_940), qty: LotQty(150) };
+        snap.asks[0] = BookLevel { price: PriceTicks(179_941), qty: LotQty(150) };
+        let kin_bounce = ShadowRunnerKinematics { flow_ema_fast: 0.08, flow_ema_slow: 0.04, in_scar_debt: false, chandelier_armed: false };
+        let q_bail_opt = compute_canonical_exit_quote_omega_v52(&base_ctx, kin_bounce, &snap, Some(-2.2), 0, 5_000);
+        assert!(q_bail_opt.is_some());
+        let Some(q_bail) = q_bail_opt else { return };
+        let zero_loss_px = defensive_zero_loss_maker_exit_price_with_fees(Side::Bid, base_ctx.avg_price_ticks, base_ctx.active_fees);
+        assert!(q_bail.target_price.0 < zero_loss_px.0 && q_bail.target_price.0 == 179_941);
+        // Healthy Wald (p_cont >= 0.50) does NOT bail out below zero_loss_px on bounce
+        let q_hold_opt = compute_canonical_exit_quote_omega_v52(&base_ctx, kin_bounce, &snap, Some(0.5), 0, 5_000);
+        assert!(q_hold_opt.is_some());
+        let Some(q_hold) = q_hold_opt else { return };
+        let mut healthy_ctx = base_ctx;
+        healthy_ctx.last_closed_mfe_bps = 300;
+        let q_healthy = compute_canonical_exit_quote_omega_v52(&healthy_ctx, kin_bounce, &snap, Some(0.5), 0, 5_000);
+        assert!(q_hold.target_price.0 >= 179_941 && q_healthy.is_some_and(|q| q.target_price.0 >= zero_loss_px.0));
+
+        // H6b: Unsplit 1-lot adaptive s_run unlocks earlier under clean maker toxicity vs toxic tape
+        let mut run_ctx = base_ctx;
+        run_ctx.defensive_floor_locked = false;
+        run_ctx.worst_adverse_price = PriceTicks(180_000);
+        run_ctx.last_closed_mae_bps = 0;
+        run_ctx.structural_tp_price = PriceTicks(180_105);
+        run_ctx.learned_taker_prob_pm = 25;
+        run_ctx.learned_ir_x100 = 80;
+        snap.bids[0] = BookLevel { price: PriceTicks(180_040), qty: LotQty(200) };
+        snap.asks[0] = BookLevel { price: PriceTicks(180_041), qty: LotQty(200) };
+        snap.factor_ofi = BoundedScore::new_clamped(0.48);
+        snap.factor_tfi = BoundedScore::new_clamped(0.50);
+        let kin_clean = ShadowRunnerKinematics { flow_ema_fast: 0.56, flow_ema_slow: 0.44, in_scar_debt: false, chandelier_armed: false };
+        let q_clean_opt = compute_canonical_exit_quote_omega_v52(&run_ctx, kin_clean, &snap, None, 0, 5_000);
+        assert!(q_clean_opt.is_some());
+        let Some(q_clean) = q_clean_opt else { return };
+        let mut tox_ctx = run_ctx;
+        tox_ctx.learned_taker_prob_pm = 450;
+        tox_ctx.learned_ir_x100 = 0;
+        let q_tox_opt = compute_canonical_exit_quote_omega_v52(&tox_ctx, kin_clean, &snap, None, 0, 5_000);
+        assert!(q_tox_opt.is_some());
+        let Some(q_tox) = q_tox_opt else { return };
+        assert!(q_clean.target_price.0 > q_tox.target_price.0);
     }
 }

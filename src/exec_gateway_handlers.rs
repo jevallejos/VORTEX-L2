@@ -60,6 +60,7 @@ pub struct ExecRuntimeState {
     pub last_abort_veto: [LastVetoCode; MAX_ACTIVE_PAIRS], pub daily_gov: DailySessionGovernor, pub intra_rings: [crate::execution_fsm::SlotIntraTradeRing; MAX_ACTIVE_PAIRS], pub last_plasticity_audit_ns: i64, pub last_persisted_utc_day: i64,
     pub last_zeta_tox: [f64; MAX_ACTIVE_PAIRS],
     pub geom_adv_since_ns: [i64; MAX_ACTIVE_PAIRS],
+    pub queue_flow_ema: [f64; MAX_ACTIVE_PAIRS],
     pub drain_flushed_once: bool,
     pub halt_locked: bool,
     pub drain_active: bool,
@@ -94,6 +95,7 @@ impl ExecRuntimeState {
             last_abort_veto: [LastVetoCode::None; MAX_ACTIVE_PAIRS], daily_gov: DailySessionGovernor::new(DEFAULT_WALLET_EQUITY_1E8), intra_rings: [crate::execution_fsm::SlotIntraTradeRing::new(); MAX_ACTIVE_PAIRS], last_plasticity_audit_ns: 0, last_persisted_utc_day: -1,
             last_zeta_tox: [0.0; MAX_ACTIVE_PAIRS],
             geom_adv_since_ns: [0; MAX_ACTIVE_PAIRS],
+            queue_flow_ema: [0.0; MAX_ACTIVE_PAIRS],
             drain_flushed_once: false,
             halt_locked: false,
             drain_active: false,
@@ -355,11 +357,12 @@ pub fn handle_gateway_event(
             };
             if accepted {
                 rt.verified_exchange_sl[slot_idx] = sl_price;
+                let snap = cached_snaps[slot_idx];
+                rt.queue_flow_ema[slot_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                 let _ = engines[slot_idx].on_entry_order_resting(now_ns);
                 arena.exec_armed_count.fetch_add(1, Ordering::Relaxed);
                 engines[slot_idx].sync_to_shm_telemetry(arena);
                 let spec = APPROVED_SPECS[slot_idx];
-                let snap = cached_snaps[slot_idx];
                 let (ew_p, ef_p) = spec.format_price_usdt_parts(entry_price);
                 let (sw_p, sf_p) = spec.format_price_usdt_parts(sl_price);
                 println!(
@@ -369,6 +372,7 @@ pub fn handle_gateway_event(
                     snap.factor_ofi.get(), snap.factor_tfi.get(), snap.factor_geom.get(), ANSI_RESET
                 );
             } else {
+                rt.queue_flow_ema[slot_idx] = 0.0;
                 engines[slot_idx].state = OrderLifecycleState::Idle;
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             }
@@ -394,8 +398,10 @@ pub fn handle_gateway_event(
                 rt.last_l1_q_obs[slot_idx] = q_new;
                 rt.last_opp_trades[slot_idx] = opp_cum;
                 rt.geom_adv_since_ns[slot_idx] = 0;
+                rt.queue_flow_ema[slot_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             } else {
+                rt.queue_flow_ema[slot_idx] = 0.0;
                 engines[slot_idx].state = OrderLifecycleState::Idle;
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             }
@@ -404,6 +410,7 @@ pub fn handle_gateway_event(
             rt.slot_rpc_inflight[slot_idx] = false;
             rt.abort_cmd_inflight[slot_idx] = false;
             rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
+            rt.queue_flow_ema[slot_idx] = 0.0;
             if matches!(engines[slot_idx].state, OrderLifecycleState::PlacingEntryMaker { .. } | OrderLifecycleState::RestingEntryQueue { .. }) {
                 gov.observe_entry_abort(slot_idx, side, aborted_price, now_ns);
                 let veto = if rt.last_abort_veto[slot_idx] != LastVetoCode::None {
@@ -421,6 +428,7 @@ pub fn handle_gateway_event(
         GatewayEvent::EntryOrderVanished { slot_idx } | GatewayEvent::WsEntryOrderTerminated { slot_idx } => {
             rt.slot_rpc_inflight[slot_idx] = false;
             rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
+            rt.queue_flow_ema[slot_idx] = 0.0;
             if let OrderLifecycleState::PlacingEntryMaker { side, entry_price, .. }
             | OrderLifecycleState::RestingEntryQueue { side, entry_price, .. } = engines[slot_idx].state
             {
@@ -446,6 +454,7 @@ pub fn handle_gateway_event(
         GatewayEvent::EntryFilledLive { slot_idx, real_side, verified_avg, real_lots, sl_verified, tag } => {
             rt.slot_rpc_inflight[slot_idx] = false;
             rt.abort_cmd_inflight[slot_idx] = false;
+            rt.queue_flow_ema[slot_idx] = 0.0;
             if !matches!(engines[slot_idx].state, OrderLifecycleState::PlacingEntryMaker { .. } | OrderLifecycleState::RestingEntryQueue { .. }) {
                 return;
             }
@@ -610,6 +619,7 @@ pub fn handle_gateway_event(
                 if let Some(armed_qty) = armed_qty_opt {
                     rt.slot_rpc_inflight[slot_idx] = false;
                     rt.abort_cmd_inflight[slot_idx] = false;
+                    rt.queue_flow_ema[slot_idx] = 0.0;
                     if real_lots.0 < armed_qty.0 {
                         if let Some(gw) = gateway { let _ = gw.try_send(GatewayCommand::CancelResidualEntries { slot_idx }); }
                     }
@@ -621,6 +631,65 @@ pub fn handle_gateway_event(
                         rt.markout_rings[slot_idx].arm_fill_probe(eff_s, eff_px, mid_t0, now_ns);
                         apply_post_fill_sl_or_breach(slot_idx, eff_s, eff_px, false, prev_sl, &cached_snaps[slot_idx], &mut engines[slot_idx], rt);
                         record_and_notify_entry_fill(slot_idx, APPROVED_SPECS[slot_idx], engines, entry_forensics, arena, tg_tx, vault_tx, now_ns, eff_s, eff_px, eff_q, "MAKER FILL WS");
+                    }
+                } else if matches!(engines[slot_idx].state, OrderLifecycleState::Idle) && real_lots.0 > 0 {
+                    rt.slot_rpc_inflight[slot_idx] = false;
+                    rt.abort_cmd_inflight[slot_idx] = false;
+                    rt.queue_flow_ema[slot_idx] = 0.0;
+                    if let Some(gw) = gateway {
+                        let _ = gw.try_send(GatewayCommand::CancelResidualEntries { slot_idx });
+                    }
+                    let eff_px = verified_avg
+                        .filter(|p| p.0 > 0)
+                        .unwrap_or_else(|| mid_or_fallback(&cached_snaps[slot_idx], PriceTicks(0)));
+                    if eff_px.0 > 0 {
+                        gov.clear_abort_streak(slot_idx, real_side);
+                        engines[slot_idx].sync_governor_for_side(gov, real_side);
+                        if engines[slot_idx]
+                            .adopt_live_open_position(
+                                real_side,
+                                eff_px,
+                                real_lots,
+                                real_lots,
+                                false,
+                                eff_px,
+                                eff_px,
+                                now_ns,
+                                &cached_snaps[slot_idx],
+                            )
+                            .is_ok()
+                        {
+                            rt.markout_rings[slot_idx].arm_fill_probe(
+                                real_side,
+                                eff_px,
+                                mid_or_fallback(&cached_snaps[slot_idx], eff_px),
+                                now_ns,
+                            );
+                            apply_post_fill_sl_or_breach(
+                                slot_idx,
+                                real_side,
+                                eff_px,
+                                false,
+                                PriceTicks(0),
+                                &cached_snaps[slot_idx],
+                                &mut engines[slot_idx],
+                                rt,
+                            );
+                            record_and_notify_entry_fill(
+                                slot_idx,
+                                APPROVED_SPECS[slot_idx],
+                                engines,
+                                entry_forensics,
+                                arena,
+                                tg_tx,
+                                vault_tx,
+                                now_ns,
+                                real_side,
+                                eff_px,
+                                real_lots,
+                                "LIVE WS ORPHAN ADOPT",
+                            );
+                        }
                     }
                 } else if let OrderLifecycleState::PositionOpenMakerExit { side, open_lots, .. } = engines[slot_idx].state {
                     if real_side == side {

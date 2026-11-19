@@ -363,6 +363,32 @@ pub fn passes_live_boot_shm_and_ws_convergence_gate(
         && (cand_trades > 0 || cand.factor_tfi.get().abs() >= crate::alpha_3factor::INV_PHI_FOURTH)
 }
 
+#[inline]
+#[must_use]
+#[allow(clippy::suboptimal_flops)]
+pub fn should_abort_queue_on_adverse_flow_c1(
+    inst_signed_flow: f64,
+    slow_signed_flow: f64,
+    taker_prob_pm: i64,
+    ir_x100: i64,
+    spoof_density: f64,
+) -> bool {
+    let p_t = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    let ir_pos = (ir_x100.clamp(0, 100) as f64) * 1e-2;
+    let sp = if spoof_density.is_finite() {
+        spoof_density.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let theta_imp = -(crate::alpha_3factor::INV_PHI
+        * (1.0 + crate::alpha_3factor::INV_PHI_CUBE * ir_pos)
+        / (1.0 + crate::alpha_3factor::PHI * p_t + crate::alpha_3factor::INV_PHI_SQ * sp));
+    let theta_ema = -(crate::alpha_3factor::INV_PHI_CUBE
+        * (1.0 + crate::alpha_3factor::INV_PHI_CUBE * ir_pos)
+        / (1.0 + crate::alpha_3factor::PHI * p_t));
+    inst_signed_flow <= theta_imp && slow_signed_flow <= theta_ema
+}
+
 pub fn step_12_slot_daemon_tick(
     now_ns: TimestampNs, gateway: Option<&BybitAsyncGateway>, instruments: InstrumentSpecVerification,
     lock_watch: Option<&AtomicLockWatch>, rt: &mut ExecRuntimeState, last_rest_dispatch_ns: &mut i64,
@@ -418,6 +444,7 @@ pub fn step_12_slot_daemon_tick(
                     !passes_live_boot_shm_and_ws_convergence_gate(s_idx, cached_snaps, gov, ws_rtt_us, ws_quota_rem)
                 };
                 if block_new_entries || !instruments.is_slot_tradable(s_idx) || live_unconverged {
+                    rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::WarmupOrLock);
@@ -428,18 +455,21 @@ pub fn step_12_slot_daemon_tick(
                 if now_ns.0.saturating_sub(submitted_ts.0) < engines[s_idx].elastic_preflight_window_ns(snap.realized_vol_5m) { continue; }
                 let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
                 let Ok((e_kin, e_min)) = gov.confirm_preflight_kinematics_v49(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta) else {
+                    rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::PreflightDriftOrDecay);
                     continue;
                 };
                 let Ok((synced_entry_px, synced_sl_px)) = engines[s_idx].sync_preflight_l1_entry_auto(&snap) else {
+                    rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::PreflightDriftOrDecay);
                     continue;
                 };
                 let Some(pre_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_sbps(s_idx, side, qty, synced_entry_px, mfe_s, &snap) else {
+                    rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::QueueDepthOrOversizedLot);
@@ -469,6 +499,7 @@ pub fn step_12_slot_daemon_tick(
                 rt.last_l1_q_obs[s_idx] = q_l1;
                 rt.last_opp_trades[s_idx] = opp_cum;
                 rt.geom_adv_since_ns[s_idx] = 0;
+                rt.queue_flow_ema[s_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                 if let Some(gw) = gateway {
                     if gw.try_send(GatewayCommand::PlaceEntry { slot_idx: s_idx, side, entry_price: synced_entry_px, qty, sl_price: synced_sl_px }) {
                         rt.slot_rpc_inflight[s_idx] = true;
@@ -494,8 +525,23 @@ pub fn step_12_slot_daemon_tick(
                 rt.cur_q_ahead[s_idx] = next_q;
                 rt.last_l1_q_obs[s_idx] = next_obs;
                 if let Ok(tel) = arena.telemetry(s_idx) { tel.store_queue_ahead_lots(next_q); }
-                let flow_imp = (0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get()) * side.sign_f64();
-                let signed_slow = crate::types::BoundedScore::new_clamped(flow_imp);
+                let (ws_rtt_us, _) = crate::execution_fsm::read_live_ws_pulse();
+                let raw_q_flow = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
+                if rt.queue_flow_ema[s_idx].abs() <= 1e-12 {
+                    rt.queue_flow_ema[s_idx] = raw_q_flow;
+                } else {
+                    rt.queue_flow_ema[s_idx] = crate::execution_fsm::step_intrinsic_slow_flow_ema(
+                        crate::types::BoundedScore::new_clamped(rt.queue_flow_ema[s_idx]),
+                        crate::types::BoundedScore::new_clamped(raw_q_flow),
+                        5_000_000,
+                        engines[s_idx].intrinsic_tau_mkt_s,
+                        evt_dil,
+                        u64::from(ws_rtt_us),
+                    )
+                    .get();
+                }
+                let flow_imp = raw_q_flow * side.sign_f64();
+                let signed_slow = crate::types::BoundedScore::new_clamped(rt.queue_flow_ema[s_idx] * side.sign_f64());
                 let mut q_shield = engines[s_idx].evaluate_resting_queue_shield_with_beta(side, rt.init_q_ahead[s_idx], next_q, opp_hit, &snap, &btc_snap, epps_beta);
                 let wall_collapsed = at_l1 && (crate::alpha_3factor::should_abort_l1_cancellation_collapse_v51(spec, side, prev_l1_obs, live_l1_q, opp_hit, entry_price, signed_slow, engines[s_idx].active_fees) || (opp_hit.0 == 0 && crate::alpha_3factor::should_abort_collapsed_resting_l1_wall_dynamic(spec, side, entry_price, &snap, rt.init_q_ahead[s_idx], engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)));
                 if wall_collapsed { q_shield.abort_now = true; }
@@ -507,7 +553,6 @@ pub fn step_12_slot_daemon_tick(
                 let hwk_lam = evt_dil * (1.0 + 1.618_033_988_749_895 * ((opp_hit.0 as f64) / ((rt.init_q_ahead[s_idx].0.max(1) as f64) * dt_s))).clamp(0.382, 6.854);
                 let max_chase_ns = if at_l1 { gov.elastic_resting_l1_patience_ns_v51(s_idx, side, snap.realized_vol_5m, evt_dil, hwk_lam, signed_slow).max(base_chase_ns) } else { base_chase_ns };
                 let q_timers = elastic_resting_queue_timers_ns(base_chase_ns);
-                let (ws_rtt_us, _) = crate::execution_fsm::read_live_ws_pulse();
                 let fast_sweep = at_l1 && evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, rt.init_q_ahead[s_idx], next_q, elapsed_ns, &snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, ws_rtt_us);
                 if fast_sweep { q_shield.abort_now = true; }
                 let btc_aligned = epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
@@ -523,8 +568,15 @@ pub fn step_12_slot_daemon_tick(
                 let macro_bad = opp_wave3_now || (elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard(side, &snap));
                 let ob_bad = elapsed_ns >= q_timers.macro_abort_ns && !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
                 let geom_flip = evaluate_elastic_spoof_geom_abort_v51(side, &snap, entry_forensics[s_idx].geom_in, elapsed_ns, signed_slow, spoof_d, evt_dil, engines[s_idx].learned_taker_prob_pm, ws_rtt_us, now_ns.0, &mut rt.geom_adv_since_ns[s_idx]);
+                let adverse_flow = should_abort_queue_on_adverse_flow_c1(
+                    flow_imp,
+                    signed_slow.get(),
+                    engines[s_idx].learned_taker_prob_pm,
+                    engines[s_idx].learned_ir_x100,
+                    spoof_d,
+                );
                 let chase_expired = (!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
-                if block_new_entries || !instruments.is_slot_tradable(s_idx) || chase_expired || (elapsed_ns >= 25_000_000 && q_shield.abort_now) || fast_sweep || headwind_erosion || macro_bad || ob_bad || geom_flip || flow_imp <= -0.48 {
+                if block_new_entries || !instruments.is_slot_tradable(s_idx) || chase_expired || (elapsed_ns >= 25_000_000 && q_shield.abort_now) || fast_sweep || headwind_erosion || macro_bad || ob_bad || geom_flip || adverse_flow {
                     let abort_veto = if block_new_entries { LastVetoCode::WarmupOrLock } else if macro_bad { LastVetoCode::MacroElliottContradiction } else if ob_bad { LastVetoCode::OpposingOrderBlockWall } else if geom_flip { LastVetoCode::SpoofingVeto } else if headwind_erosion { LastVetoCode::BtcLeadLagHeadwind } else { LastVetoCode::HawkesStoikovQueueAbort };
                     rt.last_abort_veto[s_idx] = abort_veto;
                     publish_slot_veto_code(arena, s_idx, abort_veto);
@@ -535,6 +587,7 @@ pub fn step_12_slot_daemon_tick(
                             rt.abort_cmd_inflight[s_idx] = true;
                         }
                     } else {
+                        rt.queue_flow_ema[s_idx] = 0.0;
                         gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
                         rt.markout_rings[s_idx].arm_abort_probe_v49(side, entry_price, abort_veto, TimestampNs(entry_forensics[s_idx].armed_ts_ns.max(1)), now_ns, rt.init_q_ahead[s_idx], rt.cur_q_ahead[s_idx]);
                         engines[s_idx].state = OrderLifecycleState::Idle;
@@ -574,8 +627,14 @@ pub fn step_12_slot_daemon_tick(
                                 entry_forensics[s_idx].ev_ex_ante_bps = (repeg_ev_sbps as f64) / 100.0;
                                 engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + q_timers.repeg_cooldown_ns;
                                 if let Some(gw) = gateway {
-                                    if gw.try_send(GatewayCommand::RepegEntry { slot_idx: s_idx, side, new_price: new_l1, qty, new_sl_price: repeg_sl }) { rt.slot_rpc_inflight[s_idx] = true; rt.slot_rpc_sent_ns[s_idx] = now_ns.0; continue; }
+                                    if gw.try_send(GatewayCommand::RepegEntry { slot_idx: s_idx, side, new_price: new_l1, qty, new_sl_price: repeg_sl }) {
+                                        rt.queue_flow_ema[s_idx] = raw_q_flow;
+                                        rt.slot_rpc_inflight[s_idx] = true;
+                                        rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
+                                        continue;
+                                    }
                                 } else {
+                                    rt.queue_flow_ema[s_idx] = raw_q_flow;
                                     engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);
                                     engines[s_idx].sync_to_shm_telemetry(arena);
                                     continue;
@@ -593,6 +652,7 @@ pub fn step_12_slot_daemon_tick(
                 } else {
                     let bbo_crossed = match side { Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0, Side::Ask => snap.bids[0].price.0 >= entry_price.0 };
                     if next_q.0 <= 0 || bbo_crossed {
+                        rt.queue_flow_ema[s_idx] = 0.0;
                         gov.clear_abort_streak(s_idx, side);
                         engines[s_idx].sync_governor_for_side(gov, side);
                         if let Some((eff_s, eff_px, eff_q)) = crate::exec_gateway_handlers::promote_verified_fill_state(&mut engines[s_idx], now_ns, None, None, None) {
@@ -654,7 +714,14 @@ pub fn step_12_slot_daemon_tick(
                         if !rt.slot_rpc_inflight[s_idx] && (preempt_peg || now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns) && now_ns.0.saturating_sub(*last_rest_dispatch_ns) >= 55_000_000 {
                             *last_rest_dispatch_ns = now_ns.0;
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + next_sync_delay_ns;
-                            if gw.try_send(GatewayCommand::SyncOpenSlot { slot_idx: s_idx, side, target_px: quote.target_price, target_lots: quote.order_lots, defensive_lock: quote.urgent_close_repeg, cur_gross_bps: quote.cur_gross_bps, vac_level: quote.vac_level, opened_ts_ns: opened_ts.0, tranche1_harvested, fees: engines[s_idx].active_fees }) {
+                            let live_mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+                                PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+                            } else if snap.mark_price.0 > 0 {
+                                snap.mark_price
+                            } else {
+                                avg_price_ticks
+                            };
+                            if gw.try_send(GatewayCommand::SyncOpenSlot { slot_idx: s_idx, side, live_mid_px, target_px: quote.target_price, target_lots: quote.order_lots, defensive_lock: quote.urgent_close_repeg, cur_gross_bps: quote.cur_gross_bps, vac_level: quote.vac_level, opened_ts_ns: opened_ts.0, tranche1_harvested, fees: engines[s_idx].active_fees }) {
                                 rt.slot_rpc_inflight[s_idx] = true;
                                 rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
                             }
@@ -756,6 +823,7 @@ pub fn step_12_slot_daemon_tick(
                     }
                     engines[s_idx].sync_governor_for_side(gov, side);
                     if engines[s_idx].try_arm_maker_entry(&snap, verdict, lots).is_ok() && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. }) {
+                        rt.queue_flow_ema[s_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                         rt.last_abort_veto[s_idx] = LastVetoCode::None;
                         publish_slot_veto_code(arena, s_idx, LastVetoCode::None);
                         beta_guard.register_slot_open(s_idx, side, risk_ppm, beta_x1000);
@@ -1440,5 +1508,83 @@ mod v51_f1_f4b_daemon_tests {
         s.factor_ofi = BoundedScore::new_clamped(0.52);
         s.factor_tfi = BoundedScore::new_clamped(0.84);
         assert!(evaluate_toxic_sweep_velocity_abort_v51(APPROVED_SPECS[1], Side::Ask, PriceTicks(179_961), LotQty(11_211), LotQty(1_200), 210_000_000, &s, 1.0, 50, FeeSchedule::VIP0_DEFAULT, 75_000));
+    }
+
+    #[test]
+    fn test_v52_h3_idle_ws_orphan_adopt_and_h6a_adverse_flow_c1() {
+        assert!(!should_abort_queue_on_adverse_flow_c1(-0.72, 0.15, 50, 33, 0.0));
+        assert!(should_abort_queue_on_adverse_flow_c1(-0.72, -0.35, 50, 33, 0.0));
+        assert!(!should_abort_queue_on_adverse_flow_c1(-0.42, -0.18, 50, 80, 0.0));
+        assert!(should_abort_queue_on_adverse_flow_c1(-0.42, -0.18, 450, -20, 0.75));
+
+        let shm_p = MappedShmRegion::ephemeral_self_test_path("v52_h3_orphan_adopt");
+        if let Ok(reg) = MappedShmRegion::open_or_create(&shm_p, true) {
+            let mut engines = SlotExecutionEngine::new_12_slot_array();
+            let mut gov = OnlineAdaptiveGovernor::new();
+            let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+            let mut rt = ExecRuntimeState::new();
+            let forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+            let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+            snaps[3].symbol_id = APPROVED_SPECS[3].symbol_id;
+            snaps[3].ts_local_ns = TimestampNs(2_000_000_000);
+            snaps[3].realized_vol_5m = ScaledBps(5_000);
+            snaps[3].bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(400) };
+            snaps[3].asks[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(250) };
+            snaps[3].mark_price = PriceTicks(8_201);
+            snaps[3].last_trade_price = PriceTicks(8_201);
+
+            rt.slot_rpc_inflight[3] = true;
+            rt.abort_cmd_inflight[3] = true;
+            rt.queue_flow_ema[3] = -0.35;
+            let (tg_tx, tg_rx) = mpsc::sync_channel::<String>(8);
+            let (vault_tx, _vault_rx) = mpsc::sync_channel::<VaultIoCommand>(8);
+
+            handle_gateway_event(
+                GatewayEvent::WsPositionUpdate {
+                    slot_idx: 3,
+                    is_open: true,
+                    real_side: Side::Ask,
+                    verified_avg: Some(PriceTicks(8_202)),
+                    real_lots: LotQty(26),
+                },
+                TimestampNs(2_000_000_000),
+                None,
+                &mut rt,
+                &snaps,
+                &forensics,
+                &mut engines,
+                &mut gov,
+                &mut ledger,
+                reg.arena(),
+                &tg_tx,
+                &vault_tx,
+            );
+
+            assert!(!rt.slot_rpc_inflight[3] && !rt.abort_cmd_inflight[3]);
+            assert!(rt.queue_flow_ema[3].abs() <= f64::EPSILON && rt.sl_needs_sync[3]);
+            assert!(matches!(
+                engines[3].state,
+                OrderLifecycleState::PositionOpenMakerExit {
+                    side: Side::Ask,
+                    avg_price_ticks: PriceTicks(8_202),
+                    open_lots: LotQty(26),
+                    ..
+                }
+            ));
+            assert!(engines[3].last_eff_sl_ticks.0 > 8_202);
+            let tg_msg = tg_rx.try_recv().unwrap_or_default();
+            assert!(tg_msg.contains("LIVE WS ORPHAN ADOPT"));
+
+            if let OrderLifecycleState::PositionOpenMakerExit { resting_exit_price: ref mut rx_p, .. } = engines[3].state {
+                *rx_p = PriceTicks(8_194);
+            }
+            let smp_opt = engines[3].sample_intra_trade_1hz(&snaps[3], 0.0);
+            assert!(smp_opt.is_some());
+            let Some(smp) = smp_opt else { return };
+            let expected_tp_sbps = (((8_202_i64 - 8_194) * 1_000_000) / 8_202) as i16;
+            assert_eq!(smp.tp_delta_sbps, expected_tp_sbps);
+            drop(reg);
+        }
+        let _ = std::fs::remove_file(&shm_p);
     }
 }

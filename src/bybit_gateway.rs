@@ -76,6 +76,7 @@ pub enum GatewayCommand {
     SyncOpenSlot {
         slot_idx: usize,
         side: Side,
+        live_mid_px: PriceTicks,
         target_px: PriceTicks,
         target_lots: LotQty,
         defensive_lock: bool,
@@ -525,7 +526,7 @@ pub fn process_gateway_command(
             }
         }
         GatewayCommand::SyncOpenSlot {
-            slot_idx, side: _, target_px, target_lots, defensive_lock, cur_gross_bps,
+            slot_idx, side: _, live_mid_px, target_px, target_lots, defensive_lock, cur_gross_bps,
             vac_level, opened_ts_ns, tranche1_harvested, fees,
         } => {
             let spec = APPROVED_SPECS[slot_idx];
@@ -559,10 +560,14 @@ pub fn process_gateway_command(
                 return;
             };
             let eff_lots = LotQty(target_lots.0.min(real_lots.0).max(1));
-            let ref_mid = match verified_avg {
-                Some(px) if px.0 > 0 => px,
-                _ if target_px.0 > 0 => target_px,
-                _ => resting_tp,
+            let ref_mid = if live_mid_px.0 > 0 {
+                live_mid_px
+            } else {
+                match verified_avg {
+                    Some(px) if px.0 > 0 => px,
+                    _ if target_px.0 > 0 => target_px,
+                    _ => resting_tp,
+                }
             };
             let should_repeg = should_repeg_resting_exit_tp(
                 spec, r_side, ref_mid, resting_tp, resting_qty, target_px, eff_lots, defensive_lock, cur_gross_bps, fees,

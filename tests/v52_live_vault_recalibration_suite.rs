@@ -352,3 +352,217 @@ fn test_v52_preserves_all_constitutional_invariants_scar63_oos520_and_digital_tw
     assert_eq!(twin.parity_sync_drift_1e8, 0);
     assert!(twin.cum_net_bps_x100 >= 7_000);
 }
+
+#[test]
+fn test_v521_trade32_eth5_low_hurst_opposing_wave3_veto_and_idle_ws_quota_100pct() {
+    let t0 = 1_795_050_000_000_000_000_i64;
+    let mut eth32 = mk_vault_snap(1, 197_200, 3_200, 0.22, 0.45, 0.35, t0);
+    eth32.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.253),
+        macro_phase: BoundedScore::new_clamped(-0.90),
+        oi_impulse: BoundedScore::new_clamped(-0.20),
+        liq_imbalance: BoundedScore::new_clamped(-0.35),
+        fib_proj_bps: ScaledBps(-15_790),
+    });
+    assert!(is_opposing_impulse_wave3_hazard(Side::Bid, &eth32));
+    assert!(!passes_elliott_macro_coherence_guard(Side::Bid, &eth32));
+    assert_eq!(
+        passes_elastic_geom_and_macro_impulse_guard(&eth32, Side::Bid, 0.0),
+        Err(LastVetoCode::MacroElliottContradiction)
+    );
+
+    assert!(vortex_rs::bybit_client::BybitV5LiveClient::with_base_url(
+        "k".to_owned(),
+        "s".to_owned(),
+        "https://api.bybit.com",
+    )
+    .is_some_and(|mut cli| {
+        let rtt_us = cli.observe_authenticated_ws_rtt_ns(42_000_000);
+        cli.refresh_ws_quota_pulse();
+        let (live_rtt_us, live_quota_rem) = vortex_rs::execution_fsm::read_live_ws_pulse();
+        rtt_us < 120_000
+            && cli.ws_min_available_quota() == 100
+            && live_quota_rem == 100
+            && live_rtt_us < 120_000
+    }));
+}
+
+#[test]
+fn test_v53_endogenous_tfi_prior_limit_bailout_reconcile_and_bounce_rescue() {
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_060_000_000_000_000_i64;
+
+    // (a) Endogenous TFI prior: 500 lots Bid/Ask L1 does not saturate on 2-lot retail print, nor inflate on unilateral 50,000-lot Ask spoof.
+    let mut fs_sym = vortex_rs::alpha_3factor::OrthogonalFactorState::new();
+    let mut s_sym = mk_vault_snap(5, 7_200, 2_800, 0.0, 0.0, 0.0, t0);
+    s_sym.bids[0] = BookLevel { price: PriceTicks(7_200), qty: LotQty(500) };
+    s_sym.asks[0] = BookLevel { price: PriceTicks(7_201), qty: LotQty(500) };
+    s_sym.refresh_deep_l1_l5_totals();
+    fs_sym.on_l2_book_update(&mut s_sym);
+    s_sym.ts_local_ns = TimestampNs(t0 + 10_000_000);
+    fs_sym.on_trade_print(Side::Bid, LotQty(2), &mut s_sym);
+    let tfi_sym = s_sym.factor_tfi.get();
+    assert!(tfi_sym > 0.0 && tfi_sym < 0.15);
+
+    let mut fs_spoof = vortex_rs::alpha_3factor::OrthogonalFactorState::new();
+    let mut s_spoof = mk_vault_snap(5, 7_200, 2_800, 0.0, 0.0, 0.0, t0);
+    s_spoof.bids[0] = BookLevel { price: PriceTicks(7_200), qty: LotQty(500) };
+    s_spoof.asks[0] = BookLevel { price: PriceTicks(7_201), qty: LotQty(500) };
+    s_spoof.refresh_deep_l1_l5_totals();
+    fs_spoof.on_l2_book_update(&mut s_spoof);
+    for step in 1..=4_i64 {
+        s_spoof.ts_local_ns = TimestampNs(t0 + step * 5_000_000);
+        s_spoof.asks[0].qty = LotQty(50_000);
+        s_spoof.refresh_deep_l1_l5_totals();
+        fs_spoof.on_l2_book_update(&mut s_spoof);
+    }
+    s_spoof.ts_local_ns = TimestampNs(t0 + 30_000_000);
+    fs_spoof.on_trade_print(Side::Bid, LotQty(2), &mut s_spoof);
+    let tfi_spoof = s_spoof.factor_tfi.get();
+    assert!(tfi_spoof > 0.0 && tfi_spoof < 0.15);
+    assert!((tfi_spoof - tfi_sym).abs() < 0.02 && tfi_spoof >= tfi_sym * 0.85);
+
+    // (b) Limit bailout reconcile & soft taker_prob plasticity
+    let rec_ctx = OpenExitContext {
+        slot_idx: 5,
+        side: Side::Bid,
+        avg_price_ticks: PriceTicks(7_200),
+        peak_favorable_price: PriceTicks(7_200),
+        worst_adverse_price: PriceTicks(7_196),
+        initial_lots: LotQty(20),
+        open_lots: LotQty(20),
+        tranche1_harvested: false,
+        tranche1_lots: LotQty(0),
+        tranche1_exit_price: PriceTicks(0),
+        defensive_floor_locked: true,
+        active_exit_price: PriceTicks(7_199),
+        structural_tp_price: PriceTicks(7_206),
+        resting_exit_price: PriceTicks(7_199),
+        sl_trigger_price: PriceTicks(7_025),
+        opened_ts: TimestampNs(t0),
+        learned_mfe_bps: 620,
+        learned_t1_permille: 500,
+        learned_ir_x100: 20,
+        learned_ret_std_bps: 210,
+        intrinsic_tau_mkt_s: 180,
+        last_eff_sl_ticks: PriceTicks(7_025),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 0,
+        last_closed_mae_bps: -556,
+        active_fees: fees,
+        learned_taker_prob_pm: 50,
+    };
+    let closed_pnl_json = serde_json::json!({
+        "retCode": 0,
+        "result": {
+            "list": [{
+                "symbol": "SUIUSDT",
+                "orderType": "Limit",
+                "side": "Sell",
+                "qty": "20",
+                "avgEntryPrice": "0.7200",
+                "avgExitPrice": "0.7199",
+                "closedPnl": "-0.0079",
+                "createdTime": "1795060005000",
+                "updatedTime": "1795060005000"
+            }]
+        }
+    });
+    match vortex_rs::exit_quoter::reconcile_closed_pnl_core(&rec_ctx, &closed_pnl_json, 20, false) {
+        vortex_rs::exit_quoter::ClosedPnlQueryOutcome::Verified(res) => {
+            assert_eq!(res.kind, ClosedTradeKind::MakerPassiveUnwind);
+            assert_ne!(res.kind, ClosedTradeKind::ServerMarkPriceStopLoss);
+        }
+        other => assert!(matches!(other, vortex_rs::exit_quoter::ClosedPnlQueryOutcome::Verified(_))),
+    }
+
+    let mut gp_bail = vortex_rs::governor_plasticity::GovernorPlasticityState::new();
+    let mut gp_sl = vortex_rs::governor_plasticity::GovernorPlasticityState::new();
+    gp_bail.observe_exit_outcome_with_net_and_mfe(
+        5, Side::Bid, false, ScaledBps(-550), ScaledBps(0), 400, 2_000,
+    );
+    gp_sl.observe_exit_outcome_with_net_and_mfe(
+        5, Side::Bid, true, ScaledBps(-2_500), ScaledBps(0), 400, 2_000,
+    );
+    let p_bail = gp_bail.slot_taker_prob_permille(5, Side::Bid);
+    let p_sl = gp_sl.slot_taker_prob_permille(5, Side::Bid);
+    assert!(p_bail > 50 && p_bail < p_sl);
+
+    // (c) Dead-cat bounce BBO rescue under exhausted Wald vs healthy Wald
+    let zero_loss_px = vortex_rs::execution_fsm::defensive_zero_loss_maker_exit_price_with_fees(
+        Side::Bid, PriceTicks(20_000), fees,
+    );
+    let mut bounce_snap = mk_vault_snap(4, 20_002, 1_800, 0.05, 0.05, 0.05, t0 + 36_000_000_000);
+    bounce_snap.bids[0] = BookLevel { price: PriceTicks(20_002), qty: LotQty(600) };
+    bounce_snap.asks[0] = BookLevel { price: PriceTicks(20_003), qty: LotQty(600) };
+    bounce_snap.mark_price = PriceTicks(20_003);
+    bounce_snap.last_trade_price = PriceTicks(20_003);
+    let bounce_ctx = OpenExitContext {
+        slot_idx: 4,
+        side: Side::Bid,
+        avg_price_ticks: PriceTicks(20_000),
+        peak_favorable_price: PriceTicks(20_003),
+        worst_adverse_price: PriceTicks(19_960),
+        initial_lots: LotQty(4),
+        open_lots: LotQty(4),
+        tranche1_harvested: false,
+        tranche1_lots: LotQty(0),
+        tranche1_exit_price: PriceTicks(0),
+        defensive_floor_locked: true,
+        active_exit_price: PriceTicks(19_995),
+        structural_tp_price: PriceTicks(20_018),
+        resting_exit_price: PriceTicks(19_995),
+        sl_trigger_price: PriceTicks(19_928),
+        opened_ts: TimestampNs(t0),
+        learned_mfe_bps: 620,
+        learned_t1_permille: 500,
+        learned_ir_x100: 20,
+        learned_ret_std_bps: 210,
+        intrinsic_tau_mkt_s: 180,
+        last_eff_sl_ticks: PriceTicks(19_928),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 150,
+        last_closed_mae_bps: -2_000,
+        active_fees: fees,
+        learned_taker_prob_pm: 95,
+    };
+    let kin_bounce = ShadowRunnerKinematics {
+        flow_ema_fast: 0.05,
+        flow_ema_slow: -0.18,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_exhausted = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v52(
+        &bounce_ctx, kin_bounce, &bounce_snap, Some(-2.2), 0, 5_000,
+    );
+    assert!(q_exhausted.is_some_and(|q| {
+        q.target_price == PriceTicks(20_003) && q.target_price < zero_loss_px && q.urgent_close_repeg
+    }));
+    let q_healthy = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v52(
+        &bounce_ctx, kin_bounce, &bounce_snap, Some(1.5), 0, 5_000,
+    );
+    assert!(q_healthy.is_some_and(|q| q.target_price >= zero_loss_px));
+
+    // (d) Adverse queue flow C1 frontier tightens when taker_prob_pm rises from 50 to 280
+    let mut thr_50 = -1.0_f64;
+    let mut thr_280 = -1.0_f64;
+    for k in 1..=100_i32 {
+        let f = -f64::from(k) * 0.01;
+        if thr_50 <= -0.999
+            && vortex_rs::exec_daemon::should_abort_queue_on_adverse_flow_c1(f, f, 50, 20, 0.0)
+        {
+            thr_50 = f;
+        }
+        if thr_280 <= -0.999
+            && vortex_rs::exec_daemon::should_abort_queue_on_adverse_flow_c1(f, f, 280, 20, 0.0)
+        {
+            thr_280 = f;
+        }
+    }
+    assert!(thr_280 > thr_50);
+    let mid_f = f64::midpoint(thr_50, thr_280);
+    assert!(!vortex_rs::exec_daemon::should_abort_queue_on_adverse_flow_c1(mid_f, mid_f, 50, 20, 0.0));
+    assert!(vortex_rs::exec_daemon::should_abort_queue_on_adverse_flow_c1(mid_f, mid_f, 280, 20, 0.0));
+}

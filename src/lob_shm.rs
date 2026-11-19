@@ -423,6 +423,13 @@ pub struct SlotTelemetrySnapshot {
     pub queue_ahead_lots: i64,
 }
 
+const _: () = assert!(
+    core::mem::size_of::<SymbolLobSnapshot>().is_multiple_of(8)
+        && core::mem::align_of::<SymbolLobSnapshot>() >= 8
+        && core::mem::size_of::<SlotTelemetrySnapshot>() == 96
+        && core::mem::align_of::<SlotTelemetrySnapshot>() >= 8
+);
+
 #[repr(C, align(64))]
 pub struct SlotTelemetryCell {
     seq: AtomicU64,

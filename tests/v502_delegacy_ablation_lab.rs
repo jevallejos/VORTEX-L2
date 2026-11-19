@@ -373,11 +373,11 @@ fn test_v502_delegacy_ablation_tao1_cadence_l1_contagion_and_400ep_pareto() {
 
     println!("------------------------------------------------------------------------------------------------");
     println!(
-        "  [D5 ARM A — LEGACY V5.0.1 ] Trades={:>3} (W:{:>3} SCR:{:>3} L:{:>2} | AmputatedWins:{:>3}) | Net={:+8.2}bp | PF={:.2} | Drift={}",
+        "  [D5 ARM A \u{2014} LEGACY V5.0.1 ] Trades={:>3} (W:{:>3} SCR:{:>3} L:{:>2} | AmputatedWins:{:>3}) | Net={:+8.2}bp | PF={:.2} | Drift={}",
         tr_old, w_old, sc_old, l_old, amputated_wins_old, (net_bps_old as f64) / 100.0, pf_old, drift_old
     );
     println!(
-        "  [D5 ARM B — ELASTIC V5.0.2] Trades={:>3} (W:{:>3} SCR:{:>3} L:{:>2} | AmputatedWins:  0) | Net={:+8.2}bp | PF={:.2} | Drift={}",
+        "  [D5 ARM B \u{2014} ELASTIC V5.0.2] Trades={:>3} (W:{:>3} SCR:{:>3} L:{:>2} | AmputatedWins:  0) | Net={:+8.2}bp | PF={:.2} | Drift={}",
         tr_new, w_new, sc_new, l_new, (net_bps_new as f64) / 100.0, pf_new, drift_new
     );
     println!("================================================================================================\n");
