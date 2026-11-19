@@ -1045,7 +1045,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.2}", rep.pf_v48)
     };
     let v70_txt = if rep.vault_70_ok { "Vault>12.5b OK" } else { "Vault<=12.5b" };
-    let g2_c3 = format!("PF V5.3.2: {pf_txt:<12} | {v70_txt}");
+    let g2_c3 = format!("PF V5.3.2: {pf_txt:<10} | {v70_txt}");
 
     let mkr_ref = if rep.v48_trades >= 10 { rep.v48_mkr_pct } else { rep.global_mkr_pct };
     let g3_pct = ((mkr_ref / 82.0) * 100.0).clamp(0.0, 100.0);
