@@ -1007,7 +1007,8 @@ impl PairSpec {
         ) {
             return None;
         }
-        let mkr_net = (INV_PHI + INV_PHI2 * q_struct.get().clamp(0.0, 1.0)) * (eff_mfe.raw().max(0) as f64) - c_mkr;
+        let eff_learned_mfe = coupled_c1_effective_mfe_raw(eff_mfe, dyn_target, q_struct);
+        let mkr_net = (INV_PHI + INV_PHI2 * q_struct.get().clamp(0.0, 1.0)) * (eff_learned_mfe.max(0) as f64) - c_mkr;
         let sl_all_in = (diff_sl.raw().max(0) as f64) + c_tkr + INV_PHI2 * (tau_tick.raw() as f64);
         let ev_sbps = ((1.0 - p_t) * mkr_net - p_t * sl_all_in).round() as i64;
         (ev_sbps > 0).then_some(ev_sbps)
@@ -1055,6 +1056,52 @@ mod single_lot_ev_v49_tests {
             LotQty(16), PriceTicks(7_316), ScaledBps(1_582), 726, 48, 0.17, 522, 478, Side::Ask, fees,
         ));
     }
+
+    #[test]
+    fn test_v531_c1_diffusive_excursion_coupling_lifts_strong_geom_and_preserves_weak_rejections() {
+        let eth = APPROVED_SPECS[1];
+        let fees = FeeSchedule::VIP0_DEFAULT;
+        assert_eq!(
+            coupled_c1_effective_mfe_raw(ScaledBps(613), ScaledBps(850), BoundedScore::new_clamped(0.36)),
+            613
+        );
+        assert!(
+            coupled_c1_effective_mfe_raw(ScaledBps(613), ScaledBps(850), BoundedScore::new_clamped(0.70)) > 750
+        );
+        // Cold-seed 613 single-lot ETH with strong geometry unlocks positive EV, while weak geom <= 0.36 stays None
+        assert!(
+            eth.evaluate_pilar2_asymmetry_ev_sbps(
+                LotQty(1), PriceTicks(182_000), ScaledBps(2_500), 613, 46, 0.85, 520, 480, Side::Bid, fees,
+            )
+            .is_some()
+        );
+        assert!(
+            eth.evaluate_pilar2_asymmetry_ev_sbps(
+                LotQty(1), PriceTicks(182_000), ScaledBps(2_500), 613, 46, 0.35, 520, 480, Side::Bid, fees,
+            )
+            .is_none()
+        );
+    }
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn coupled_c1_effective_mfe_raw(
+    learned_mfe_bps: ScaledBps,
+    target_bps: ScaledBps,
+    q_struct: BoundedScore,
+) -> i64 {
+    const INV_PHI_C1: f64 = 0.618_033_988_749_895;
+    const INV_PHI_SQ_C1: f64 = 0.381_966_011_250_105;
+    if q_struct.get() > INV_PHI_SQ_C1 && target_bps.raw() > learned_mfe_bps.raw() {
+        let u = ((q_struct.get() - INV_PHI_SQ_C1) / (INV_PHI_C1 - INV_PHI_SQ_C1)).clamp(0.0, 1.0);
+        let s_struct = u * u * (3.0 - 2.0 * u);
+        learned_mfe_bps.raw()
+            + ((INV_PHI_C1 * s_struct * ((target_bps.raw() - learned_mfe_bps.raw()) as f64)).round() as i64)
+    } else {
+        learned_mfe_bps.raw()
+    }
 }
 
 #[inline]
@@ -1081,7 +1128,8 @@ pub fn passes_asymmetry_ev_gate_v51(
     let c_mkr = fees.round_trip_maker_exit_bps().raw() as f64;
     let c_tkr = (fees.round_trip_taker_exit_bps().raw().max(50)) as f64;
     let q_pos = q_struct.get().clamp(0.0, 1.0);
-    let cap_gross = (learned_mfe_bps.raw().max(0).min(target_bps.raw().max(0))) as f64;
+    let eff_learned_mfe = coupled_c1_effective_mfe_raw(learned_mfe_bps, target_bps, q_struct);
+    let cap_gross = (eff_learned_mfe.max(0).min(target_bps.raw().max(0))) as f64;
     let sl_all_in = (sl_bps.raw().max(0) as f64) + c_tkr + INV_PHI2_E * (tau_tick.raw() as f64);
     if spec.can_split_runner_legs(allocated_lots, entry_px) {
         let g_net = cap_gross * (1.0 + INV_PHI2_E * q_pos) - c_mkr;

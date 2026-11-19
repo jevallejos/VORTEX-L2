@@ -550,8 +550,30 @@ pub fn step_12_slot_daemon_tick(
                 let total_chase_ns = now_ns.0.saturating_sub(entry_forensics[s_idx].armed_ts_ns);
                 let base_chase_ns = gov.max_total_entry_chase_ns(s_idx, snap.realized_vol_5m);
                 let dt_s = ((elapsed_ns.max(5_000_000) as f64) * 1e-9).max(0.05);
-                let hwk_lam = evt_dil * (1.0 + 1.618_033_988_749_895 * ((opp_hit.0 as f64) / ((rt.init_q_ahead[s_idx].0.max(1) as f64) * dt_s))).clamp(0.382, 6.854);
-                let max_chase_ns = if at_l1 { gov.elastic_resting_l1_patience_ns_v51(s_idx, side, snap.realized_vol_5m, evt_dil, hwk_lam, signed_slow).max(base_chase_ns) } else { base_chase_ns };
+                let hwk_lam = compute_resting_l1_hawkes_lambda_v531(
+                    evt_dil,
+                    opp_hit,
+                    rt.init_q_ahead[s_idx],
+                    dt_s,
+                    q_shield.hawkes_lambda_ratio,
+                    signed_slow,
+                );
+                let max_chase_ns = if at_l1 {
+                    compute_resting_l1_max_chase_ns_v531(
+                        gov,
+                        s_idx,
+                        side,
+                        snap.realized_vol_5m,
+                        evt_dil,
+                        hwk_lam,
+                        signed_slow,
+                        rt.init_q_ahead[s_idx],
+                        next_q,
+                        base_chase_ns,
+                    )
+                } else {
+                    base_chase_ns
+                };
                 let q_timers = elastic_resting_queue_timers_ns(base_chase_ns);
                 let fast_sweep = at_l1 && evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, rt.init_q_ahead[s_idx], next_q, elapsed_ns, &snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, ws_rtt_us);
                 if fast_sweep { q_shield.abort_now = true; }
@@ -567,7 +589,21 @@ pub fn step_12_slot_daemon_tick(
                 );
                 let macro_bad = opp_wave3_now || (elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard(side, &snap));
                 let ob_bad = elapsed_ns >= q_timers.macro_abort_ns && !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
-                let geom_flip = evaluate_elastic_spoof_geom_abort_v51(side, &snap, entry_forensics[s_idx].geom_in, elapsed_ns, signed_slow, spoof_d, evt_dil, engines[s_idx].learned_taker_prob_pm, ws_rtt_us, now_ns.0, &mut rt.geom_adv_since_ns[s_idx]);
+                let geom_flip = evaluate_elastic_spoof_geom_abort_with_queue_v531(
+                    side,
+                    &snap,
+                    entry_forensics[s_idx].geom_in,
+                    elapsed_ns,
+                    signed_slow,
+                    spoof_d,
+                    evt_dil,
+                    engines[s_idx].learned_taker_prob_pm,
+                    ws_rtt_us,
+                    now_ns.0,
+                    &mut rt.geom_adv_since_ns[s_idx],
+                    rt.init_q_ahead[s_idx],
+                    next_q,
+                );
                 let adverse_flow = should_abort_queue_on_adverse_flow_c1(
                     flow_imp,
                     signed_slow.get(),
@@ -1388,6 +1424,114 @@ pub fn compute_exit_sync_schedule_adaptive_v51(
         }
     }
     (false, calm_cd.clamp(650_000_000, 1_800_000_000))
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::suboptimal_flops)]
+pub fn compute_resting_l1_hawkes_lambda_v531(
+    event_dilation: f64,
+    opp_hit: LotQty,
+    init_q: LotQty,
+    dt_s: f64,
+    tracker_lambda_ratio: f64,
+    signed_flow_slow: crate::types::BoundedScore,
+) -> f64 {
+    const INV_PHI4_H: f64 = 0.145_898_033_750_315;
+    let inst_burst = (1.0
+        + 1.618_033_988_749_895
+            * ((opp_hit.0.max(0) as f64) / ((init_q.0.max(1) as f64) * dt_s.max(0.05))))
+    .clamp(0.382, 6.854);
+    let trk = if tracker_lambda_ratio.is_finite() {
+        tracker_lambda_ratio.clamp(1.0, 6.854)
+    } else {
+        1.0
+    };
+    let burst = inst_burst.max(trk);
+    let dil_mult = if signed_flow_slow.get() >= -INV_PHI4_H && burst <= 1.05 {
+        event_dilation.min(1.0)
+    } else {
+        event_dilation
+    };
+    dil_mult * burst
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_resting_l1_max_chase_ns_v531(
+    gov: &OnlineAdaptiveGovernor,
+    slot_idx: usize,
+    side: Side,
+    realized_vol_5m: ScaledBps,
+    event_dilation: f64,
+    hawkes_lambda_ratio: f64,
+    signed_flow_slow: crate::types::BoundedScore,
+    init_q: LotQty,
+    rem_q: LotQty,
+    base_chase_ns: i64,
+) -> i64 {
+    let pat_l1 = gov.elastic_resting_l1_patience_ns_with_queue_v531(
+        slot_idx,
+        side,
+        realized_vol_5m,
+        event_dilation,
+        hawkes_lambda_ratio,
+        signed_flow_slow,
+        init_q,
+        rem_q,
+    );
+    if signed_flow_slow.get() >= -crate::alpha_3factor::INV_PHI_FOURTH
+        && hawkes_lambda_ratio <= crate::alpha_3factor::PHI
+    {
+        pat_l1.max(base_chase_ns)
+    } else {
+        pat_l1
+    }
+}
+
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+pub fn evaluate_elastic_spoof_geom_abort_with_queue_v531(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    armed_geom_raw: f64,
+    elapsed_ns: i64,
+    signed_flow_slow: crate::types::BoundedScore,
+    spoof_density: f64,
+    event_dilation: f64,
+    taker_prob_pm: i64,
+    ws_rtt_us: u32,
+    now_ns: i64,
+    geom_adv_since_ns: &mut i64,
+    init_q_lots: LotQty,
+    rem_q_lots: LotQty,
+) -> bool {
+    let dir_s = side.sign_f64();
+    let signed_ofi = snap.factor_ofi.get() * dir_s;
+    if !crate::kinematic_surface::allows_front_of_queue_spoof_geom_abort_v531(
+        init_q_lots,
+        rem_q_lots,
+        elapsed_ns,
+        signed_ofi,
+        signed_flow_slow.get(),
+    ) {
+        *geom_adv_since_ns = 0;
+        return false;
+    }
+    evaluate_elastic_spoof_geom_abort_v51(
+        side,
+        snap,
+        armed_geom_raw,
+        elapsed_ns,
+        signed_flow_slow,
+        spoof_density,
+        event_dilation,
+        taker_prob_pm,
+        ws_rtt_us,
+        now_ns,
+        geom_adv_since_ns,
+    )
 }
 
 #[inline]

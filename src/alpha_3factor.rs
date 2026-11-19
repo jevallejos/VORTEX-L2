@@ -73,6 +73,7 @@ pub struct OrthogonalFactorState {
     tfi_sell_accum: f64,
     learned_l1_depth_lots: f64,
     learned_trade_lots: f64,
+    learned_flow_lots: f64,
     spoof_density_ewma: f64,
     last_ofi: BoundedScore,
     last_tfi: BoundedScore,
@@ -110,6 +111,7 @@ impl OrthogonalFactorState {
             tfi_sell_accum: 1.0,
             learned_l1_depth_lots: 0.0,
             learned_trade_lots: 0.0,
+            learned_flow_lots: 0.0,
             spoof_density_ewma: 0.0,
             last_ofi: BoundedScore::ZERO,
             last_tfi: BoundedScore::ZERO,
@@ -170,9 +172,10 @@ impl OrthogonalFactorState {
         if snap.bids[0].qty.0 <= 0 && snap.asks[0].qty.0 <= 0 {
             return 1e-6;
         }
-        ((INV_PHI_FOURTH * self.learned_l1_depth_lots + INV_PHI_CUBE * self.learned_trade_lots)
-            * (1.0 + INV_PHI * self.spoof_density_ewma))
-            .max(PHI * floor_lots)
+        let q_ref = self.learned_trade_lots.max(PHI * floor_lots).max(PHI);
+        let kappa_spatial = INV_PHI * (self.learned_l1_depth_lots.max(0.0) * q_ref).sqrt();
+        let kappa_flow = INV_PHI_SQ * self.learned_flow_lots.max(0.0) + INV_PHI * q_ref;
+        kappa_spatial.max(kappa_flow).max(PHI * floor_lots) * (1.0 + INV_PHI * self.spoof_density_ewma)
     }
 
     #[inline]
@@ -293,6 +296,9 @@ impl OrthogonalFactorState {
                 if self.learned_trade_lots <= 0.0 {
                     self.learned_trade_lots = init_lots;
                 }
+                if self.learned_flow_lots <= 0.0 {
+                    self.learned_flow_lots = init_lots;
+                }
             }
             self.last_l2_ts_ns = snap.ts_local_ns.0;
             if self.last_tfi_ts_ns <= 0 {
@@ -391,6 +397,11 @@ impl OrthogonalFactorState {
                 (1.0 - alpha_l1) * self.learned_l1_depth_lots + alpha_l1 * thin_bbo;
         }
         self.decay_tfi_to_clock(ts_now, floor_lots);
+        if dt_s > 0.0 {
+            let active_vol = self.tfi_buy_accum + self.tfi_sell_accum;
+            let alpha_fl = 1.0 - (-dt_s / V45_EQ_RATE_TAU_SECS).exp();
+            self.learned_flow_lots += alpha_fl * (active_vol - self.learned_flow_lots);
+        }
         let tfi_prior = self.tfi_endogenous_prior_lots(snap, floor_lots);
         self.last_tfi = BoundedScore::new_clamped(
             (self.tfi_buy_accum - self.tfi_sell_accum)
@@ -1683,11 +1694,40 @@ mod v51_f4_l1_depletion_vs_cancel_tests {
         assert!(st.learned_l1_depth_lots <= 1_200.0);
 
         st.on_trade_print(Side::Bid, LotQty(600), &mut snap);
+        snap.ts_local_ns = TimestampNs(15_000_000_000);
+        st.on_l2_book_update(&mut snap);
         let tr_saved = st.learned_trade_lots;
+        let fl_saved = st.learned_flow_lots;
+        assert!(fl_saved > 0.0);
         st.reset_l2_book_only();
         assert!(st.learned_l1_depth_lots.abs() < 1e-12);
         assert!((st.learned_trade_lots - tr_saved).abs() < 1e-12);
+        assert!((st.learned_flow_lots - fl_saved).abs() < 1e-12);
         st.reset();
         assert!(st.learned_trade_lots.abs() < 1e-12);
+        assert!(st.learned_flow_lots.abs() < 1e-12);
+
+        // 2-lot retail print vs 500-lot L1 stays < 0.15, while deep 25k-lot L1 book does not crush real flow
+        let mut st_ret = OrthogonalFactorState::new();
+        let mut s_ret = SymbolLobSnapshot::new_empty();
+        s_ret.symbol_id = APPROVED_SPECS[3].symbol_id;
+        s_ret.ts_local_ns = TimestampNs(1_000_000_000);
+        s_ret.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(500) };
+        s_ret.asks[0] = BookLevel { price: PriceTicks(8_201), qty: LotQty(500) };
+        st_ret.on_l2_book_update(&mut s_ret);
+        st_ret.on_trade_print(Side::Bid, LotQty(2), &mut s_ret);
+        assert!(s_ret.factor_tfi.get() < 0.15);
+
+        let mut st_deep = OrthogonalFactorState::new();
+        let mut s_deep = SymbolLobSnapshot::new_empty();
+        s_deep.symbol_id = APPROVED_SPECS[8].symbol_id; // WIF
+        s_deep.ts_local_ns = TimestampNs(1_000_000_000);
+        s_deep.bids[0] = BookLevel { price: PriceTicks(1_600), qty: LotQty(25_000) };
+        s_deep.asks[0] = BookLevel { price: PriceTicks(1_601), qty: LotQty(25_000) };
+        st_deep.on_l2_book_update(&mut s_deep);
+        for _ in 0..4 {
+            st_deep.on_trade_print(Side::Bid, LotQty(80), &mut s_deep);
+        }
+        assert!(s_deep.factor_tfi.get() > 0.20);
     }
 }

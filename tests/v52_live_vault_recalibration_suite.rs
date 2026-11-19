@@ -566,3 +566,147 @@ fn test_v53_endogenous_tfi_prior_limit_bailout_reconcile_and_bounce_rescue() {
     assert!(!vortex_rs::exec_daemon::should_abort_queue_on_adverse_flow_c1(mid_f, mid_f, 50, 20, 0.0));
     assert!(vortex_rs::exec_daemon::should_abort_queue_on_adverse_flow_c1(mid_f, mid_f, 280, 20, 0.0));
 }
+
+#[test]
+fn test_v531_thick_book_tfi_front_of_queue_immunity_and_diffusive_ev() {
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_080_000_000_000_000_i64;
+
+    // (a) Thick-book TFI (30,000 lots Bid/Ask L1, NEAR / WIF): 10-lot retail print -> TFI < 0.10; 1,800-lot institutional impulse -> TFI > 0.68.
+    let near_slot = vortex_rs::types::slot_from_symbol_name("NEARUSDT").unwrap_or(6);
+    let wif_slot = vortex_rs::types::slot_from_symbol_name("WIFUSDT").unwrap_or(7);
+    for (slot, px_ticks) in [(near_slot, 2_200_i64), (wif_slot, 3_500_i64)] {
+        let mut fs_ret = vortex_rs::alpha_3factor::OrthogonalFactorState::new();
+        let mut s_ret = mk_vault_snap(slot, px_ticks, 3_200, 0.0, 0.0, 0.0, t0);
+        s_ret.bids[0] = BookLevel { price: PriceTicks(px_ticks), qty: LotQty(30_000) };
+        s_ret.asks[0] = BookLevel { price: PriceTicks(px_ticks + 1), qty: LotQty(30_000) };
+        s_ret.refresh_deep_l1_l5_totals();
+        fs_ret.on_l2_book_update(&mut s_ret);
+        s_ret.ts_local_ns = TimestampNs(t0 + 10_000_000);
+        fs_ret.on_trade_print(Side::Bid, LotQty(10), &mut s_ret);
+        let tfi_ret = s_ret.factor_tfi.get();
+        assert!(tfi_ret > 0.0 && tfi_ret < 0.10);
+
+        let mut fs_inst = vortex_rs::alpha_3factor::OrthogonalFactorState::new();
+        let mut s_inst = mk_vault_snap(slot, px_ticks, 3_200, 0.0, 0.0, 0.0, t0);
+        s_inst.bids[0] = BookLevel { price: PriceTicks(px_ticks), qty: LotQty(30_000) };
+        s_inst.asks[0] = BookLevel { price: PriceTicks(px_ticks + 1), qty: LotQty(30_000) };
+        s_inst.refresh_deep_l1_l5_totals();
+        fs_inst.on_l2_book_update(&mut s_inst);
+        for k in 1..=36_i64 {
+            s_inst.ts_local_ns = TimestampNs(t0 + k * 500_000);
+            fs_inst.on_trade_print(Side::Bid, LotQty(50), &mut s_inst);
+        }
+        let tfi_inst = s_inst.factor_tfi.get();
+        assert!(tfi_inst > 0.68);
+    }
+
+    // (b) Front-of-queue FIFO immunity (ETH Ask: init_q=4401, rem_q=57, wait=2,131ms, signed_geom=-0.65, signed_ofi=-0.05, signed_slow=0.0)
+    // does NOT fire SpoofingVeto, whereas at 170ms with rem_q=4401 it DOES abort; and L1 passive patience avoids 4,357ms truncation.
+    let eth_foq = mk_vault_snap(1, 197_600, 2_800, 0.05, 0.0, 0.65, t0 + 2_131_000_000);
+    let mut adv_since_foq = 0_i64;
+    assert!(!vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        Side::Ask,
+        &eth_foq,
+        -0.32,
+        2_131_000_000,
+        BoundedScore::ZERO,
+        0.15,
+        1.0,
+        50,
+        75_000,
+        t0 + 2_131_000_000,
+        &mut adv_since_foq,
+        LotQty(4_401),
+        LotQty(57),
+    ));
+    let mut adv_since_early = 0_i64;
+    assert!(vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        Side::Ask,
+        &eth_foq,
+        -0.32,
+        170_000_000,
+        BoundedScore::ZERO,
+        0.15,
+        1.0,
+        50,
+        75_000,
+        t0 + 170_000_000,
+        &mut adv_since_early,
+        LotQty(4_401),
+        LotQty(4_401),
+    ));
+    let eth_foq_rev = mk_vault_snap(1, 197_600, 2_800, 0.45, 0.45, 0.65, t0 + 2_131_000_000);
+    let mut adv_since_rev = 0_i64;
+    assert!(vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        Side::Ask,
+        &eth_foq_rev,
+        -0.32,
+        2_131_000_000,
+        BoundedScore::new_clamped(-0.30),
+        0.15,
+        1.0,
+        50,
+        75_000,
+        t0 + 2_131_000_000,
+        &mut adv_since_rev,
+        LotQty(4_401),
+        LotQty(57),
+    ));
+
+    let mut gov = OnlineAdaptiveGovernor::new();
+    gov.seed_prewarm_slot_emas(1, 197_600 * 10_000, 197_600 * 10_000, 14_200, t0);
+    let pat_back = gov.elastic_resting_l1_patience_ns_with_queue_v531(
+        1,
+        Side::Ask,
+        ScaledBps(14_200),
+        1.618_033_988_749_895,
+        1.0,
+        BoundedScore::ZERO,
+        LotQty(4_401),
+        LotQty(4_401),
+    );
+    let pat_front = gov.elastic_resting_l1_patience_ns_with_queue_v531(
+        1,
+        Side::Ask,
+        ScaledBps(14_200),
+        1.618_033_988_749_895,
+        1.0,
+        BoundedScore::ZERO,
+        LotQty(4_401),
+        LotQty(57),
+    );
+    assert!(pat_back > 6_000_000_000 && pat_front > pat_back);
+
+    // (c) evaluate_pilar2_asymmetry_ev_sbps blocks weak geometry (q_struct=0.25, mfe=613, vol_5m=45 bps)
+    // and unlocks EV > 0 when q_struct=0.75 and target_bps=1150.
+    let eth_spec = APPROVED_SPECS[1];
+    assert!(eth_spec
+        .evaluate_pilar2_asymmetry_ev_sbps(
+            LotQty(1),
+            PriceTicks(197_600),
+            ScaledBps(4_500),
+            613,
+            50,
+            0.25,
+            500,
+            500,
+            Side::Bid,
+            fees,
+        )
+        .is_none());
+    assert!(eth_spec
+        .evaluate_pilar2_asymmetry_ev_sbps(
+            LotQty(1),
+            PriceTicks(197_600),
+            ScaledBps(4_500),
+            1_150,
+            50,
+            0.75,
+            750,
+            500,
+            Side::Bid,
+            fees,
+        )
+        .is_some_and(|ev_sbps| ev_sbps > 0));
+}

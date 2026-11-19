@@ -99,6 +99,34 @@ pub fn check_queue_depletion_velocity_abort_with_spoof(
     (depleted_frac >= (0.50 * nu_sigma) && sweep_book_weak) || tail_exposed
 }
 
+/// Front-of-queue C1 pre-fill immunity predicate (V5.3.1):
+/// Once a passive Maker order in `RestingEntryQueue` has consumed more than `61.8%` of its initial
+/// FIFO queue (`init_q_lots > 0` and `rem_q_lots / init_q_lots < INV_PHI_SQ`) and waited at least
+/// `500_000_000 ns` (preserving `V06` at `170 ms`), mechanical `X_GEOM` thinning of our own filling L1
+/// level cannot trigger `SpoofingVeto` unless real flow reversal co-occurs
+/// (`signed_ofi <= -INV_PHI_SQ` AND `signed_slow <= -INV_PHI_CUBE`).
+#[inline]
+#[must_use]
+pub fn allows_front_of_queue_spoof_geom_abort_v531(
+    init_q_lots: LotQty,
+    rem_q_lots: LotQty,
+    wait_ns: i64,
+    signed_ofi: f64,
+    signed_slow: f64,
+) -> bool {
+    const INV_PHI_SQ_FOQ: f64 = 0.381_966_011_250_105;
+    const INV_PHI_CUBE_FOQ: f64 = 0.236_067_977_499_79;
+    const MIN_FOQ_IMMUNITY_WAIT_NS: i64 = 500_000_000;
+
+    if init_q_lots.0 > 0 && wait_ns >= MIN_FOQ_IMMUNITY_WAIT_NS {
+        let rem_q_ratio = (rem_q_lots.0.max(0) as f64) / (init_q_lots.0 as f64);
+        if rem_q_ratio < INV_PHI_SQ_FOQ {
+            return signed_ofi <= -INV_PHI_SQ_FOQ && signed_slow <= -INV_PHI_CUBE_FOQ;
+        }
+    }
+    true
+}
+
 /// Evaluates C1 Kinematic Free-Energy & Lyapunov Crest-Reversal with live `FeeSchedule` (`SCAR-LOCK 63/63` invariant).
 #[inline]
 pub fn evaluate_kinematic_surface_with_fees(

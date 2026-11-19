@@ -244,6 +244,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
     let mut exit_role_latch = [ExitOrderRole::None; MAX_ACTIVE_PAIRS];
     let mut init_q_ahead = [LotQty(0); MAX_ACTIVE_PAIRS];
     let mut armed_ts_latch = [0_i64; MAX_ACTIVE_PAIRS];
+    let mut armed_geom_latch = [0.0_f64; MAX_ACTIVE_PAIRS];
+    let mut geom_adv_since_ns = [0_i64; MAX_ACTIVE_PAIRS];
     let mut queue_flow_ema = [0.0_f64; MAX_ACTIVE_PAIRS];
     let mut first_ring_ts_ns = 0_i64;
     let require_ring_warmup = files.len() >= 64;
@@ -365,6 +367,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. })
                                 {
                                     armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
+                                    armed_geom_latch[s_idx] = cur_snap.factor_geom.get();
+                                    geom_adv_since_ns[s_idx] = 0;
                                     queue_flow_ema[s_idx] = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
                                     entry_fifo[s_idx].reset();
                                 }
@@ -391,6 +395,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 continue;
                             };
                             armed_ts_latch[s_idx] = cur_snap.ts_local_ns.0;
+                            armed_geom_latch[s_idx] = cur_snap.factor_geom.get();
+                            geom_adv_since_ns[s_idx] = 0;
                             queue_flow_ema[s_idx] = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
                             entry_fifo[s_idx].submit_post_only(side, synced_px, qty, cur_snap.ts_local_ns);
                             rep.armed += 1;
@@ -455,10 +461,49 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             )
                             .get();
                             let signed_slow = crate::types::BoundedScore::new_clamped(queue_flow_ema[s_idx] * side.sign_f64());
+                            let opp_hit = if matches!(row.par2_kind, Par2EventKind::PublicTradePrint) {
+                                let hits = match side {
+                                    Side::Bid => row.side == Side::Ask && row.price_ticks.0 > 0 && row.price_ticks.0 <= entry_price.0,
+                                    Side::Ask => row.side == Side::Bid && row.price_ticks.0 >= entry_price.0,
+                                };
+                                if hits { row.lot_qty } else { LotQty(0) }
+                            } else {
+                                LotQty(0)
+                            };
+                            let q_shield = engines[s_idx].evaluate_resting_queue_shield_with_beta(
+                                side,
+                                init_q_ahead[s_idx],
+                                queue_ahead_qty,
+                                opp_hit,
+                                &cur_snap,
+                                &btc_snap,
+                                epps_beta,
+                            );
                             let dt_s = ((elapsed_ns.max(5_000_000) as f64) * 1e-9).max(0.05);
-                            let consumed_q = init_q_ahead[s_idx].0.saturating_sub(queue_ahead_qty.0).max(0);
-                            let hwk_lam = evt_dil * (1.0 + 1.618_033_988_749_895 * ((consumed_q as f64) / ((init_q_ahead[s_idx].0.max(1) as f64) * dt_s))).clamp(0.382, 6.854);
-                            let max_chase_ns = if at_l1 { gov.elastic_resting_l1_patience_ns_v51(s_idx, side, cur_snap.realized_vol_5m, evt_dil, hwk_lam, signed_slow).max(base_chase_ns) } else { base_chase_ns };
+                            let hwk_lam = crate::exec_daemon::compute_resting_l1_hawkes_lambda_v531(
+                                evt_dil,
+                                opp_hit,
+                                init_q_ahead[s_idx],
+                                dt_s,
+                                q_shield.hawkes_lambda_ratio,
+                                signed_slow,
+                            );
+                            let max_chase_ns = if at_l1 {
+                                crate::exec_daemon::compute_resting_l1_max_chase_ns_v531(
+                                    &gov,
+                                    s_idx,
+                                    side,
+                                    cur_snap.realized_vol_5m,
+                                    evt_dil,
+                                    hwk_lam,
+                                    signed_slow,
+                                    init_q_ahead[s_idx],
+                                    queue_ahead_qty,
+                                    base_chase_ns,
+                                )
+                            } else {
+                                base_chase_ns
+                            };
                             let fast_sweep = at_l1 && crate::exec_daemon::evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, init_q_ahead[s_idx], queue_ahead_qty, elapsed_ns, &cur_snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, 75_000);
                             let btc_aligned = epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
                             let q_eroded = init_q_ahead[s_idx].0 > 0 && queue_ahead_qty.0 * 100 <= init_q_ahead[s_idx].0 * 65;
@@ -474,9 +519,24 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 || (elapsed_ns >= q_timers.macro_abort_ns
                                     && (!passes_elliott_macro_coherence_guard(side, &cur_snap)
                                         || !passes_order_block_wall_guard_dynamic(s_idx, side, &cur_snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)));
+                            let geom_flip = crate::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+                                side,
+                                &cur_snap,
+                                armed_geom_latch[s_idx],
+                                elapsed_ns,
+                                signed_slow,
+                                spoof_d,
+                                evt_dil,
+                                engines[s_idx].learned_taker_prob_pm,
+                                75_000,
+                                cur_snap.ts_local_ns.0,
+                                &mut geom_adv_since_ns[s_idx],
+                                init_q_ahead[s_idx],
+                                queue_ahead_qty,
+                            );
                             let chase_expired = (!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
-                            let dq_abort = block_new_entries || fast_sweep || headwind_erosion || macro_contradiction
-                                || (elapsed_ns >= 25_000_000 && at_l1 && crate::kinematic_surface::check_queue_depletion_velocity_abort_with_spoof(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap, spoof_d))
+                            let dq_abort = block_new_entries || fast_sweep || headwind_erosion || macro_contradiction || geom_flip
+                                || (elapsed_ns >= 25_000_000 && at_l1 && (q_shield.abort_now || crate::kinematic_surface::check_queue_depletion_velocity_abort_with_spoof(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap, spoof_d)))
                                 || crate::exec_daemon::should_abort_queue_on_adverse_flow_c1(
                                     flow_imp,
                                     queue_flow_ema[s_idx] * side.sign_f64(),
@@ -486,7 +546,17 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 );
                             if chase_expired || dq_abort {
                                 gov.observe_entry_abort(s_idx, side, entry_price, cur_snap.ts_local_ns);
-                                let veto_c = if block_new_entries { LastVetoCode::WarmupOrLock } else { LastVetoCode::HawkesStoikovQueueAbort };
+                                let veto_c = if block_new_entries {
+                                    LastVetoCode::WarmupOrLock
+                                } else if macro_contradiction {
+                                    LastVetoCode::MacroElliottContradiction
+                                } else if geom_flip {
+                                    LastVetoCode::SpoofingVeto
+                                } else if headwind_erosion {
+                                    LastVetoCode::BtcLeadLagHeadwind
+                                } else {
+                                    LastVetoCode::HawkesStoikovQueueAbort
+                                };
                                 markout_rings[s_idx].arm_abort_probe(side, entry_price, veto_c, cur_snap.ts_local_ns);
                                 entry_fifo[s_idx].reset();
                                 engines[s_idx].state = OrderLifecycleState::Idle;
@@ -522,6 +592,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&cur_snap, new_l1) {
                                         engines[s_idx].next_peg_allowed_ts_ns = cur_snap.ts_local_ns.0 + q_timers.repeg_cooldown_ns;
                                         engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, cur_snap.ts_local_ns);
+                                        armed_geom_latch[s_idx] = cur_snap.factor_geom.get();
+                                        geom_adv_since_ns[s_idx] = 0;
                                         queue_flow_ema[s_idx] = 0.55 * cur_snap.factor_ofi.get() + 0.45 * cur_snap.factor_tfi.get();
                                         entry_fifo[s_idx].submit_post_only(side, new_l1, qty, cur_snap.ts_local_ns);
                                     }

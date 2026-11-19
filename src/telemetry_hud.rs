@@ -18,11 +18,12 @@ use std::path::Path;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
-use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
+use crate::alpha_3factor::{OrthogonalFactorState, SignalVerdict, INV_PHI_FOURTH};
 use crate::bybit_client::{BybitV5LiveClient, HANDSHAKE_VAULT_CACHE_PATH};
 use crate::execution_fsm::{
     defensive_zero_loss_maker_exit_price_with_fees, dynamic_maker_floor_price, ClosedTradeKind,
-    ClosedTradeSummary, ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
+    ClosedTradeSummary, ExitSubReason, OnlineAdaptiveGovernor, OrderLifecycleState,
+    SlotExecutionEngine,
 };
 use crate::exit_quoter::compute_elastic_offensive_win_floor_bps;
 use crate::fee_cadence_beta::FeeSchedule;
@@ -53,6 +54,14 @@ pub const SCAR_MEMORY_VAULT_PATH: &str = "data/vault/vortex_governor_scar_memory
 pub const OPEN_POS_STATE_PATH: &str = "data/vault/vortex_open_positions_state.json";
 pub const DRAIN_LOCK_PATH: &str = "data/vault/DRAIN_MODE.lock";
 pub const HALT_LOCK_PATH: &str = "data/vault/HALTED_ON_LOSS.lock";
+pub const DEFAULT_LEARNED_MFE_SCALED_BPS: i64 = 613;
+pub const SCAR_MFE_REHYDRATE_CAP_SCALED_BPS: i64 = 820;
+const BPS_TO_SCALED_BPS_F64: f64 = 100.0;
+const LEGACY_SCAR_MAKER_FEE_RT_BPS: f64 =
+    ((ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 * 2) as f64) / BPS_TO_SCALED_BPS_F64;
+const SCAR_MFE_REHYDRATE_FLOOR_BPS: f64 =
+    ((ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 * 2 + ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 / 4) as f64)
+        / BPS_TO_SCALED_BPS_F64;
 
 #[inline]
 #[must_use]
@@ -295,6 +304,81 @@ pub fn format_telegram_close_message(
     )
 }
 
+pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
+    engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    reader: R,
+) {
+    let mut cold_mask = [false; MAX_ACTIVE_PAIRS];
+    let mut has_any_cold = false;
+    for s_idx in 0..MAX_ACTIVE_PAIRS {
+        if engines[s_idx].learned_mfe_bps == DEFAULT_LEARNED_MFE_SCALED_BPS {
+            cold_mask[s_idx] = true;
+            has_any_cold = true;
+        }
+    }
+    if !has_any_cold {
+        return;
+    }
+    let seed_sbps = DEFAULT_LEARNED_MFE_SCALED_BPS as f64;
+    let mut ewma_sbps = [seed_sbps; MAX_ACTIVE_PAIRS];
+    let mut sample_counts = [0_u32; MAX_ACTIVE_PAIRS];
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let is_maker_exit = v
+            .get("maker_exit")
+            .or_else(|| v.get("is_maker_exit"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !is_maker_exit {
+            continue;
+        }
+        let Some(s_idx) = v
+            .get("symbol")
+            .and_then(serde_json::Value::as_str)
+            .and_then(slot_from_symbol_name)
+        else {
+            continue;
+        };
+        if !cold_mask[s_idx] {
+            continue;
+        }
+        let mfe_bps_opt = v
+            .get("mfe_bps")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|&m| m > 0.0)
+            .or_else(|| {
+                v.get("net_bps")
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|n| n + LEGACY_SCAR_MAKER_FEE_RT_BPS)
+            });
+        let Some(obs_mfe_bps) = mfe_bps_opt else {
+            continue;
+        };
+        if obs_mfe_bps.is_finite() && obs_mfe_bps > SCAR_MFE_REHYDRATE_FLOOR_BPS {
+            let obs_sbps = obs_mfe_bps * BPS_TO_SCALED_BPS_F64;
+            ewma_sbps[s_idx] += INV_PHI_FOURTH * (obs_sbps - ewma_sbps[s_idx]);
+            sample_counts[s_idx] = sample_counts[s_idx].saturating_add(1);
+        }
+    }
+    for s_idx in 0..MAX_ACTIVE_PAIRS {
+        if cold_mask[s_idx] && sample_counts[s_idx] > 0 {
+            engines[s_idx].learned_mfe_bps = (ewma_sbps[s_idx].round() as i64)
+                .clamp(DEFAULT_LEARNED_MFE_SCALED_BPS, SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);
+        }
+    }
+}
+
+pub fn rehydrate_cold_mfe_seeds_from_scar_vault(
+    engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    scar_vault_path: &Path,
+) {
+    if let Ok(file) = File::open(scar_vault_path) {
+        rehydrate_cold_mfe_seeds_from_reader(engines, BufReader::new(file));
+    }
+}
+
 pub fn rehydrate_shadow_ledger(
     ledger: &mut ParitySyncLedger,
     engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
@@ -347,6 +431,7 @@ pub fn rehydrate_shadow_ledger(
             }
         }
     }
+    rehydrate_cold_mfe_seeds_from_scar_vault(engines, Path::new(SCAR_MEMORY_VAULT_PATH));
     ledger.closed_trades_count = l3_vault_count;
     arena.exec_closed_count.store(l3_vault_count, Ordering::Release);
     println!(
@@ -1434,5 +1519,46 @@ mod v49_hud_telemetry_tests {
         assert!(line.contains("\"markout_resolved_mask\":31"));
         assert!(line.contains("\"markout_5h_bps\":[-0.35,-0.8,1.4,4.2,9.1]"));
         assert!(line.contains("\"ws_rtt_us\":1310") && line.contains("\"fnv1a64_hex\":\"0x"));
+    }
+
+    #[test]
+    fn test_v531_rehydrate_cold_mfe_seeds_from_scar_jsonl_preserves_warm_and_clamps_613_to_820() {
+        let mut engines: [SlotExecutionEngine; MAX_ACTIVE_PAIRS] =
+            core::array::from_fn(|idx| {
+                let mut eng = SlotExecutionEngine::new(idx);
+                eng.learned_mfe_bps = DEFAULT_LEARNED_MFE_SCALED_BPS;
+                eng
+            });
+        // Warm pairs (BTC, ETH, AVAX, TAO, SUI) must never be touched
+        engines[0].learned_mfe_bps = 568;
+        engines[1].learned_mfe_bps = 647;
+        engines[3].learned_mfe_bps = 628;
+        engines[4].learned_mfe_bps = 710;
+        engines[5].learned_mfe_bps = 890;
+
+        let scar_jsonl = concat!(
+            "{\"symbol\":\"BTCUSDT\",\"maker_exit\":true,\"mfe_bps\":14.0}\n",
+            "{\"symbol\":\"SUIUSDT\",\"maker_exit\":true,\"mfe_bps\":5.0}\n",
+            "{\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":8.40}\n",
+            "{\"symbol\":\"SOLUSDT\",\"maker_exit\":false,\"mfe_bps\":12.0}\n",
+            "{\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":4.20}\n",
+            "{\"symbol\":\"LINKUSDT\",\"maker_exit\":true,\"net_bps\":3.50}\n",
+            "{\"symbol\":\"LINKUSDT\",\"maker_exit\":true,\"net_bps\":0.30}\n",
+            "{\"symbol\":\"WIFUSDT\",\"maker_exit\":true,\"mfe_bps\":35.0}\n",
+            "{\"symbol\":\"WIFUSDT\",\"maker_exit\":true,\"mfe_bps\":35.0}\n",
+            "{\"symbol\":\"NEARUSDT\",\"maker_exit\":true,\"mfe_bps\":5.00}\n",
+        );
+        rehydrate_cold_mfe_seeds_from_reader(&mut engines, std::io::Cursor::new(scar_jsonl.as_bytes()));
+
+        assert_eq!(engines[0].learned_mfe_bps, 568);
+        assert_eq!(engines[1].learned_mfe_bps, 647);
+        assert_eq!(engines[3].learned_mfe_bps, 628);
+        assert_eq!(engines[4].learned_mfe_bps, 710);
+        assert_eq!(engines[5].learned_mfe_bps, 890);
+        assert!(engines[2].learned_mfe_bps > 640 && engines[2].learned_mfe_bps < 660); // SOL: 613 -> ~646
+        assert!(engines[9].learned_mfe_bps > 630 && engines[9].learned_mfe_bps < 640); // LINK: net 3.5+4.0=7.5 -> ~633
+        assert_eq!(engines[8].learned_mfe_bps, SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);     // WIF: capped at 820
+        assert_eq!(engines[10].learned_mfe_bps, DEFAULT_LEARNED_MFE_SCALED_BPS);       // NEAR: floored at 613
+        assert_eq!(engines[11].learned_mfe_bps, DEFAULT_LEARNED_MFE_SCALED_BPS);       // LTC: 0 samples -> 613
     }
 }
