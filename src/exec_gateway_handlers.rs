@@ -1,4 +1,4 @@
-//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V4.8).
+//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V5.3.2).
 #![allow(
     clippy::cast_precision_loss,
     clippy::manual_clamp,
@@ -604,7 +604,7 @@ pub fn handle_gateway_event(
                         });
                         if new_phase != prev_phase && matches!(new_phase, DailyShieldPhase::ProfitLockArmed | DailyShieldPhase::HibernatingProfitLocked | DailyShieldPhase::HibernatingLossCap) {
                             let _ = tg_tx.try_send(format!(
-                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.2 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.3.2 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                                 new_phase.label(),
                                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
@@ -776,7 +776,7 @@ pub fn bootstrap_live_adopt_if_enabled(
             };
             engines[s_idx].sync_to_shm_telemetry(arena);
             println!(
-                "{}\u{1f7e2} [VORTEX-OMEGA V5.2 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
+                "{}\u{1f7e2} [VORTEX-OMEGA V5.3.2 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
                 ANSI_GREEN, s_idx, sym_name, side_p, sz_s, bybit_avg_t.0, sl_t.0, sl_ok, t1_done, ANSI_RESET
             );
         }

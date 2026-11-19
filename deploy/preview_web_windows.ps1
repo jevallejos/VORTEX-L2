@@ -1,4 +1,4 @@
-﻿# VORTEX-OMEGA V5.1 — Local Windows 11 Observatory Preview & E2E Smoke Gate (127.0.0.1:8787, Zero-Dollar)
+# VORTEX-OMEGA V5.3.2 — Local Windows 11 Observatory Preview & E2E Smoke Gate (127.0.0.1:8787, Zero-Dollar)
 param([switch]$NoBrowser)
 
 Add-Type -TypeDefinition (@(
@@ -124,7 +124,7 @@ Add-Type -TypeDefinition (@(
     '                if (srv == null || srv.HasExited) throw new InvalidOperationException("vortex_web_preview exited early");',
     '                try { html = HttpGet(baseUrl + "/", out csrf); if (csrf.Length == 64) break; } catch { Thread.Sleep(200); }',
     '            }',
-    '            if (csrf.Length != 64 || !html.Contains("VORTEX-OMEGA V5.1 OBSERVATORY")) throw new InvalidOperationException("HTML/CSRF check failed");',
+    '            if (csrf.Length != 64 || !html.Contains("VORTEX-OMEGA V5.3.2 OBSERVATORY")) throw new InvalidOperationException("HTML/CSRF check failed");',
     '            string d; string stJ = HttpGet(baseUrl + "/api/state", out d);',
     '            string klJ = HttpGet(baseUrl + "/api/candles?symbol=BTCUSDT&tf=1m&limit=90", out d);',
     '            string trJ = HttpGet(baseUrl + "/api/trades?limit=10", out d);',

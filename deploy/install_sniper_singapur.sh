@@ -26,4 +26,4 @@ if [ -f /etc/systemd/system/vortex-exec.service ]; then
   sudo sed -i '/prewarm_emas_bybit\.py/d' /etc/systemd/system/vortex-exec.service || true
 fi
 sudo systemctl daemon-reload
-echo "[OK] VORTEX-OMEGA V5.2 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."
+echo "[OK] VORTEX-OMEGA V5.3.2 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."

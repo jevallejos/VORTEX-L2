@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V5.2 Loopback Observatory & SSE Bridge Daemon (`127.0.0.1:8787`, Zero-Jitter Read-Only SHM v15).
+//! VORTEX-OMEGA V5.3.2 Loopback Observatory & SSE Bridge Daemon (`127.0.0.1:8787`, Zero-Jitter Read-Only SHM v15).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         println!(
-            "{ANSI_GREEN}[VORTEX-WEB OMEGA V5.2] LOOPBACK 127.0.0.1:{DEFAULT_WEB_PORT}, X-VORTEX-CSRF, VKL1 & 5Hz SSE GATE OK{ANSI_RESET}"
+            "{ANSI_GREEN}[VORTEX-WEB OMEGA V5.3.2] LOOPBACK 127.0.0.1:{DEFAULT_WEB_PORT}, X-VORTEX-CSRF, VKL1 & 5Hz SSE GATE OK{ANSI_RESET}"
         );
         return ExitCode::SUCCESS;
     }
@@ -152,7 +152,7 @@ fn main() -> ExitCode {
     let port = cfg.port;
     let ctx = Arc::new(VortexWebContext::new(cfg));
     println!(
-        "{ANSI_SKY_BLUE}[VORTEX-WEB OMEGA V5.2] Listening on http://127.0.0.1:{port} (Loopback Read-Only SHM v15, 5Hz SSE){ANSI_RESET}"
+        "{ANSI_SKY_BLUE}[VORTEX-WEB OMEGA V5.3.2] Listening on http://127.0.0.1:{port} (Loopback Read-Only SHM v15, 5Hz SSE){ANSI_RESET}"
     );
     match serve_observatory_blocking(ctx, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
