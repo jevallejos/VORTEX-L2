@@ -1,4 +1,4 @@
-//! Zero-Jitter Off-Thread Atomic Vault Persister (V5.4: Queue Aborts, 1Hz Position Paths & Plasticity Audit).
+//! Zero-Jitter Off-Thread Atomic Vault Persister (V5.4.1: Queue Aborts, 1Hz Position Paths & Plasticity Audit).
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -320,7 +320,7 @@ pub fn build_funding_settlement_vault_json(task: &FundingSettlementPersistTask) 
     let notional = task.position_notional_1e8.max(1);
     let funding_bps = ((task.funding_net_1e8 as f64) * 10_000.0) / (notional as f64);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "FUNDING_SETTLEMENT", "schema": "V5.4", "ts_ns": task.ts_ns,
+        "event": "FUNDING_SETTLEMENT", "schema": "V5.4.1", "ts_ns": task.ts_ns,
         "funding_cut_id": task.funding_cut_id, "slot_idx": task.slot_idx,
         "symbol": spec.symbol_id.name(), "side": side_str,
         "funding_rate_bps": (task.funding_rate_scaled_bps as f64) / 100.0,
@@ -338,7 +338,7 @@ pub fn build_queue_abort_vault_json(rec: &QueueAbortRecord) -> String {
     let wait_ms = rec.aborted_ts_ns.0.saturating_sub(rec.armed_ts_ns.0).max(0) / 1_000_000;
     let saved_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (rec.saved_tox_bps[k].raw() as f64) / 100.0);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "QUEUE_ABORTED", "schema": "V5.4", "ts_ns": rec.aborted_ts_ns.0,
+        "event": "QUEUE_ABORTED", "schema": "V5.4.1", "ts_ns": rec.aborted_ts_ns.0,
         "armed_ts_ns": rec.armed_ts_ns.0, "queue_wait_ms": wait_ms,
         "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
         "veto_code": rec.veto_code as u8, "veto_name": format!("{:?}", rec.veto_code),
@@ -362,7 +362,7 @@ pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String 
     }
     let m5_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (path_sum.markout_5h.samples_bps[k] as f64) / 100.0);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "POSITION_PATH_1HZ", "schema": "V5.4", "trade_id": path_sum.trade_id,
+        "event": "POSITION_PATH_1HZ", "schema": "V5.4.1", "trade_id": path_sum.trade_id,
         "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
         "opened_ts_ns": path_sum.opened_ts_ns.0, "closed_ts_ns": path_sum.closed_ts_ns.0,
         "entry_ticks": path_sum.entry_ticks.0, "exit_ticks": path_sum.exit_ticks.0,
@@ -377,7 +377,7 @@ pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String 
 #[must_use]
 pub fn build_plasticity_audit_vault_json(snap: &PlasticityAuditSnapshot) -> String {
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "PLASTICITY_AUDIT_V49", "schema": "V5.4", "ts_ns": snap.ts_ns,
+        "event": "PLASTICITY_AUDIT_V49", "schema": "V5.4.1", "ts_ns": snap.ts_ns,
         "taker_prob_pm": snap.taker_prob_pm, "learned_mfe_bps": snap.learned_mfe_bps,
         "ob_bull_pm": snap.ob_bull_pm, "ob_bear_pm": snap.ob_bear_pm,
         "epps_corr_pm": snap.epps_corr_pm, "ws_rtt_us": snap.ws_rtt_us, "ws_quota_rem": snap.ws_quota_rem,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VORTEX-OMEGA V5.4 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
+"""VORTEX-OMEGA V5.4.1 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
 import json
 import math
 import os
@@ -39,7 +39,7 @@ def fetch_1m_klines(symbol: str, limit: int = 90) -> list:
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit={limit}"
     for attempt in range(3):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/5.4.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/5.4.1"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             rows = data.get("result", {}).get("list", [])
@@ -102,7 +102,7 @@ def main() -> int:
         hydrated += 1
 
     if hydrated == 0:
-        print("[PREWARM V5.4 WARN] 0/12 pares hidratados desde Bybit REST.")
+        print("[PREWARM V5.4.1 WARN] 0/12 pares hidratados desde Bybit REST.")
         return 1
     now_ns = time.time_ns()
     payload = {
@@ -119,7 +119,7 @@ def main() -> int:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp_path, out_path)
-    print(f"[PREWARM V5.4 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
+    print(f"[PREWARM V5.4.1 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
     return 0
 
 

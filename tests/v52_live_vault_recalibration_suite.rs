@@ -1253,19 +1253,19 @@ fn test_v54_eth2_counterfactual_elastic_bailout_non_censored_mfe_and_epps_sync()
     }));
 
     // =========================================================================
-    // (b) Right-censored learned_mfe_bps non-contraction (LINKUSDT #1: 805 stays 805 on +5.01/+5.42 bps
-    //     Maker win with 92.4% capture >= INV_PHI), uncapped upward expansion on higher excursion / markout,
-    //     and smooth offensive Tranche 1 + Runner anti-fee-drag scaling.
+    // (b) Right-censored learned_mfe_bps non-contraction (offensive Maker win >= round(PHI * fee_rt_mkr):
+    //     805 stays 805 on +6.65/+7.10 bps Maker win with 93.7% capture >= INV_PHI), uncapped upward
+    //     expansion on higher excursion / markout, and smooth offensive Tranche 1 + Runner scaling.
     // =========================================================================
     let mut eng_link = SlotExecutionEngine::new(9);
     eng_link.learned_mfe_bps = 805;
     eng_link.open_vol_5m_bps = ScaledBps(2_200);
     eng_link.flow_ema_fast = 0.12;
-    eng_link.last_closed_mfe_bps = 542;
+    eng_link.last_closed_mfe_bps = 710;
     eng_link.last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
-    eng_link.observe_censored_close_mfe_plasticity(Side::Bid, 501, true);
+    eng_link.observe_censored_close_mfe_plasticity(Side::Bid, 665, true);
     assert_eq!(eng_link.learned_mfe_bps, 805);
-    eng_link.observe_mfe_sample_uncensored(501, 542, true, false, 400);
+    eng_link.observe_mfe_sample_uncensored(665, 710, true, false, 400);
     assert_eq!(eng_link.learned_mfe_bps, 805);
 
     // Post-exit SlotMarkoutRing peak > learned_mfe_bps expands learned_mfe_bps upward without 820 ceiling:
@@ -1274,7 +1274,7 @@ fn test_v54_eth2_counterfactual_elastic_bailout_non_censored_mfe_and_epps_sync()
     markout_ring.step_clock(PriceTicks(9_335), TimestampNs(t0 + 61_000_000_000), 200);
     let uncensored_peak = markout_ring.take_uncensored_fill_peak_sbps().unwrap_or(0);
     assert!(uncensored_peak > 1_200);
-    eng_link.observe_mfe_sample_uncensored(501, 542_i64.max(uncensored_peak), true, false, 400);
+    eng_link.observe_mfe_sample_uncensored(665, 710_i64.max(uncensored_peak), true, false, 400);
     assert!(eng_link.learned_mfe_bps > 900);
 
     // Exhausted close that failed to reach TP (capture < INV_PHI) still decays smoothly:
@@ -1518,5 +1518,435 @@ fn test_v54_eth2_counterfactual_elastic_bailout_non_censored_mfe_and_epps_sync()
         &mut adv_v06_l1,
         LotQty(500),
         LotQty(500),
+    ));
+}
+
+#[test]
+fn test_v541_scratch_uncensored_decay_iceberg_multilot_reduceonly_split_and_stagger() {
+    record_live_ws_pulse(69_700, 100);
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_200_000_000_000_000_i64;
+    let w_65 = 6_468_940_634_i64;
+
+    // =========================================================================
+    // 1. Seal Trap 1: Sub-offensive scratch (+4.28/+4.34 bps < round(PHI * 400) = 647)
+    //    relaxes smoothly when market cools, while offensive win (>= 647) stays immune;
+    //    storm-learned MFE modulates down smoothly by sqrt(vol / eq_vol).clamp(INV_PHI, PHI).
+    // =========================================================================
+    let mut eng_eth_scratch = SlotExecutionEngine::new(1);
+    eng_eth_scratch.learned_mfe_bps = 1_200;
+    eng_eth_scratch.open_vol_5m_bps = ScaledBps(1_350);
+    eng_eth_scratch.flow_ema_fast = -0.05;
+    eng_eth_scratch.last_closed_mfe_bps = 434;
+    eng_eth_scratch.last_exit_sub_reason = ExitSubReason::StandardStructuralTp;
+    eng_eth_scratch.observe_censored_close_mfe_plasticity(Side::Bid, 428, true);
+    assert!(eng_eth_scratch.learned_mfe_bps < 1_200);
+
+    let mut eng_off_win = SlotExecutionEngine::new(1);
+    eng_off_win.learned_mfe_bps = 920;
+    eng_off_win.open_vol_5m_bps = ScaledBps(1_500);
+    eng_off_win.flow_ema_fast = 0.10;
+    eng_off_win.last_closed_mfe_bps = 720;
+    eng_off_win.last_exit_sub_reason = ExitSubReason::StandardStructuralTp;
+    eng_off_win.observe_censored_close_mfe_plasticity(Side::Bid, 680, true);
+    assert_eq!(eng_off_win.learned_mfe_bps, 920);
+
+    let calm_proj = vortex_rs::types::modulate_learned_mfe_by_diffusive_regime_sbps(
+        1_400,
+        ScaledBps(850),
+        ScaledBps(2_400),
+    );
+    assert_eq!(calm_proj, 865);
+    let storm_proj = vortex_rs::types::modulate_learned_mfe_by_diffusive_regime_sbps(
+        700,
+        ScaledBps(7_500),
+        ScaledBps(2_400),
+    );
+    assert_eq!(storm_proj, 1_133);
+
+    // Storm structural TP (180_252 = +14.00 bps) relaxes in calm (900 sbps) instead of hanging unreachable:
+    let mut calm_snap = mk_vault_snap(1, 180_020, 900, 0.42, 0.44, 0.30, t0 + 15_000_000_000);
+    calm_snap.bids[0] = BookLevel { price: PriceTicks(180_020), qty: LotQty(400) };
+    calm_snap.asks[0] = BookLevel { price: PriceTicks(180_021), qty: LotQty(350) };
+    let calm_ctx = OpenExitContext {
+        slot_idx: 1,
+        side: Side::Bid,
+        avg_price_ticks: PriceTicks(180_000),
+        peak_favorable_price: PriceTicks(180_025),
+        worst_adverse_price: PriceTicks(179_995),
+        initial_lots: LotQty(1),
+        open_lots: LotQty(1),
+        tranche1_harvested: false,
+        tranche1_lots: LotQty(0),
+        tranche1_exit_price: PriceTicks(0),
+        defensive_floor_locked: false,
+        active_exit_price: PriceTicks(180_252),
+        structural_tp_price: PriceTicks(180_252),
+        resting_exit_price: PriceTicks(180_252),
+        sl_trigger_price: PriceTicks(179_400),
+        opened_ts: TimestampNs(t0),
+        learned_mfe_bps: 1_400,
+        learned_t1_permille: 500,
+        learned_ir_x100: 25,
+        learned_ret_std_bps: 200,
+        intrinsic_tau_mkt_s: 180,
+        last_eff_sl_ticks: PriceTicks(179_400),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 140,
+        last_closed_mae_bps: -28,
+        active_fees: fees,
+        learned_taker_prob_pm: 50,
+    };
+    let kin_calm = ShadowRunnerKinematics {
+        flow_ema_fast: 0.45,
+        flow_ema_slow: 0.40,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_calm = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &calm_ctx,
+        kin_calm,
+        &calm_snap,
+        ScaledBps(5_200),
+        None,
+        0,
+        50_000,
+    );
+    assert!(q_calm.is_some_and(|q| q.target_price.0 < 180_180));
+
+    // =========================================================================
+    // 2. Seal Trap 2: Deep opposing ImpulseWave3 keeps S_band = 0 while accelerating
+    //    (ETH #2 mid-whiplash), but reactivates S_3 Maker evacuation during a pause
+    //    (aligned_fast > aligned_slow && aligned_fast >= -INV_PHI_CUBE) to rescue at 4.00 bps.
+    // =========================================================================
+    let eth2_zero_loss_px = vortex_rs::execution_fsm::defensive_zero_loss_maker_exit_price_with_fees(
+        Side::Ask,
+        PriceTicks(177_485),
+        fees,
+    );
+    let mut eth2_w3 = mk_vault_snap(1, 177_760, 2_980, 0.06, 0.08, 0.20, t0 + 38_000_000_000);
+    eth2_w3.bids[0] = BookLevel { price: PriceTicks(177_760), qty: LotQty(3_200) };
+    eth2_w3.asks[0] = BookLevel { price: PriceTicks(177_761), qty: LotQty(3_200) };
+    eth2_w3.mark_price = PriceTicks(177_760);
+    eth2_w3.last_trade_price = PriceTicks(177_760);
+    eth2_w3.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.72),
+        macro_phase: BoundedScore::new_clamped(0.92),
+        oi_impulse: BoundedScore::new_clamped(0.30),
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(4_800),
+    });
+    let eth2_rescue_ctx = OpenExitContext {
+        slot_idx: 1,
+        side: Side::Ask,
+        avg_price_ticks: PriceTicks(177_485),
+        peak_favorable_price: PriceTicks(177_480),
+        worst_adverse_price: PriceTicks(177_816),
+        initial_lots: LotQty(1),
+        open_lots: LotQty(1),
+        tranche1_harvested: false,
+        tranche1_lots: LotQty(0),
+        tranche1_exit_price: PriceTicks(0),
+        defensive_floor_locked: true,
+        active_exit_price: eth2_zero_loss_px,
+        structural_tp_price: PriceTicks(176_350),
+        resting_exit_price: eth2_zero_loss_px,
+        sl_trigger_price: PriceTicks(178_195),
+        opened_ts: TimestampNs(t0),
+        learned_mfe_bps: 647,
+        learned_t1_permille: 500,
+        learned_ir_x100: 20,
+        learned_ret_std_bps: 220,
+        intrinsic_tau_mkt_s: 180,
+        last_eff_sl_ticks: PriceTicks(178_195),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 28,
+        last_closed_mae_bps: -1_859,
+        active_fees: fees,
+        learned_taker_prob_pm: 50,
+    };
+    // Accelerating adverse whiplash -> NO Maker bailout:
+    let kin_chase = ShadowRunnerKinematics {
+        flow_ema_fast: 0.48,
+        flow_ema_slow: 0.42,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_chase = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &eth2_rescue_ctx,
+        kin_chase,
+        &eth2_w3,
+        ScaledBps(2_980),
+        Some(-2.6),
+        0,
+        69_700,
+    );
+    assert!(q_chase.is_some_and(|q| q.target_price <= eth2_zero_loss_px));
+
+    // Pause in opposing ImpulseWave3 (aligned_fast = -0.06 > aligned_slow = -0.34, >= -INV_PHI_CUBE) -> Maker BBO evacuation!
+    let kin_pause = ShadowRunnerKinematics {
+        flow_ema_fast: 0.06,
+        flow_ema_slow: 0.34,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_pause = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &eth2_rescue_ctx,
+        kin_pause,
+        &eth2_w3,
+        ScaledBps(2_980),
+        Some(-2.6),
+        0,
+        69_700,
+    );
+    assert!(q_pause.is_some_and(|q| {
+        q.target_price == PriceTicks(177_760) && q.urgent_close_repeg
+    }));
+
+    // Diffusive CorrectiveAbc pullback at same depth & pause does NOT panic-bailout:
+    let mut eth2_abc = eth2_w3;
+    eth2_abc.set_wave_observables(WaveObservables {
+        regime: WaveRegime::CorrectiveAbc,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.54),
+        macro_phase: BoundedScore::new_clamped(0.35),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(0),
+    });
+    let q_abc = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &eth2_rescue_ctx,
+        kin_pause,
+        &eth2_abc,
+        ScaledBps(2_980),
+        Some(-2.6),
+        0,
+        69_700,
+    );
+    assert!(q_abc.is_some_and(|q| q.target_price <= eth2_zero_loss_px));
+
+    // =========================================================================
+    // 3. Seal Trap 3: Universal C1 Passive Iceberg Absorption Penalty across
+    //    multi-lot (SOL, AVAX, SUI, TAO) & 1-lot (ETH), while healthy impulses
+    //    (ofi_al >= INV_PHI_SQ) remain 100% intact (penalty == 0.0).
+    // =========================================================================
+    assert!(
+        vortex_rs::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(0.42, 0.88, -0.25)
+            .abs()
+            <= f64::EPSILON
+    );
+    let pen_ice = vortex_rs::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+        0.22,
+        0.64,
+        -0.05,
+    );
+    assert!(pen_ice > 0.90);
+
+    let mut btc_ice_leader = mk_vault_snap(0, 650_000, 3_000, -0.08, -0.06, -0.05, t0);
+    btc_ice_leader.bids[0].qty = LotQty(1_500);
+    btc_ice_leader.asks[0].qty = LotQty(1_500);
+    btc_ice_leader.refresh_deep_l1_l5_totals();
+
+    let gov_ice = OnlineAdaptiveGovernor::new();
+    for &(slot, px, lots) in &[
+        (1_usize, 180_000_i64, 1_i64), // ETH 1-lot
+        (2_usize, 7_200_i64, 2_i64),   // SOL multi-lot
+        (3_usize, 8_150_i64, 16_i64),  // AVAX multi-lot
+        (4_usize, 19_500_i64, 6_i64),  // TAO multi-lot
+        (5_usize, 7_400_i64, 18_i64),  // SUI multi-lot
+    ] {
+        // Iceberg ceiling on Bid: ofi=+0.22 (< INV_PHI_SQ), tfi=+0.66 (tfi - ofi = 0.44 > INV_PHI_SQ), btc <= 0.0:
+        let mut s_ice = mk_vault_snap(slot, px, 3_600, 0.22, 0.66, 0.85, t0);
+        s_ice.bids[0].qty = LotQty(2_400);
+        s_ice.asks[0].qty = LotQty(900);
+        s_ice.refresh_deep_l1_l5_totals();
+        let v_ice = vortex_rs::alpha_3factor::OrthogonalFactorState::evaluate_entry_signal_v54(
+            APPROVED_SPECS[slot],
+            &s_ice,
+            &btc_ice_leader,
+            ScaledBps(720),
+            ScaledBps(120),
+            50,
+            fees,
+            0.0,
+            1.0,
+            0.75,
+        );
+        assert!(!matches!(
+            v_ice,
+            vortex_rs::alpha_3factor::SignalVerdict::AuthorizeMakerEntry { .. }
+        ));
+        assert!(gov_ice
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+                slot,
+                Side::Bid,
+                LotQty(lots),
+                PriceTicks(px),
+                ScaledBps(720),
+                &s_ice,
+                &btc_ice_leader,
+                1.0,
+            )
+            .is_none());
+        assert!(gov_ice
+            .authorizes_adaptive_entry_v54(
+                slot,
+                Side::Bid,
+                w_65,
+                1_000,
+                ScaledBps(720),
+                &s_ice,
+                &btc_ice_leader,
+                0.0,
+                1.0,
+                0.75,
+            )
+            .is_err());
+
+        // Healthy impulse (ofi_al = 0.56 >= INV_PHI_SQ) stays 100% intact:
+        let mut s_ok = s_ice;
+        s_ok.factor_ofi = BoundedScore::new_clamped(0.56);
+        let mut btc_ok = btc_ice_leader;
+        btc_ok.factor_ofi = BoundedScore::new_clamped(0.45);
+        btc_ok.factor_tfi = BoundedScore::new_clamped(0.48);
+        btc_ok.factor_geom = BoundedScore::new_clamped(0.35);
+        assert!(matches!(
+            vortex_rs::alpha_3factor::OrthogonalFactorState::evaluate_entry_signal_v54(
+                APPROVED_SPECS[slot],
+                &s_ok,
+                &btc_ok,
+                ScaledBps(720),
+                ScaledBps(120),
+                50,
+                fees,
+                0.0,
+                1.0,
+                0.75,
+            ),
+            vortex_rs::alpha_3factor::SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+        ));
+        assert!(gov_ice
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+                slot,
+                Side::Bid,
+                LotQty(lots),
+                PriceTicks(px),
+                ScaledBps(720),
+                &s_ok,
+                &btc_ok,
+                1.0,
+            )
+            .is_some());
+    }
+
+    // =========================================================================
+    // 4. Seal Trap 4: Bybit UTA V5 reduceOnly Tranche 1 + Runner split on
+    //    deleveraged multi-lot positions ($6..$13.70 USDT, lots >= 2), while
+    //    preserving 1-lot orphan (rem_lots == 1) and < $5.25 guards.
+    // =========================================================================
+    // AVAX 10L @ $7.14 = $7.14 USDT (2 legs of 5L = $3.57 each, valid reduceOnly):
+    assert!(APPROVED_SPECS[3].can_split_runner_legs(LotQty(10), PriceTicks(7_140)));
+    assert_eq!(
+        compute_tranche1_split_lots_core(3, LotQty(10), PriceTicks(7_140), 500),
+        Some(LotQty(5))
+    );
+    // SUI 10L @ $0.72 = $7.20 USDT -> splits 5 + 5:
+    assert!(APPROVED_SPECS[5].can_split_runner_legs(LotQty(10), PriceTicks(7_200)));
+    assert_eq!(
+        compute_tranche1_split_lots_core(5, LotQty(10), PriceTicks(7_200), 500),
+        Some(LotQty(5))
+    );
+    // TAO 4L @ $195.00 = $7.80 USDT -> splits 2 + 2:
+    assert!(APPROVED_SPECS[4].can_split_runner_legs(LotQty(4), PriceTicks(19_500)));
+    assert_eq!(
+        compute_tranche1_split_lots_core(4, LotQty(4), PriceTicks(19_500), 500),
+        Some(LotQty(2))
+    );
+    // SOL 2L @ $45.00 = $9.00 USDT -> splits 1 + 1:
+    assert!(APPROVED_SPECS[2].can_split_runner_legs(LotQty(2), PriceTicks(4_500)));
+    assert_eq!(
+        compute_tranche1_split_lots_core(2, LotQty(2), PriceTicks(4_500), 500),
+        Some(LotQty(1))
+    );
+    // 1-lot orphan (V02) and sub-$5.25 positions never split:
+    assert!(!APPROVED_SPECS[5].can_split_runner_legs(LotQty(1), PriceTicks(7_200)));
+    assert_eq!(
+        compute_tranche1_split_lots_core(5, LotQty(1), PriceTicks(7_200), 500),
+        None
+    );
+    assert!(!APPROVED_SPECS[5].can_split_runner_legs(LotQty(6), PriceTicks(7_200)));
+    assert_eq!(
+        compute_tranche1_split_lots_core(5, LotQty(6), PriceTicks(7_200), 500),
+        None
+    );
+
+    // =========================================================================
+    // 5. Seal Trap 5: Same-Side Stagger release after harvesting Tranche 1
+    //    (30s blocked, 65s pre-T1 below cushion blocked, 65s post-T1 with cur_gross_bps >= 0 admitted).
+    // =========================================================================
+    let mut stg_engines = SlotExecutionEngine::new_12_slot_array();
+    let mut stg_snaps = [SymbolLobSnapshot::new_empty(); vortex_rs::lob_shm::MAX_ACTIVE_PAIRS];
+    stg_snaps[5] = mk_vault_snap(5, 7_202, 2_200, 0.45, 0.48, 0.35, t0);
+    stg_snaps[5].mark_price = PriceTicks(7_202); // +2.78 bps >= 0 over 7_200, but < req_cushion_bps (~830 sbps)
+    assert!(stg_engines[5]
+        .adopt_live_open_position(
+            Side::Bid,
+            PriceTicks(7_200),
+            LotQty(10),
+            LotQty(10),
+            false,
+            PriceTicks(7_204),
+            PriceTicks(7_199),
+            TimestampNs(t0),
+            &stg_snaps[5],
+        )
+        .is_ok());
+
+    // Pre-Tranche 1: blocked at 30s AND blocked at 65s (cur_gross_bps = +277 < req_cushion_bps):
+    assert!(!vortex_rs::exec_daemon::can_stage_same_direction_entry(
+        3,
+        Side::Bid,
+        TimestampNs(t0 + 30_000_000_000),
+        &stg_engines,
+        &stg_snaps,
+    ));
+    assert!(!vortex_rs::exec_daemon::can_stage_same_direction_entry(
+        3,
+        Side::Bid,
+        TimestampNs(t0 + 65_000_000_000),
+        &stg_engines,
+        &stg_snaps,
+    ));
+
+    // Harvest Tranche 1 on deleveraged 10L SUI ($7.20 -> 5L harvested + 5L runner):
+    assert!(stg_engines[5].record_tranche1_harvest(PriceTicks(7_204)));
+    assert_eq!(stg_engines[5].tranche1_harvests_count, 1);
+
+    // Post-Tranche 1: 30s STILL blocked by stagger clock, 65s with cur_gross_bps >= 0 ADMITTED!
+    assert!(!vortex_rs::exec_daemon::can_stage_same_direction_entry(
+        3,
+        Side::Bid,
+        TimestampNs(t0 + 30_000_000_000),
+        &stg_engines,
+        &stg_snaps,
+    ));
+    assert!(vortex_rs::exec_daemon::can_stage_same_direction_entry(
+        3,
+        Side::Bid,
+        TimestampNs(t0 + 65_000_000_000),
+        &stg_engines,
+        &stg_snaps,
+    ));
+
+    // If runner slips underwater (cur_gross_bps < 0) without Chandelier lock, stagger re-engages:
+    stg_snaps[5].mark_price = PriceTicks(7_195);
+    assert!(!vortex_rs::exec_daemon::can_stage_same_direction_entry(
+        3,
+        Side::Bid,
+        TimestampNs(t0 + 65_000_000_000),
+        &stg_engines,
+        &stg_snaps,
     ));
 }

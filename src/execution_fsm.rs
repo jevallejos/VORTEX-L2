@@ -522,9 +522,9 @@ impl SlotExecutionEngine {
         }
     }
 
-    /// Right-censoring-aware MFE plasticity helper for vault rehydration & closed-trade accounting (V5.4).
+    /// Right-censoring-aware MFE plasticity helper for vault rehydration & closed-trade accounting (V5.4.1).
     #[inline]
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn observe_mfe_sample_uncensored(
         &mut self,
         gross_close_sbps: i64,
@@ -533,6 +533,7 @@ impl SlotExecutionEngine {
         is_scratch: bool,
         fee_rt_bps: i64,
     ) {
+        const PHI_MFE: f64 = 1.618_033_988_749_895;
         const INV_PHI_MFE: f64 = 0.618_033_988_749_895;
         let eff_rt = fee_rt_bps.max(100);
         let m_obs = closed_mfe_sbps.max(gross_close_sbps);
@@ -541,8 +542,10 @@ impl SlotExecutionEngine {
         {
             return;
         }
+        let offensive_floor_sbps = (PHI_MFE * (eff_rt as f64)).round() as i64;
         let right_censored_maker_win = is_maker_exit
-            && gross_close_sbps > eff_rt
+            && !is_scratch
+            && gross_close_sbps >= offensive_floor_sbps
             && m_obs > 0
             && (gross_close_sbps as f64) >= INV_PHI_MFE * (m_obs as f64);
         if right_censored_maker_win && m_obs < self.learned_mfe_bps {
@@ -551,10 +554,9 @@ impl SlotExecutionEngine {
         self.observe_mfe_sample_with_fee_rt(m_obs, eff_rt);
     }
 
-    /// Buckley-James / Kaplan-Meier right-censored MFE plasticity for passive Limit TP fills (V5.4).
-    /// Strictly protects `learned_mfe_bps` from downward shrinkage when a profitable Maker Limit TP
-    /// right-censored its own excursion (`capture >= INV_PHI` and `m_km < learned_mfe_bps`), while
-    /// permitting uncapped upward adaptation when `closed_mfe_sbps > learned_mfe_bps`.
+    /// Buckley-James / Kaplan-Meier right-censored MFE plasticity for passive Limit TP fills (V5.4.1).
+    /// Requires `gross_close_sbps >= round(PHI * active_fee_rt_mkr_sbps)` for right-censoring immunity,
+    /// allowing sub-offensive scratches to smoothly relax `learned_mfe_bps` via `S_3` when volatility cools.
     #[inline]
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn observe_censored_close_mfe_plasticity(
@@ -563,16 +565,14 @@ impl SlotExecutionEngine {
         gross_close_sbps: i64,
         is_maker_exit: bool,
     ) {
+        const PHI_MFE: f64 = 1.618_033_988_749_895;
         const INV_PHI_MFE: f64 = 0.618_033_988_749_895;
         let eff_rt = self.active_maker_rt_fee_bps();
         let m_obs = self.last_closed_mfe_bps.max(gross_close_sbps);
-        let is_defensive_scratch = matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
-            || m_obs < (eff_rt * 13) / 10;
-        if (is_defensive_scratch && m_obs < self.learned_mfe_bps)
-            || !crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, eff_rt)
-        {
+        if !crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, eff_rt) {
             return;
         }
+        let offensive_floor_sbps = (PHI_MFE * (eff_rt as f64)).round() as i64;
         let m_km = if is_maker_exit
             && m_obs >= (eff_rt * 13) / 10
             && !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
@@ -590,11 +590,40 @@ impl SlotExecutionEngine {
         } else {
             m_obs
         };
+        if m_km > self.learned_mfe_bps {
+            self.observe_mfe_sample_with_fee_rt(m_km, eff_rt);
+            return;
+        }
         let right_censored_maker_win = is_maker_exit
-            && gross_close_sbps > eff_rt
+            && !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
+            && gross_close_sbps >= offensive_floor_sbps
             && m_obs > 0
             && (gross_close_sbps as f64) >= INV_PHI_MFE * (m_obs as f64);
         if right_censored_maker_win && m_km < self.learned_mfe_bps {
+            return;
+        }
+        let is_sub_offensive_scratch = matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
+            || gross_close_sbps < offensive_floor_sbps;
+        if is_sub_offensive_scratch && m_km < self.learned_mfe_bps {
+            let eq_vol_f = (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2)) as f64;
+            let open_v_f = (if self.open_vol_5m_bps.raw() > 0 {
+                self.open_vol_5m_bps.raw()
+            } else {
+                ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw()
+            }) as f64;
+            let s_cool = crate::wave_elliott::hermite_smoothstep_c1(
+                PHI_MFE * eq_vol_f - open_v_f,
+                0.0,
+                eq_vol_f,
+            );
+            if s_cool <= 0.0 {
+                return;
+            }
+            let floor_dn = m_km.max(eff_rt + 40);
+            let eff_sample = ((self.learned_mfe_bps as f64)
+                - s_cool * ((self.learned_mfe_bps - floor_dn).max(0) as f64))
+                .round() as i64;
+            self.observe_mfe_sample_with_fee_rt(eff_sample, eff_rt);
             return;
         }
         self.observe_mfe_sample_with_fee_rt(m_km, eff_rt);
@@ -894,7 +923,17 @@ impl SlotExecutionEngine {
             let vol_raw = self.open_vol_5m_bps.raw();
             let max_single_cap = fee_rt * 12;
             let vol_unit_cap = if vol_raw > 0 { ((vol_raw * 62) / 100).clamp(min_win_gross + 15, max_single_cap) } else { (fee_rt * 9) / 4 };
-            let phi_mfe = ((1.618_033_988_749_895 * (self.learned_mfe_bps as f64)).round() as i64).max(self.learned_mfe_bps);
+            let eq_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2));
+            let reg_mfe = if vol_raw > 0 {
+                crate::types::modulate_learned_mfe_by_diffusive_regime_sbps(
+                    self.learned_mfe_bps,
+                    self.open_vol_5m_bps,
+                    eq_vol,
+                )
+            } else {
+                self.learned_mfe_bps
+            };
+            let phi_mfe = ((1.618_033_988_749_895 * (reg_mfe as f64)).round() as i64).max(reg_mfe);
             let mfe_cap = phi_mfe.clamp(min_win_gross + 15, max_single_cap);
             target_excursion.raw().min(mfe_cap.min(vol_unit_cap)).max(min_win_gross)
         };
@@ -946,7 +985,16 @@ impl SlotExecutionEngine {
         let eff_init = LotQty(initial_lots.0.max(eff_open.0));
         let q_fl = defensive_zero_loss_maker_exit_price_with_fees(side, verified_avg_price, self.active_fees);
         let fee_rt = self.active_maker_rt_fee_bps();
-        let struct_tp = dynamic_maker_floor_price(side, verified_avg_price, ScaledBps(self.learned_mfe_bps.max((fee_rt * 27) / 20)));
+        let adopt_mfe = if snap.realized_vol_5m.raw() > 0 {
+            crate::types::modulate_learned_mfe_by_diffusive_regime_sbps(
+                self.learned_mfe_bps,
+                snap.realized_vol_5m,
+                ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2)),
+            )
+        } else {
+            self.learned_mfe_bps
+        };
+        let struct_tp = dynamic_maker_floor_price(side, verified_avg_price, ScaledBps(adopt_mfe.max((fee_rt * 27) / 20)));
         let harvested_lots = LotQty((eff_init.0 - eff_open.0).max(0));
         let t1_done = tranche1_harvested || harvested_lots.0 > 0;
         let split_opt = if !t1_done { Self::compute_tranche1_split_lots(self.slot_idx, eff_open, q_fl, self.learned_t1_permille) } else { None };
@@ -1047,8 +1095,7 @@ impl SlotExecutionEngine {
         if *tranche1_harvested { return false; }
         let wave_override = if matches!(*active_exit_role, ExitOrderRole::Tranche1Harvest50) && active_exit_lots.0 >= 1 && active_exit_lots.0 < open_lots.0 {
             let rem = LotQty(open_lots.0 - active_exit_lots.0);
-            if spec.lot_notional_1e8(*active_exit_lots, fill_price) >= SPLIT_LEG_MIN_NOTIONAL_1E8
-                && spec.lot_notional_1e8(rem, fill_price) >= SPLIT_LEG_MIN_NOTIONAL_1E8
+            if rem.0 >= 1 && spec.lot_notional_1e8(*open_lots, fill_price) >= SPLIT_LEG_MIN_NOTIONAL_1E8
             { Some(*active_exit_lots) } else { None }
         } else { None };
         let Some(harvested) = wave_override.or_else(|| Self::compute_tranche1_split_lots(s_idx, *open_lots, fill_price, phi)) else { return false; };

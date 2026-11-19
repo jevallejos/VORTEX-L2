@@ -385,17 +385,21 @@ pub fn compute_chandelier_profit_lock_sl(ctx: &OpenExitContext, snap: &SymbolLob
 pub fn compute_tranche1_split_lots_core(slot_idx: usize, open_lots: LotQty, exit_price: PriceTicks, t1_permille: i64) -> Option<LotQty> {
     if open_lots.0 < 2 || exit_price.0 <= 0 { return None; }
     let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    if spec.lot_notional_1e8(open_lots, exit_price) < SPLIT_LEG_MIN_NOTIONAL_1E8 {
+        return None;
+    }
     let one_lot_1e8 = spec.lot_notional_1e8(LotQty(1), exit_price);
     if one_lot_1e8 <= 0 { return None; }
-    let min_leg_lots = ((SPLIT_LEG_MIN_NOTIONAL_1E8 + one_lot_1e8 - 1) / one_lot_1e8).max(1);
-    if open_lots.0 < min_leg_lots.saturating_mul(2) { return None; }
+    let full_leg_lots = ((SPLIT_LEG_MIN_NOTIONAL_1E8 + one_lot_1e8 - 1) / one_lot_1e8).max(1);
+    let min_leg_lots = if open_lots.0 >= full_leg_lots.saturating_mul(2) {
+        full_leg_lots
+    } else {
+        1
+    };
     let raw_t1 = (((open_lots.0.saturating_mul(t1_permille.clamp(350, 650))) + 500) / 1_000).clamp(1, open_lots.0 - 1);
-    if raw_t1 < min_leg_lots { return None; }
-    let t1_lots = LotQty(raw_t1.min(open_lots.0 - min_leg_lots));
+    let t1_lots = LotQty(raw_t1.clamp(min_leg_lots, open_lots.0 - min_leg_lots));
     let rem_lots = LotQty(open_lots.0 - t1_lots.0);
-    if spec.lot_notional_1e8(t1_lots, exit_price) < SPLIT_LEG_MIN_NOTIONAL_1E8
-        || spec.lot_notional_1e8(rem_lots, exit_price) < SPLIT_LEG_MIN_NOTIONAL_1E8
-    {
+    if t1_lots.0 < 1 || rem_lots.0 < 1 {
         None
     } else {
         Some(t1_lots)
@@ -767,6 +771,16 @@ pub fn compute_canonical_exit_quote_omega_v54(
     let rt_raw = ctx.active_fees.round_trip_maker_exit_bps().raw();
     let fee_rt = rt_raw.max(100);
     let win_floor_bps = compute_elastic_offensive_win_floor_bps(fee_rt, snap.realized_vol_5m).raw();
+    let eq_vol_mfe = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2));
+    let projected_mfe_bps = if snap.realized_vol_5m.raw() > 0 {
+        crate::types::modulate_learned_mfe_by_diffusive_regime_sbps(
+            ctx.learned_mfe_bps,
+            snap.realized_vol_5m,
+            eq_vol_mfe,
+        )
+    } else {
+        ctx.learned_mfe_bps
+    };
     let dir_s = ctx.side.sign_f64();
     let d_sign = ctx.side.sign_i64();
     let avg_denom = ctx.avg_price_ticks.0.max(1);
@@ -852,10 +866,10 @@ pub fn compute_canonical_exit_quote_omega_v54(
                 let s_t1_accel = hermite_s3_unit(flow_accel, INV_PHI_FOURTH, INV_PHI_SQ);
                 let s_t1_prop = hermite_s3_unit(s_prop, INV_PHI_CUBE, INV_PHI);
                 let s_t1_vol = hermite_s3_unit(sigma_1m_cur, c_mkr_scale, PHI_SQ * c_mkr_scale);
-                let s_t1_mfe = hermite_s3_unit(ctx.learned_mfe_bps as f64, PHI * c_mkr_scale, PHI_SQ * c_mkr_scale);
+                let s_t1_mfe = hermite_s3_unit(projected_mfe_bps as f64, PHI * c_mkr_scale, PHI_SQ * c_mkr_scale);
                 let t1_base_f = win_floor_bps as f64;
                 let t1_ceil = (INV_PHI * sigma_1m_cur)
-                    .min(INV_PHI * (ctx.learned_mfe_bps as f64) + INV_PHI_CUBE * sigma_1m_cur)
+                    .min(INV_PHI * (projected_mfe_bps as f64) + INV_PHI_CUBE * sigma_1m_cur)
                     .max(t1_base_f);
                 let t1_exp_bps = (t1_base_f
                     + s_t1_accel * s_t1_prop * s_t1_vol * s_t1_mfe * (t1_ceil - t1_base_f))
@@ -881,7 +895,7 @@ pub fn compute_canonical_exit_quote_omega_v54(
         let p_taker = (ctx.learned_taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
         let s_adv_flow = hermite_s3_unit(-eff_flow_slow, INV_PHI_FOURTH, INV_PHI);
         let p_eff_cont = (p_cont * (1.0 - p_taker) * (1.0 - INV_PHI * s_adv_flow)).clamp(0.0, 1.0);
-        let g_recov = (ctx.learned_mfe_bps.max(win_floor_bps) as f64) - c_mkr - f_adv;
+        let g_recov = (projected_mfe_bps.max(win_floor_bps) as f64) - c_mkr - f_adv;
         let live_sl_sbps = if ctx.last_eff_sl_ticks.0 > 0 {
             (((ctx.avg_price_ticks.0 - ctx.last_eff_sl_ticks.0)
                 .saturating_mul(d_sign)
@@ -940,12 +954,41 @@ pub fn compute_canonical_exit_quote_omega_v54(
         };
         let sigma_1m_open_sbps = (eff_open_vol_sbps as f64) / SQRT_5;
         let b_floor_sbps = -((PHI * c_mkr_scale).max(INV_PHI_SQ * sigma_1m_open_sbps));
-        let s_bailout_band = hermite_s3_unit(cur_g, PHI * b_floor_sbps, b_floor_sbps);
-        let chi_stress = s_wave3_stress
+        let base_bailout_band = hermite_s3_unit(cur_g, PHI * b_floor_sbps, b_floor_sbps);
+        let aligned_fast = if has_live_kin {
+            BoundedScore::new_clamped(kin.flow_ema_fast * dir_s).get()
+        } else {
+            own_flow
+        };
+        let opp_w3_confirmed = crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+            ctx.side,
+            snap,
+            eff_open_vol_sbps,
+            ctx.learned_taker_prob_pm,
+            ctx.active_fees,
+        );
+        let s_w3_pause_evac = if opp_w3_confirmed
+            && aligned_fast > eff_flow_slow
+            && aligned_fast >= -INV_PHI_CUBE
+        {
+            let s_hold_w3 = hermite_s3_unit(hold_s_f, INV_PHI_SQ * tau_wave3_s, tau_wave3_s);
+            let s_decel = hermite_s3_unit(aligned_fast - eff_flow_slow, 0.0, INV_PHI_FIFTH);
+            let s_breather = hermite_s3_unit(aligned_fast, -INV_PHI_CUBE, -INV_PHI_FOURTH);
+            let s_sl_headroom = hermite_s3_unit(
+                cur_g + live_sl_sbps,
+                INV_PHI_SQ * c_mkr_scale,
+                PHI * c_mkr_scale,
+            );
+            s_hold_w3 * s_decel * s_breather * s_sl_headroom
+        } else {
+            0.0
+        };
+        let chi_stress = (s_wave3_stress
             .max(s_stag_stress)
             .max(s_wald_deep_stress)
             .max(s_bounce_bailout)
-            * s_bailout_band;
+            * base_bailout_band)
+            .max(s_w3_pause_evac);
         let trapped_or_underwater = cur_gross_bps < 0 || worst_mae_bps < 0;
         let maker_bailout_active = trapped_or_underwater
             && cur_gross_bps < zero_loss_bps
@@ -976,7 +1019,27 @@ pub fn compute_canonical_exit_quote_omega_v54(
         });
     }
     let min_win_px = dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(eff_ratchet_bps.max(win_floor_bps)));
-    let base_tp = pick_more_ambitious_tp(ctx.side, min_win_px, ctx.structural_tp_price);
+    let eff_struct_tp = if snap.realized_vol_5m.raw() > 0
+        && snap.realized_vol_5m.raw() < eq_vol_mfe.raw()
+        && !matches!(w_obs.regime, WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5)
+    {
+        let calm_cap_px = dynamic_maker_floor_price(
+            ctx.side,
+            ctx.avg_price_ticks,
+            ScaledBps(projected_mfe_bps.max(win_floor_bps + fee_rt / 2)),
+        );
+        match ctx.side {
+            Side::Bid => PriceTicks(ctx.structural_tp_price.0.min(calm_cap_px.0)),
+            Side::Ask => PriceTicks(if ctx.structural_tp_price.0 > 0 {
+                ctx.structural_tp_price.0.max(calm_cap_px.0)
+            } else {
+                calm_cap_px.0
+            }),
+        }
+    } else {
+        ctx.structural_tp_price
+    };
+    let base_tp = pick_more_ambitious_tp(ctx.side, min_win_px, eff_struct_tp);
     let (mut lvdbs_vac_level, mut lvdbs_px) = (1_usize, base_tp);
     if own_flow >= 0.35 {
         let (own_lvls, opp_lvls) = match ctx.side { Side::Bid => (&snap.bids, &snap.asks), Side::Ask => (&snap.asks, &snap.bids) };
@@ -993,7 +1056,7 @@ pub fn compute_canonical_exit_quote_omega_v54(
         }
     }
     let vol_f = snap.realized_vol_5m.raw().max(1_600) as f64;
-    let max_fib_cap = ((vol_f * PHI_SQ).round() as i64).clamp((fee_rt * 4).max(ctx.learned_mfe_bps.min(fee_rt * 12)), fee_rt * 45);
+    let max_fib_cap = ((vol_f * PHI_SQ).round() as i64).clamp((fee_rt * 4).max(projected_mfe_bps.min(fee_rt * 12)), fee_rt * 45);
     let s_run = if ctx.tranche1_harvested {
         hermite_s3_unit(own_flow.max(s_prop), INV_PHI_FIFTH, INV_PHI_SQ)
     } else {
@@ -1004,7 +1067,7 @@ pub fn compute_canonical_exit_quote_omega_v54(
     };
     let runner2_px = if lvdbs_vac_level < 2 && s_run > 1e-6 {
         let sigma_1m = vol_f / SQRT_5;
-        let base_r = ctx.learned_mfe_bps.max(win_floor_bps) as f64;
+        let base_r = (projected_mfe_bps as f64).min(PHI * sigma_1m).max(win_floor_bps as f64);
         let opt_coeff = if ctx.tranche1_harvested {
             INV_PHI + INV_PHI_SQ * s_run
         } else {

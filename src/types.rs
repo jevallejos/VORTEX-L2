@@ -746,10 +746,24 @@ impl PairSpec {
         fees: FeeSchedule,
     ) -> f64 {
         const PHI_Q: f64 = 1.618_033_988_749_895;
+        const PHI_SQ_Q: f64 = 2.618_033_988_749_895;
         const INV_PHI2_Q: f64 = 0.381_966_011_250_105;
         let rho_q = self.quantum_lot_distortion_ratio(wallet_usdt_1e8, entry_price, realized_vol_5m, fees);
         let p_t = (taker_prob_pm.clamp(20, 450) as f64) * 1e-3;
-        let mfe_f = learned_mfe_bps.raw().max(0) as f64;
+        let b3x_q = (self
+            .three_x_friction_barrier_bps_dynamic(entry_price, taker_prob_pm, fees)
+            .raw()
+            .max(300)) as f64;
+        let eq_vol_q = ScaledBps(
+            ((PHI_SQ_Q * b3x_q).round() as i64)
+                .max(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2)),
+        );
+        let mfe_f = modulate_learned_mfe_by_diffusive_regime_sbps(
+            learned_mfe_bps.raw(),
+            realized_vol_5m,
+            eq_vol_q,
+        )
+        .max(0) as f64;
         let e_gross = if rho_q <= PHI_Q {
             mfe_f.max(INV_PHI2_Q * (realized_vol_5m.raw().max(0) as f64))
         } else {
@@ -808,15 +822,15 @@ mod quantum_ev_v48_tests {
 }
 
 impl PairSpec {
-    /// True iff `allocated_lots` can split into `Tranche 1 + Runner` above exchange leg minimum.
+    /// True iff `allocated_lots` (`>= 2`) satisfies Bybit UTA V5 opening exchange notional (`>= $5.25 USDT`),
+    /// permitting `reduceOnly: true` `Tranche 1 + Runner` integer-lot (`>= 1` lot/leg) splits (V5.4.1).
     #[inline]
     #[must_use]
     pub const fn can_split_runner_legs(self, allocated_lots: LotQty, mid_price: PriceTicks) -> bool {
         if allocated_lots.0 < 2 || mid_price.0 <= 0 {
             return false;
         }
-        let half_lots = LotQty(allocated_lots.0 / 2);
-        self.lot_notional_1e8(half_lots, mid_price) >= SPLIT_LEG_MIN_NOTIONAL_1E8
+        self.lot_notional_1e8(allocated_lots, mid_price) >= SPLIT_LEG_MIN_NOTIONAL_1E8
     }
 
     /// Continuous C1 single-lot asymmetry EV gate (`EV_1lot > 0` when Runner split is impossible).
@@ -902,8 +916,7 @@ impl PairSpec {
             let p_mkr = 1.0 - p_tkr;
             let c_mkr_rt = fees.round_trip_maker_exit_bps().raw() as f64;
             let c_tkr_rt = (fees.round_trip_taker_exit_bps().raw().max(100)) as f64;
-            let eq_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0.saturating_mul(4));
-            let eq_sl = Self::elastic_server_sl_distance_bps_with_fees(eq_vol, fees).raw().max(100) as f64;
+            let eq_vol = ScaledBps((PHI * (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 as f64)).round() as i64);
             let srv_sl = Self::elastic_server_sl_distance_bps_with_fees(realized_vol_5m, fees).raw() as f64;
             let g_clamped = signed_geom.clamp(-1.0, 1.0);
             let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
@@ -914,7 +927,12 @@ impl PairSpec {
             };
             let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
             let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
-            let learned_f = (learned_mfe_bps.max(0) as f64) * (srv_sl / eq_sl).max(1.0);
+            let learned_f = modulate_learned_mfe_by_diffusive_regime_sbps(
+                learned_mfe_bps,
+                realized_vol_5m,
+                eq_vol,
+            )
+            .max(0) as f64;
             let diff_cap = INV_PHI2 * (realized_vol_5m.raw().max(0) as f64);
             let base_mfe = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
             let runner_gain = 1.0 + INV_PHI2 * h_geom + INV_PHI3 * (ob_ratio - 1.0);
@@ -947,13 +965,28 @@ impl PairSpec {
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
+        let eq_vol_reg = (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2)) as f64;
+        let regime_ratio = if vol_f > 0.0 {
+            (vol_f / eq_vol_reg).sqrt().clamp(INV_PHI, PHI)
+        } else {
+            INV_PHI
+        };
+        let c_mkr_floor = (fees.round_trip_maker_exit_bps().raw().max(100)) as f64;
+        let mfe_struct_floor = mfe_f.min(PHI * c_mkr_floor * (1.0 + INV_PHI3 * h_geom))
+            * h_geom
+            * (INV_PHI + INV_PHI2 * s_support.get());
+        let mfe_reg = if regime_ratio <= 1.0 {
+            (mfe_f * regime_ratio).max(mfe_struct_floor)
+        } else {
+            mfe_f * (1.0 + s_prop.get() * h_vol * (regime_ratio - 1.0))
+        };
         let diff_1m = vol_f / SQRT_5;
         let vol_exp = if vol_f > eq_vol_f {
-            1.0 + s_prop.get() * h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
+            1.0 + s_prop.get() * h_vol * INV_PHI2 * ((diff_1m / mfe_reg.max(100.0)) - 1.0).max(0.0)
         } else {
             1.0 - INV_PHI3 * (1.0 - h_geom) * (1.0 - (vol_f / eq_vol_f).clamp(0.0, 1.0))
         };
-        let eff_mfe = ScaledBps((mfe_f * vol_exp).round() as i64);
+        let eff_mfe = ScaledBps((mfe_reg * vol_exp).round() as i64);
         let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2 * s_prop.get())).round() as i64);
         let c_rt_dyn = (self.expected_round_trip_cost_bps_dynamic(mid_price, taker_prob_pm, fees).raw().max(150)) as f64;
         let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom * s_support.get()))).round() as i64);
@@ -998,7 +1031,7 @@ impl PairSpec {
         )
     }
 
-    /// Coherent V5.4 Pillar-2 ex-ante net Expected Value (`ScaledBps`) coupling indivisible `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
+    /// Coherent V5.4.1 Pillar-2 ex-ante net Expected Value (`ScaledBps`) coupling indivisible `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
     #[inline]
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
@@ -1046,12 +1079,16 @@ impl PairSpec {
         let g_clamped = signed_geom.clamp(-1.0, 1.0);
 
         if self.can_split_runner_legs(allocated_lots, entry_px) {
-            let eq_vol = ScaledBps(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0.saturating_mul(4));
-            let eq_sl = Self::elastic_server_sl_distance_bps_with_fees(eq_vol, fees).raw().max(100) as f64;
+            let eq_vol = ScaledBps((PHI * (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 as f64)).round() as i64);
             let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
             let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
             let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
-            let learned_f = (learned_mfe_bps.max(0) as f64) * (srv_sl / eq_sl).max(1.0);
+            let learned_f = modulate_learned_mfe_by_diffusive_regime_sbps(
+                learned_mfe_bps,
+                realized_vol_5m,
+                eq_vol,
+            )
+            .max(0) as f64;
             let diff_cap = INV_PHI2 * (realized_vol_5m.raw().max(0) as f64);
             let base_mfe = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
             let runner_gain = 1.0 + INV_PHI2 * h_geom + INV_PHI3 * (ob_ratio - 1.0);
@@ -1072,13 +1109,28 @@ impl PairSpec {
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
+        let eq_vol_reg = (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw().saturating_mul(2)) as f64;
+        let regime_ratio = if vol_f > 0.0 {
+            (vol_f / eq_vol_reg).sqrt().clamp(INV_PHI, PHI)
+        } else {
+            INV_PHI
+        };
+        let c_mkr_floor = (fees.round_trip_maker_exit_bps().raw().max(100)) as f64;
+        let mfe_struct_floor = mfe_f.min(PHI * c_mkr_floor * (1.0 + INV_PHI3 * h_geom))
+            * h_geom
+            * (INV_PHI + INV_PHI2 * s_support.get());
+        let mfe_reg = if regime_ratio <= 1.0 {
+            (mfe_f * regime_ratio).max(mfe_struct_floor)
+        } else {
+            mfe_f * (1.0 + s_prop.get() * h_vol * (regime_ratio - 1.0))
+        };
         let diff_1m = vol_f / SQRT_5;
         let vol_exp = if vol_f > eq_vol_f {
-            1.0 + s_prop.get() * h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
+            1.0 + s_prop.get() * h_vol * INV_PHI2 * ((diff_1m / mfe_reg.max(100.0)) - 1.0).max(0.0)
         } else {
             1.0 - INV_PHI3 * (1.0 - h_geom) * (1.0 - (vol_f / eq_vol_f).clamp(0.0, 1.0))
         };
-        let eff_mfe = ScaledBps((mfe_f * vol_exp).round() as i64);
+        let eff_mfe = ScaledBps((mfe_reg * vol_exp).round() as i64);
         let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2 * s_prop.get())).round() as i64);
         let c_rt_dyn = (self.expected_round_trip_cost_bps_dynamic(entry_px, taker_prob_pm, fees).raw().max(150)) as f64;
         let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom * s_support.get()))).round() as i64);
@@ -1292,4 +1344,29 @@ pub fn passes_asymmetry_ev_gate_v51(
         BoundedScore::ONE,
         fees,
     )
+}
+
+/// Smooth C1 diffusive regime modulator `sqrt(realized_vol_5m / eq_vol_5m).clamp(INV_PHI, PHI)`
+/// preventing storm-inflated `learned_mfe_bps` from leaving unreachable hanging quotes in calm markets (V5.4.1).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::manual_clamp)]
+pub fn modulate_learned_mfe_by_diffusive_regime_sbps(
+    learned_mfe_bps: i64,
+    realized_vol_5m: ScaledBps,
+    eq_vol_5m: ScaledBps,
+) -> i64 {
+    const PHI_D: f64 = 1.618_033_988_749_895;
+    const INV_PHI_D: f64 = 0.618_033_988_749_895;
+    if learned_mfe_bps <= 0 {
+        return 0;
+    }
+    let eq_f = (eq_vol_5m.raw().max(ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw())) as f64;
+    let cur_f = (realized_vol_5m.raw().max(0)) as f64;
+    let regime_mult = if cur_f > 0.0 {
+        (cur_f / eq_f).sqrt().clamp(INV_PHI_D, PHI_D)
+    } else {
+        INV_PHI_D
+    };
+    ((learned_mfe_bps as f64) * regime_mult).round() as i64
 }

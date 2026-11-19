@@ -1,4 +1,4 @@
-//! Continuous 1:1 Walk-Forward PAR1/PAR2 Replay Engine, Elastic Daily Shield, Quantum EV & Digital Twin (V5.4).
+//! Continuous 1:1 Walk-Forward PAR1/PAR2 Replay Engine, Elastic Daily Shield, Quantum EV & Digital Twin (V5.4.1).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -334,7 +334,22 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             if require_ring_warmup && (first_ring_ts_ns <= 0 || warm_dt < 300_000_000_000) { continue; }
                             let s_taker_pm = gov.slot_taker_prob_permille(s_idx, side);
                             let cand_px = side.select_entry_bbo_price(cur_snap.bids[0].price, cur_snap.asks[0].price);
-                            if !spec.passes_quantum_ev_growth_gate(eq_now, cand_px, cur_snap.realized_vol_5m, mfe_s, s_taker_pm, fees) {
+                            let is_foll = s_idx > 0 && cur_snap.symbol_id != btc_snap.symbol_id;
+                            let btc_ice_al = if is_foll {
+                                (if epps_beta < -1e-6 { -1.0 } else { 1.0 })
+                                    * OrthogonalFactorState::snr_composite_score(&btc_snap)
+                                    * side.sign_f64()
+                            } else {
+                                0.0
+                            };
+                            let s_ice = crate::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+                                cur_snap.factor_ofi.get() * side.sign_f64(),
+                                cur_snap.factor_tfi.get() * side.sign_f64(),
+                                btc_ice_al,
+                            );
+                            if s_ice >= crate::alpha_3factor::INV_PHI
+                                || !spec.passes_quantum_ev_growth_gate(eq_now, cand_px, cur_snap.realized_vol_5m, mfe_s, s_taker_pm, fees)
+                            {
                                 rep.quantum_ev_vetoes += 1;
                                 continue;
                             }
@@ -979,7 +994,21 @@ pub mod omega_twin {
                     if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
                         let s_taker_pm = self.gov.slot_taker_prob_permille(s_idx, side);
                         let cand_px = side.select_entry_bbo_price(ev.snap.bids[0].price, ev.snap.asks[0].price);
-                        if !spec.passes_quantum_ev_growth_gate(eq_now, cand_px, ev.snap.realized_vol_5m, mfe_s, s_taker_pm, fees)
+                        let is_foll = s_idx > 0 && ev.snap.symbol_id != btc_snap.symbol_id;
+                        let btc_ice_al = if is_foll {
+                            (if epps_beta < -1e-6 { -1.0 } else { 1.0 })
+                                * OrthogonalFactorState::snr_composite_score(&btc_snap)
+                                * side.sign_f64()
+                        } else {
+                            0.0
+                        };
+                        let s_ice = crate::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+                            ev.snap.factor_ofi.get() * side.sign_f64(),
+                            ev.snap.factor_tfi.get() * side.sign_f64(),
+                            btc_ice_al,
+                        );
+                        if s_ice >= crate::alpha_3factor::INV_PHI
+                            || !spec.passes_quantum_ev_growth_gate(eq_now, cand_px, ev.snap.realized_vol_5m, mfe_s, s_taker_pm, fees)
                             || !passes_elliott_macro_coherence_guard_with_sync(side, &ev.snap, &btc_snap, epps_corr)
                             || !passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, s_taker_pm, fees)
                             || !can_stage_same_direction_entry(s_idx, side, now_ns, &self.engines, &self.cached_snaps)
@@ -1479,7 +1508,7 @@ pub mod omega_twin {
         let ab = run_quadruple_omega_ablation_suite();
         let twin = run_omega_digital_twin_walk_forward_lab();
 
-        let sec_title = vec![format!("{ANSI_SKY_BLUE}[VORTEX-REPLAY OMEGA V5.4] 4-ARM PARETO ABLATION & 1:1 PAR2 DIGITAL TWIN GATE{ANSI_RESET}")];
+        let sec_title = vec![format!("{ANSI_SKY_BLUE}[VORTEX-REPLAY OMEGA V5.4.1] 4-ARM PARETO ABLATION & 1:1 PAR2 DIGITAL TWIN GATE{ANSI_RESET}")];
         let sec_fifo = vec![format!("  {ANSI_GREEN}200k FIFO Queue Sim{ANSI_RESET}: {ev_per_sec} ev/s | Passive Fills: {fills} | PostOnly Rejects: {rejects}")];
         let sec_arms = vec![
             format!("  MODEL A   (Baseline Fixed L1)      : {:>+8.2} bps net", (ab.arm_a_baseline_net_bps_x100 as f64) / 100.0),

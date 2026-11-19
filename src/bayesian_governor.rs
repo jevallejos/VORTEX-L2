@@ -841,13 +841,29 @@ impl OnlineAdaptiveGovernor {
         let (self_drift_bps, self_ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, candidate_snap);
         let dir_s = side.sign_f64();
         let signed_geom = candidate_snap.factor_geom.get() * dir_s;
-        let cand_comp = OrthogonalFactorState::adaptive_snr_from_snapshot(candidate_snap, spoof_density).get().abs();
+        if !spoof_density.is_finite() || !epps_signed_beta.is_finite() { return false; }
+        let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
+        let btc_iceberg_al = if slot_idx > 0 && candidate_snap.symbol_id != btc_leader_snap.symbol_id {
+            (if beta_c < -1e-6 { -1.0 } else { 1.0 })
+                * OrthogonalFactorState::snr_composite_score(btc_leader_snap)
+                * dir_s
+        } else {
+            0.0
+        };
+        let s_iceberg = crate::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+            candidate_snap.factor_ofi.get() * dir_s,
+            candidate_snap.factor_tfi.get() * dir_s,
+            btc_iceberg_al,
+        );
+        let cand_comp = OrthogonalFactorState::adaptive_snr_from_snapshot(candidate_snap, spoof_density)
+            .get()
+            .abs()
+            * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg);
         let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         let in_scar = self.is_in_scar_debt(slot_idx, side);
         if !spec.passes_oversized_lot_conviction_guard_with_vol_and_fees(
             wallet_usdt_1e8, entry_px, candidate_snap.realized_vol_5m, cand_comp, in_local_scar, fees,
         ) { return false; }
-        if !spoof_density.is_finite() || !epps_signed_beta.is_finite() { return false; }
         let Ok((e_kin, base_e_min)) = self.evaluate_kinematic_energy_surface(slot_idx, side, self_drift_bps, self_ext_bps, signed_geom, cand_comp) else { return false; };
         let cadence = self.slot_temporal_cadence_for_side(slot_idx, Some(side), candidate_snap);
         let fee_rt = self.active_maker_rt_fee_bps();
@@ -863,7 +879,6 @@ impl OnlineAdaptiveGovernor {
         let ir_adj = (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
         if in_scar && candidate_snap.factor_tfi.get().abs() < (if in_local_scar { 0.45 } else { 0.38 }) { return false; }
         if self.sl_streak[slot_idx][d] >= 1 && self.ewma_net_bps_x100[slot_idx][d] <= -800 && cand_comp < 0.72 { return false; }
-        let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
         let beta_sign = if beta_c >= 0.0 { 1.0 } else { -1.0 };
         let btc_signed_snr = if slot_idx == 0 {
             OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
@@ -936,7 +951,21 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_cross_side_abc_chop_shield(slot_idx, side, snap) { return Err("VETO_CROSS_SIDE_ABC_CHOP_COOLDOWN"); }
         let dir_s = side.sign_f64();
         if (ofi * dir_s) < 0.08 { return Err("VETO_PREFLIGHT_OFI_DECAY"); }
-        let signed_snr = OrthogonalFactorState::adaptive_snr_from_snapshot(snap, spoof_density).get() * dir_s;
+        let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
+        let btc_iceberg_al = if slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id {
+            (if beta_c < -1e-6 { -1.0 } else { 1.0 })
+                * OrthogonalFactorState::snr_composite_score(btc_leader_snap)
+                * dir_s
+        } else {
+            0.0
+        };
+        let s_iceberg = crate::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+            ofi * dir_s,
+            tfi * dir_s,
+            btc_iceberg_al,
+        );
+        let raw_signed_snr = OrthogonalFactorState::adaptive_snr_from_snapshot(snap, spoof_density).get() * dir_s;
+        let signed_snr = raw_signed_snr * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg);
         if signed_snr < 0.30 { return Err("VETO_PREFLIGHT_SNR_COLLAPSE"); }
         let spec = APPROVED_SPECS[slot_idx];
         let fees = self.active_fee_schedule();
@@ -950,7 +979,6 @@ impl OnlineAdaptiveGovernor {
         let (own_q, opp_q) = match side { Side::Bid => (best_bid.qty.0, best_ask.qty.0), Side::Ask => (best_ask.qty.0, best_bid.qty.0) };
         let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(if signed_snr >= 0.68 && own_q >= opp_q { 0.00 } else { 0.02 }, 0.06);
         if signed_geom < min_pre_geom { return Err("VETO_PREFLIGHT_GEOM_REVERSAL"); }
-        let beta_c = if slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
         let btc_snr = if slot_idx == 0 {
             OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
         } else {
@@ -1743,10 +1771,16 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
-    /// Evaluates V5.4 Pillar-2 ex-ante Expected Value coupling `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
+    /// Evaluates V5.4.1 Pillar-2 ex-ante Expected Value coupling `1-lot` excursion to `OFI + BTC` propulsion `S_prop`
+    /// and universal `C1` passive Iceberg absorption attenuation across multi-lot and `1-lot` contracts.
     #[inline]
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        clippy::too_many_arguments
+    )]
     pub fn evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
         &self,
         slot_idx: usize,
@@ -1765,6 +1799,7 @@ impl OnlineAdaptiveGovernor {
         let dir_s = side.sign_f64();
         let signed_geom = dir_s * snap.factor_geom.get();
         let ofi_aligned = dir_s * snap.factor_ofi.get();
+        let tfi_aligned = dir_s * snap.factor_tfi.get();
         let is_follower = slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id;
         let beta_dir = if epps_signed_beta < -1e-6 { -1.0 } else { 1.0 };
         let btc_aligned = if is_follower {
@@ -1772,13 +1807,22 @@ impl OnlineAdaptiveGovernor {
         } else {
             crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(snap) * dir_s
         };
+        let btc_iceberg_al = if is_follower { btc_aligned } else { 0.0 };
+        let s_iceberg = crate::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+            ofi_aligned,
+            tfi_aligned,
+            btc_iceberg_al,
+        );
+        let eff_learned_mfe = ((learned_mfe_bps.raw() as f64)
+            * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg))
+            .round() as i64;
         let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
         let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
-        spec.evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+        let base_ev = spec.evaluate_pilar2_asymmetry_ev_with_flow_sbps(
             allocated_lots,
             entry_px,
             snap.realized_vol_5m,
-            learned_mfe_bps.raw(),
+            eff_learned_mfe,
             self.slot_taker_prob_permille(slot_idx, side),
             signed_geom,
             bull_u16,
@@ -1787,7 +1831,9 @@ impl OnlineAdaptiveGovernor {
             self.active_fee_schedule(),
             ofi_aligned,
             btc_aligned,
-        )
+        )?;
+        let ev_damped = ((base_ev as f64) * (1.0 - crate::alpha_3factor::PHI * s_iceberg)).round() as i64;
+        (ev_damped > 0).then_some(ev_damped)
     }
 
     /// Continuous C1 pre-funding cliff survival gate coupled to self-learned `tau_mkt`, `MFE`, `IR` & `p_Taker`.

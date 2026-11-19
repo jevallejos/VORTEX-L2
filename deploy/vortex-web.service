@@ -1,5 +1,5 @@
 [Unit]
-Description=VORTEX-OMEGA V5.4 Loopback Observatory & 5Hz SSE Bridge (127.0.0.1:8787, SHM v15 Read-Only)
+Description=VORTEX-OMEGA V5.4.1 Loopback Observatory & 5Hz SSE Bridge (127.0.0.1:8787, SHM v15 Read-Only)
 After=network-online.target vortex-tap.service
 Wants=network-online.target
 

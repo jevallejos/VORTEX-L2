@@ -614,6 +614,15 @@ impl OrthogonalFactorState {
         if !passes_corrective_abc_snapshot_guard_with_sync_c1(side, snap, eff_epps_corr, btc_aligned) {
             return SignalVerdict::NeutralNoAction;
         }
+        let s_iceberg = compute_passive_iceberg_absorption_penalty_c1(
+            ofi * dir_sign,
+            tfi * dir_sign,
+            btc_aligned,
+        );
+        let eff_composite_abs = composite.abs() * (1.0 - INV_PHI * s_iceberg);
+        if eff_composite_abs < elastic_snr_floor {
+            return SignalVerdict::NeutralNoAction;
+        }
         let raw_vol = snap.realized_vol_5m.raw() as f64;
         let learned_span = learned_mfe_bps.raw().max(0).saturating_add(learned_dir_edge_bps.raw().max(0));
         let eq_horizon = b3x_barrier.raw().saturating_mul(3).saturating_add(learned_span.saturating_mul(2)) as f64;
@@ -638,8 +647,8 @@ impl OrthogonalFactorState {
         } else {
             raw_vol
         };
-        let flow_boost = 0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs();
-        let expected_excursion = ScaledBps(((composite.abs() * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
+        let flow_boost = (0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs()) * (1.0 - INV_PHI_SQ * s_iceberg);
+        let expected_excursion = ScaledBps(((eff_composite_abs * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
         if expected_excursion.raw() >= b3x_barrier.raw() {
             SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps: expected_excursion }
         } else {
@@ -1342,6 +1351,46 @@ mod v49_geom_macro_guard_tests {
             APPROVED_SPECS[4], Side::Ask, PriceTicks(19_336), &q_snap, LotQty(740),
         ));
     }
+}
+
+/// Continuous C1 passive Iceberg absorption / exhaustion penalty in `[0.0, 1.0]` across all contracts (V5.4.1).
+/// Activates smoothly when aggressive tape hits without displacing the L1..L5 book (`tfi_al - ofi_al > INV_PHI_SQ`),
+/// book orderflow is weak (`ofi_al < INV_PHI_SQ`), and BTC leader lacks positive confirmation (`btc_al <= 0.0`),
+/// while remaining identically `0.0` on all healthy impulses (`ofi_al >= INV_PHI_SQ`).
+#[inline]
+#[must_use]
+pub fn compute_passive_iceberg_absorption_penalty_c1(
+    ofi_aligned: f64,
+    tfi_aligned: f64,
+    btc_aligned: f64,
+) -> f64 {
+    const INV_PHI_7: f64 = INV_PHI_CUBE * INV_PHI_FOURTH;
+    const INV_PHI_8: f64 = INV_PHI_FOURTH * INV_PHI_FOURTH;
+    if !ofi_aligned.is_finite()
+        || !tfi_aligned.is_finite()
+        || !btc_aligned.is_finite()
+        || ofi_aligned >= INV_PHI_SQ
+        || tfi_aligned - ofi_aligned <= INV_PHI_SQ
+        || btc_aligned >= INV_PHI_7
+    {
+        return 0.0;
+    }
+    let s_div = crate::wave_elliott::hermite_smoothstep_c1(
+        tfi_aligned - ofi_aligned,
+        INV_PHI_SQ,
+        INV_PHI_SQ + INV_PHI_8,
+    );
+    let s_ofi_weak = crate::wave_elliott::hermite_smoothstep_c1(
+        INV_PHI_SQ - ofi_aligned,
+        0.0,
+        INV_PHI_FIFTH,
+    );
+    let s_btc_nonpos = crate::wave_elliott::hermite_smoothstep_c1(
+        INV_PHI_7 - btc_aligned,
+        0.0,
+        INV_PHI_7,
+    );
+    (s_div * s_ofi_weak * s_btc_nonpos).clamp(0.0, 1.0)
 }
 
 /// Self-learned `C1` inter-asset synchronized breakout lift `delta_h_sync` in `[0.0, INV_PHI_SQ]` for `CorrectiveAbc` (V5.4).
