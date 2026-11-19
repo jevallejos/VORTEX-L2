@@ -1,4 +1,4 @@
-//! 200Hz Zero-Jitter 12-Slot Execution Daemon (V5.3.2: Elastic Daily Shield, Quantum EV, Toxic Unwind & 8h Funding).
+//! 200Hz Zero-Jitter 12-Slot Execution Daemon (V5.4: Elastic Daily Shield, Quantum EV, Toxic Unwind & 8h Funding).
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -25,7 +25,7 @@ use crate::exec_gateway_handlers::{
     bootstrap_live_adopt_if_enabled, handle_gateway_event, run_oos_520_certification_suite, ExecRuntimeState,
 };
 use crate::execution_fsm::{
-    passes_elliott_macro_coherence_guard, passes_order_block_wall_guard_dynamic,
+    passes_elliott_macro_coherence_guard_with_sync, passes_order_block_wall_guard_dynamic,
     passes_stoikov_repeg_coherence_guard_with_beta, CanonicalExitQuote, ExitSubReason,
     OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
 };
@@ -446,7 +446,7 @@ pub fn step_12_slot_daemon_tick(
         let _ = vault_tx.try_send(VaultIoCommand::SaveDailyGovernor { ts_ns: now_ns.0, state: rt.daily_gov });
         if rt.daily_gov.is_hibernating() || prev_phase.label().starts_with("SLEEP") {
             let _ = tg_tx.try_send(format!(
-                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.3.2 DAILY SHIELD] Transicion UTC: {} -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4 DAILY SHIELD] Transicion UTC: {} -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                 prev_phase.label(), cur_phase.label(),
                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
@@ -470,6 +470,7 @@ pub fn step_12_slot_daemon_tick(
         let spoof_d = rt.spoof_clocks[s_idx].spoofing_density();
         engines[s_idx].hawkes_tracker.set_spoof_density(spoof_d);
         let evt_dil = rt.spoof_clocks[s_idx].event_clock_dilation();
+        let epps_corr = if s_idx == 0 { 0.0 } else { rt.epps_trackers[s_idx].correlation(false) };
         let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &snap, &btc_snap, &rt.epps_trackers[s_idx]);
         match engines[s_idx].state {
             OrderLifecycleState::Idle => {}
@@ -500,21 +501,21 @@ pub fn step_12_slot_daemon_tick(
                 engines[s_idx].sync_governor_dynamics(gov);
                 if now_ns.0.saturating_sub(submitted_ts.0) < engines[s_idx].elastic_preflight_window_ns(snap.realized_vol_5m) { continue; }
                 let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-                let Ok((e_kin, e_min)) = gov.confirm_preflight_kinematics_v49(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta) else {
+                let Ok((e_kin, e_min)) = gov.confirm_preflight_kinematics_v54(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr) else {
                     rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::PreflightDriftOrDecay);
                     continue;
                 };
-                let Ok((synced_entry_px, synced_sl_px)) = engines[s_idx].sync_preflight_l1_entry_auto(&snap) else {
+                let Ok((synced_entry_px, synced_sl_px)) = engines[s_idx].sync_preflight_l1_entry_auto_with_sync(&snap, &btc_snap, epps_corr) else {
                     rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::PreflightDriftOrDecay);
                     continue;
                 };
-                let Some(pre_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_sbps(s_idx, side, qty, synced_entry_px, mfe_s, &snap) else {
+                let Some(pre_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(s_idx, side, qty, synced_entry_px, mfe_s, &snap, &btc_snap, epps_beta) else {
                     rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
@@ -632,10 +633,11 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].learned_taker_prob_pm,
                     engines[s_idx].active_fees,
                 );
-                let macro_bad = opp_wave3_now || (elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard(side, &snap));
+                let macro_bad = opp_wave3_now || (elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard_with_sync(side, &snap, &btc_snap, epps_corr));
                 let ob_bad = elapsed_ns >= q_timers.macro_abort_ns && !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
-                let geom_flip = evaluate_elastic_spoof_geom_abort_with_queue_v531(
+                let geom_flip = evaluate_elastic_spoof_geom_abort_with_entry_v54(
                     side,
+                    entry_price,
                     &snap,
                     entry_forensics[s_idx].geom_in,
                     elapsed_ns,
@@ -690,14 +692,14 @@ pub fn step_12_slot_daemon_tick(
                         engines[s_idx].active_fees,
                     )
                     && passes_stoikov_repeg_coherence_guard_with_beta(s_idx, side, &snap, &btc_snap, epps_beta)
-                    && passes_elliott_macro_coherence_guard(side, &snap)
+                    && passes_elliott_macro_coherence_guard_with_sync(side, &snap, &btc_snap, epps_corr)
                     && passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)
                 {
                     let new_l1 = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
                     let max_chase_ticks = spec.max_repeg_chase_ticks(entry_price, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
                     let moved_away = match side { Side::Bid => new_l1.0 > entry_price.0 && (new_l1.0 - entry_price.0) <= max_chase_ticks, Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase_ticks };
-                    if moved_away && gov.confirm_preflight_kinematics_v49(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta).is_ok() {
-                        if let Some(repeg_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_sbps(s_idx, side, qty, new_l1, mfe_s, &snap) {
+                    if moved_away && gov.confirm_preflight_kinematics_v54(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr).is_ok() {
+                        if let Some(repeg_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(s_idx, side, qty, new_l1, mfe_s, &snap, &btc_snap, epps_beta) {
                             if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&snap, new_l1) {
                                 entry_forensics[s_idx].ofi_in = snap.factor_ofi.get();
                                 entry_forensics[s_idx].tfi_in = snap.factor_tfi.get();
@@ -867,12 +869,13 @@ pub fn step_12_slot_daemon_tick(
             let spec = APPROVED_SPECS[s_idx];
             let spoof_d = rt.spoof_clocks[s_idx].spoofing_density();
             engines[s_idx].hawkes_tracker.set_spoof_density(spoof_d);
+            let epps_corr = if s_idx == 0 { 0.0 } else { rt.epps_trackers[s_idx].correlation(false) };
             let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &snap, &btc_snap, &rt.epps_trackers[s_idx]);
             let probe_side = if OrthogonalFactorState::adaptive_snr_from_snapshot(&snap, spoof_d).get() >= 0.0 { Side::Bid } else { Side::Ask };
             let (probe_edge, _, _) = gov.slot_direction_diagnostics(s_idx, probe_side);
             let taker_pm = gov.slot_taker_prob_permille(s_idx, probe_side);
             let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-            let verdict = OrthogonalFactorState::evaluate_entry_signal_v46(spec, &snap, &btc_snap, mfe_s, ScaledBps(probe_edge), taker_pm, fees, spoof_d, epps_beta);
+            let verdict = OrthogonalFactorState::evaluate_entry_signal_v54(spec, &snap, &btc_snap, mfe_s, ScaledBps(probe_edge), taker_pm, fees, spoof_d, epps_beta, epps_corr);
             match verdict {
                 SignalVerdict::SpoofingVeto => publish_slot_veto_code(arena, s_idx, LastVetoCode::SpoofingVeto),
                 SignalVerdict::NeutralNoAction => {
@@ -883,7 +886,7 @@ pub fn step_12_slot_daemon_tick(
                             gov.slot_eq_vol_5m_bps(s_idx),
                             taker_pm,
                             fees,
-                        ) || !passes_elliott_macro_coherence_guard(probe_side, &snap)
+                        ) || !passes_elliott_macro_coherence_guard_with_sync(probe_side, &snap, &btc_snap, epps_corr)
                         {
                             LastVetoCode::MacroElliottContradiction
                         } else {
@@ -899,20 +902,20 @@ pub fn step_12_slot_daemon_tick(
                         publish_slot_veto_code(arena, s_idx, LastVetoCode::QueueDepthOrOversizedLot);
                         continue;
                     }
-                    if !passes_elliott_macro_coherence_guard(side, &snap) { publish_slot_veto_code(arena, s_idx, LastVetoCode::MacroElliottContradiction); continue; }
+                    if !passes_elliott_macro_coherence_guard_with_sync(side, &snap, &btc_snap, epps_corr) { publish_slot_veto_code(arena, s_idx, LastVetoCode::MacroElliottContradiction); continue; }
                     if !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, s_taker_pm, fees) { publish_slot_veto_code(arena, s_idx, LastVetoCode::OpposingOrderBlockWall); continue; }
                     if !can_stage_same_direction_entry(s_idx, side, now_ns, engines, cached_snaps) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
                     let lots = gov.compute_slot_entry_lots_v48(s_idx, side, rt.wallet_1e8, &snap, daily_damper_pm);
                     let risk_ppm = slot_position_risk_ppm_with_fees(spec, rt.wallet_1e8, cand_px, lots, snap.realized_vol_5m, fees);
                     let beta_x1000 = rt.epps_trackers[s_idx].correlated_beta_x1000(s_idx == 0, snap.realized_vol_5m, btc_vol);
                     if !beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000) || !passes_elastic_daily_tail_risk_budget(s_idx, side, risk_ppm, rt.wallet_1e8, &rt.daily_gov, ledger.sinking_fund_reserve_bps_x100, engines, cached_snaps, gov) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
-                    if let Err(v49_veto) = gov.authorizes_adaptive_entry_v49(s_idx, side, rt.wallet_1e8, daily_damper_pm, mfe_s, &snap, &btc_snap, spoof_d, epps_beta) {
+                    if let Err(v49_veto) = gov.authorizes_adaptive_entry_v54(s_idx, side, rt.wallet_1e8, daily_damper_pm, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr) {
                         let veto_c = if gov.audit_historical_entry_veto(s_idx, side, cand_px.0, snap.ts_local_ns.0).is_some() { LastVetoCode::ScarCooldownOrContagion } else { v49_veto };
                         publish_slot_veto_code(arena, s_idx, veto_c);
                         continue;
                     }
                     engines[s_idx].sync_governor_for_side(gov, side);
-                    if engines[s_idx].try_arm_maker_entry(&snap, verdict, lots).is_ok() && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. }) {
+                    if engines[s_idx].try_arm_maker_entry_with_sync(&snap, &btc_snap, verdict, lots, epps_corr).is_ok() && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. }) {
                         rt.queue_flow_ema[s_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                         rt.last_abort_veto[s_idx] = LastVetoCode::None;
                         publish_slot_veto_code(arena, s_idx, LastVetoCode::None);
@@ -975,7 +978,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         gov.set_entry_warmup_until_ns(warmup_until_ns);
         rt.entry_warmup_until_ns = warmup_until_ns;
         println!(
-            "{ANSI_GREEN}\u{1f7e2} [EMA+EPPS PREWARM V5.3.2] Hydrated {prewarmed_slots}/12 EMAs, {epps_slots}/12 Epps | Live L2+WS converge gate armed ({}s floor) | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
+            "{ANSI_GREEN}\u{1f7e2} [EMA+EPPS PREWARM V5.4] Hydrated {prewarmed_slots}/12 EMAs, {epps_slots}/12 Epps | Live L2+WS converge gate armed ({}s floor) | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
             warmup_ns / 1_000_000_000,
             (startup_hs.fee_schedule.maker_fee_bps.raw() as f64) / 100.0,
             (startup_hs.fee_schedule.taker_fee_bps.raw() as f64) / 100.0
@@ -994,7 +997,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     let mut last_handshake_refresh_ns = boot_ns.0;
     let mut last_rest_dispatch_ns = 0_i64;
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V5.3.2 200.0 Hz ARMED] Elastic Daily Shield + C1 EV Dominance + Anti-Spoof OFI + 8h Funding.{ANSI_RESET}"
+        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V5.4 200.0 Hz ARMED] Elastic Daily Shield + C1 EV Dominance + Anti-Spoof OFI + 8h Funding.{ANSI_RESET}"
     );
 
     loop {
@@ -1022,6 +1025,9 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
                         rt.markout_rings[s_idx].step_clock(
                             mid_now, snap.ts_local_ns, gov.active_fee_schedule().maker_fee_bps.raw(),
                         );
+                        if let Some(mk_pk) = rt.markout_rings[s_idx].take_uncensored_fill_peak_sbps() {
+                            engines[s_idx].observe_markout_ring_favorable_peak(mk_pk);
+                        }
                         gov.observe_market_price(s_idx, &snap);
                     }
                 }
@@ -1074,7 +1080,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         let any_inflight = rt.slot_rpc_inflight.iter().any(|&b| b);
         let (flush_drain_once, drain_standby) = step_drain_standby_latch(rt.drain_active, open_count, pending_entry_count, any_inflight, &mut rt.drain_flushed_once);
         if flush_drain_once {
-            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V5.3.2 DRAIN STANDBY] 0 open positions verified (Wallet == Equity). Standing by.".to_string());
+            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V5.4 DRAIN STANDBY] 0 open positions verified (Wallet == Equity). Standing by.".to_string());
             let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
             if vault_tx.send(VaultIoCommand::FlushBarrier(ack_tx)).is_ok() {
                 let _ = ack_rx.recv_timeout(Duration::from_secs(2));
@@ -1093,7 +1099,7 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
     if args.iter().any(|a| a == "--live") {
         match MappedShmRegion::open_existing_read_only(&shm_path) {
             Ok(reg) => render_live_hud(reg.arena()),
-            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V5.3.2 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
+            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V5.4 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
         }
         return ExitCode::SUCCESS;
     }
@@ -1103,7 +1109,7 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
     }
     let (oos_trades, maker_ratio, pf, cum_usdt, drift) = run_oos_520_certification_suite();
     let sep = "=".repeat(80);
-    println!("{sep}\n[VORTEX-EXEC OMEGA V5.3.2] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
+    println!("{sep}\n[VORTEX-EXEC OMEGA V5.4] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> OOS Closed Trades Verified : {oos_trades} (Gate >= 500){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Maker Exit Ratio           : {maker_ratio:.2}% (Gate >= 80.00%){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Net Profit Factor (PostFee): {pf:.2} (Gate >= 1.35){ANSI_RESET}");
@@ -1603,6 +1609,45 @@ pub fn evaluate_resting_queue_chase_budget_v532(
 
 #[inline]
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+pub fn evaluate_elastic_spoof_geom_abort_with_entry_v54(
+    side: Side,
+    entry_price: PriceTicks,
+    snap: &SymbolLobSnapshot,
+    armed_geom_raw: f64,
+    elapsed_ns: i64,
+    signed_flow_slow: crate::types::BoundedScore,
+    spoof_density: f64,
+    event_dilation: f64,
+    taker_prob_pm: i64,
+    ws_rtt_us: u32,
+    now_ns: i64,
+    geom_adv_since_ns: &mut i64,
+    init_q_lots: LotQty,
+    rem_q_lots: LotQty,
+) -> bool {
+    if crate::kinematic_surface::is_bbo_favorably_past_resting_entry(side, entry_price, snap) {
+        *geom_adv_since_ns = 0;
+        return false;
+    }
+    evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        side,
+        snap,
+        armed_geom_raw,
+        elapsed_ns,
+        signed_flow_slow,
+        spoof_density,
+        event_dilation,
+        taker_prob_pm,
+        ws_rtt_us,
+        now_ns,
+        geom_adv_since_ns,
+        init_q_lots,
+        rem_q_lots,
+    )
+}
+
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
 pub fn evaluate_elastic_spoof_geom_abort_with_queue_v531(
     side: Side,
     snap: &SymbolLobSnapshot,
@@ -1620,12 +1665,14 @@ pub fn evaluate_elastic_spoof_geom_abort_with_queue_v531(
 ) -> bool {
     let dir_s = side.sign_f64();
     let signed_ofi = snap.factor_ofi.get() * dir_s;
-    if !crate::kinematic_surface::allows_front_of_queue_spoof_geom_abort_v531(
+    if !crate::kinematic_surface::allows_front_of_queue_spoof_geom_abort_v54(
         init_q_lots,
         rem_q_lots,
         elapsed_ns,
         signed_ofi,
         signed_flow_slow.get(),
+        ws_rtt_us,
+        event_dilation,
     ) {
         *geom_adv_since_ns = 0;
         return false;

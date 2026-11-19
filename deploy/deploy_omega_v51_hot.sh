@@ -26,13 +26,13 @@ echo "=== [3/5] VERIFICACION P0-B (DRAIN + 0 POSICIONES ABIERTAS + TAP L2 100% A
 touch "$VAULT_DIR/DRAIN_MODE.lock"
 sleep 2
 while [ "$(wc -c < "$VAULT_DIR/vortex_open_positions_state.json" 2>/dev/null || echo 2)" -gt 4 ]; do
-  echo "Esperando cierre natural a 200.0 Hz antes de promover V5.3.2..."
+  echo "Esperando cierre natural a 200.0 Hz antes de promover V5.4..."
   sleep 2
 done
 sudo systemctl stop vortex-web.service vortex-exec.service 2>/dev/null || true
 echo "[OK] vortex-exec detenido sin exposicion | vortex-tap activo (PID=$TAP_PID_BEFORE)."
 
-echo "=== [4/5] SNAPSHOT INMUTABLE PRE-V5.3.2 (BINARIOS + BAULES + SHA256) ==="
+echo "=== [4/5] SNAPSHOT INMUTABLE PRE-V5.4 (BINARIOS + BAULES + SHA256) ==="
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BACKUP_DIR="$VORTEX_DIR/backups/pre_omega_v532_$STAMP"
 mkdir -p "$BACKUP_DIR/bin" "$BACKUP_DIR/vault"
@@ -44,7 +44,7 @@ cp -a "$VAULT_DIR/." "$BACKUP_DIR/vault/" 2>/dev/null || true
 chmod -R a-w "$BACKUP_DIR/vault" 2>/dev/null || true
 echo "[OK] Respaldo sellado en: $BACKUP_DIR"
 
-echo "=== [5/5] INSTALACION ATOMICA + REAPERTURA ZERO-RESTART VORTEX-OMEGA V5.3.2 ==="
+echo "=== [5/5] INSTALACION ATOMICA + REAPERTURA ZERO-RESTART VORTEX-OMEGA V5.4 ==="
 install -m 0755 target/release/vortex_tap "$VORTEX_DIR/bin/vortex_tap"
 install -m 0755 target/release/vortex_replay "$VORTEX_DIR/bin/vortex_replay"
 install -m 0755 target/release/vortex_exec "$VORTEX_DIR/bin/vortex_exec"
@@ -52,7 +52,7 @@ install -m 0755 target/release/vortex_web "$VORTEX_DIR/bin/vortex_web"
 sudo install -m 0644 "$VORTEX_DIR/deploy/vortex-web.service" /etc/systemd/system/vortex-web.service || true
 for unit_f in /etc/systemd/system/vortex-exec.service /etc/systemd/system/vortex-tap.service; do
   if [ -f "$unit_f" ]; then
-    sudo sed -i -E '/prewarm_emas_bybit\.py/d; s/VORTEX-OMEGA V[0-9]+(\.[0-9]+)*/VORTEX-OMEGA V5.3.2/g' "$unit_f" || true
+    sudo sed -i -E '/prewarm_emas_bybit\.py/d; s/VORTEX-OMEGA V[0-9]+(\.[0-9]+)*/VORTEX-OMEGA V5.4/g' "$unit_f" || true
   fi
 done
 sudo systemctl daemon-reload || true

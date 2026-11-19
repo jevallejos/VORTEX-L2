@@ -83,7 +83,12 @@ pub fn passes_order_block_wall_guard(slot_idx: usize, side: Side, snap: &SymbolL
 
 #[inline]
 #[must_use]
-pub fn evaluate_macro_coherence_surface_c1(side: Side, snap: &SymbolLobSnapshot) -> f64 {
+pub fn evaluate_macro_coherence_surface_with_sync_c1(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    epps_corr: f64,
+    btc_aligned: f64,
+) -> f64 {
     if crate::alpha_3factor::is_opposing_impulse_wave3_hazard(side, snap) {
         return 1.0;
     }
@@ -108,8 +113,46 @@ pub fn evaluate_macro_coherence_surface_c1(side: Side, snap: &SymbolLobSnapshot)
     } else {
         0.0
     };
-    let abc_pen = crate::alpha_3factor::evaluate_corrective_abc_fractal_penalty_c1(side, snap);
-    base_c1.max(oi_inv).max(fib_br).max(abc_pen).clamp(0.0, 1.0)
+    let abc_pen = crate::alpha_3factor::evaluate_corrective_abc_fractal_penalty_with_sync_c1(
+        side,
+        snap,
+        epps_corr,
+        btc_aligned,
+    );
+    let s_abc_sync = crate::alpha_3factor::compute_corrective_abc_snapshot_sync_c1(
+        side,
+        snap,
+        epps_corr,
+        btc_aligned,
+    );
+    let slow_zigzag_pen = base_c1.max(oi_inv) * (1.0 - s_abc_sync);
+    slow_zigzag_pen.max(fib_br).max(abc_pen).clamp(0.0, 1.0)
+}
+
+#[inline]
+#[must_use]
+pub fn evaluate_macro_coherence_surface_c1(side: Side, snap: &SymbolLobSnapshot) -> f64 {
+    evaluate_macro_coherence_surface_with_sync_c1(side, snap, 0.0, 0.0)
+}
+
+#[inline]
+#[must_use]
+pub fn passes_elliott_macro_coherence_guard_with_sync(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    btc_leader_snap: &SymbolLobSnapshot,
+    epps_corr: f64,
+) -> bool {
+    let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
+    let eff_corr = if is_follower { epps_corr } else { 0.0 };
+    let corr_sign = if eff_corr < 0.0 { -1.0 } else { 1.0 };
+    let btc_aligned = if is_follower {
+        corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * side.sign_f64()
+    } else {
+        0.0
+    };
+    evaluate_macro_coherence_surface_with_sync_c1(side, snap, eff_corr, btc_aligned)
+        < 0.618_033_988_749_895
 }
 
 #[inline]
@@ -444,12 +487,26 @@ impl SlotExecutionEngine {
         self.sync_preflight_l1_entry(snap, max_drift)
     }
 
+    pub fn sync_preflight_l1_entry_auto_with_sync(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_corr: f64,
+    ) -> Result<(PriceTicks, PriceTicks), VortexError> {
+        let max_drift = self.max_preflight_drift_ticks(snap);
+        self.sync_preflight_l1_entry_with_sync(snap, btc_leader_snap, max_drift, epps_corr)
+    }
+
     #[inline]
     pub fn observe_mfe_sample_with_fee_rt(&mut self, gross_mfe_scaled_bps: i64, fee_rt_bps: i64) {
         let eff_rt = fee_rt_bps.max(100);
-        let m_obs = gross_mfe_scaled_bps.clamp(eff_rt + 40, eff_rt.saturating_mul(12));
-        let eta_pm = if m_obs >= self.learned_mfe_bps { 200 } else { 120 };
-        self.learned_mfe_bps = ((1_000 - eta_pm) * self.learned_mfe_bps + eta_pm * m_obs) / 1_000;
+        if gross_mfe_scaled_bps > self.learned_mfe_bps {
+            let m_up = gross_mfe_scaled_bps.min(9_600);
+            self.learned_mfe_bps = (618 * self.learned_mfe_bps + 382 * m_up) / 1_000;
+        } else {
+            let m_dn = gross_mfe_scaled_bps.clamp(eff_rt + 40, 9_600);
+            self.learned_mfe_bps = (880 * self.learned_mfe_bps + 120 * m_dn) / 1_000;
+        }
     }
 
     #[inline]
@@ -457,7 +514,47 @@ impl SlotExecutionEngine {
         self.observe_mfe_sample_with_fee_rt(gross_mfe_scaled_bps, self.active_maker_rt_fee_bps());
     }
 
-    /// Buckley-James / Kaplan-Meier right-censored MFE plasticity for passive Limit TP fills.
+    /// Couples superior uncensored favorable excursions observed post-fill in `SlotMarkoutRing` directly upward.
+    #[inline]
+    pub fn observe_markout_ring_favorable_peak(&mut self, markout_peak_sbps: i64) {
+        if markout_peak_sbps > self.learned_mfe_bps {
+            self.observe_mfe_sample_with_fee_rt(markout_peak_sbps, self.active_maker_rt_fee_bps());
+        }
+    }
+
+    /// Right-censoring-aware MFE plasticity helper for vault rehydration & closed-trade accounting (V5.4).
+    #[inline]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn observe_mfe_sample_uncensored(
+        &mut self,
+        gross_close_sbps: i64,
+        closed_mfe_sbps: i64,
+        is_maker_exit: bool,
+        is_scratch: bool,
+        fee_rt_bps: i64,
+    ) {
+        const INV_PHI_MFE: f64 = 0.618_033_988_749_895;
+        let eff_rt = fee_rt_bps.max(100);
+        let m_obs = closed_mfe_sbps.max(gross_close_sbps);
+        if (is_scratch && m_obs < self.learned_mfe_bps)
+            || !crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, eff_rt)
+        {
+            return;
+        }
+        let right_censored_maker_win = is_maker_exit
+            && gross_close_sbps > eff_rt
+            && m_obs > 0
+            && (gross_close_sbps as f64) >= INV_PHI_MFE * (m_obs as f64);
+        if right_censored_maker_win && m_obs < self.learned_mfe_bps {
+            return;
+        }
+        self.observe_mfe_sample_with_fee_rt(m_obs, eff_rt);
+    }
+
+    /// Buckley-James / Kaplan-Meier right-censored MFE plasticity for passive Limit TP fills (V5.4).
+    /// Strictly protects `learned_mfe_bps` from downward shrinkage when a profitable Maker Limit TP
+    /// right-censored its own excursion (`capture >= INV_PHI` and `m_km < learned_mfe_bps`), while
+    /// permitting uncapped upward adaptation when `closed_mfe_sbps > learned_mfe_bps`.
     #[inline]
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn observe_censored_close_mfe_plasticity(
@@ -466,6 +563,7 @@ impl SlotExecutionEngine {
         gross_close_sbps: i64,
         is_maker_exit: bool,
     ) {
+        const INV_PHI_MFE: f64 = 0.618_033_988_749_895;
         let eff_rt = self.active_maker_rt_fee_bps();
         let m_obs = self.last_closed_mfe_bps.max(gross_close_sbps);
         let is_defensive_scratch = matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
@@ -483,15 +581,22 @@ impl SlotExecutionEngine {
             let s_flow = crate::wave_elliott::hermite_smoothstep_c1(
                 mu_exit,
                 0.145_898_033_750_315,
-                0.618_033_988_749_895,
+                INV_PHI_MFE,
             );
             let sigma_1m = (self.open_vol_5m_bps.raw().max(1_200) as f64) / 2.236_067_977_499_79;
-            let headroom = (0.618_033_988_749_895 * sigma_1m - (m_obs as f64)).max(0.0);
+            let headroom = (INV_PHI_MFE * sigma_1m - (m_obs as f64)).max(0.0);
             let overshoot = (0.381_966_011_250_105 * s_flow * headroom).round() as i64;
             m_obs.saturating_add(overshoot)
         } else {
             m_obs
         };
+        let right_censored_maker_win = is_maker_exit
+            && gross_close_sbps > eff_rt
+            && m_obs > 0
+            && (gross_close_sbps as f64) >= INV_PHI_MFE * (m_obs as f64);
+        if right_censored_maker_win && m_km < self.learned_mfe_bps {
+            return;
+        }
         self.observe_mfe_sample_with_fee_rt(m_km, eff_rt);
     }
 
@@ -632,6 +737,17 @@ impl SlotExecutionEngine {
     }
 
     pub fn try_arm_maker_entry(&mut self, snap: &SymbolLobSnapshot, verdict: SignalVerdict, qty: LotQty) -> Result<OrderLifecycleState, VortexError> {
+        self.try_arm_maker_entry_with_sync(snap, snap, verdict, qty, 0.0)
+    }
+
+    pub fn try_arm_maker_entry_with_sync(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        verdict: SignalVerdict,
+        qty: LotQty,
+        epps_corr: f64,
+    ) -> Result<OrderLifecycleState, VortexError> {
         if !matches!(self.state, OrderLifecycleState::Idle) || snap.ts_local_ns.0 < self.cooldown_until_ns.0 { return Ok(self.state); }
         let SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps } = verdict else { return Ok(self.state); };
         if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
@@ -641,7 +757,7 @@ impl SlotExecutionEngine {
             self.learned_taker_prob_pm,
             self.active_fees,
         )
-            || !passes_elliott_macro_coherence_guard(side, snap)
+            || !passes_elliott_macro_coherence_guard_with_sync(side, snap, btc_leader_snap, epps_corr)
             || !passes_order_block_wall_guard_dynamic(self.slot_idx, side, snap, self.learned_taker_prob_pm, self.active_fees)
         {
             return Ok(self.state);
@@ -676,6 +792,16 @@ impl SlotExecutionEngine {
     }
 
     pub fn sync_preflight_l1_entry(&mut self, snap: &SymbolLobSnapshot, max_drift_ticks: i64) -> Result<(PriceTicks, PriceTicks), VortexError> {
+        self.sync_preflight_l1_entry_with_sync(snap, snap, max_drift_ticks, 0.0)
+    }
+
+    pub fn sync_preflight_l1_entry_with_sync(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        max_drift_ticks: i64,
+        epps_corr: f64,
+    ) -> Result<(PriceTicks, PriceTicks), VortexError> {
         let OrderLifecycleState::PlacingEntryMaker { side, entry_price: armed_px, .. } = self.state else { return Err(VortexError::InvalidPriceOrTickSpec); };
         if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
             side,
@@ -684,7 +810,7 @@ impl SlotExecutionEngine {
             self.learned_taker_prob_pm,
             self.active_fees,
         )
-            || !passes_elliott_macro_coherence_guard(side, snap)
+            || !passes_elliott_macro_coherence_guard_with_sync(side, snap, btc_leader_snap, epps_corr)
             || !passes_order_block_wall_guard_dynamic(self.slot_idx, side, snap, self.learned_taker_prob_pm, self.active_fees)
         {
             return Err(VortexError::InvalidPriceOrTickSpec);
@@ -1028,10 +1154,11 @@ impl SlotExecutionEngine {
         let ctx = self.open_exit_context()?;
         let adv_f_sbps = self.accrued_open_adverse_funding_sbps(snap);
         let (ws_rtt_us, _) = read_live_ws_pulse();
-        let mut quote = crate::exit_quoter::compute_canonical_exit_quote_omega_v52(
+        let mut quote = crate::exit_quoter::compute_canonical_exit_quote_omega_v54(
             &ctx,
             self.shadow_runner_kinematics(),
             snap,
+            self.open_vol_5m_bps,
             Some(self.wald_sprt.log_likelihood),
             adv_f_sbps,
             ws_rtt_us,
@@ -2033,9 +2160,14 @@ impl SlotExecutionEngine {
                 zeta_eff,
             );
         }
+        let mk_peak = markout_ring.peak_favorable_fill_markout_sbps(self.last_opened_ts);
+        if mk_peak > self.last_closed_mfe_bps {
+            self.last_closed_mfe_bps = mk_peak;
+        }
         let closed = self.step_open_position_with_beta(snap, btc_leader_snap, gov, ledger, epps_signed_beta);
         if let Some(ref sum) = closed {
             self.restore_mfe_if_zero_discovery_sl(prev_mfe, sum);
+            self.observe_markout_ring_favorable_peak(mk_peak);
         }
         closed
     }

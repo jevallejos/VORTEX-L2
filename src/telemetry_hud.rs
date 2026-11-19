@@ -1,4 +1,4 @@
-//! Tear-Free SHM v15 Live HUD, Full 360 Executive Dashboard, Daily Shield & Zero-Alloc Vault Dispatch (V5.3.2).
+//! Tear-Free SHM v15 Live HUD, Full 360 Executive Dashboard, Daily Shield & Zero-Alloc Vault Dispatch (V5.4).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -55,7 +55,9 @@ pub const OPEN_POS_STATE_PATH: &str = "data/vault/vortex_open_positions_state.js
 pub const DRAIN_LOCK_PATH: &str = "data/vault/DRAIN_MODE.lock";
 pub const HALT_LOCK_PATH: &str = "data/vault/HALTED_ON_LOSS.lock";
 pub const DEFAULT_LEARNED_MFE_SCALED_BPS: i64 = 613;
-pub const SCAR_MFE_REHYDRATE_CAP_SCALED_BPS: i64 = 820;
+pub const SCAR_MFE_REHYDRATE_CAP_MULTIPLIER: i64 = 12;
+pub const SCAR_MFE_REHYDRATE_CAP_SCALED_BPS: i64 =
+    SCAR_MFE_REHYDRATE_CAP_MULTIPLIER * (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 * 2);
 const BPS_TO_SCALED_BPS_F64: f64 = 100.0;
 const LEGACY_SCAR_MAKER_FEE_RT_BPS: f64 =
     ((ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 * 2) as f64) / BPS_TO_SCALED_BPS_F64;
@@ -226,7 +228,7 @@ pub fn record_and_notify_entry_fill(
     );
     let _ = tg_tx.try_send(format!(
         concat!(
-            "\u{1f7e1} [VORTEX-OMEGA V5.3.2 {}]\n",
+            "\u{1f7e1} [VORTEX-OMEGA V5.4 {}]\n",
             "\u{2022} Par y Lado : {} ({:?}) | Lote: {}\n",
             "\u{2022} Entrada L1 : {}.{:04} USDT ({}t) | Cola: {} ms\n",
             "\u{2022} Techos/SL  : WIN Floor: {}.{:04} USDT | SL: {}.{:04} USDT\n",
@@ -288,7 +290,7 @@ pub fn format_telegram_close_message(
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
-            "{} [VORTEX-OMEGA V5.3.2 {} #{} \u{2014} {:?}]\n",
+            "{} [VORTEX-OMEGA V5.4 {} #{} \u{2014} {:?}]\n",
             "- Ganancia : {:+.2}% @10x | {:+.4} USDT\n",
             "- Par y Lado : {} ({:?}) qty={} ({}L) | Maker: {}\n",
             "- Precios    : {}.{:04} -> {}.{:04} USDT ({}t -> {}t)\n",
@@ -308,19 +310,29 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
     engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
     reader: R,
 ) {
+    const PHI_REHYD: f64 = 1.618_033_988_749_895;
+    const INV_PHI_REHYD: f64 = 0.618_033_988_749_895;
+
     let mut cold_mask = [false; MAX_ACTIVE_PAIRS];
-    let mut has_any_cold = false;
+    let mut sunk_mask = [false; MAX_ACTIVE_PAIRS];
+    let mut has_any_eligible = false;
+    let mut ewma_sbps = [DEFAULT_LEARNED_MFE_SCALED_BPS as f64; MAX_ACTIVE_PAIRS];
     for s_idx in 0..MAX_ACTIVE_PAIRS {
-        if engines[s_idx].learned_mfe_bps == DEFAULT_LEARNED_MFE_SCALED_BPS {
+        let cur = engines[s_idx].learned_mfe_bps;
+        let active_fee_rt_mkr = engines[s_idx].active_maker_rt_fee_bps().max(100);
+        if cur == DEFAULT_LEARNED_MFE_SCALED_BPS {
             cold_mask[s_idx] = true;
-            has_any_cold = true;
+            ewma_sbps[s_idx] = cur as f64;
+            has_any_eligible = true;
+        } else if cur < ((PHI_REHYD * (active_fee_rt_mkr as f64)).round() as i64) {
+            sunk_mask[s_idx] = true;
+            ewma_sbps[s_idx] = cur as f64;
+            has_any_eligible = true;
         }
     }
-    if !has_any_cold {
+    if !has_any_eligible {
         return;
     }
-    let seed_sbps = DEFAULT_LEARNED_MFE_SCALED_BPS as f64;
-    let mut ewma_sbps = [seed_sbps; MAX_ACTIVE_PAIRS];
     let mut sample_counts = [0_u32; MAX_ACTIVE_PAIRS];
     for line in reader.lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -334,6 +346,12 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
         if !is_maker_exit {
             continue;
         }
+        if matches!(
+            v.get("exit_sub_reason").and_then(serde_json::Value::as_str),
+            Some("AdverseScratchEscape")
+        ) {
+            continue;
+        }
         let Some(s_idx) = v
             .get("symbol")
             .and_then(serde_json::Value::as_str)
@@ -341,31 +359,51 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
         else {
             continue;
         };
-        if !cold_mask[s_idx] {
+        if !cold_mask[s_idx] && !sunk_mask[s_idx] {
             continue;
         }
-        let mfe_bps_opt = v
+        let active_fee_rt_mkr = engines[s_idx].active_maker_rt_fee_bps().max(100);
+        let fee_rt_bps = (active_fee_rt_mkr as f64) / BPS_TO_SCALED_BPS_F64;
+        let floor_bps = ((active_fee_rt_mkr + active_fee_rt_mkr / 8) as f64)
+            / BPS_TO_SCALED_BPS_F64;
+        let explicit_mfe_opt = v
             .get("mfe_bps")
             .and_then(serde_json::Value::as_f64)
-            .filter(|&m| m > 0.0)
-            .or_else(|| {
-                v.get("net_bps")
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|n| n + LEGACY_SCAR_MAKER_FEE_RT_BPS)
-            });
+            .filter(|&m| m > 0.0);
+        let mfe_bps_opt = explicit_mfe_opt.or_else(|| {
+            v.get("net_bps")
+                .and_then(serde_json::Value::as_f64)
+                .map(|n| n + fee_rt_bps.max(LEGACY_SCAR_MAKER_FEE_RT_BPS))
+        });
         let Some(obs_mfe_bps) = mfe_bps_opt else {
             continue;
         };
-        if obs_mfe_bps.is_finite() && obs_mfe_bps > SCAR_MFE_REHYDRATE_FLOOR_BPS {
-            let obs_sbps = obs_mfe_bps * BPS_TO_SCALED_BPS_F64;
-            ewma_sbps[s_idx] += INV_PHI_FOURTH * (obs_sbps - ewma_sbps[s_idx]);
-            sample_counts[s_idx] = sample_counts[s_idx].saturating_add(1);
+        if !obs_mfe_bps.is_finite() || obs_mfe_bps <= floor_bps.min(SCAR_MFE_REHYDRATE_FLOOR_BPS) {
+            continue;
         }
+        let obs_sbps = obs_mfe_bps * BPS_TO_SCALED_BPS_F64;
+        let cap_pct_opt = v.get("mfe_capture_pct").and_then(serde_json::Value::as_f64);
+        let gross_opt = v.get("gross_bps").and_then(serde_json::Value::as_f64);
+        let right_censored = explicit_mfe_opt.is_none()
+            || cap_pct_opt.is_some_and(|pct| pct >= 100.0 * INV_PHI_REHYD)
+            || gross_opt.is_some_and(|g| g > fee_rt_bps && g >= INV_PHI_REHYD * obs_mfe_bps);
+        if obs_sbps < ewma_sbps[s_idx] && (right_censored || sunk_mask[s_idx]) {
+            continue;
+        }
+        ewma_sbps[s_idx] += INV_PHI_FOURTH * (obs_sbps - ewma_sbps[s_idx]);
+        sample_counts[s_idx] = sample_counts[s_idx].saturating_add(1);
     }
     for s_idx in 0..MAX_ACTIVE_PAIRS {
-        if cold_mask[s_idx] && sample_counts[s_idx] > 0 {
-            engines[s_idx].learned_mfe_bps = (ewma_sbps[s_idx].round() as i64)
-                .clamp(DEFAULT_LEARNED_MFE_SCALED_BPS, SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);
+        if sample_counts[s_idx] == 0 {
+            continue;
+        }
+        let active_fee_rt_mkr = engines[s_idx].active_maker_rt_fee_bps().max(100);
+        let cap_sbps = SCAR_MFE_REHYDRATE_CAP_MULTIPLIER.saturating_mul(active_fee_rt_mkr);
+        let cand_sbps = ewma_sbps[s_idx].round() as i64;
+        if cold_mask[s_idx] {
+            engines[s_idx].learned_mfe_bps = cand_sbps.clamp(DEFAULT_LEARNED_MFE_SCALED_BPS, cap_sbps);
+        } else if sunk_mask[s_idx] && cand_sbps > engines[s_idx].learned_mfe_bps {
+            engines[s_idx].learned_mfe_bps = cand_sbps.clamp(engines[s_idx].learned_mfe_bps, cap_sbps);
         }
     }
 }
@@ -408,7 +446,18 @@ pub fn rehydrate_shadow_ledger(
                     let side = side_from_str(v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid"));
                     let net_f = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                     let fee_f = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or((fee_rt as f64) / 100.0);
+                    let gross_f = v.get("gross_bps").and_then(serde_json::Value::as_f64).unwrap_or(net_f + fee_f);
                     let mfe_f = v.get("mfe_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                    let is_mkr = v
+                        .get("is_maker_exit")
+                        .or_else(|| v.get("maker_exit"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let is_scratch = matches!(
+                        v.get("exit_sub_reason").and_then(serde_json::Value::as_str),
+                        Some("AdverseScratchEscape")
+                    );
+                    let gross_sc = (gross_f * 100.0).round() as i64;
                     let net_sc = ScaledBps((net_f * 100.0).round() as i64);
                     let fee_sc = ScaledBps((fee_f * 100.0).round() as i64);
                     let s_opt = slot_from_symbol_name(sym);
@@ -416,7 +465,11 @@ pub fn rehydrate_shadow_ledger(
                     ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
                     if let Some(s_idx) = s_opt {
                         let mfe_sc = (mfe_f * 100.0).round() as i64;
-                        if mfe_sc > 0 { engines[s_idx].observe_mfe_sample_with_fee_rt(mfe_sc, fee_rt); }
+                        if mfe_sc > 0 {
+                            engines[s_idx].observe_mfe_sample_uncensored(
+                                gross_sc, mfe_sc, is_mkr, is_scratch, fee_rt,
+                            );
+                        }
                     }
                 }
                 Some("FUNDING_SETTLEMENT") => {
@@ -435,7 +488,7 @@ pub fn rehydrate_shadow_ledger(
     ledger.closed_trades_count = l3_vault_count;
     arena.exec_closed_count.store(l3_vault_count, Ordering::Release);
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.3.2] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns}){ANSI_RESET}",
+        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.4] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns}){ANSI_RESET}",
         (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
         (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
     );
@@ -527,7 +580,7 @@ fn build_closed_trade_vault_json_v48_core(
         (markout_curve.samples_bps[2] as f64) / 100.0, (markout_curve.samples_bps[3] as f64) / 100.0,
     ];
     let mut base_val = serde_json::json!({
-        "event": "TRADE_CLOSE", "schema": "V5.3.2", "trade_id": ledger.closed_trades_count,
+        "event": "TRADE_CLOSE", "schema": "V5.4", "trade_id": ledger.closed_trades_count,
         "armed_ts_ns": entry_f.armed_ts_ns, "opened_ts_ns": eng.last_opened_ts.0, "ts_ns": ts_ns.0,
         "queue_wait_ms": q_wait_ms, "hold_ms": hold_ms, "symbol": sym, "slot_idx": slot_idx, "side": side_str,
         "closed_lots": summary.closed_lots.0, "legs_consolidated": summary.legs_consolidated,
@@ -717,7 +770,7 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
         DailyShieldPhase::HibernatingLossCap => ANSI_ORANGE,
     };
     let sec_title = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.3.2 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
+        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.4 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
         arena.version()
     )];
     let sec_hdr = vec![concat!(
@@ -922,7 +975,7 @@ pub fn evaluate_capital_scaling_semaphore(
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
             let is_v48 = matches!(
                 v.get("schema").and_then(serde_json::Value::as_str),
-                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2")
+                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4")
             );
             match v.get("event").and_then(serde_json::Value::as_str) {
                 Some("EPOCH_RESET") => {
@@ -1016,7 +1069,7 @@ pub fn render_capital_scaling_semaphore(
         } else {
             (ANSI_YELLOW, "\u{1f7e1}", pending_tag)
         };
-        let c1 = format!("{col}{ico} [REQ {idx}/4 {st_lbl}] {name:<19}{ANSI_RESET}");
+        let c1 = format!("{col}{ico} [REQ {idx}/4 {st_lbl}] {name:<18}{ANSI_RESET}");
         fmt_3col(c1, c2, c3)
     };
     let g1_pct = (((rep.v48_trades.min(50) as f64) / 50.0) * 50.0
@@ -1028,7 +1081,7 @@ pub fn render_capital_scaling_semaphore(
         rep.v48_trades,
         g1_pct
     );
-    let g1_c3 = format!("Dias UTC V5.3.2: {:>2}/12 dias", rep.v48_days);
+    let g1_c3 = format!("Dias UTC V5.4: {:>2}/12 dias", rep.v48_days);
 
     let w_pct = ((rep.wallet_usdt / 67.0) * 100.0).clamp(0.0, 100.0);
     let g2_c2 = format!(
@@ -1045,7 +1098,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.2}", rep.pf_v48)
     };
     let v70_txt = if rep.vault_70_ok { "Vault>12.5b OK" } else { "Vault<=12.5b" };
-    let g2_c3 = format!("PF V5.3.2: {pf_txt:<10} | {v70_txt}");
+    let g2_c3 = format!("PF V5.4: {pf_txt:<12} | {v70_txt}");
 
     let mkr_ref = if rep.v48_trades >= 10 { rep.v48_mkr_pct } else { rep.global_mkr_pct };
     let g3_pct = ((mkr_ref / 82.0) * 100.0).clamp(0.0, 100.0);
@@ -1057,7 +1110,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.1}% ({}/{}t)", rep.v48_mkr_pct, rep.v48_maker_closes, rep.v48_trades)
     };
     let g3_c3 = format!(
-        "V5.3.2 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
+        "V5.4 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
         rep.parity_drift_1e8,
         usize::from(rep.halt_active)
     );
@@ -1092,10 +1145,10 @@ pub fn render_capital_scaling_semaphore(
         )
     };
     let sec_hdr = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.3.2 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
+        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.4 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
     )];
     let sec_gates = vec![
-        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.3.2", g1_c2, g1_c3),
+        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.4", g1_c2, g1_c3),
         fmt_gate(2, rep.gate2_ok, "EN PROGRESO", "Expectativa & Cap.", g2_c2, g2_c3),
         fmt_gate(3, rep.gate3_ok, g3_tag, "Ejecucion Maker", g3_c2, g3_c3),
         fmt_gate(4, rep.gate4_ok, "EN PROGRESO", "Resiliencia Escudo", g4_c2, g4_c3),
@@ -1176,7 +1229,7 @@ pub fn render_trades_and_executive_dashboard() {
         }
     }
     if rows_out.is_empty() {
-        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.3.2...{ANSI_RESET}"));
+        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.4...{ANSI_RESET}"));
     }
     let mut live_client = BybitV5LiveClient::from_env_if_enabled(true);
     let fb_w = (DEFAULT_WALLET_EQUITY_1E8 as f64) / 100_000_000.0;
@@ -1206,7 +1259,7 @@ pub fn render_trades_and_executive_dashboard() {
     let parity_drift_1e8 = (dash_ledger.cumulative_net_pnl_1e8 - sum_cashflow_1e8).abs();
     let halt_active = Path::new(HALT_LOCK_PATH).exists();
 
-    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.3.2 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
+    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.4 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
     let sec_kpi = vec![
         fmt_3col(
             format!("Wallet: {w_usdt:.4} USDT (Eq: {eq_usdt:.4} | Avail: {av_usdt:.4})"),
@@ -1381,7 +1434,7 @@ pub fn build_closed_trade_vault_json(
     let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
     if let Some(obj) = val.as_object_mut() {
         let _ = obj.remove("fnv1a64_hex");
-        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.3.2"));
+        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.4"));
         obj.insert(
             "markout_resolved_mask".to_string(),
             serde_json::json!(markout_curve.resolved_mask),
@@ -1515,7 +1568,7 @@ mod v49_hud_telemetry_tests {
             140,
             TimestampNs(1_794_920_000_000_000_000),
         );
-        assert!(line.contains("\"telemetry_rev\":\"V5.3.2\""));
+        assert!(line.contains("\"telemetry_rev\":\"V5.4\""));
         assert!(line.contains("\"markout_resolved_mask\":31"));
         assert!(line.contains("\"markout_5h_bps\":[-0.35,-0.8,1.4,4.2,9.1]"));
         assert!(line.contains("\"ws_rtt_us\":1310") && line.contains("\"fnv1a64_hex\":\"0x"));
@@ -1529,7 +1582,7 @@ mod v49_hud_telemetry_tests {
                 eng.learned_mfe_bps = DEFAULT_LEARNED_MFE_SCALED_BPS;
                 eng
             });
-        // Warm pairs (BTC, ETH, AVAX, TAO, SUI) must never be touched
+        // Scratch-sunk (< PHI * 400 = 647.2) vs truly warm (>= 648) pairs
         engines[0].learned_mfe_bps = 568;
         engines[1].learned_mfe_bps = 647;
         engines[3].learned_mfe_bps = 628;
@@ -1546,18 +1599,22 @@ mod v49_hud_telemetry_tests {
             "{\"symbol\":\"LINKUSDT\",\"maker_exit\":true,\"net_bps\":0.30}\n",
             "{\"symbol\":\"WIFUSDT\",\"maker_exit\":true,\"mfe_bps\":35.0}\n",
             "{\"symbol\":\"WIFUSDT\",\"maker_exit\":true,\"mfe_bps\":35.0}\n",
+            "{\"symbol\":\"ORDIUSDT\",\"maker_exit\":true,\"mfe_bps\":250.0}\n",
+            "{\"symbol\":\"ORDIUSDT\",\"maker_exit\":true,\"mfe_bps\":250.0}\n",
+            "{\"symbol\":\"ORDIUSDT\",\"maker_exit\":true,\"mfe_bps\":250.0}\n",
             "{\"symbol\":\"NEARUSDT\",\"maker_exit\":true,\"mfe_bps\":5.00}\n",
         );
         rehydrate_cold_mfe_seeds_from_reader(&mut engines, std::io::Cursor::new(scar_jsonl.as_bytes()));
 
-        assert_eq!(engines[0].learned_mfe_bps, 568);
-        assert_eq!(engines[1].learned_mfe_bps, 647);
-        assert_eq!(engines[3].learned_mfe_bps, 628);
-        assert_eq!(engines[4].learned_mfe_bps, 710);
-        assert_eq!(engines[5].learned_mfe_bps, 890);
+        assert!(engines[0].learned_mfe_bps > 568);                                      // BTC: sunk < PHI*400 rescued by 14.0bp Maker win
+        assert_eq!(engines[1].learned_mfe_bps, 647);                                    // ETH: 0 rows -> preserved
+        assert_eq!(engines[3].learned_mfe_bps, 628);                                    // AVAX: 0 rows -> preserved
+        assert_eq!(engines[4].learned_mfe_bps, 710);                                    // TAO: warm >= PHI*400 untouched
+        assert_eq!(engines[5].learned_mfe_bps, 890);                                    // SUI: warm >= PHI*400 untouched
         assert!(engines[2].learned_mfe_bps > 640 && engines[2].learned_mfe_bps < 660); // SOL: 613 -> ~646
         assert!(engines[9].learned_mfe_bps > 630 && engines[9].learned_mfe_bps < 640); // LINK: net 3.5+4.0=7.5 -> ~633
-        assert_eq!(engines[8].learned_mfe_bps, SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);     // WIF: capped at 820
+        assert!(engines[8].learned_mfe_bps > 820 && engines[8].learned_mfe_bps <= SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);
+        assert_eq!(engines[6].learned_mfe_bps, SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);     // DOGE: capped at elastic 12 * active_fee_rt_mkr (4800)
         assert_eq!(engines[10].learned_mfe_bps, DEFAULT_LEARNED_MFE_SCALED_BPS);       // NEAR: floored at 613
         assert_eq!(engines[11].learned_mfe_bps, DEFAULT_LEARNED_MFE_SCALED_BPS);       // LTC: 0 samples -> 613
     }

@@ -739,7 +739,30 @@ pub fn compute_canonical_exit_quote_omega_v52(
     funding_adv_sbps: i64,
     ws_rtt_us: u32,
 ) -> Option<CanonicalExitQuote> {
+    compute_canonical_exit_quote_omega_v54(
+        ctx,
+        kin,
+        snap,
+        snap.realized_vol_5m,
+        wald_log_likelihood,
+        funding_adv_sbps,
+        ws_rtt_us,
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_canonical_exit_quote_omega_v54(
+    ctx: &OpenExitContext,
+    kin: ShadowRunnerKinematics,
+    snap: &SymbolLobSnapshot,
+    open_vol_5m_bps: ScaledBps,
+    wald_log_likelihood: Option<f64>,
+    funding_adv_sbps: i64,
+    ws_rtt_us: u32,
+) -> Option<CanonicalExitQuote> {
     const INV_PHI_FOURTH: f64 = 0.145_898_033_750_315;
+    const SQRT_5: f64 = PHI + INV_PHI;
     if ctx.avg_price_ticks.0 <= 0 || ctx.open_lots.0 <= 0 { return None; }
     let rt_raw = ctx.active_fees.round_trip_maker_exit_bps().raw();
     let fee_rt = rt_raw.max(100);
@@ -819,11 +842,29 @@ pub fn compute_canonical_exit_quote_omega_v52(
     if !ctx.tranche1_harvested && !ratchet_pullback && !shadow_crest_snap && !opposing_wave3_escape && !climax_harvest
         && (!defensive_lock_active || (!still_locked && signed_flow_slow.get() >= INV_PHI_FIFTH))
     {
+        let sigma_1m_cur = (snap.realized_vol_5m.raw().max(0) as f64) / SQRT_5;
         let raw_t1_px = if defensive_lock_active {
             zero_loss_px
         } else {
             let urgency = (INV_PHI - INV_PHI_FIFTH * own_flow.clamp(0.0, 1.0) * (1.0 + ir_norm)).clamp(0.50, INV_PHI);
-            elastic_offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, fee_rt, snap.realized_vol_5m, urgency)
+            let base_t1_px = elastic_offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, fee_rt, snap.realized_vol_5m, urgency);
+            if s_prop > 0.0 && sigma_1m_cur > c_mkr_scale && flow_accel > INV_PHI_FOURTH {
+                let s_t1_accel = hermite_s3_unit(flow_accel, INV_PHI_FOURTH, INV_PHI_SQ);
+                let s_t1_prop = hermite_s3_unit(s_prop, INV_PHI_CUBE, INV_PHI);
+                let s_t1_vol = hermite_s3_unit(sigma_1m_cur, c_mkr_scale, PHI_SQ * c_mkr_scale);
+                let s_t1_mfe = hermite_s3_unit(ctx.learned_mfe_bps as f64, PHI * c_mkr_scale, PHI_SQ * c_mkr_scale);
+                let t1_base_f = win_floor_bps as f64;
+                let t1_ceil = (INV_PHI * sigma_1m_cur)
+                    .min(INV_PHI * (ctx.learned_mfe_bps as f64) + INV_PHI_CUBE * sigma_1m_cur)
+                    .max(t1_base_f);
+                let t1_exp_bps = (t1_base_f
+                    + s_t1_accel * s_t1_prop * s_t1_vol * s_t1_mfe * (t1_ceil - t1_base_f))
+                    .round() as i64;
+                let exp_px = dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(t1_exp_bps));
+                pick_more_ambitious_tp(ctx.side, base_t1_px, exp_px)
+            } else {
+                base_t1_px
+            }
         };
         let win1_px = enforce_maker_bbo_bound(ctx.side, raw_t1_px, snap);
         let eff_t1_pm = compute_wave_dynamic_t1_permille(ctx.learned_t1_permille, ctx.side, snap, kin.in_scar_debt);
@@ -892,10 +933,19 @@ pub fn compute_canonical_exit_quote_omega_v52(
         } else {
             0.0
         };
+        let eff_open_vol_sbps = if open_vol_5m_bps.raw() > 0 {
+            open_vol_5m_bps.raw()
+        } else {
+            snap.realized_vol_5m.raw().max(0)
+        };
+        let sigma_1m_open_sbps = (eff_open_vol_sbps as f64) / SQRT_5;
+        let b_floor_sbps = -((PHI * c_mkr_scale).max(INV_PHI_SQ * sigma_1m_open_sbps));
+        let s_bailout_band = hermite_s3_unit(cur_g, PHI * b_floor_sbps, b_floor_sbps);
         let chi_stress = s_wave3_stress
             .max(s_stag_stress)
             .max(s_wald_deep_stress)
-            .max(s_bounce_bailout);
+            .max(s_bounce_bailout)
+            * s_bailout_band;
         let trapped_or_underwater = cur_gross_bps < 0 || worst_mae_bps < 0;
         let maker_bailout_active = trapped_or_underwater
             && cur_gross_bps < zero_loss_bps
@@ -953,14 +1003,18 @@ pub fn compute_canonical_exit_quote_omega_v52(
         hermite_s3_unit(own_flow.max(s_prop), run_lo, 1.0 - INV_PHI_FOURTH)
     };
     let runner2_px = if lvdbs_vac_level < 2 && s_run > 1e-6 {
-        let sigma_1m = vol_f / 2.236_067_977_499_79;
+        let sigma_1m = vol_f / SQRT_5;
         let base_r = ctx.learned_mfe_bps.max(win_floor_bps) as f64;
         let opt_coeff = if ctx.tranche1_harvested {
-            INV_PHI + (INV_PHI_SQ * INV_PHI_SQ) * s_run
+            INV_PHI + INV_PHI_SQ * s_run
         } else {
             1.0 + INV_PHI_SQ * s_run
         };
-        let prop_r = (opt_coeff * sigma_1m).max(base_r);
+        let s_vol_mkr = hermite_s3_unit(sigma_1m, c_mkr_scale, PHI * c_mkr_scale);
+        let mfe_runner_r = (base_r * (1.0 + INV_PHI_SQ * s_run * s_vol_mkr))
+            .min(PHI * sigma_1m)
+            .max(base_r);
+        let prop_r = (opt_coeff * sigma_1m).max(mfe_runner_r);
         let runner_bps = ((base_r + s_run * (prop_r - base_r)).round() as i64)
             .max(eff_ratchet_bps)
             .clamp(win_floor_bps + fee_rt / 2, max_fib_cap);

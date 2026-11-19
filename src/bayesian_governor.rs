@@ -1355,7 +1355,7 @@ impl OnlineAdaptiveGovernor {
     ///
     /// # Errors
     /// Returns the causal `LastVetoCode` when quantum EV, `ImpulseWave3`, `GEOM` or single-lot asymmetry fails.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     pub fn authorizes_adaptive_entry_v49(
         &self,
         slot_idx: usize,
@@ -1367,6 +1367,46 @@ impl OnlineAdaptiveGovernor {
         btc_leader_snap: &SymbolLobSnapshot,
         spoof_density: f64,
         epps_signed_beta: f64,
+    ) -> Result<LotQty, crate::lob_shm::LastVetoCode> {
+        let is_follower = slot_idx > 0 && candidate_snap.symbol_id != btc_leader_snap.symbol_id;
+        let implied_corr = if is_follower {
+            let own_v = candidate_snap.realized_vol_5m.raw().max(100) as f64;
+            let btc_v = btc_leader_snap.realized_vol_5m.raw().max(100) as f64;
+            (epps_signed_beta * (btc_v / own_v)).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.authorizes_adaptive_entry_v54(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            daily_damper_permille,
+            learned_mfe_bps,
+            candidate_snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+            implied_corr,
+        )
+    }
+
+    /// Unified V5.4 entry gate coupling indivisible `1-lot` EV to `OFI + BTC` propulsion and `Epps + BTC` `CorrectiveAbc` sync.
+    ///
+    /// # Errors
+    /// Returns the causal `LastVetoCode` when quantum EV, `ImpulseWave3`, `GEOM` or Pillar-2 EV fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorizes_adaptive_entry_v54(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        daily_damper_permille: i64,
+        learned_mfe_bps: ScaledBps,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
     ) -> Result<LotQty, crate::lob_shm::LastVetoCode> {
         use crate::lob_shm::LastVetoCode;
 
@@ -1416,10 +1456,12 @@ impl OnlineAdaptiveGovernor {
         ) {
             return Err(LastVetoCode::SpoofingVeto);
         }
-        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
+        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard_with_sync(
             candidate_snap,
+            btc_leader_snap,
             side,
             spoof_density,
+            epps_corr,
         )?;
         let lots = self.compute_slot_entry_lots_v48(
             slot_idx,
@@ -1429,13 +1471,15 @@ impl OnlineAdaptiveGovernor {
             daily_damper_permille,
         );
         if self
-            .evaluate_slot_pilar2_ex_ante_ev_sbps(
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
                 slot_idx,
                 side,
                 lots,
                 entry_px,
                 learned_mfe_bps,
                 candidate_snap,
+                btc_leader_snap,
+                epps_signed_beta,
             )
             .is_none()
         {
@@ -1460,7 +1504,7 @@ impl OnlineAdaptiveGovernor {
     ///
     /// # Errors
     /// Returns `LastVetoCode` if BBO, `ImpulseWave3`, `GEOM`, single-lot EV or preflight kinematics decay.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     pub fn confirm_preflight_kinematics_v49(
         &self,
         slot_idx: usize,
@@ -1472,6 +1516,46 @@ impl OnlineAdaptiveGovernor {
         btc_leader_snap: &SymbolLobSnapshot,
         spoof_density: f64,
         epps_signed_beta: f64,
+    ) -> Result<(i64, i64), crate::lob_shm::LastVetoCode> {
+        let is_follower = slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id;
+        let implied_corr = if is_follower {
+            let own_v = snap.realized_vol_5m.raw().max(100) as f64;
+            let btc_v = btc_leader_snap.realized_vol_5m.raw().max(100) as f64;
+            (epps_signed_beta * (btc_v / own_v)).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.confirm_preflight_kinematics_v54(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            allocated_lots,
+            learned_mfe_bps,
+            snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+            implied_corr,
+        )
+    }
+
+    /// Unified V5.4 preflight confirmation coupling `OFI + BTC` 1-lot EV and `Epps + BTC` `CorrectiveAbc` sync.
+    ///
+    /// # Errors
+    /// Returns `LastVetoCode` if BBO, `ImpulseWave3`, `GEOM`, Pillar-2 EV or preflight kinematics decay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_preflight_kinematics_v54(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        allocated_lots: LotQty,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
     ) -> Result<(i64, i64), crate::lob_shm::LastVetoCode> {
         use crate::lob_shm::LastVetoCode;
 
@@ -1505,23 +1589,27 @@ impl OnlineAdaptiveGovernor {
         ) {
             return Err(LastVetoCode::SpoofingVeto);
         }
-        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
+        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard_with_sync(
             snap,
+            btc_leader_snap,
             side,
             spoof_density,
+            epps_corr,
         )?;
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         if !self.passes_elastic_preflight_l1_support(slot_idx, side, entry_px, snap) {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
         if self
-            .evaluate_slot_pilar2_ex_ante_ev_sbps(
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
                 slot_idx,
                 side,
                 allocated_lots,
                 entry_px,
                 learned_mfe_bps,
                 snap,
+                btc_leader_snap,
+                epps_signed_beta,
             )
             .is_none()
         {
@@ -1652,6 +1740,53 @@ impl OnlineAdaptiveGovernor {
             bear_u16,
             side,
             self.active_fee_schedule(),
+        )
+    }
+
+    /// Evaluates V5.4 Pillar-2 ex-ante Expected Value coupling `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_signed_beta: f64,
+    ) -> Option<i64> {
+        if slot_idx >= MAX_ACTIVE_PAIRS || entry_px.0 <= 0 {
+            return None;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let dir_s = side.sign_f64();
+        let signed_geom = dir_s * snap.factor_geom.get();
+        let ofi_aligned = dir_s * snap.factor_ofi.get();
+        let is_follower = slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id;
+        let beta_dir = if epps_signed_beta < -1e-6 { -1.0 } else { 1.0 };
+        let btc_aligned = if is_follower {
+            beta_dir * crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
+        } else {
+            crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(snap) * dir_s
+        };
+        let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
+        let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
+        spec.evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+            allocated_lots,
+            entry_px,
+            snap.realized_vol_5m,
+            learned_mfe_bps.raw(),
+            self.slot_taker_prob_permille(slot_idx, side),
+            signed_geom,
+            bull_u16,
+            bear_u16,
+            side,
+            self.active_fee_schedule(),
+            ofi_aligned,
+            btc_aligned,
         )
     }
 

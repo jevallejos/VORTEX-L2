@@ -1,4 +1,4 @@
-//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V5.3.2).
+//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V5.4).
 #![allow(
     clippy::cast_precision_loss,
     clippy::manual_clamp,
@@ -569,6 +569,12 @@ pub fn handle_gateway_event(
                         }
                         _ => None,
                     };
+                    if let Some((_, _, _, p_open_ts)) = pre_open {
+                        let mk_pk = rt.markout_rings[slot_idx].peak_favorable_fill_markout_sbps(p_open_ts);
+                        if mk_pk > engines[slot_idx].last_closed_mfe_bps {
+                            engines[slot_idx].last_closed_mfe_bps = mk_pk;
+                        }
+                    }
                     let prev_closed = ledger.closed_trades_count;
                     let prev_pnl_1e8 = ledger.cumulative_net_pnl_1e8;
                     let prev_phase = rt.daily_gov.phase;
@@ -604,7 +610,7 @@ pub fn handle_gateway_event(
                         });
                         if new_phase != prev_phase && matches!(new_phase, DailyShieldPhase::ProfitLockArmed | DailyShieldPhase::HibernatingProfitLocked | DailyShieldPhase::HibernatingLossCap) {
                             let _ = tg_tx.try_send(format!(
-                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.3.2 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                                 new_phase.label(),
                                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
@@ -776,7 +782,7 @@ pub fn bootstrap_live_adopt_if_enabled(
             };
             engines[s_idx].sync_to_shm_telemetry(arena);
             println!(
-                "{}\u{1f7e2} [VORTEX-OMEGA V5.3.2 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
+                "{}\u{1f7e2} [VORTEX-OMEGA V5.4 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
                 ANSI_GREEN, s_idx, sym_name, side_p, sz_s, bybit_avg_t.0, sl_t.0, sl_ok, t1_done, ANSI_RESET
             );
         }

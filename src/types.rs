@@ -62,6 +62,7 @@ pub struct BoundedScore(f64);
 
 impl BoundedScore {
     pub const ZERO: Self = Self(0.0);
+    pub const ONE: Self = Self(1.0);
     #[inline] #[must_use]
     pub fn new_clamped(val: f64) -> Self {
         if val.is_nan() { Self(0.0) } else { Self(val.clamp(-1.0, 1.0)) }
@@ -839,6 +840,47 @@ impl PairSpec {
         side: Side,
         fees: FeeSchedule,
     ) -> bool {
+        let neutral_align = signed_geom.clamp(0.0, 1.0);
+        self.passes_single_lot_asymmetry_ev_gate_with_flow(
+            allocated_lots,
+            mid_price,
+            realized_vol_5m,
+            learned_mfe_bps,
+            taker_prob_pm,
+            signed_geom,
+            ob_bull_pm,
+            ob_bear_pm,
+            side,
+            fees,
+            neutral_align,
+            neutral_align,
+        )
+    }
+
+    /// Continuous C1 Pillar-2 <-> `ExitQuoter` coherent EV gate coupling indivisible `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::manual_clamp,
+        clippy::suboptimal_flops,
+        clippy::too_many_arguments
+    )]
+    pub fn passes_single_lot_asymmetry_ev_gate_with_flow(
+        self,
+        allocated_lots: LotQty,
+        mid_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+        ofi_aligned: f64,
+        btc_aligned: f64,
+    ) -> bool {
         const PHI: f64 = 1.618_033_988_749_895;
         const INV_PHI: f64 = 0.618_033_988_749_895;
         const INV_PHI2: f64 = 0.381_966_011_250_105;
@@ -888,6 +930,7 @@ impl PairSpec {
         }
         const PHI_SQ: f64 = 2.618_033_988_749_895;
         const SQRT_5: f64 = PHI + INV_PHI;
+        let (s_prop, s_support) = compute_single_lot_flow_btc_propulsion_c1(ofi_aligned, btc_aligned);
         let b3x_f = (self.three_x_friction_barrier_bps_dynamic(mid_price, taker_prob_pm, fees).raw().max(300)) as f64;
         let eq_vol_f = (PHI_SQ * b3x_f).max(3_200.0);
         let vol_f = (realized_vol_5m.raw().max(0)) as f64;
@@ -900,23 +943,23 @@ impl PairSpec {
             Side::Ask => (ob_bear_pm, ob_bull_pm),
         };
         let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
-        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio));
+        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get());
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
         let diff_1m = vol_f / SQRT_5;
         let vol_exp = if vol_f > eq_vol_f {
-            1.0 + h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
+            1.0 + s_prop.get() * h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
         } else {
             1.0 - INV_PHI3 * (1.0 - h_geom) * (1.0 - (vol_f / eq_vol_f).clamp(0.0, 1.0))
         };
         let eff_mfe = ScaledBps((mfe_f * vol_exp).round() as i64);
-        let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2)).round() as i64);
+        let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2 * s_prop.get())).round() as i64);
         let c_rt_dyn = (self.expected_round_trip_cost_bps_dynamic(mid_price, taker_prob_pm, fees).raw().max(150)) as f64;
-        let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom))).round() as i64);
-        passes_asymmetry_ev_gate_v51(
+        let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom * s_support.get()))).round() as i64);
+        passes_asymmetry_ev_gate_v54(
             self, mid_price, allocated_lots, dyn_target, eff_mfe,
-            diff_sl, taker_prob_pm, q_struct, fees,
+            diff_sl, taker_prob_pm, q_struct, s_prop, fees,
         )
     }
 
@@ -938,6 +981,42 @@ impl PairSpec {
         side: Side,
         fees: FeeSchedule,
     ) -> Option<i64> {
+        let neutral_align = signed_geom.clamp(0.0, 1.0);
+        self.evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+            allocated_lots,
+            entry_px,
+            realized_vol_5m,
+            learned_mfe_bps,
+            taker_prob_pm,
+            signed_geom,
+            ob_bull_pm,
+            ob_bear_pm,
+            side,
+            fees,
+            neutral_align,
+            neutral_align,
+        )
+    }
+
+    /// Coherent V5.4 Pillar-2 ex-ante net Expected Value (`ScaledBps`) coupling indivisible `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+    pub fn evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+        self,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+        ofi_aligned: f64,
+        btc_aligned: f64,
+    ) -> Option<i64> {
         const PHI: f64 = 1.618_033_988_749_895;
         const PHI_SQ: f64 = 2.618_033_988_749_895;
         const INV_PHI: f64 = 0.618_033_988_749_895;
@@ -945,9 +1024,10 @@ impl PairSpec {
         const INV_PHI3: f64 = 0.236_067_977_499_79;
         const SQRT_5: f64 = PHI + INV_PHI;
 
-        if !self.passes_single_lot_asymmetry_ev_gate(
+        if !self.passes_single_lot_asymmetry_ev_gate_with_flow(
             allocated_lots, entry_px, realized_vol_5m, learned_mfe_bps,
             taker_prob_pm, signed_geom, ob_bull_pm, ob_bear_pm, side, fees,
+            ofi_aligned, btc_aligned,
         ) {
             return None;
         }
@@ -982,32 +1062,33 @@ impl PairSpec {
             return (ev_sbps > 0).then_some(ev_sbps);
         }
 
+        let (s_prop, s_support) = compute_single_lot_flow_btc_propulsion_c1(ofi_aligned, btc_aligned);
         let b3x_f = (self.three_x_friction_barrier_bps_dynamic(entry_px, taker_prob_pm, fees).raw().max(300)) as f64;
         let eq_vol_f = (PHI_SQ * b3x_f).max(3_200.0);
         let vol_f = (realized_vol_5m.raw().max(0)) as f64;
         let u_g = ((g_clamped - INV_PHI3) / (0.854_101_966_249_685 - INV_PHI3)).clamp(0.0, 1.0);
         let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
-        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio));
+        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get());
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
         let diff_1m = vol_f / SQRT_5;
         let vol_exp = if vol_f > eq_vol_f {
-            1.0 + h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
+            1.0 + s_prop.get() * h_vol * INV_PHI2 * ((diff_1m / mfe_f) - 1.0).max(0.0)
         } else {
             1.0 - INV_PHI3 * (1.0 - h_geom) * (1.0 - (vol_f / eq_vol_f).clamp(0.0, 1.0))
         };
         let eff_mfe = ScaledBps((mfe_f * vol_exp).round() as i64);
-        let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2)).round() as i64);
+        let dyn_target = ScaledBps(((eff_mfe.raw() as f64) * (1.0 + INV_PHI2 * s_prop.get())).round() as i64);
         let c_rt_dyn = (self.expected_round_trip_cost_bps_dynamic(entry_px, taker_prob_pm, fees).raw().max(150)) as f64;
-        let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom))).round() as i64);
-        if !passes_asymmetry_ev_gate_v51(
+        let diff_sl = ScaledBps(((4.236_067_977_499_79 * c_rt_dyn).max(INV_PHI2 * srv_sl * (1.0 - INV_PHI3 * h_geom * s_support.get()))).round() as i64);
+        if !passes_asymmetry_ev_gate_v54(
             self, entry_px, allocated_lots, dyn_target, eff_mfe,
-            diff_sl, taker_prob_pm, q_struct, fees,
+            diff_sl, taker_prob_pm, q_struct, s_prop, fees,
         ) {
             return None;
         }
-        let eff_learned_mfe = coupled_c1_effective_mfe_raw(eff_mfe, dyn_target, q_struct);
+        let eff_learned_mfe = coupled_c1_effective_mfe_for_lot_raw(eff_mfe, dyn_target, q_struct, false, s_prop);
         let mkr_net = (INV_PHI + INV_PHI2 * q_struct.get().clamp(0.0, 1.0)) * (eff_learned_mfe.max(0) as f64) - c_mkr;
         let sl_all_in = (diff_sl.raw().max(0) as f64) + c_tkr + INV_PHI2 * (tau_tick.raw() as f64);
         let ev_sbps = ((1.0 - p_t) * mkr_net - p_t * sl_all_in).round() as i64;
@@ -1086,19 +1167,48 @@ mod single_lot_ev_v49_tests {
 
 #[inline]
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-pub fn coupled_c1_effective_mfe_raw(
+#[allow(clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn compute_single_lot_flow_btc_propulsion_c1(
+    ofi_aligned: f64,
+    btc_aligned: f64,
+) -> (BoundedScore, BoundedScore) {
+    const INV_PHI_C1: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_C1: f64 = 0.381_966_011_250_105;
+    const INV_PHI3_C1: f64 = 0.236_067_977_499_79;
+    let s3 = |x: f64, lo: f64, hi: f64| -> f64 {
+        let u = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+        u * u * (3.0 - 2.0 * u)
+    };
+    let s_ofi = s3(ofi_aligned, INV_PHI3_C1, INV_PHI_C1);
+    let s_btc = s3(btc_aligned, INV_PHI3_C1, INV_PHI_C1);
+    let s_prop = BoundedScore::new_clamped(s_ofi * s_btc);
+    let support_mix = INV_PHI_C1 * ofi_aligned + INV_PHI2_C1 * btc_aligned;
+    let s_support = BoundedScore::new_clamped(s3(support_mix, INV_PHI3_C1, INV_PHI2_C1));
+    (s_prop, s_support)
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn coupled_c1_effective_mfe_for_lot_raw(
     learned_mfe_bps: ScaledBps,
     target_bps: ScaledBps,
     q_struct: BoundedScore,
+    can_split_runner_legs: bool,
+    s_prop: BoundedScore,
 ) -> i64 {
     const INV_PHI_C1: f64 = 0.618_033_988_749_895;
     const INV_PHI_SQ_C1: f64 = 0.381_966_011_250_105;
-    if q_struct.get() > INV_PHI_SQ_C1 && target_bps.raw() > learned_mfe_bps.raw() {
+    let prop_gate = if can_split_runner_legs {
+        1.0
+    } else {
+        s_prop.get().clamp(0.0, 1.0)
+    };
+    if prop_gate > 0.0 && q_struct.get() > INV_PHI_SQ_C1 && target_bps.raw() > learned_mfe_bps.raw() {
         let u = ((q_struct.get() - INV_PHI_SQ_C1) / (INV_PHI_C1 - INV_PHI_SQ_C1)).clamp(0.0, 1.0);
         let s_struct = u * u * (3.0 - 2.0 * u);
         learned_mfe_bps.raw()
-            + ((INV_PHI_C1 * s_struct * ((target_bps.raw() - learned_mfe_bps.raw()) as f64)).round() as i64)
+            + ((INV_PHI_C1 * s_struct * prop_gate * ((target_bps.raw() - learned_mfe_bps.raw()) as f64)).round() as i64)
     } else {
         learned_mfe_bps.raw()
     }
@@ -1106,8 +1216,18 @@ pub fn coupled_c1_effective_mfe_raw(
 
 #[inline]
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
-pub fn passes_asymmetry_ev_gate_v51(
+pub fn coupled_c1_effective_mfe_raw(
+    learned_mfe_bps: ScaledBps,
+    target_bps: ScaledBps,
+    q_struct: BoundedScore,
+) -> i64 {
+    coupled_c1_effective_mfe_for_lot_raw(learned_mfe_bps, target_bps, q_struct, true, BoundedScore::ONE)
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::manual_clamp, clippy::suboptimal_flops, clippy::too_many_arguments)]
+pub fn passes_asymmetry_ev_gate_v54(
     spec: PairSpec,
     entry_px: PriceTicks,
     allocated_lots: LotQty,
@@ -1116,6 +1236,7 @@ pub fn passes_asymmetry_ev_gate_v51(
     sl_bps: ScaledBps,
     taker_prob_pm: i64,
     q_struct: BoundedScore,
+    s_prop: BoundedScore,
     fees: FeeSchedule,
 ) -> bool {
     const PHI_E: f64 = 1.618_033_988_749_895;
@@ -1128,10 +1249,11 @@ pub fn passes_asymmetry_ev_gate_v51(
     let c_mkr = fees.round_trip_maker_exit_bps().raw() as f64;
     let c_tkr = (fees.round_trip_taker_exit_bps().raw().max(50)) as f64;
     let q_pos = q_struct.get().clamp(0.0, 1.0);
-    let eff_learned_mfe = coupled_c1_effective_mfe_raw(learned_mfe_bps, target_bps, q_struct);
+    let can_split = spec.can_split_runner_legs(allocated_lots, entry_px);
+    let eff_learned_mfe = coupled_c1_effective_mfe_for_lot_raw(learned_mfe_bps, target_bps, q_struct, can_split, s_prop);
     let cap_gross = (eff_learned_mfe.max(0).min(target_bps.raw().max(0))) as f64;
     let sl_all_in = (sl_bps.raw().max(0) as f64) + c_tkr + INV_PHI2_E * (tau_tick.raw() as f64);
-    if spec.can_split_runner_legs(allocated_lots, entry_px) {
+    if can_split {
         let g_net = cap_gross * (1.0 + INV_PHI2_E * q_pos) - c_mkr;
         let shield = 1.0 + PHI_E * q_pos;
         let min_mfe = INV_PHI2_E * c_mkr.max(100.0);
@@ -1142,4 +1264,32 @@ pub fn passes_asymmetry_ev_gate_v51(
     let ev_1lot = (1.0 - p_t) * mkr_net - p_t * sl_all_in;
     let min_edge = INV_PHI3_E * c_mkr.max(100.0);
     mkr_net > min_edge && ev_1lot >= min_edge
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn passes_asymmetry_ev_gate_v51(
+    spec: PairSpec,
+    entry_px: PriceTicks,
+    allocated_lots: LotQty,
+    target_bps: ScaledBps,
+    learned_mfe_bps: ScaledBps,
+    sl_bps: ScaledBps,
+    taker_prob_pm: i64,
+    q_struct: BoundedScore,
+    fees: FeeSchedule,
+) -> bool {
+    passes_asymmetry_ev_gate_v54(
+        spec,
+        entry_px,
+        allocated_lots,
+        target_bps,
+        learned_mfe_bps,
+        sl_bps,
+        taker_prob_pm,
+        q_struct,
+        BoundedScore::ONE,
+        fees,
+    )
 }

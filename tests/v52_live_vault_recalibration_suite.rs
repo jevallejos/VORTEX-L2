@@ -968,15 +968,555 @@ fn test_v532_warmup_latch_no_4356ms_truncation_intact_wall_and_mfe_order() {
         let before = SlotExecutionEngine::extract_12_slot_mfe_array(&live_eng);
         vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_scar_vault(&mut live_eng, scar_vault);
         let after = SlotExecutionEngine::extract_12_slot_mfe_array(&live_eng);
+        let mut rescued_sunk = 0_usize;
         for s_idx in 0..vortex_rs::lob_shm::MAX_ACTIVE_PAIRS {
-            if before[s_idx] != vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS {
+            let active_fee_rt_mkr = live_eng[s_idx].active_maker_rt_fee_bps().max(100);
+            let sunk_floor = (vortex_rs::alpha_3factor::PHI * (active_fee_rt_mkr as f64)).round() as i64;
+            if before[s_idx] != vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS
+                && before[s_idx] >= sunk_floor
+            {
                 assert_eq!(after[s_idx], before[s_idx]);
             } else {
                 assert!(
-                    after[s_idx] >= vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS
+                    after[s_idx] >= before[s_idx]
                         && after[s_idx] <= vortex_rs::telemetry_hud::SCAR_MFE_REHYDRATE_CAP_SCALED_BPS
                 );
+                if after[s_idx] > before[s_idx] {
+                    rescued_sunk += 1;
+                }
             }
         }
+        assert!(rescued_sunk >= 1);
     }
+}
+
+#[test]
+fn test_v54_eth2_counterfactual_elastic_bailout_non_censored_mfe_and_epps_sync() {
+    record_live_ws_pulse(69_700, 100);
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_100_000_000_000_000_i64;
+    let w_65 = 6_468_940_634_i64;
+
+    // =========================================================================
+    // (a) Counterfactual V5.3.2 #2 ETHUSDT Ask @ 177485 (1 lot, ofi=-0.22, btc=-0.14):
+    //     1) Ex-ante EV is NOT inflated to +9.93 bps by crash volatility alone -> vetoed (EV <= 0),
+    //        while real live wins ETH #15 (ofi=+0.42, btc=+0.36) & ETH #16 (ofi=+0.22, btc=+0.58) stay EV > 0.
+    //     2) Ex-post Maker Bailout: SUI #4 at -1.39 bps (7137t) and bounce +2.80 bps (7140t) activates 100%
+    //        maker_bailout_active, whereas ETH #2 deep wick to -18.59 bps (177485 -> 177815 at 38 s)
+    //        attenuates maker_bailout_active to false via S_3(cur_gross; PHI*b_floor, b_floor) and refuses
+    //        to liquidate voluntarily at the bottom of the wick.
+    // =========================================================================
+    let eth_spec = APPROVED_SPECS[1];
+    assert!(eth_spec
+        .evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+            LotQty(1),
+            PriceTicks(177_485),
+            ScaledBps(5_800),
+            647,
+            50,
+            0.92,
+            509,
+            532,
+            Side::Ask,
+            fees,
+            0.22,
+            0.14,
+        )
+        .is_none());
+
+    let mut gov_eth2 = OnlineAdaptiveGovernor::new();
+    gov_eth2.seed_prewarm_slot_emas(1, 177_485 * 10_000, 177_560 * 10_000, 2_926, t0);
+    let mut btc_weak = mk_vault_snap(0, 645_000, 2_800, -0.14, -0.14, -0.14, t0);
+    btc_weak.bids[0].qty = LotQty(2_500);
+    btc_weak.asks[0].qty = LotQty(2_500);
+    btc_weak.refresh_deep_l1_l5_totals();
+    let mut eth2_in = mk_vault_snap(1, 177_484, 5_800, -0.22, -0.62, -0.92, t0);
+    eth2_in.bids[0] = BookLevel { price: PriceTicks(177_484), qty: LotQty(4_200) };
+    eth2_in.asks[0] = BookLevel { price: PriceTicks(177_485), qty: LotQty(5_100) };
+    eth2_in.refresh_deep_l1_l5_totals();
+    eth2_in.ob_bull_efficacy_pm = 509;
+    eth2_in.ob_bear_efficacy_pm = 532;
+    eth2_in.ob_bear_score = BoundedScore::new_clamped(0.88);
+    eth2_in.ob_dist_bear_bps = ScaledBps(850);
+    eth2_in.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.64),
+        macro_phase: BoundedScore::new_clamped(-0.82),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(-3_200),
+    });
+    assert!(gov_eth2
+        .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+            1,
+            Side::Ask,
+            LotQty(1),
+            PriceTicks(177_485),
+            ScaledBps(647),
+            &eth2_in,
+            &btc_weak,
+            1.0,
+        )
+        .is_none());
+    assert_eq!(
+        gov_eth2.authorizes_adaptive_entry_v54(
+            1,
+            Side::Ask,
+            w_65,
+            1_000,
+            ScaledBps(647),
+            &eth2_in,
+            &btc_weak,
+            0.0,
+            1.0,
+            0.85,
+        ),
+        Err(LastVetoCode::QueueDepthOrOversizedLot)
+    );
+
+    // ETH #15 (ofi=+0.42, btc=+0.36) & ETH #16 (ofi=+0.22, btc=+0.58) 1-lot wins remain EV > 0:
+    assert!(eth_spec
+        .evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+            LotQty(1),
+            PriceTicks(182_033),
+            ScaledBps(2_991),
+            670,
+            46,
+            0.96,
+            457,
+            471,
+            Side::Bid,
+            fees,
+            0.42,
+            0.36,
+        )
+        .is_some_and(|ev| ev > 0));
+    assert!(eth_spec
+        .evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+            LotQty(1),
+            PriceTicks(183_268),
+            ScaledBps(1_507),
+            670,
+            44,
+            0.99,
+            448,
+            471,
+            Side::Bid,
+            fees,
+            0.22,
+            0.58,
+        )
+        .is_some_and(|ev| ev > 0));
+
+    // Ex-post Maker Bailout: SUI #4 (entry 7138t) at -1.39 bps (Ask=7137t) & bounce +2.80 bps (Ask=7140t) -> active!
+    let mut sui4_dip = mk_vault_snap(5, 7_136, 5_227, -0.42, -0.50, -0.25, t0 + 14_000_000_000);
+    sui4_dip.bids[0] = BookLevel { price: PriceTicks(7_136), qty: LotQty(700) };
+    sui4_dip.asks[0] = BookLevel { price: PriceTicks(7_137), qty: LotQty(550) };
+    sui4_dip.mark_price = PriceTicks(7_136);
+    sui4_dip.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.756),
+        macro_phase: BoundedScore::new_clamped(-0.95),
+        oi_impulse: BoundedScore::new_clamped(-0.25),
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(-5_753),
+    });
+    let sui4_ctx = OpenExitContext {
+        slot_idx: 5,
+        side: Side::Bid,
+        avg_price_ticks: PriceTicks(7_138),
+        peak_favorable_price: PriceTicks(7_140),
+        worst_adverse_price: PriceTicks(7_136),
+        initial_lots: LotQty(20),
+        open_lots: LotQty(20),
+        tranche1_harvested: false,
+        tranche1_lots: LotQty(0),
+        tranche1_exit_price: PriceTicks(0),
+        defensive_floor_locked: true,
+        active_exit_price: PriceTicks(7_142),
+        structural_tp_price: PriceTicks(7_144),
+        resting_exit_price: PriceTicks(7_142),
+        sl_trigger_price: PriceTicks(7_020),
+        opened_ts: TimestampNs(t0),
+        learned_mfe_bps: 778,
+        learned_t1_permille: 500,
+        learned_ir_x100: 20,
+        learned_ret_std_bps: 210,
+        intrinsic_tau_mkt_s: 180,
+        last_eff_sl_ticks: PriceTicks(7_020),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 280,
+        last_closed_mae_bps: -280,
+        active_fees: fees,
+        learned_taker_prob_pm: 48,
+    };
+    let kin_sui4 = ShadowRunnerKinematics {
+        flow_ema_fast: -0.45,
+        flow_ema_slow: -0.40,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_sui4_dip = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &sui4_ctx,
+        kin_sui4,
+        &sui4_dip,
+        ScaledBps(5_227),
+        Some(-2.0),
+        0,
+        69_700,
+    );
+    assert!(q_sui4_dip.is_some_and(|q| q.target_price == PriceTicks(7_137) && q.urgent_close_repeg));
+
+    let mut sui4_bounce = sui4_dip;
+    sui4_bounce.bids[0] = BookLevel { price: PriceTicks(7_139), qty: LotQty(700) };
+    sui4_bounce.asks[0] = BookLevel { price: PriceTicks(7_140), qty: LotQty(550) };
+    sui4_bounce.mark_price = PriceTicks(7_140);
+    let q_sui4_bounce = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &sui4_ctx,
+        kin_sui4,
+        &sui4_bounce,
+        ScaledBps(5_227),
+        Some(-2.0),
+        0,
+        69_700,
+    );
+    assert!(q_sui4_bounce.is_some_and(|q| q.target_price == PriceTicks(7_140) && q.urgent_close_repeg));
+
+    // ETHUSDT Ask #2 @ 177485 -> 177815 (-18.59 bps in 38 s): deep wick under PHI * b_floor_sbps -> NO panic Limit bailout at 177815!
+    let eth2_zero_loss_px = vortex_rs::execution_fsm::defensive_zero_loss_maker_exit_price_with_fees(
+        Side::Ask,
+        PriceTicks(177_485),
+        fees,
+    );
+    let mut eth2_wick = mk_vault_snap(1, 177_815, 2_980, 0.48, 0.55, 0.35, t0 + 38_000_000_000);
+    eth2_wick.bids[0] = BookLevel { price: PriceTicks(177_815), qty: LotQty(3_500) };
+    eth2_wick.asks[0] = BookLevel { price: PriceTicks(177_816), qty: LotQty(3_500) };
+    eth2_wick.mark_price = PriceTicks(177_815);
+    eth2_wick.last_trade_price = PriceTicks(177_815);
+    eth2_wick.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.72),
+        macro_phase: BoundedScore::new_clamped(0.92),
+        oi_impulse: BoundedScore::new_clamped(0.30),
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(4_800),
+    });
+    let eth2_ctx = OpenExitContext {
+        slot_idx: 1,
+        side: Side::Ask,
+        avg_price_ticks: PriceTicks(177_485),
+        peak_favorable_price: PriceTicks(177_480),
+        worst_adverse_price: PriceTicks(177_816),
+        initial_lots: LotQty(1),
+        open_lots: LotQty(1),
+        tranche1_harvested: false,
+        tranche1_lots: LotQty(0),
+        tranche1_exit_price: PriceTicks(0),
+        defensive_floor_locked: true,
+        active_exit_price: eth2_zero_loss_px,
+        structural_tp_price: PriceTicks(176_350),
+        resting_exit_price: eth2_zero_loss_px,
+        sl_trigger_price: PriceTicks(178_195),
+        opened_ts: TimestampNs(t0),
+        learned_mfe_bps: 647,
+        learned_t1_permille: 500,
+        learned_ir_x100: 20,
+        learned_ret_std_bps: 220,
+        intrinsic_tau_mkt_s: 180,
+        last_eff_sl_ticks: PriceTicks(178_195),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 28,
+        last_closed_mae_bps: -1_859,
+        active_fees: fees,
+        learned_taker_prob_pm: 50,
+    };
+    let kin_eth2_wick = ShadowRunnerKinematics {
+        flow_ema_fast: 0.48,
+        flow_ema_slow: 0.42,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_eth2_wick = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &eth2_ctx,
+        kin_eth2_wick,
+        &eth2_wick,
+        ScaledBps(2_980),
+        Some(-2.6),
+        0,
+        69_700,
+    );
+    assert!(q_eth2_wick.is_some_and(|q| {
+        q.target_price <= eth2_zero_loss_px && q.target_price < PriceTicks(177_815)
+    }));
+
+    // =========================================================================
+    // (b) Right-censored learned_mfe_bps non-contraction (LINKUSDT #1: 805 stays 805 on +5.01/+5.42 bps
+    //     Maker win with 92.4% capture >= INV_PHI), uncapped upward expansion on higher excursion / markout,
+    //     and smooth offensive Tranche 1 + Runner anti-fee-drag scaling.
+    // =========================================================================
+    let mut eng_link = SlotExecutionEngine::new(9);
+    eng_link.learned_mfe_bps = 805;
+    eng_link.open_vol_5m_bps = ScaledBps(2_200);
+    eng_link.flow_ema_fast = 0.12;
+    eng_link.last_closed_mfe_bps = 542;
+    eng_link.last_exit_sub_reason = ExitSubReason::LvdbsDeepVacuumSurf;
+    eng_link.observe_censored_close_mfe_plasticity(Side::Bid, 501, true);
+    assert_eq!(eng_link.learned_mfe_bps, 805);
+    eng_link.observe_mfe_sample_uncensored(501, 542, true, false, 400);
+    assert_eq!(eng_link.learned_mfe_bps, 805);
+
+    // Post-exit SlotMarkoutRing peak > learned_mfe_bps expands learned_mfe_bps upward without 820 ceiling:
+    let mut markout_ring = vortex_rs::markout_tracker::SlotMarkoutRing::new();
+    markout_ring.arm_fill_probe(Side::Bid, PriceTicks(9_218), PriceTicks(9_218), TimestampNs(t0));
+    markout_ring.step_clock(PriceTicks(9_335), TimestampNs(t0 + 61_000_000_000), 200);
+    let uncensored_peak = markout_ring.take_uncensored_fill_peak_sbps().unwrap_or(0);
+    assert!(uncensored_peak > 1_200);
+    eng_link.observe_mfe_sample_uncensored(501, 542_i64.max(uncensored_peak), true, false, 400);
+    assert!(eng_link.learned_mfe_bps > 900);
+
+    // Exhausted close that failed to reach TP (capture < INV_PHI) still decays smoothly:
+    let before_decay = eng_link.learned_mfe_bps;
+    eng_link.observe_mfe_sample_uncensored(410, 760, true, false, 400);
+    assert!(eng_link.learned_mfe_bps < before_decay);
+
+    // Divisible high-propulsion high-vol position expands Tranche 1 above static floor to compress fee drag:
+    let mut link_prop_snap = mk_vault_snap(9, 9_222, 5_600, 0.72, 0.78, 0.65, t0 + 8_000_000_000);
+    link_prop_snap.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.68),
+        macro_phase: BoundedScore::new_clamped(0.75),
+        oi_impulse: BoundedScore::new_clamped(0.25),
+        liq_imbalance: BoundedScore::new_clamped(0.30),
+        fib_proj_bps: ScaledBps(3_200),
+    });
+    let mut link_t1_ctx = sui4_ctx;
+    link_t1_ctx.slot_idx = 9;
+    link_t1_ctx.avg_price_ticks = PriceTicks(9_218);
+    link_t1_ctx.peak_favorable_price = PriceTicks(9_222);
+    link_t1_ctx.worst_adverse_price = PriceTicks(9_218);
+    link_t1_ctx.initial_lots = LotQty(24);
+    link_t1_ctx.open_lots = LotQty(24);
+    link_t1_ctx.defensive_floor_locked = false;
+    link_t1_ctx.learned_mfe_bps = 1_150;
+    link_t1_ctx.structural_tp_price = PriceTicks(9_232);
+    let kin_link_prop = ShadowRunnerKinematics {
+        flow_ema_fast: 0.74,
+        flow_ema_slow: 0.52,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_link_t1 = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        &link_t1_ctx,
+        kin_link_prop,
+        &link_prop_snap,
+        ScaledBps(5_600),
+        None,
+        0,
+        69_700,
+    );
+    assert!(q_link_t1.is_some_and(|q| {
+        q.role == ExitOrderRole::Tranche1Harvest50 && q.target_price > PriceTicks(9_224)
+    }));
+
+    // =========================================================================
+    // (c) Self-learned Epps + BTC synchronized breakout in CorrectiveAbc:
+    //     High |epps_corr|, aligned BTC, strong OFI + TFI, and NO opposing OB wall unlocks CorrectiveAbc,
+    //     while an opposing OB wall OR any of the 6 historical CorrectiveAbc range losses
+    //     (#18, #19, #22, #23, #27, #30) and ETH #2 remain 100% blocked.
+    // =========================================================================
+    let mut btc_sync = mk_vault_snap(0, 658_000, 3_600, 0.82, 0.86, 0.78, t0);
+    btc_sync.bids[0].qty = LotQty(3_200);
+    btc_sync.asks[0].qty = LotQty(1_800);
+    btc_sync.refresh_deep_l1_l5_totals();
+    let mut tao_sync = mk_vault_snap(4, 19_650, 3_800, 0.74, 0.78, 0.62, t0);
+    tao_sync.ob_bull_efficacy_pm = 560;
+    tao_sync.ob_bear_efficacy_pm = 530;
+    tao_sync.ob_bull_score = BoundedScore::new_clamped(0.68);
+    tao_sync.ob_dist_bull_bps = ScaledBps(2_400);
+    tao_sync.ob_bear_score = BoundedScore::ZERO;
+    tao_sync.ob_dist_bear_bps = ScaledBps(0);
+    tao_sync.set_wave_observables(WaveObservables {
+        regime: WaveRegime::CorrectiveAbc,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.72),
+        macro_phase: BoundedScore::new_clamped(-0.35),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(0),
+    });
+    // Without Epps+BTC sync: blocked by slow ZigZag CorrectiveAbc guard!
+    assert!(!passes_corrective_abc_snapshot_guard_c1(Side::Bid, &tao_sync));
+    // With strong Epps (0.86) + BTC leader sync (+0.82) + OFI/TFI >= 0.74 and no opposing Bear OB wall: UNLOCKED!
+    let btc_al = vortex_rs::alpha_3factor::OrthogonalFactorState::snr_composite_score(&btc_sync);
+    assert!(vortex_rs::alpha_3factor::passes_corrective_abc_snapshot_guard_with_sync_c1(
+        Side::Bid, &tao_sync, 0.86, btc_al,
+    ));
+    assert!(vortex_rs::execution_fsm::passes_elliott_macro_coherence_guard_with_sync(
+        Side::Bid, &tao_sync, &btc_sync, 0.86,
+    ));
+    assert!(matches!(
+        vortex_rs::alpha_3factor::OrthogonalFactorState::evaluate_entry_signal_v54(
+            APPROVED_SPECS[4],
+            &tao_sync,
+            &btc_sync,
+            ScaledBps(720),
+            ScaledBps(150),
+            50,
+            fees,
+            0.0,
+            0.95,
+            0.86,
+        ),
+        vortex_rs::alpha_3factor::SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+    ));
+
+    // Adding an opposing Bear OB wall immediately cancels delta_h_sync via (1 - s_opp_ob_wall):
+    let mut tao_opp_wall = tao_sync;
+    tao_opp_wall.ob_bear_score = BoundedScore::new_clamped(0.88);
+    tao_opp_wall.ob_dist_bear_bps = ScaledBps(650);
+    assert!(!vortex_rs::alpha_3factor::passes_corrective_abc_snapshot_guard_with_sync_c1(
+        Side::Bid,
+        &tao_opp_wall,
+        0.86,
+        btc_al,
+    ));
+
+    // All 6 historical CorrectiveAbc range losses (#18, #19, #22/V5.0#3, #23/V5.0#4, #27/V5.0#8, #30/V5.1#3) + ETH #2 stay 100% blocked:
+    #[derive(Copy, Clone, Debug)]
+    struct HistAbcLoss {
+        slot: usize,
+        px: i64,
+        vol: i64,
+        ofi: f64,
+        tfi: f64,
+        geom: f64,
+        btc_c: f64,
+        side: Side,
+        h_val: f64,
+        m_ph: f64,
+        bull_pm: u16,
+        bear_pm: u16,
+        opp_sc: f64,
+        opp_dist: i64,
+    }
+    let hist_abc_losses = [
+        // #18 ETH Bid: btc_comp=0.10, H=0.696, macro=+0.45 (weak geom=0.09 + Bear OB wall 55.7bp sc=0.50)
+        HistAbcLoss { slot: 1, px: 179_267, vol: 1_725, ofi: 0.57, tfi: 0.93, geom: 0.09, btc_c: 0.10, side: Side::Bid, h_val: 0.696, m_ph: 0.45, bull_pm: 438, bear_pm: 415, opp_sc: 0.50, opp_dist: 5_572 },
+        // #19 SUI Ask: btc_comp=-0.55, H=0.748, macro=-0.45, Bull OB wall 96.7bp sc=0.57
+        HistAbcLoss { slot: 5, px: 7_316, vol: 1_582, ofi: -0.75, tfi: -0.84, geom: -0.17, btc_c: -0.55, side: Side::Ask, h_val: 0.748, m_ph: -0.45, bull_pm: 522, bear_pm: 478, opp_sc: 0.57, opp_dist: 9_670 },
+        // #22 (V5.0 #3) AVAX Ask: btc_comp=-0.21, H=0.637, macro=-0.45, Bull OB 39.1bp sc=0.60
+        HistAbcLoss { slot: 3, px: 7_156, vol: 1_873, ofi: -0.49, tfi: -0.95, geom: -0.20, btc_c: -0.21, side: Side::Ask, h_val: 0.637, m_ph: -0.45, bull_pm: 465, bear_pm: 471, opp_sc: 0.60, opp_dist: 3_908 },
+        // #23 (V5.0 #4) TAO Bid: btc_comp=+0.36, H=0.729, macro=-0.30, Bear OB 49.8bp sc=0.44
+        HistAbcLoss { slot: 4, px: 19_691, vol: 2_428, ofi: 0.65, tfi: 0.86, geom: 0.36, btc_c: 0.36, side: Side::Bid, h_val: 0.729, m_ph: -0.30, bull_pm: 564, bear_pm: 516, opp_sc: 0.44, opp_dist: 4_984 },
+        // #27 (V5.0 #8) ETH Bid: btc_comp=+0.43, ofi=0.48, H=0.715, macro=+0.45, Bear OB 63.4bp sc=0.39
+        HistAbcLoss { slot: 1, px: 179_552, vol: 1_890, ofi: 0.48, tfi: 0.84, geom: 0.93, btc_c: 0.43, side: Side::Bid, h_val: 0.715, m_ph: 0.45, bull_pm: 443, bear_pm: 441, opp_sc: 0.39, opp_dist: 6_337 },
+        // #30 (V5.1 #3) TAO Ask: btc_comp=-0.32, H=0.744, macro=-0.45, Bull OB 88.6bp sc=0.64
+        HistAbcLoss { slot: 4, px: 19_038, vol: 3_023, ofi: -0.72, tfi: -0.67, geom: -0.27, btc_c: -0.32, side: Side::Ask, h_val: 0.744, m_ph: -0.45, bull_pm: 476, bear_pm: 548, opp_sc: 0.64, opp_dist: 8_861 },
+        // V5.3.2 #2 ETH Ask @ 177485: ofi=-0.22, btc_comp=-0.14
+        HistAbcLoss { slot: 1, px: 177_485, vol: 5_800, ofi: -0.22, tfi: -0.62, geom: -0.92, btc_c: -0.14, side: Side::Ask, h_val: 0.700, m_ph: -0.35, bull_pm: 509, bear_pm: 532, opp_sc: 0.67, opp_dist: 1_133 },
+    ];
+    for c in hist_abc_losses {
+        let mut s_loss = mk_vault_snap(c.slot, c.px, c.vol, c.ofi, c.tfi, c.geom, t0);
+        s_loss.ob_bull_efficacy_pm = i64::from(c.bull_pm);
+        s_loss.ob_bear_efficacy_pm = i64::from(c.bear_pm);
+        match c.side {
+            Side::Bid => {
+                s_loss.ob_bear_score = BoundedScore::new_clamped(c.opp_sc);
+                s_loss.ob_dist_bear_bps = ScaledBps(c.opp_dist);
+            }
+            Side::Ask => {
+                s_loss.ob_bull_score = BoundedScore::new_clamped(c.opp_sc);
+                s_loss.ob_dist_bull_bps = ScaledBps(c.opp_dist);
+            }
+        }
+        s_loss.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(c.h_val),
+            macro_phase: BoundedScore::new_clamped(c.m_ph),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        let btc_aligned_loss = c.btc_c * c.side.sign_f64();
+        let blocked_abc = !vortex_rs::alpha_3factor::passes_corrective_abc_snapshot_guard_with_sync_c1(
+            c.side,
+            &s_loss,
+            0.78,
+            btc_aligned_loss,
+        );
+        let blocked_ev = APPROVED_SPECS[c.slot]
+            .evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+                LotQty(if c.slot == 1 { 1 } else { 12 }),
+                PriceTicks(c.px),
+                ScaledBps(c.vol),
+                647,
+                50,
+                c.geom * c.side.sign_f64(),
+                c.bull_pm,
+                c.bear_pm,
+                c.side,
+                fees,
+                c.ofi * c.side.sign_f64(),
+                btc_aligned_loss,
+            )
+            .is_none();
+        assert!(blocked_abc || blocked_ev);
+    }
+
+    // =========================================================================
+    // (d) Elimination of static 500_000_000 ns scalar in queue SpoofingVeto & !at_l1 favorable shield:
+    //     1) TAO Ask @ 19862 at 523 ms when BBO already stepped favorably to asks[0]=19860 (!at_l1 favorable)
+    //        does NOT trigger SpoofingVeto even if L1 geometry at the new level flips (+0.55).
+    //     2) Red-Team V06 QUEUE_GEOM_FLIP_170MS (resting AT L1 asks[0]==19511, 170 ms, g_in - g_t >= INV_PHI)
+    //        STILL triggers SpoofingVeto 100%.
+    // =========================================================================
+    let mut tao_fav = mk_vault_snap(4, 19_859, 2_800, 0.12, 0.05, 0.55, t0 + 523_000_000);
+    tao_fav.bids[0] = BookLevel { price: PriceTicks(19_859), qty: LotQty(450) };
+    tao_fav.asks[0] = BookLevel { price: PriceTicks(19_860), qty: LotQty(320) };
+    tao_fav.refresh_deep_l1_l5_totals();
+    let mut adv_tao_fav = 0_i64;
+    assert!(!vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_entry_v54(
+        Side::Ask,
+        PriceTicks(19_862),
+        &tao_fav,
+        -0.52,
+        523_000_000,
+        BoundedScore::ZERO,
+        0.15,
+        1.0,
+        50,
+        75_000,
+        t0 + 523_000_000,
+        &mut adv_tao_fav,
+        LotQty(240),
+        LotQty(180),
+    ));
+
+    // Red-Team V06 QUEUE_GEOM_FLIP_170MS at L1 (entry == asks[0] == 19511, g_in = 0.64, g_t = -0.18 -> flip = 0.82 >= INV_PHI):
+    let mut tao_v06 = mk_vault_snap(4, 19_510, 2_800, 0.25, 0.15, 0.18, t0 + 170_000_000);
+    tao_v06.bids[0] = BookLevel { price: PriceTicks(19_510), qty: LotQty(600) };
+    tao_v06.asks[0] = BookLevel { price: PriceTicks(19_511), qty: LotQty(500) };
+    tao_v06.refresh_deep_l1_l5_totals();
+    let mut adv_v06_l1 = 0_i64;
+    assert!(vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_entry_v54(
+        Side::Ask,
+        PriceTicks(19_511),
+        &tao_v06,
+        -0.64,
+        170_000_000,
+        BoundedScore::ZERO,
+        0.18,
+        1.0,
+        50,
+        75_000,
+        t0 + 170_000_000,
+        &mut adv_v06_l1,
+        LotQty(500),
+        LotQty(500),
+    ));
 }

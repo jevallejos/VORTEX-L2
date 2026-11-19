@@ -182,6 +182,7 @@ pub struct SlotMarkoutRing {
     ewma_lvr_5s_bps: i64,
     ewma_markout_15s_bps: i64,
     ewma_markout_60s_bps: i64,
+    pending_uncensored_peak_sbps: i64,
     tp_abort_count: u64,
     resolved_abort_count: u64,
     veto_tp_counts: [u32; VETO_CODE_CARDINALITY],
@@ -216,6 +217,7 @@ impl SlotMarkoutRing {
             ewma_lvr_5s_bps: 0,
             ewma_markout_15s_bps: 0,
             ewma_markout_60s_bps: 0,
+            pending_uncensored_peak_sbps: 0,
             tp_abort_count: 0,
             resolved_abort_count: 0,
             veto_tp_counts: [0; VETO_CODE_CARDINALITY],
@@ -377,6 +379,9 @@ impl SlotMarkoutRing {
                             self.last_fill_curve = slot.curve;
                             self.last_fill_t0_ns = slot.t0_ns;
                         }
+                        if slot.curve.samples_bps[h_idx] > self.pending_uncensored_peak_sbps {
+                            self.pending_uncensored_peak_sbps = slot.curve.samples_bps[h_idx];
+                        }
                     }
                 }
             }
@@ -439,6 +444,40 @@ impl SlotMarkoutRing {
         let pos = self.abort_read_idx % DRAIN_ABORT_CAP;
         self.abort_read_idx = self.abort_read_idx.wrapping_add(1);
         Some(self.completed_aborts[pos])
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn peak_favorable_fill_markout_sbps(&self, opened_ts: TimestampNs) -> i64 {
+        let mut peak = 0_i64;
+        for slot in &self.probes {
+            if slot.active && !slot.is_abort_probe && slot.ref_price.0 > 0
+                && slot.t0_ns.saturating_sub(opened_ts.0).saturating_abs() <= 2_000_000_000
+            {
+                for h_idx in 0..MARKOUT_HORIZONS_V49 {
+                    if (slot.curve.resolved_mask & (1_u8 << h_idx)) != 0 {
+                        peak = peak.max(slot.curve.samples_bps[h_idx]);
+                    }
+                }
+            }
+        }
+        if self.last_fill_t0_ns > 0
+            && (opened_ts.0 <= 0 || self.last_fill_t0_ns.saturating_sub(opened_ts.0).saturating_abs() <= 2_000_000_000)
+        {
+            for h_idx in 0..MARKOUT_HORIZONS_V49 {
+                if (self.last_fill_curve.resolved_mask & (1_u8 << h_idx)) != 0 {
+                    peak = peak.max(self.last_fill_curve.samples_bps[h_idx]);
+                }
+            }
+        }
+        peak
+    }
+
+    #[inline]
+    pub fn take_uncensored_fill_peak_sbps(&mut self) -> Option<i64> {
+        let pk = self.pending_uncensored_peak_sbps;
+        self.pending_uncensored_peak_sbps = 0;
+        (pk > 0).then_some(pk)
     }
 
     #[inline]

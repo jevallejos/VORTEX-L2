@@ -99,13 +99,68 @@ pub fn check_queue_depletion_velocity_abort_with_spoof(
     (depleted_frac >= (0.50 * nu_sigma) && sweep_book_weak) || tail_exposed
 }
 
-/// Front-of-queue and intact-wall C1 pre-fill immunity predicate (V5.3.2):
-/// Once a passive Maker order in `RestingEntryQueue` has waited at least `500_000_000 ns`
-/// (preserving `V06` at `170 ms`), mechanical `X_GEOM` thinning cannot trigger `SpoofingVeto`
-/// at either queue extreme — front-of-queue (`rem_q_ratio < INV_PHI_SQ`, >61.8% consumed) or
-/// intact L1 wall (`rem_q_ratio >= 1.0 - INV_PHI_FOURTH`, >=85.4% intact) — unless real flow
-/// reversal co-occurs (`signed_ofi <= -INV_PHI_SQ` AND `signed_slow <= -INV_PHI_CUBE`).
-/// Genuine mid-queue wall collapses (`INV_PHI_SQ <= rem_q_ratio < 0.8541`) remain unshielded.
+/// Returns `true` when the live BBO has already stepped favorably past our passive `RestingEntryQueue` price
+/// (`!at_l1` favorable: `best_bid > entry_price` on `Bid`, or `best_ask < entry_price` on `Ask`), making
+/// BBO-level `X_GEOM` flips non-representative of our resting queue level (V5.4).
+#[inline]
+#[must_use]
+pub const fn is_bbo_favorably_past_resting_entry(
+    side: Side,
+    entry_price: PriceTicks,
+    snap: &SymbolLobSnapshot,
+) -> bool {
+    if entry_price.0 <= 0 {
+        return false;
+    }
+    match side {
+        Side::Bid => snap.bids[0].price.0 > entry_price.0,
+        Side::Ask => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 < entry_price.0,
+    }
+}
+
+/// Front-of-queue and intact-wall C1 pre-fill immunity predicate (V5.4):
+/// Replaces the static `500_000_000 ns` scalar with the continuous RTT-and-dilation horizon
+/// `tau_foq_ns = (PHI^4 * rtt_ns) / kappa` (preserving `V06` at `170 ms`), preventing mechanical
+/// `X_GEOM` thinning from triggering `SpoofingVeto` at front-of-queue (`rem_q_ratio < INV_PHI_SQ`)
+/// or intact L1 wall (`rem_q_ratio >= 1.0 - INV_PHI_FOURTH`) unless real flow reversal co-occurs.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn allows_front_of_queue_spoof_geom_abort_v54(
+    init_q_lots: LotQty,
+    rem_q_lots: LotQty,
+    wait_ns: i64,
+    signed_ofi: f64,
+    signed_slow: f64,
+    ws_rtt_us: u32,
+    event_dilation: f64,
+) -> bool {
+    const PHI_FOQ: f64 = 1.618_033_988_749_895;
+    const PHI_FOURTH_FOQ: f64 = 6.854_101_966_249_685;
+    const INV_PHI_FOQ: f64 = 0.618_033_988_749_895;
+    const INV_PHI_SQ_FOQ: f64 = 0.381_966_011_250_105;
+    const INV_PHI_CUBE_FOQ: f64 = 0.236_067_977_499_79;
+    const INV_PHI_FOURTH_FOQ: f64 = 0.145_898_033_750_315;
+
+    let eff_rtt_ns = (if ws_rtt_us > 0 { u64::from(ws_rtt_us) } else { 75_000 })
+        .clamp(30_000, 250_000) as f64
+        * 1_000.0;
+    let kappa = if event_dilation.is_finite() {
+        event_dilation.clamp(INV_PHI_FOQ, PHI_FOQ)
+    } else {
+        PHI_FOQ
+    };
+    let min_foq_wait_ns = ((PHI_FOURTH_FOQ * eff_rtt_ns) / kappa).round() as i64;
+
+    if init_q_lots.0 > 0 && wait_ns >= min_foq_wait_ns {
+        let rem_q_ratio = (rem_q_lots.0.max(0) as f64) / (init_q_lots.0 as f64);
+        if rem_q_ratio < INV_PHI_SQ_FOQ || rem_q_ratio >= (1.0 - INV_PHI_FOURTH_FOQ) {
+            return signed_ofi <= -INV_PHI_SQ_FOQ && signed_slow <= -INV_PHI_CUBE_FOQ;
+        }
+    }
+    true
+}
+
 #[inline]
 #[must_use]
 pub fn allows_front_of_queue_spoof_geom_abort_v531(
@@ -115,18 +170,16 @@ pub fn allows_front_of_queue_spoof_geom_abort_v531(
     signed_ofi: f64,
     signed_slow: f64,
 ) -> bool {
-    const INV_PHI_SQ_FOQ: f64 = 0.381_966_011_250_105;
-    const INV_PHI_CUBE_FOQ: f64 = 0.236_067_977_499_79;
-    const INV_PHI_FOURTH_FOQ: f64 = 0.145_898_033_750_315;
-    const MIN_FOQ_IMMUNITY_WAIT_NS: i64 = 500_000_000;
-
-    if init_q_lots.0 > 0 && wait_ns >= MIN_FOQ_IMMUNITY_WAIT_NS {
-        let rem_q_ratio = (rem_q_lots.0.max(0) as f64) / (init_q_lots.0 as f64);
-        if rem_q_ratio < INV_PHI_SQ_FOQ || rem_q_ratio >= (1.0 - INV_PHI_FOURTH_FOQ) {
-            return signed_ofi <= -INV_PHI_SQ_FOQ && signed_slow <= -INV_PHI_CUBE_FOQ;
-        }
-    }
-    true
+    let (ws_rtt_us, _) = crate::execution_fsm::read_live_ws_pulse();
+    allows_front_of_queue_spoof_geom_abort_v54(
+        init_q_lots,
+        rem_q_lots,
+        wait_ns,
+        signed_ofi,
+        signed_slow,
+        ws_rtt_us,
+        1.0,
+    )
 }
 
 /// Evaluates C1 Kinematic Free-Energy & Lyapunov Crest-Reversal with live `FeeSchedule` (`SCAR-LOCK 63/63` invariant).

@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V5.3.2 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 + Live VIP Fees).
+//! VORTEX-OMEGA V5.4 Immortal 12-Pair WebSocket Ingestor Daemon (SHM v15 + PAR2 + Live VIP Fees).
 #![allow(
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -80,7 +80,7 @@ impl TapLiveState {
             }
             let live_fees = load_hud_fee_schedule();
             println!(
-                "{}\u{1f7e2} [OB PLASTICITY V5.3.2 REHYDRATE] Hydrated 12/12 [OB+, OB-] SSOT slots | Fees: {:+.2}/{:.2}bp{}",
+                "{}\u{1f7e2} [OB PLASTICITY V5.4 REHYDRATE] Hydrated 12/12 [OB+, OB-] SSOT slots | Fees: {:+.2}/{:.2}bp{}",
                 ANSI_GREEN,
                 (live_fees.maker_fee_bps.raw() as f64) / 100.0,
                 (live_fees.taker_fee_bps.raw() as f64) / 100.0,
@@ -565,7 +565,7 @@ fn warm_start_elliott_and_order_blocks(state: &mut TapLiveState) {
         }
     }
     println!(
-        "{}\u{1f7e2} [TAP WARM-START V5.3.2] Hydrated {}/12 slots (Chunked Keep-Alive TLS -> Elliott + [OB+, OB-] + Live VIP){}",
+        "{}\u{1f7e2} [TAP WARM-START V5.4] Hydrated {}/12 slots (Chunked Keep-Alive TLS -> Elliott + [OB+, OB-] + Live VIP){}",
         ANSI_GREEN, hydrated_slots, ANSI_RESET
     );
 }
@@ -666,7 +666,7 @@ fn main() -> ExitCode {
 
     println!("{sep}");
     println!(
-        "[VORTEX-TAP OMEGA V5.3.2] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
+        "[VORTEX-TAP OMEGA V5.4] 12-PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM v{}: {})",
         VORTEX_SHM_VERSION,
         shm_path.display()
     );
