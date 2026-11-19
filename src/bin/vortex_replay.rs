@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V5.4.1 Deterministic 4-Arm Pareto, 1:1 PAR2 Digital Twin & Cold `.par2z` Replay CLI.
+//! VORTEX-OMEGA V5.4.2 Deterministic 4-Arm Pareto, 1:1 PAR2 Digital Twin & Cold `.par2z` Replay CLI.
 #![allow(clippy::cast_precision_loss)]
 
 use std::path::Path;
@@ -39,14 +39,14 @@ fn main() -> ExitCode {
         let rep = run_par2z_archive_walk_forward(Path::new(&arc), max_segments, true);
         let cum_bps = (rep.cum_net_bps_x100 as f64) / 100.0;
         println!(
-            "[PAR2Z COLD WALK-FORWARD V5.4.1] Archive: {arc} | Files: {} | Events: {} | CumNet: {cum_bps:+.2} bps",
+            "[PAR2Z COLD WALK-FORWARD V5.4.2] Archive: {arc} | Files: {} | Events: {} | CumNet: {cum_bps:+.2} bps",
             rep.files_count, rep.total_events
         );
     } else {
         let rep = run_parquet_walk_forward_on_dir(Path::new(&dir), true);
         let cum_bps = (rep.cum_net_bps_x100 as f64) / 100.0;
         println!(
-            "[PAR2 WALK-FORWARD ARCHIVE V5.4.1] Dir: {dir} | Files: {} | Events: {} | CumNet: {cum_bps:+.2} bps",
+            "[PAR2 WALK-FORWARD ARCHIVE V5.4.2] Dir: {dir} | Files: {} | Events: {} | CumNet: {cum_bps:+.2} bps",
             rep.files_count, rep.total_events
         );
     }

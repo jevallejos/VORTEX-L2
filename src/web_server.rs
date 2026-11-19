@@ -1,4 +1,4 @@
-//! Loopback-Only Observatory HTTP/SSE Backend (`127.0.0.1:8787`, Tear-Free SHM v15 & VKL1 Reader, V5.4.1).
+//! Loopback-Only Observatory HTTP/SSE Backend (`127.0.0.1:8787`, Tear-Free SHM v15 & VKL1 Reader, V5.4.2).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -299,6 +299,9 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
     let _ = dg.sync_utc_day(now, eq_1e8);
 
     let mut slots_json = Vec::with_capacity(MAX_ACTIVE_PAIRS);
+    let mut open_mtm_upl_1e8 = 0_i64;
+    let pre_shield_5u_halt = halt_locked
+        || (-ledger.cumulative_net_pnl_1e8).max(0) >= crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8;
     for (s_idx, &spec) in APPROVED_SPECS.iter().enumerate() {
         let (snap, tel) = raw_slots[s_idx];
         let w = snap.wave_observables();
@@ -312,6 +315,16 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             open_slots += 1;
             let p_side = if tel.side_code == 1 { Side::Ask } else { Side::Bid };
             let ref_t = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { tel.avg_price_ticks };
+            if tel.open_lots > 0 {
+                let (gross_1e8, est_fee_1e8, _, _) = spec.compute_leg_pnl_and_fee_1e8(
+                    p_side,
+                    crate::types::LotQty(tel.open_lots),
+                    crate::types::PriceTicks(tel.avg_price_ticks),
+                    crate::types::PriceTicks(ref_t),
+                    fees.round_trip_maker_exit_bps(),
+                );
+                open_mtm_upl_1e8 = open_mtm_upl_1e8.saturating_add(gross_1e8.saturating_sub(est_fee_1e8));
+            }
             let g_bps = ((ref_t - tel.avg_price_ticks) * p_side.sign_i64()).saturating_mul(1_000_000) / tel.avg_price_ticks.max(1);
             upl_bps = ((g_bps - fee_rt) as f64) / 100.0;
             upl_pct_10x = upl_bps / 10.0;
@@ -328,7 +341,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             "QUEUE_L1"
         } else if !shm_online {
             "SHM_OFFLINE"
-        } else if halt_locked {
+        } else if pre_shield_5u_halt {
             "HALT_LOCKED"
         } else if drain_mode {
             "DRAIN_P0B"
@@ -359,18 +372,35 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
         }));
     }
 
+    let (epoch_loss_1e8, _) = crate::exec_gateway_handlers::compute_validation_epoch_loss_1e8(
+        &ledger,
+        None,
+        open_mtm_upl_1e8,
+    );
+    let halt_effective = halt_locked || epoch_loss_1e8 >= crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8;
+    let shield_5u_rem_1e8 = crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8
+        .saturating_sub(epoch_loss_1e8.max(0))
+        .max(0);
+    let shield_5u_used_pct = ((epoch_loss_1e8.max(0) as f64) * 100.0
+        / (crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8 as f64))
+        .clamp(0.0, 999.9);
+    let shield_5u_summary = crate::telemetry_hud::format_total_loss_shield_5u_plain(
+        epoch_loss_1e8,
+        halt_effective,
+    );
+
     let mkr_pct = if total > 0 { (mkr_cnt as f64 * 100.0) / (total as f64) } else { 100.0 };
     let v70_bps = (ledger.vault_locked_profit_bps_x100 as f64) / 100.0;
     let r30_bps = (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0;
     let sem_rep = crate::telemetry_hud::evaluate_capital_scaling_semaphore(
-        &vault_path, eq_1e8, ledger.vault_locked_profit_bps_x100, mkr_pct, 0, halt_locked, &dg, fees,
+        &vault_path, eq_1e8, ledger.vault_locked_profit_bps_x100, mkr_pct, 0, halt_effective, &dg, fees,
     );
     let (g1, g2, g3, g4) = (sem_rep.gate1_ok, sem_rep.gate2_ok, sem_rep.gate3_ok, sem_rep.gate4_ok);
 
     serde_json::json!({
-        "ts_ns": now.0, "engine_version": "V5.4.1", "shm_version": VORTEX_SHM_VERSION, "shm_online": shm_online,
+        "ts_ns": now.0, "engine_version": "V5.4.2", "shm_version": VORTEX_SHM_VERSION, "shm_online": shm_online,
         "hb_age_ms": hb_age_ms, "resyncs": resyncs, "ws_rtt_us": ws_rtt_us,
-        "drain_mode": drain_mode, "halt_locked": halt_locked,
+        "drain_mode": drain_mode, "halt_locked": halt_effective,
         "lab_running": ctx.lab_running.load(Ordering::Acquire),
         "open_slots": open_slots, "queued_slots": queued_slots,
         "counters": { "armed": armed, "aborts": aborts, "fills": fills, "closed_shm": closed_shm },
@@ -387,6 +417,17 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             "day_usdt": (dg.day_realized_pnl_1e8 as f64) / 100_000_000.0,
             "stop_pct": (dg.elastic_loss_stop_ppm(ledger.sinking_fund_reserve_bps_x100, fee_rt) as f64) / 10_000.0,
             "wins": dg.day_wins, "losses": dg.day_losses,
+        },
+        "total_loss_shield": {
+            "loss_1e8": epoch_loss_1e8.max(0),
+            "max_loss_1e8": crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8,
+            "loss_usdt": (epoch_loss_1e8.max(0) as f64) / 100_000_000.0,
+            "max_loss_usdt": 5.0,
+            "used_pct": shield_5u_used_pct,
+            "remaining_usdt": (shield_5u_rem_1e8 as f64) / 100_000_000.0,
+            "status": if halt_effective { "HALTED" } else { "ARMED" },
+            "halted": halt_effective,
+            "summary": shield_5u_summary,
         },
         "semaphore_4_4": {
             "oos_520_ok": g1, "vault_70_ok": g2, "maker_80_ok": g3, "sample_25_ok": g4,
@@ -536,7 +577,7 @@ pub fn build_markdown_360_clip(ctx: &VortexWebContext, trade_id: Option<u64>) ->
     let ds = &st["daily_shield"];
     let sm = &st["semaphore_4_4"];
     let mut out = String::with_capacity(2_048);
-    out.push_str("### VORTEX-OMEGA V5.4.1 \u{2014} Snapshot Ejecutivo 360 (Loopback Read-Only)\n");
+    out.push_str("### VORTEX-OMEGA V5.4.2 \u{2014} Snapshot Ejecutivo 360 (Loopback Read-Only)\n");
     let _ = writeln!(
         out,
         "- **SHM v{}**: online={} | HB={} ms | Resyncs={} | WS_RTT={} us | Open={}/6 | Q={}",
@@ -557,6 +598,9 @@ pub fn build_markdown_360_clip(ctx: &VortexWebContext, trade_id: Option<u64>) ->
         ds["day_usdt"].as_f64().unwrap_or(0.0), ds["stop_pct"].as_f64().unwrap_or(0.0),
         sm["passed"].as_u64().unwrap_or(0), st["drain_mode"], st["halt_locked"]
     );
+    if let Some(s5_txt) = st["total_loss_shield"]["summary"].as_str() {
+        let _ = writeln!(out, "- **{s5_txt}**");
+    }
     if let Some(arr) = st["slots"].as_array() {
         out.push_str("\n| Slot | Symbol | Bid | Ask | Spr | OFI | TFI | OB+/- | Estado / Veto |\n|---|---|---|---|---|---|---|---|---|\n");
         for s in arr {

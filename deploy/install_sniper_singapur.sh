@@ -24,8 +24,8 @@ install -m 0755 target/release/vortex_web /home/ubuntu/vortex-rs/bin/vortex_web
 sudo install -m 0644 /home/ubuntu/vortex-rs/deploy/vortex-web.service /etc/systemd/system/vortex-web.service
 for unit_f in /etc/systemd/system/vortex-exec.service /etc/systemd/system/vortex-tap.service; do
   if [ -f "$unit_f" ]; then
-    sudo sed -i -E '/prewarm_emas_bybit\.py/d; s/VORTEX-OMEGA V[0-9]+(\.[0-9]+)*/VORTEX-OMEGA V5.4.1/g' "$unit_f" || true
+    sudo sed -i -E '/prewarm_emas_bybit\.py/d; s/VORTEX-OMEGA V[0-9]+(\.[0-9]+)*/VORTEX-OMEGA V5.4.2/g' "$unit_f" || true
   fi
 done
 sudo systemctl daemon-reload
-echo "[OK] VORTEX-OMEGA V5.4.1 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."
+echo "[OK] VORTEX-OMEGA V5.4.2 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."

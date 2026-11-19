@@ -20,6 +20,7 @@ pub const GEOM_DEPTH: usize = 10;
 pub const PHI: f64 = 1.618_033_988_749_895;
 pub const PHI_SQ: f64 = 2.618_033_988_749_895;
 pub const PHI_CUBE: f64 = 4.236_067_977_499_79;
+pub const PHI_FOURTH: f64 = 6.854_101_966_249_685;
 pub const INV_PHI: f64 = 0.618_033_988_749_895;
 pub const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
 pub const INV_PHI_CUBE: f64 = 0.236_067_977_499_79;
@@ -530,6 +531,38 @@ impl OrthogonalFactorState {
         epps_signed_beta: f64,
         epps_corr: f64,
     ) -> SignalVerdict {
+        Self::evaluate_entry_signal_v542(
+            spec,
+            snap,
+            leader_btc_snap,
+            learned_mfe_bps,
+            learned_dir_edge_bps,
+            taker_prob_pm,
+            fees,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            None,
+            1.0,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_entry_signal_v542(
+        spec: PairSpec,
+        snap: &SymbolLobSnapshot,
+        leader_btc_snap: &SymbolLobSnapshot,
+        learned_mfe_bps: ScaledBps,
+        learned_dir_edge_bps: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+    ) -> SignalVerdict {
         let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
@@ -606,18 +639,29 @@ impl OrthogonalFactorState {
         };
         let eff_epps_corr = if is_follower { epps_corr } else { 0.0 };
         let corr_sign = if eff_epps_corr < 0.0 { -1.0 } else { 1.0 };
-        let btc_aligned = if is_follower {
+        let inst_btc_aligned = if is_follower {
             corr_sign * Self::snr_composite_score(leader_btc_snap) * dir_sign
         } else {
             0.0
         };
-        if !passes_corrective_abc_snapshot_guard_with_sync_c1(side, snap, eff_epps_corr, btc_aligned) {
+        let btc_sync_aligned = if is_follower {
+            btc_lead_aligned_override.map_or(inst_btc_aligned, |m| inst_btc_aligned.max(m))
+        } else {
+            0.0
+        };
+        if !passes_corrective_abc_snapshot_guard_with_health_c1(
+            side,
+            snap,
+            eff_epps_corr,
+            btc_sync_aligned,
+            psi_health,
+        ) {
             return SignalVerdict::NeutralNoAction;
         }
         let s_iceberg = compute_passive_iceberg_absorption_penalty_c1(
             ofi * dir_sign,
             tfi * dir_sign,
-            btc_aligned,
+            inst_btc_aligned,
         );
         let eff_composite_abs = composite.abs() * (1.0 - INV_PHI * s_iceberg);
         if eff_composite_abs < elastic_snr_floor {
@@ -629,16 +673,29 @@ impl OrthogonalFactorState {
         let eff_vol = if matches!(w_entry.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc) && raw_vol < eq_horizon {
             let ob_tot = (al_ob_pm.max(382) + op_ob_pm.max(382)) as f64;
             let rho_ob_v = if al_ob_pm > 0 || op_ob_pm > 0 { (al_ob_pm.max(382) as f64) / ob_tot } else { 0.50 };
-            let s_sync = (compute_corrective_abc_epps_sync_lift_c1(
+            let s_opp_w = compute_s_opp_ob_wall_c1(side, snap, 0, taker_prob_pm, fees);
+            let chi_threat = compute_corrective_abc_structural_threat_c1(
+                s_opp_w,
+                dir_sign * w_entry.macro_phase.get(),
+            );
+            let delta_h_clear = compute_corrective_abc_clear_lift_c1(
+                psi_health,
+                (ofi * dir_sign).min(tfi * dir_sign),
+                chi_threat,
+                s_iceberg,
+            );
+            let s_sync = ((compute_corrective_abc_epps_sync_lift_c1(
                 eff_epps_corr,
-                btc_aligned,
+                btc_sync_aligned,
                 ofi * dir_sign,
                 tfi * dir_sign,
-                0.0,
-            ) / V45_INV_PHI_SQ)
+                s_opp_w,
+            ) + delta_h_clear)
+                / V45_INV_PHI_SQ)
                 .clamp(0.0, 1.0);
             let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob_v, 0.50, V45_INV_PHI).max(s_sync);
-            let h_drag = crate::wave_elliott::hermite_smoothstep_c1(w_entry.hurst_exponent(), 0.50, V45_INV_PHI)
+            let h_drag = chi_threat
+                * crate::wave_elliott::hermite_smoothstep_c1(w_entry.hurst_exponent(), 0.50, V45_INV_PHI)
                 * (1.0 - V45_INV_PHI * s_ob);
             let geom_mean = (raw_vol * eq_horizon).sqrt();
             geom_mean - h_drag * (geom_mean - raw_vol).max(0.0)
@@ -1148,6 +1205,33 @@ pub fn passes_elastic_geom_and_macro_impulse_guard_with_sync(
     spoof_density: f64,
     epps_corr: f64,
 ) -> Result<(), crate::lob_shm::LastVetoCode> {
+    passes_elastic_geom_and_macro_impulse_guard_with_health(
+        snap,
+        btc_leader_snap,
+        side,
+        spoof_density,
+        epps_corr,
+        None,
+        1.0,
+    )
+}
+
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_precision_loss,
+    clippy::manual_clamp,
+    clippy::suboptimal_flops,
+    clippy::too_many_arguments
+)]
+pub fn passes_elastic_geom_and_macro_impulse_guard_with_health(
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    btc_leader_snap: &crate::lob_shm::SymbolLobSnapshot,
+    side: crate::types::Side,
+    spoof_density: f64,
+    epps_corr: f64,
+    btc_lead_aligned_override: Option<f64>,
+    psi_health: f64,
+) -> Result<(), crate::lob_shm::LastVetoCode> {
     const INV_PHI: f64 = 0.618_033_988_749_895;
     const INV_PHI2: f64 = 0.381_966_011_250_105;
     const INV_PHI3: f64 = 0.236_067_977_499_790;
@@ -1157,14 +1241,25 @@ pub fn passes_elastic_geom_and_macro_impulse_guard_with_sync(
     let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
     let eff_corr = if is_follower { epps_corr } else { 0.0 };
     let corr_sign = if eff_corr < 0.0 { -1.0 } else { 1.0 };
-    let btc_aligned = if is_follower {
+    let inst_btc_aligned = if is_follower {
         corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
+    } else {
+        0.0
+    };
+    let btc_aligned = if is_follower {
+        btc_lead_aligned_override.map_or(inst_btc_aligned, |m| inst_btc_aligned.max(m))
     } else {
         0.0
     };
     let w_obs = snap.wave_observables();
     if is_opposing_impulse_wave3_hazard(side, snap)
-        || !passes_corrective_abc_snapshot_guard_with_sync_c1(side, snap, eff_corr, btc_aligned)
+        || !passes_corrective_abc_snapshot_guard_with_health_c1(
+            side,
+            snap,
+            eff_corr,
+            btc_aligned,
+            psi_health,
+        )
     {
         return Err(crate::lob_shm::LastVetoCode::MacroElliottContradiction);
     }
@@ -1252,7 +1347,7 @@ pub fn should_abort_collapsed_resting_l1_wall_dynamic(
         crate::types::Side::Bid => (snap.bids[0].price, snap.bids[0].qty),
         crate::types::Side::Ask => (snap.asks[0].price, snap.asks[0].qty),
     };
-    if bbo_px.0 <= 0 || bbo_px != entry_price {
+    if init_q_lots.0 <= 0 || bbo_px.0 <= 0 || bbo_px != entry_price {
         return false;
     }
     let p_tkr = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
@@ -1425,10 +1520,155 @@ pub fn compute_corrective_abc_epps_sync_lift_c1(
     INV_PHI2_S * s_epps * s_btc * s_flow * opp_clear
 }
 
+/// Zero-allocation short exponential memory (`\tau = \varphi^4` s) capturing natural `BTC -> Altcoin` lead-lag (V5.4.2 M1).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BtcLeadLagMemory {
+    snr_ema: f64,
+    last_ts_ns: i64,
+    initialized: bool,
+}
+
+impl BtcLeadLagMemory {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            snr_ema: 0.0,
+            last_ts_ns: 0,
+            initialized: false,
+        }
+    }
+
+    #[inline]
+    pub fn observe_btc_snapshot(&mut self, btc_snap: &SymbolLobSnapshot) -> f64 {
+        if btc_snap.bids[0].price.0 <= 0 || btc_snap.asks[0].price.0 <= 0 {
+            return self.snr_ema;
+        }
+        let inst_snr = OrthogonalFactorState::snr_composite_score(btc_snap);
+        if !inst_snr.is_finite() {
+            return self.snr_ema;
+        }
+        let ts = btc_snap.ts_local_ns.0;
+        if !self.initialized || ts <= 0 || self.last_ts_ns <= 0 || ts < self.last_ts_ns {
+            self.snr_ema = inst_snr;
+            self.last_ts_ns = ts;
+            self.initialized = true;
+        } else if ts > self.last_ts_ns {
+            let dt_s = ((ts - self.last_ts_ns) as f64) * 1e-9;
+            let alpha = if dt_s >= 60.0 {
+                1.0
+            } else {
+                (1.0 - (-dt_s / PHI_FOURTH).exp()).clamp(0.0, 1.0)
+            };
+            self.snr_ema += alpha * (inst_snr - self.snr_ema);
+            self.last_ts_ns = ts;
+        }
+        self.snr_ema
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn effective_aligned_impulse(
+        &self,
+        btc_snap: &SymbolLobSnapshot,
+        corr_sign: f64,
+        side: Side,
+    ) -> f64 {
+        let dir_s = side.sign_f64();
+        let inst = corr_sign * OrthogonalFactorState::snr_composite_score(btc_snap) * dir_s;
+        if self.initialized {
+            inst.max(corr_sign * self.snr_ema * dir_s)
+        } else {
+            inst
+        }
+    }
+}
+
+/// Real structural threat `chi_threat = s_opp_ob_wall.max(S_3(-macro_aligned; INV_PHI_CUBE, 0.50))` in `[0.0, 1.0]` (V5.4.2 M1).
+#[inline]
+#[must_use]
+pub fn compute_corrective_abc_structural_threat_c1(
+    s_opp_ob_wall: f64,
+    macro_aligned: f64,
+) -> f64 {
+    let s_opp = if s_opp_ob_wall.is_finite() {
+        s_opp_ob_wall.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let s_macro_adv =
+        crate::wave_elliott::hermite_smoothstep_c1(-macro_aligned, INV_PHI_CUBE, 0.50);
+    s_opp.max(s_macro_adv).clamp(0.0, 1.0)
+}
+
+/// Clear-runway `CorrectiveAbc` Hurst lift `delta_h_clear` in `[0.0, INV_PHI_SQ]` gated by `psi_health` (V5.4.2 M1).
+#[inline]
+#[must_use]
+pub fn compute_corrective_abc_clear_lift_c1(
+    psi_health: f64,
+    flow_aligned: f64,
+    chi_threat: f64,
+    s_iceberg_pen: f64,
+) -> f64 {
+    if !psi_health.is_finite()
+        || !flow_aligned.is_finite()
+        || !chi_threat.is_finite()
+        || !s_iceberg_pen.is_finite()
+    {
+        return 0.0;
+    }
+    let psi = psi_health.clamp(0.0, 1.0);
+    let s_flow = crate::wave_elliott::hermite_smoothstep_c1(flow_aligned, INV_PHI_CUBE, INV_PHI);
+    psi * INV_PHI_SQ
+        * s_flow
+        * (1.0 - chi_threat.clamp(0.0, 1.0))
+        * (1.0 - s_iceberg_pen.clamp(0.0, 1.0))
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_s_opp_ob_wall_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> f64 {
+    let (own_sc, opp_sc, own_dist, opp_dist) = match side {
+        crate::types::Side::Bid => (
+            snap.ob_bull_score.get(),
+            snap.ob_bear_score.get(),
+            snap.ob_dist_bull_bps.raw(),
+            snap.ob_dist_bear_bps.raw(),
+        ),
+        crate::types::Side::Ask => (
+            snap.ob_bear_score.get(),
+            snap.ob_bull_score.get(),
+            snap.ob_dist_bear_bps.raw(),
+            snap.ob_dist_bull_bps.raw(),
+        ),
+    };
+    let (b3x_sbps, eq_vol_sbps) =
+        endogenous_b3x_and_eq_vol_sbps(snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let prox_div_sbps = (PHI * (eq_vol_sbps.max(b3x_sbps) as f64)).max(100.0);
+    let own_eff = if own_dist > 0 && own_sc > 0.0 {
+        own_sc / (1.0 + (own_dist as f64) / prox_div_sbps)
+    } else {
+        0.0
+    };
+    let opp_eff = if opp_dist > 0 && opp_sc > 0.0 {
+        opp_sc / (1.0 + (opp_dist as f64) / prox_div_sbps)
+    } else {
+        0.0
+    };
+    crate::wave_elliott::hermite_smoothstep_c1(opp_eff - own_eff, INV_PHI_FIFTH, INV_PHI_FOURTH)
+}
+
 #[inline]
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
-pub fn passes_corrective_abc_fractal_guard_with_sync_c1(
+pub fn passes_corrective_abc_fractal_guard_with_health_c1(
     side: crate::types::Side,
     wave: crate::wave_elliott::WaveObservables,
     ob_align_pm: i64,
@@ -1438,6 +1678,7 @@ pub fn passes_corrective_abc_fractal_guard_with_sync_c1(
     ofi_aligned: f64,
     tfi_aligned: f64,
     s_opp_ob_wall: f64,
+    psi_health: f64,
 ) -> bool {
     const INV_PHI_C: f64 = 0.618_033_988_749_895;
     const INV_PHI2_C: f64 = 0.381_966_011_250_105;
@@ -1453,6 +1694,15 @@ pub fn passes_corrective_abc_fractal_guard_with_sync_c1(
     } else {
         0.50
     };
+    let chi_threat = compute_corrective_abc_structural_threat_c1(s_opp_ob_wall, aligned_macro);
+    let s_iceberg_pen =
+        compute_passive_iceberg_absorption_penalty_c1(ofi_aligned, tfi_aligned, btc_aligned);
+    let delta_h_clear = compute_corrective_abc_clear_lift_c1(
+        psi_health,
+        ofi_aligned.min(tfi_aligned),
+        chi_threat,
+        s_iceberg_pen,
+    );
     let delta_h_sync = compute_corrective_abc_epps_sync_lift_c1(
         epps_corr,
         btc_aligned,
@@ -1460,7 +1710,7 @@ pub fn passes_corrective_abc_fractal_guard_with_sync_c1(
         tfi_aligned,
         s_opp_ob_wall,
     );
-    let s_sync = (delta_h_sync / INV_PHI2_C).clamp(0.0, 1.0);
+    let s_sync = ((delta_h_sync + delta_h_clear) / INV_PHI2_C).clamp(0.0, 1.0);
     let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob, INV_PHI2_C, INV_PHI_C);
     let s_adv_macro = crate::wave_elliott::hermite_smoothstep_c1(-aligned_macro, 0.0, INV_PHI_C);
     let macro_floor = -INV_PHI3_C * (0.50 + s_ob + s_sync);
@@ -1468,8 +1718,39 @@ pub fn passes_corrective_abc_fractal_guard_with_sync_c1(
         return false;
     }
     let s_pos_m = crate::wave_elliott::hermite_smoothstep_c1(aligned_macro, INV_PHI3_C, INV_PHI_C);
-    let h_crit = 0.50 + INV_PHI3_C * s_ob + 0.090_169_943_749_47 * s_pos_m - INV_PHI3_C * s_adv_macro + delta_h_sync;
+    let h_crit = 0.50 + INV_PHI3_C * s_ob + 0.090_169_943_749_47 * s_pos_m
+        - INV_PHI3_C * s_adv_macro
+        + delta_h_sync
+        + delta_h_clear;
     wave.hurst_exponent() <= h_crit
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub fn passes_corrective_abc_fractal_guard_with_sync_c1(
+    side: crate::types::Side,
+    wave: crate::wave_elliott::WaveObservables,
+    ob_align_pm: i64,
+    ob_opp_pm: i64,
+    epps_corr: f64,
+    btc_aligned: f64,
+    ofi_aligned: f64,
+    tfi_aligned: f64,
+    s_opp_ob_wall: f64,
+) -> bool {
+    passes_corrective_abc_fractal_guard_with_health_c1(
+        side,
+        wave,
+        ob_align_pm,
+        ob_opp_pm,
+        epps_corr,
+        btc_aligned,
+        ofi_aligned,
+        tfi_aligned,
+        s_opp_ob_wall,
+        1.0,
+    )
 }
 
 #[inline]
@@ -1673,11 +1954,11 @@ pub fn passes_elastic_anti_spoof_ofi_guard(
             )
 }
 
-/// Continuous `C1` `CorrectiveAbc` fractal + live Order-Block wall dominance + `Epps + BTC` sync surface in `[0.0, 1.0]`.
+/// Continuous `C1` `CorrectiveAbc` fractal + live Order-Block structural threat `chi_threat` + `Epps + BTC` sync surface in `[0.0, 1.0]` (V5.4.2 M1).
 #[inline]
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
-pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
+pub fn evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
     side: crate::types::Side,
     snap: &crate::lob_shm::SymbolLobSnapshot,
     eq_vol_5m_sbps: i64,
@@ -1685,6 +1966,7 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
     fees: FeeSchedule,
     epps_corr: f64,
     btc_aligned: f64,
+    psi_health: f64,
 ) -> f64 {
     let wave = snap.wave_observables();
     if !matches!(wave.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc) {
@@ -1723,17 +2005,29 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
         0.0
     };
     let s_opp_wall =
-        crate::wave_elliott::hermite_smoothstep_c1(opp_eff - own_eff, INV_PHI_FOURTH, INV_PHI_SQ);
+        crate::wave_elliott::hermite_smoothstep_c1(opp_eff - own_eff, INV_PHI_FIFTH, INV_PHI_FOURTH);
     let s_own_wall =
         crate::wave_elliott::hermite_smoothstep_c1(own_eff - opp_eff, INV_PHI_FIFTH, INV_PHI_CUBE);
+    let ofi_aligned = snap.factor_ofi.get() * dir_s;
+    let tfi_aligned = snap.factor_tfi.get() * dir_s;
+    let aligned_macro = dir_s * wave.macro_phase.get();
+    let chi_threat = compute_corrective_abc_structural_threat_c1(s_opp_wall, aligned_macro);
+    let s_iceberg_pen =
+        compute_passive_iceberg_absorption_penalty_c1(ofi_aligned, tfi_aligned, btc_aligned);
+    let delta_h_clear = compute_corrective_abc_clear_lift_c1(
+        psi_health,
+        ofi_aligned.min(tfi_aligned),
+        chi_threat,
+        s_iceberg_pen,
+    );
     let delta_h_sync = compute_corrective_abc_epps_sync_lift_c1(
         epps_corr,
         btc_aligned,
-        snap.factor_ofi.get() * dir_s,
-        snap.factor_tfi.get() * dir_s,
+        ofi_aligned,
+        tfi_aligned,
         s_opp_wall,
     );
-    let s_sync = (delta_h_sync / INV_PHI_SQ).clamp(0.0, 1.0);
+    let s_sync = ((delta_h_sync + delta_h_clear) / INV_PHI_SQ).clamp(0.0, 1.0);
     let rho_ob = if ob_align_pm > 0 || ob_opp_pm > 0 {
         let a = (ob_align_pm.max(382)) as f64;
         let b = (ob_opp_pm.max(382)) as f64;
@@ -1743,14 +2037,14 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
     };
     let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob, INV_PHI_SQ, INV_PHI);
     let s_ob_eff = (s_ob * (1.0 - s_opp_wall)).max(s_own_wall);
-    let aligned_macro = dir_s * wave.macro_phase.get();
     let s_adv_macro = crate::wave_elliott::hermite_smoothstep_c1(-aligned_macro, 0.0, INV_PHI);
     let macro_floor = -INV_PHI_CUBE * (0.50 + s_ob_eff + s_sync);
     let s_pos_m = crate::wave_elliott::hermite_smoothstep_c1(aligned_macro, INV_PHI_CUBE, INV_PHI);
     let h_crit = 0.50 + INV_PHI_CUBE * s_ob_eff + INV_PHI_FIFTH * s_pos_m
         - INV_PHI_CUBE * s_adv_macro
         - INV_PHI_FOURTH * s_opp_wall
-        + delta_h_sync;
+        + delta_h_sync
+        + delta_h_clear;
     let pen_macro = crate::wave_elliott::hermite_smoothstep_c1(
         macro_floor - aligned_macro,
         -0.023_144,
@@ -1766,6 +2060,30 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
 
 #[inline]
 #[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+    epps_corr: f64,
+    btc_aligned: f64,
+) -> f64 {
+    evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
+        side,
+        snap,
+        eq_vol_5m_sbps,
+        taker_prob_pm,
+        fees,
+        epps_corr,
+        btc_aligned,
+        1.0,
+    )
+}
+
+#[inline]
+#[must_use]
 pub fn evaluate_corrective_abc_fractal_penalty_c1_dynamic(
     side: crate::types::Side,
     snap: &crate::lob_shm::SymbolLobSnapshot,
@@ -1773,12 +2091,13 @@ pub fn evaluate_corrective_abc_fractal_penalty_c1_dynamic(
     taker_prob_pm: i64,
     fees: FeeSchedule,
 ) -> f64 {
-    evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
+    evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
         side,
         snap,
         eq_vol_5m_sbps,
         taker_prob_pm,
         fees,
+        0.0,
         0.0,
         0.0,
     )
@@ -1787,56 +2106,74 @@ pub fn evaluate_corrective_abc_fractal_penalty_c1_dynamic(
 #[inline]
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_corrective_abc_snapshot_sync_with_health_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    epps_corr: f64,
+    btc_aligned: f64,
+    psi_health: f64,
+) -> f64 {
+    let wave = snap.wave_observables();
+    if !matches!(
+        wave.regime,
+        crate::wave_elliott::WaveRegime::CorrectiveAbc
+    ) {
+        return 0.0;
+    }
+    let dir_s = side.sign_f64();
+    let s_opp_wall = compute_s_opp_ob_wall_c1(side, snap, 0, 50, FeeSchedule::VIP0_DEFAULT);
+    let ofi_aligned = snap.factor_ofi.get() * dir_s;
+    let tfi_aligned = snap.factor_tfi.get() * dir_s;
+    let chi_threat =
+        compute_corrective_abc_structural_threat_c1(s_opp_wall, dir_s * wave.macro_phase.get());
+    let s_iceberg_pen =
+        compute_passive_iceberg_absorption_penalty_c1(ofi_aligned, tfi_aligned, btc_aligned);
+    let delta_h_clear = compute_corrective_abc_clear_lift_c1(
+        psi_health,
+        ofi_aligned.min(tfi_aligned),
+        chi_threat,
+        s_iceberg_pen,
+    );
+    let delta_h_sync = compute_corrective_abc_epps_sync_lift_c1(
+        epps_corr,
+        btc_aligned,
+        ofi_aligned,
+        tfi_aligned,
+        s_opp_wall,
+    );
+    ((delta_h_sync + delta_h_clear) / INV_PHI_SQ).clamp(0.0, 1.0)
+}
+
+#[inline]
+#[must_use]
 pub fn compute_corrective_abc_snapshot_sync_c1(
     side: crate::types::Side,
     snap: &crate::lob_shm::SymbolLobSnapshot,
     epps_corr: f64,
     btc_aligned: f64,
 ) -> f64 {
-    if !matches!(
-        snap.wave_observables().regime,
-        crate::wave_elliott::WaveRegime::CorrectiveAbc
-    ) {
-        return 0.0;
-    }
-    let dir_s = side.sign_f64();
-    let (own_sc, opp_sc, own_dist, opp_dist) = match side {
-        crate::types::Side::Bid => (
-            snap.ob_bull_score.get(),
-            snap.ob_bear_score.get(),
-            snap.ob_dist_bull_bps.raw(),
-            snap.ob_dist_bear_bps.raw(),
-        ),
-        crate::types::Side::Ask => (
-            snap.ob_bear_score.get(),
-            snap.ob_bull_score.get(),
-            snap.ob_dist_bear_bps.raw(),
-            snap.ob_dist_bull_bps.raw(),
-        ),
-    };
-    let (b3x_sbps, eq_vol_sbps) =
-        endogenous_b3x_and_eq_vol_sbps(snap, 0, 50, FeeSchedule::VIP0_DEFAULT);
-    let prox_div_sbps = (PHI * (eq_vol_sbps.max(b3x_sbps) as f64)).max(100.0);
-    let own_eff = if own_dist > 0 && own_sc > 0.0 {
-        own_sc / (1.0 + (own_dist as f64) / prox_div_sbps)
-    } else {
-        0.0
-    };
-    let opp_eff = if opp_dist > 0 && opp_sc > 0.0 {
-        opp_sc / (1.0 + (opp_dist as f64) / prox_div_sbps)
-    } else {
-        0.0
-    };
-    let s_opp_wall =
-        crate::wave_elliott::hermite_smoothstep_c1(opp_eff - own_eff, INV_PHI_FOURTH, INV_PHI_SQ);
-    let delta_h_sync = compute_corrective_abc_epps_sync_lift_c1(
+    compute_corrective_abc_snapshot_sync_with_health_c1(side, snap, epps_corr, btc_aligned, 1.0)
+}
+
+#[inline]
+#[must_use]
+pub fn evaluate_corrective_abc_fractal_penalty_with_health_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    epps_corr: f64,
+    btc_aligned: f64,
+    psi_health: f64,
+) -> f64 {
+    evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
+        side,
+        snap,
+        0,
+        50,
+        FeeSchedule::VIP0_DEFAULT,
         epps_corr,
         btc_aligned,
-        snap.factor_ofi.get() * dir_s,
-        snap.factor_tfi.get() * dir_s,
-        s_opp_wall,
-    );
-    (delta_h_sync / INV_PHI_SQ).clamp(0.0, 1.0)
+        psi_health,
+    )
 }
 
 #[inline]
@@ -1847,15 +2184,7 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_sync_c1(
     epps_corr: f64,
     btc_aligned: f64,
 ) -> f64 {
-    evaluate_corrective_abc_fractal_penalty_with_sync_c1_dynamic(
-        side,
-        snap,
-        0,
-        50,
-        FeeSchedule::VIP0_DEFAULT,
-        epps_corr,
-        btc_aligned,
-    )
+    evaluate_corrective_abc_fractal_penalty_with_health_c1(side, snap, epps_corr, btc_aligned, 1.0)
 }
 
 #[inline]
@@ -1875,14 +2204,31 @@ pub fn evaluate_corrective_abc_fractal_penalty_c1(
 
 #[inline]
 #[must_use]
+pub fn passes_corrective_abc_snapshot_guard_with_health_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    epps_corr: f64,
+    btc_aligned: f64,
+    psi_health: f64,
+) -> bool {
+    evaluate_corrective_abc_fractal_penalty_with_health_c1(
+        side,
+        snap,
+        epps_corr,
+        btc_aligned,
+        psi_health,
+    ) < 0.618_033_988_749_895
+}
+
+#[inline]
+#[must_use]
 pub fn passes_corrective_abc_snapshot_guard_with_sync_c1(
     side: crate::types::Side,
     snap: &crate::lob_shm::SymbolLobSnapshot,
     epps_corr: f64,
     btc_aligned: f64,
 ) -> bool {
-    evaluate_corrective_abc_fractal_penalty_with_sync_c1(side, snap, epps_corr, btc_aligned)
-        < 0.618_033_988_749_895
+    passes_corrective_abc_snapshot_guard_with_health_c1(side, snap, epps_corr, btc_aligned, 1.0)
 }
 
 #[inline]
@@ -1891,7 +2237,7 @@ pub fn passes_corrective_abc_snapshot_guard_c1(
     side: crate::types::Side,
     snap: &crate::lob_shm::SymbolLobSnapshot,
 ) -> bool {
-    passes_corrective_abc_snapshot_guard_with_sync_c1(side, snap, 0.0, 0.0)
+    passes_corrective_abc_snapshot_guard_with_health_c1(side, snap, 0.0, 0.0, 0.0)
 }
 
 #[cfg(test)]

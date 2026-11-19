@@ -89,6 +89,18 @@ pub fn evaluate_macro_coherence_surface_with_sync_c1(
     epps_corr: f64,
     btc_aligned: f64,
 ) -> f64 {
+    evaluate_macro_coherence_surface_with_health_c1(side, snap, epps_corr, btc_aligned, 1.0)
+}
+
+#[inline]
+#[must_use]
+pub fn evaluate_macro_coherence_surface_with_health_c1(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    epps_corr: f64,
+    btc_aligned: f64,
+    psi_health: f64,
+) -> f64 {
     if crate::alpha_3factor::is_opposing_impulse_wave3_hazard(side, snap) {
         return 1.0;
     }
@@ -113,17 +125,19 @@ pub fn evaluate_macro_coherence_surface_with_sync_c1(
     } else {
         0.0
     };
-    let abc_pen = crate::alpha_3factor::evaluate_corrective_abc_fractal_penalty_with_sync_c1(
+    let abc_pen = crate::alpha_3factor::evaluate_corrective_abc_fractal_penalty_with_health_c1(
         side,
         snap,
         epps_corr,
         btc_aligned,
+        psi_health,
     );
-    let s_abc_sync = crate::alpha_3factor::compute_corrective_abc_snapshot_sync_c1(
+    let s_abc_sync = crate::alpha_3factor::compute_corrective_abc_snapshot_sync_with_health_c1(
         side,
         snap,
         epps_corr,
         btc_aligned,
+        psi_health,
     );
     let slow_zigzag_pen = base_c1.max(oi_inv) * (1.0 - s_abc_sync);
     slow_zigzag_pen.max(fib_br).max(abc_pen).clamp(0.0, 1.0)
@@ -132,7 +146,7 @@ pub fn evaluate_macro_coherence_surface_with_sync_c1(
 #[inline]
 #[must_use]
 pub fn evaluate_macro_coherence_surface_c1(side: Side, snap: &SymbolLobSnapshot) -> f64 {
-    evaluate_macro_coherence_surface_with_sync_c1(side, snap, 0.0, 0.0)
+    evaluate_macro_coherence_surface_with_health_c1(side, snap, 0.0, 0.0, 0.0)
 }
 
 #[inline]
@@ -143,15 +157,33 @@ pub fn passes_elliott_macro_coherence_guard_with_sync(
     btc_leader_snap: &SymbolLobSnapshot,
     epps_corr: f64,
 ) -> bool {
+    passes_elliott_macro_coherence_guard_with_health(side, snap, btc_leader_snap, epps_corr, None, 1.0)
+}
+
+#[inline]
+#[must_use]
+pub fn passes_elliott_macro_coherence_guard_with_health(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    btc_leader_snap: &SymbolLobSnapshot,
+    epps_corr: f64,
+    btc_lead_aligned_override: Option<f64>,
+    psi_health: f64,
+) -> bool {
     let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
     let eff_corr = if is_follower { epps_corr } else { 0.0 };
     let corr_sign = if eff_corr < 0.0 { -1.0 } else { 1.0 };
-    let btc_aligned = if is_follower {
+    let inst_btc_aligned = if is_follower {
         corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * side.sign_f64()
     } else {
         0.0
     };
-    evaluate_macro_coherence_surface_with_sync_c1(side, snap, eff_corr, btc_aligned)
+    let btc_aligned = if is_follower {
+        btc_lead_aligned_override.map_or(inst_btc_aligned, |m| inst_btc_aligned.max(m))
+    } else {
+        0.0
+    };
+    evaluate_macro_coherence_surface_with_health_c1(side, snap, eff_corr, btc_aligned, psi_health)
         < 0.618_033_988_749_895
 }
 
@@ -219,6 +251,7 @@ pub struct SlotExecutionEngine {
     pub last_obs_funding_cut_id: i64,
     pub pre_cut_funding_rate_sbps: i64,
     pub accrued_adverse_funding_sbps: i64,
+    pub original_armed_entry_price: PriceTicks,
     pub hawkes_tracker: HawkesQueueTracker,
     pub wald_sprt: WaldSprtState,
 }
@@ -241,6 +274,7 @@ impl SlotExecutionEngine {
             close_reconcile_retries: 0, flow_ema_fast: 0.0, flow_ema_slow: 0.0,
             last_flow_sample_ts_ns: 0, in_slot_scar_debt: false, chandelier_profit_sl_armed: false,
             last_obs_funding_cut_id: 0, pre_cut_funding_rate_sbps: 0, accrued_adverse_funding_sbps: 0,
+            original_armed_entry_price: PriceTicks(0),
             hawkes_tracker: HawkesQueueTracker::new(), wald_sprt: WaldSprtState::new(),
         }
     }
@@ -495,6 +529,25 @@ impl SlotExecutionEngine {
     ) -> Result<(PriceTicks, PriceTicks), VortexError> {
         let max_drift = self.max_preflight_drift_ticks(snap);
         self.sync_preflight_l1_entry_with_sync(snap, btc_leader_snap, max_drift, epps_corr)
+    }
+
+    pub fn sync_preflight_l1_entry_auto_v542(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+    ) -> Result<(PriceTicks, PriceTicks), VortexError> {
+        let max_drift = self.max_preflight_drift_ticks(snap);
+        self.sync_preflight_l1_entry_v542(
+            snap,
+            btc_leader_snap,
+            max_drift,
+            epps_corr,
+            btc_lead_aligned_override,
+            psi_health,
+        )
     }
 
     #[inline]
@@ -777,8 +830,23 @@ impl SlotExecutionEngine {
         qty: LotQty,
         epps_corr: f64,
     ) -> Result<OrderLifecycleState, VortexError> {
+        self.try_arm_maker_entry_v542(snap, btc_leader_snap, verdict, qty, epps_corr, None, 0.0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_arm_maker_entry_v542(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        verdict: SignalVerdict,
+        qty: LotQty,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+    ) -> Result<OrderLifecycleState, VortexError> {
         if !matches!(self.state, OrderLifecycleState::Idle) || snap.ts_local_ns.0 < self.cooldown_until_ns.0 { return Ok(self.state); }
         let SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps } = verdict else { return Ok(self.state); };
+        let eff_psi = if btc_lead_aligned_override.is_some() || psi_health > 0.0 { psi_health } else { 1.0 };
         if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
             side,
             snap,
@@ -786,7 +854,14 @@ impl SlotExecutionEngine {
             self.learned_taker_prob_pm,
             self.active_fees,
         )
-            || !passes_elliott_macro_coherence_guard_with_sync(side, snap, btc_leader_snap, epps_corr)
+            || !passes_elliott_macro_coherence_guard_with_health(
+                side,
+                snap,
+                btc_leader_snap,
+                epps_corr,
+                btc_lead_aligned_override,
+                eff_psi,
+            )
             || !passes_order_block_wall_guard_dynamic(self.slot_idx, side, snap, self.learned_taker_prob_pm, self.active_fees)
         {
             return Ok(self.state);
@@ -808,8 +883,32 @@ impl SlotExecutionEngine {
             return Ok(self.state);
         }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else { return Ok(self.state); };
-        let entry_price = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        let base_l1_price = side.select_entry_bbo_price(best_bid.price, best_ask.price);
+        let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
+        let corr_sign = if is_follower && epps_corr < 0.0 { -1.0 } else { 1.0 };
+        let btc_al = if is_follower {
+            let inst = corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * side.sign_f64();
+            btc_lead_aligned_override.map_or(inst, |m| inst.max(m))
+        } else {
+            0.0
+        };
+        let prop = compute_aligned_entry_propulsion_c1(side, snap, btc_al);
+        let cand_px = select_elastic_entry_maker_price_v542(side, snap, psi_health, prop);
+        let entry_price = if cand_px != base_l1_price
+            && passes_cumulative_repeg_chase_cap_v542(
+                side,
+                base_l1_price,
+                cand_px,
+                target_excursion_scaled_bps,
+                ScaledBps(self.active_maker_rt_fee_bps()),
+            )
+        {
+            cand_px
+        } else {
+            base_l1_price
+        };
         let sl_trigger_price = self.compute_fill_or_adopt_sl_ticks_for_slot(side, entry_price, snap)?;
+        self.original_armed_entry_price = base_l1_price;
         self.open_vol_5m_bps = snap.realized_vol_5m;
         self.hawkes_tracker.reset();
         self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
@@ -831,7 +930,21 @@ impl SlotExecutionEngine {
         max_drift_ticks: i64,
         epps_corr: f64,
     ) -> Result<(PriceTicks, PriceTicks), VortexError> {
-        let OrderLifecycleState::PlacingEntryMaker { side, entry_price: armed_px, .. } = self.state else { return Err(VortexError::InvalidPriceOrTickSpec); };
+        self.sync_preflight_l1_entry_v542(snap, btc_leader_snap, max_drift_ticks, epps_corr, None, 0.0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_preflight_l1_entry_v542(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        max_drift_ticks: i64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+    ) -> Result<(PriceTicks, PriceTicks), VortexError> {
+        let OrderLifecycleState::PlacingEntryMaker { side, entry_price: armed_px, target_excursion, .. } = self.state else { return Err(VortexError::InvalidPriceOrTickSpec); };
+        let eff_psi = if btc_lead_aligned_override.is_some() || psi_health > 0.0 { psi_health } else { 1.0 };
         if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
             side,
             snap,
@@ -839,7 +952,14 @@ impl SlotExecutionEngine {
             self.learned_taker_prob_pm,
             self.active_fees,
         )
-            || !passes_elliott_macro_coherence_guard_with_sync(side, snap, btc_leader_snap, epps_corr)
+            || !passes_elliott_macro_coherence_guard_with_health(
+                side,
+                snap,
+                btc_leader_snap,
+                epps_corr,
+                btc_lead_aligned_override,
+                eff_psi,
+            )
             || !passes_order_block_wall_guard_dynamic(self.slot_idx, side, snap, self.learned_taker_prob_pm, self.active_fees)
         {
             return Err(VortexError::InvalidPriceOrTickSpec);
@@ -862,13 +982,37 @@ impl SlotExecutionEngine {
         }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else { return Err(VortexError::InvalidPriceOrTickSpec); };
         let cur_l1_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
-        if cur_l1_px.0 <= 0 || (cur_l1_px.0 - armed_px.0).abs() > max_drift_ticks { return Err(VortexError::InvalidPriceOrTickSpec); }
-        let new_sl = self.compute_fill_or_adopt_sl_ticks_for_slot(side, cur_l1_px, snap)?;
+        let anchor_px = if self.original_armed_entry_price.0 > 0 { self.original_armed_entry_price } else { armed_px };
+        if cur_l1_px.0 <= 0 || (cur_l1_px.0 - anchor_px.0).abs() > max_drift_ticks { return Err(VortexError::InvalidPriceOrTickSpec); }
+        let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
+        let corr_sign = if is_follower && epps_corr < 0.0 { -1.0 } else { 1.0 };
+        let btc_al = if is_follower {
+            let inst = corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * side.sign_f64();
+            btc_lead_aligned_override.map_or(inst, |m| inst.max(m))
+        } else {
+            0.0
+        };
+        let prop = compute_aligned_entry_propulsion_c1(side, snap, btc_al);
+        let cand_px = select_elastic_entry_maker_price_v542(side, snap, psi_health, prop);
+        let synced_px = if cand_px != cur_l1_px
+            && passes_cumulative_repeg_chase_cap_v542(
+                side,
+                anchor_px,
+                cand_px,
+                target_excursion,
+                ScaledBps(self.active_maker_rt_fee_bps()),
+            )
+        {
+            cand_px
+        } else {
+            cur_l1_px
+        };
+        let new_sl = self.compute_fill_or_adopt_sl_ticks_for_slot(side, synced_px, snap)?;
         if let OrderLifecycleState::PlacingEntryMaker { ref mut entry_price, ref mut sl_trigger_price, .. } = self.state {
-            *entry_price = cur_l1_px;
+            *entry_price = synced_px;
             *sl_trigger_price = new_sl;
         }
-        Ok((cur_l1_px, new_sl))
+        Ok((synced_px, new_sl))
     }
 
     pub fn compute_repeg_sl_trigger(&self, snap: &SymbolLobSnapshot, new_l1_price: PriceTicks) -> Result<PriceTicks, VortexError> {
@@ -2472,6 +2616,119 @@ pub fn compute_adaptive_repeg_cooldown_ns(ws_rtt_us: u64, ws_quota_rem: u32) -> 
     let q_norm = (f64::from(ws_quota_rem.min(100)) / 100.0).clamp(0.05, 1.0);
     let denom = (INV_PHI_R + INV_PHI_R * q_norm).max(INV_PHI_R);
     ((PHI_SQ_R * eff_rtt_ns) / denom).round() as i64
+}
+
+/// Aligned orderflow propulsion `P_align` in `[-1.0, 1.0]` penalized by passive Iceberg absorption (V5.4.2 M2).
+#[inline]
+#[must_use]
+#[allow(clippy::suboptimal_flops)]
+pub fn compute_aligned_entry_propulsion_c1(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    btc_aligned: f64,
+) -> f64 {
+    let dir_s = side.sign_f64();
+    let ofi_al = snap.factor_ofi.get() * dir_s;
+    let tfi_al = snap.factor_tfi.get() * dir_s;
+    if !ofi_al.is_finite() || !tfi_al.is_finite() {
+        return 0.0;
+    }
+    let s_ice = crate::alpha_3factor::compute_passive_iceberg_absorption_penalty_c1(
+        ofi_al,
+        tfi_al,
+        btc_aligned,
+    );
+    let raw = crate::alpha_3factor::INV_PHI * ofi_al + crate::alpha_3factor::INV_PHI_SQ * tfi_al;
+    if ofi_al <= crate::alpha_3factor::INV_PHI_SQ || tfi_al <= crate::alpha_3factor::INV_PHI_SQ {
+        raw.min(crate::alpha_3factor::INV_PHI) * (1.0 - s_ice)
+    } else {
+        (raw * (1.0 - s_ice)).clamp(-1.0, 1.0)
+    }
+}
+
+/// Inside-Spread `PostOnly` Penny-Jump entry selector (V5.4.2 M2):
+/// Quotes `1 tick` inside the spread (`bids[0] + 1 < asks[0]` on `Bid`, `asks[0] - 1 > bids[0]` on `Ask`)
+/// ONLY when `spread_ticks >= 2`, `psi_health > INV_PHI_SQ`, and `aligned_propulsion > INV_PHI` (`0` PostOnly rejects).
+#[inline]
+#[must_use]
+pub fn select_elastic_entry_maker_price_v542(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    psi_health: f64,
+    aligned_propulsion: f64,
+) -> PriceTicks {
+    let best_bid = snap.bids[0].price;
+    let best_ask = snap.asks[0].price;
+    if best_bid.0 <= 0 || best_ask.0 <= best_bid.0 {
+        return side.select_entry_bbo_price(best_bid, best_ask);
+    }
+    let spread_ticks = best_ask.0 - best_bid.0;
+    if spread_ticks >= 2
+        && psi_health > crate::alpha_3factor::INV_PHI_SQ
+        && aligned_propulsion > crate::alpha_3factor::INV_PHI
+    {
+        match side {
+            Side::Bid => {
+                let cand = PriceTicks(best_bid.0.saturating_add(1));
+                if cand.0 > best_bid.0 && cand.0 < best_ask.0 {
+                    return cand;
+                }
+            }
+            Side::Ask => {
+                let cand = PriceTicks(best_ask.0.saturating_sub(1));
+                if cand.0 < best_ask.0 && cand.0 > best_bid.0 {
+                    return cand;
+                }
+            }
+        }
+    }
+    side.select_entry_bbo_price(best_bid, best_ask)
+}
+
+/// Agile `Re-Peg` cooldown `rtt_eff * (PHI^2 + PHI^3 * S_3(eta_fill; INV_PHI_CUBE, INV_PHI))` (V5.4.2 M2).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_agile_repeg_cooldown_ns_v542(ws_rtt_us: u64, eta_fill: f64) -> i64 {
+    let rtt_eff_ns = (if ws_rtt_us > 0 { ws_rtt_us.clamp(10_000, 350_000) } else { 50_000 } as f64)
+        * 1_000.0;
+    let s_eta = crate::wave_elliott::hermite_smoothstep_c1(
+        eta_fill,
+        crate::alpha_3factor::INV_PHI_CUBE,
+        crate::alpha_3factor::INV_PHI,
+    );
+    (rtt_eff_ns * (crate::alpha_3factor::PHI_SQ + crate::alpha_3factor::PHI_CUBE * s_eta)).round()
+        as i64
+}
+
+/// Cumulative chase cap from original armed entry price: strictly `< INV_PHI_SQ * (target_gross_bps - fee_rt_mkr_bps)` (V5.4.2 M2).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn passes_cumulative_repeg_chase_cap_v542(
+    side: Side,
+    original_armed_px: PriceTicks,
+    candidate_repeg_px: PriceTicks,
+    target_gross_bps: ScaledBps,
+    fee_rt_mkr_bps: ScaledBps,
+) -> bool {
+    let anchor = original_armed_px.0;
+    if anchor <= 0 || candidate_repeg_px.0 <= 0 {
+        return false;
+    }
+    let fav_ticks = match side {
+        Side::Bid => (candidate_repeg_px.0 - anchor).max(0),
+        Side::Ask => (anchor - candidate_repeg_px.0).max(0),
+    };
+    if fav_ticks == 0 {
+        return true;
+    }
+    let net_headroom_sbps = (target_gross_bps.raw() - fee_rt_mkr_bps.raw()) as f64;
+    if net_headroom_sbps <= 0.0 {
+        return false;
+    }
+    let chase_sbps = ((fav_ticks as f64) * 1_000_000.0) / (anchor as f64);
+    chase_sbps < crate::alpha_3factor::INV_PHI_SQ * net_headroom_sbps
 }
 
 #[cfg(test)]

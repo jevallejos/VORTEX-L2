@@ -1,4 +1,4 @@
-//! Zero-Jitter Off-Thread Atomic Vault Persister (V5.4.1: Queue Aborts, 1Hz Position Paths & Plasticity Audit).
+//! Zero-Jitter Off-Thread Atomic Vault Persister (V5.4.2: Queue Aborts, 1Hz Position Paths, Plasticity Audit & -5.00 USDT Total Loss Shield).
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -34,6 +34,8 @@ use crate::types::{LotQty, PriceTicks, ScaledBps, Side, TimestampNs, VortexError
 
 pub const VAULT_IO_QUEUE_CAP: usize = 64;
 pub const MAX_INTRA_TRADE_SAMPLES: usize = 128;
+/// Hard irreversible operator validation epoch loss ceiling: `5.00000000 USDT` (`1e8` integer scale).
+pub const MAX_VALIDATION_EPOCH_LOSS_1E8: i64 = 500_000_000;
 pub const MFE_PLASTICITY_VAULT_PATH: &str = "data/vault/vortex_mfe_plasticity.json";
 pub const QUEUE_ABORTS_VAULT_PATH: &str = "data/vault/vortex_queue_aborts.jsonl";
 pub const POSITION_PATHS_VAULT_PATH: &str = "data/vault/vortex_position_paths.jsonl";
@@ -42,6 +44,7 @@ pub const PLASTICITY_AUDIT_VAULT_PATH: &str = "data/vault/vortex_plasticity_audi
 #[derive(Debug)]
 pub struct AtomicLockWatch {
     halt_locked: AtomicBool,
+    halt_latched_ram: AtomicBool,
     drain_active: AtomicBool,
 }
 
@@ -58,6 +61,7 @@ impl AtomicLockWatch {
     pub const fn new(halt: bool, drain: bool) -> Self {
         Self {
             halt_locked: AtomicBool::new(halt),
+            halt_latched_ram: AtomicBool::new(halt),
             drain_active: AtomicBool::new(drain),
         }
     }
@@ -65,7 +69,7 @@ impl AtomicLockWatch {
     #[inline]
     #[must_use]
     pub fn is_halt_locked(&self) -> bool {
-        self.halt_locked.load(Ordering::Acquire)
+        self.halt_latched_ram.load(Ordering::Acquire) || self.halt_locked.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -76,11 +80,13 @@ impl AtomicLockWatch {
 
     #[inline]
     pub fn latch_halt_in_ram(&self) {
+        self.halt_latched_ram.store(true, Ordering::Release);
         self.halt_locked.store(true, Ordering::Release);
     }
 
     pub fn refresh_from_fs(&self, halt_path: &Path, drain_path: &Path) {
-        self.halt_locked.store(halt_path.exists(), Ordering::Release);
+        let latched = self.halt_latched_ram.load(Ordering::Acquire) || halt_path.exists();
+        self.halt_locked.store(latched, Ordering::Release);
         self.drain_active.store(drain_path.exists(), Ordering::Release);
     }
 }
@@ -228,8 +234,16 @@ pub enum VaultIoCommand {
     },
     SaveObPlasticity { ts_ns: i64, bull_pm: [i64; 12], bear_pm: [i64; 12] },
     SaveMfePlasticity { ts_ns: i64, learned_mfe_bps: [i64; 12] },
+    LatchTotalLossHalt {
+        ts_ns: i64,
+        anchor_equity_1e8: i64,
+        current_equity_1e8: i64,
+        epoch_loss_1e8: i64,
+    },
     FlushBarrier(SyncSender<()>),
 }
+
+const _: () = assert!(core::mem::size_of::<VaultIoCommand>() <= 512);
 
 pub fn atomic_write_bytes_sync(target: &Path, payload: &[u8]) -> Result<(), VortexError> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -320,7 +334,7 @@ pub fn build_funding_settlement_vault_json(task: &FundingSettlementPersistTask) 
     let notional = task.position_notional_1e8.max(1);
     let funding_bps = ((task.funding_net_1e8 as f64) * 10_000.0) / (notional as f64);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "FUNDING_SETTLEMENT", "schema": "V5.4.1", "ts_ns": task.ts_ns,
+        "event": "FUNDING_SETTLEMENT", "schema": "V5.4.2", "ts_ns": task.ts_ns,
         "funding_cut_id": task.funding_cut_id, "slot_idx": task.slot_idx,
         "symbol": spec.symbol_id.name(), "side": side_str,
         "funding_rate_bps": (task.funding_rate_scaled_bps as f64) / 100.0,
@@ -338,7 +352,7 @@ pub fn build_queue_abort_vault_json(rec: &QueueAbortRecord) -> String {
     let wait_ms = rec.aborted_ts_ns.0.saturating_sub(rec.armed_ts_ns.0).max(0) / 1_000_000;
     let saved_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (rec.saved_tox_bps[k].raw() as f64) / 100.0);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "QUEUE_ABORTED", "schema": "V5.4.1", "ts_ns": rec.aborted_ts_ns.0,
+        "event": "QUEUE_ABORTED", "schema": "V5.4.2", "ts_ns": rec.aborted_ts_ns.0,
         "armed_ts_ns": rec.armed_ts_ns.0, "queue_wait_ms": wait_ms,
         "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
         "veto_code": rec.veto_code as u8, "veto_name": format!("{:?}", rec.veto_code),
@@ -362,7 +376,7 @@ pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String 
     }
     let m5_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (path_sum.markout_5h.samples_bps[k] as f64) / 100.0);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "POSITION_PATH_1HZ", "schema": "V5.4.1", "trade_id": path_sum.trade_id,
+        "event": "POSITION_PATH_1HZ", "schema": "V5.4.2", "trade_id": path_sum.trade_id,
         "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
         "opened_ts_ns": path_sum.opened_ts_ns.0, "closed_ts_ns": path_sum.closed_ts_ns.0,
         "entry_ticks": path_sum.entry_ticks.0, "exit_ticks": path_sum.exit_ticks.0,
@@ -377,7 +391,7 @@ pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String 
 #[must_use]
 pub fn build_plasticity_audit_vault_json(snap: &PlasticityAuditSnapshot) -> String {
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "PLASTICITY_AUDIT_V49", "schema": "V5.4.1", "ts_ns": snap.ts_ns,
+        "event": "PLASTICITY_AUDIT_V49", "schema": "V5.4.2", "ts_ns": snap.ts_ns,
         "taker_prob_pm": snap.taker_prob_pm, "learned_mfe_bps": snap.learned_mfe_bps,
         "ob_bull_pm": snap.ob_bull_pm, "ob_bear_pm": snap.ob_bear_pm,
         "epps_corr_pm": snap.epps_corr_pm, "ws_rtt_us": snap.ws_rtt_us, "ws_quota_rem": snap.ws_quota_rem,
@@ -460,7 +474,36 @@ pub fn persist_closed_trade_bundle_sync(task: &ClosedTradePersistTask, locks: Op
     }
 }
 
-fn handle_vault_io_cmd(cmd: VaultIoCommand, locks: &AtomicLockWatch) {
+pub fn persist_total_loss_halt_to_path_atomic(
+    halt_path: &Path,
+    ts_ns: i64,
+    anchor_equity_1e8: i64,
+    current_equity_1e8: i64,
+    epoch_loss_1e8: i64,
+    locks: Option<&AtomicLockWatch>,
+) -> Result<(), VortexError> {
+    if let Some(lw) = locks {
+        lw.latch_halt_in_ram();
+    }
+    let payload = serde_json::json!({
+        "event": "TOTAL_LOSS_SHIELD_5USDT_HALT",
+        "version": "5.4.2",
+        "ts_ns": ts_ns,
+        "anchor_equity_1e8": anchor_equity_1e8,
+        "current_equity_1e8": current_equity_1e8,
+        "epoch_loss_1e8": epoch_loss_1e8,
+        "max_epoch_loss_1e8": MAX_VALIDATION_EPOCH_LOSS_1E8,
+    });
+    let txt = format!("{payload}\n");
+    atomic_write_bytes_sync(halt_path, txt.as_bytes())
+}
+
+fn handle_vault_io_cmd(
+    cmd: VaultIoCommand,
+    locks: &AtomicLockWatch,
+    halt_path: &Path,
+    drain_path: &Path,
+) {
     match cmd {
         VaultIoCommand::SaveOpenPositions(task) => {
             if let Some(txt) = serialize_open_positions_state(&task.engines, &task.entry_forensics) {
@@ -499,26 +542,57 @@ fn handle_vault_io_cmd(cmd: VaultIoCommand, locks: &AtomicLockWatch) {
         VaultIoCommand::SaveMfePlasticity { ts_ns, learned_mfe_bps } => {
             let _ = save_mfe_plasticity_to_path_atomic(Path::new(MFE_PLASTICITY_VAULT_PATH), ts_ns, &learned_mfe_bps);
         }
+        VaultIoCommand::LatchTotalLossHalt {
+            ts_ns,
+            anchor_equity_1e8,
+            current_equity_1e8,
+            epoch_loss_1e8,
+        } => {
+            let _ = persist_total_loss_halt_to_path_atomic(
+                halt_path,
+                ts_ns,
+                anchor_equity_1e8,
+                current_equity_1e8,
+                epoch_loss_1e8,
+                Some(locks),
+            );
+        }
         VaultIoCommand::FlushBarrier(ack_tx) => {
-            locks.refresh_from_fs(Path::new(HALT_LOCK_PATH), Path::new(DRAIN_LOCK_PATH));
+            locks.refresh_from_fs(halt_path, drain_path);
             let _ = ack_tx.send(());
         }
     }
 }
 
 #[must_use]
-pub fn spawn_vault_io_worker(locks: Arc<AtomicLockWatch>) -> SyncSender<VaultIoCommand> {
+pub fn spawn_vault_io_worker_with_lock_paths(
+    locks: Arc<AtomicLockWatch>,
+    halt_path: std::path::PathBuf,
+    drain_path: std::path::PathBuf,
+) -> SyncSender<VaultIoCommand> {
     let (tx, rx) = mpsc::sync_channel::<VaultIoCommand>(VAULT_IO_QUEUE_CAP);
-    let _ = fs::create_dir_all("data/vault");
-    locks.refresh_from_fs(Path::new(HALT_LOCK_PATH), Path::new(DRAIN_LOCK_PATH));
+    if let Some(parent) = halt_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    locks.refresh_from_fs(&halt_path, &drain_path);
     thread::spawn(move || loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(cmd) => handle_vault_io_cmd(cmd, &locks),
-            Err(mpsc::RecvTimeoutError::Timeout) => locks.refresh_from_fs(Path::new(HALT_LOCK_PATH), Path::new(DRAIN_LOCK_PATH)),
+            Ok(cmd) => handle_vault_io_cmd(cmd, &locks, &halt_path, &drain_path),
+            Err(mpsc::RecvTimeoutError::Timeout) => locks.refresh_from_fs(&halt_path, &drain_path),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     });
     tx
+}
+
+#[must_use]
+pub fn spawn_vault_io_worker(locks: Arc<AtomicLockWatch>) -> SyncSender<VaultIoCommand> {
+    let _ = fs::create_dir_all("data/vault");
+    spawn_vault_io_worker_with_lock_paths(
+        locks,
+        std::path::PathBuf::from(HALT_LOCK_PATH),
+        std::path::PathBuf::from(DRAIN_LOCK_PATH),
+    )
 }
 
 #[cfg(test)]

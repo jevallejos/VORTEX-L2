@@ -166,11 +166,15 @@ impl FifoQueueSimulator {
                 let level_wiped = match side {
                     Side::Bid => {
                         (best_ask.price.0 > 0 && best_ask.price.0 <= limit_price.0)
-                            || (best_bid.price.0 > 0 && best_bid.price.0 < limit_price.0)
+                            || (last_observed_lvl_qty.0 > 0
+                                && best_bid.price.0 > 0
+                                && best_bid.price.0 < limit_price.0)
                     }
                     Side::Ask => {
                         best_bid.price.0 >= limit_price.0
-                            || (best_ask.price.0 > 0 && best_ask.price.0 > limit_price.0)
+                            || (last_observed_lvl_qty.0 > 0
+                                && best_ask.price.0 > 0
+                                && best_ask.price.0 > limit_price.0)
                     }
                 };
                 if level_wiped {
@@ -256,11 +260,15 @@ impl FifoQueueSimulator {
                 let level_wiped = match side {
                     Side::Bid => {
                         (best_ask.price.0 > 0 && best_ask.price.0 <= limit_price.0)
-                            || (best_bid.price.0 > 0 && best_bid.price.0 < limit_price.0)
+                            || (last_observed_lvl_qty.0 > 0
+                                && best_bid.price.0 > 0
+                                && best_bid.price.0 < limit_price.0)
                     }
                     Side::Ask => {
                         best_bid.price.0 >= limit_price.0
-                            || (best_ask.price.0 > 0 && best_ask.price.0 > limit_price.0)
+                            || (last_observed_lvl_qty.0 > 0
+                                && best_ask.price.0 > 0
+                                && best_ask.price.0 > limit_price.0)
                     }
                 };
                 if level_wiped {

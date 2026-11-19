@@ -86,6 +86,10 @@ pub struct OnlineAdaptiveGovernor {
     abc_chop_last_sl_ts_ns: i64,
     abc_chop_sl_score_pm: i64,
     entry_warmup_until_ns: i64,
+    portfolio_ewma_net_bps_x100: i64,
+    last_daily_loss_used_ratio: f64,
+    last_epoch_loss_5u_ratio: f64,
+    cached_psi_health: f64,
     plasticity: GovernorPlasticityState,
 }
 
@@ -124,6 +128,10 @@ impl OnlineAdaptiveGovernor {
             abc_chop_last_sl_ts_ns: 0,
             abc_chop_sl_score_pm: 0,
             entry_warmup_until_ns: 0,
+            portfolio_ewma_net_bps_x100: ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw(),
+            last_daily_loss_used_ratio: 0.0,
+            last_epoch_loss_5u_ratio: 0.0,
+            cached_psi_health: 1.0,
             plasticity: GovernorPlasticityState::new(),
         }
     }
@@ -133,6 +141,59 @@ impl OnlineAdaptiveGovernor {
     #[inline] pub fn set_active_fee_schedule(&mut self, fees: FeeSchedule) { self.plasticity.set_active_fee_schedule(fees); }
     #[inline] #[must_use] pub const fn active_maker_rt_fee_bps(&self) -> i64 { self.plasticity.maker_round_trip_fee_bps() }
     #[inline] #[must_use] pub const fn slot_taker_prob_permille(&self, slot_idx: usize, side: Side) -> i64 { self.plasticity.slot_taker_prob_permille(slot_idx, side) }
+    #[inline] #[must_use] pub const fn portfolio_taker_prob_permille(&self) -> i64 { self.plasticity.portfolio_taker_prob_permille() }
+    #[inline] #[must_use] pub const fn psi_health(&self) -> f64 { self.cached_psi_health }
+    #[inline] pub fn set_psi_health(&mut self, psi: f64) { self.cached_psi_health = psi.clamp(0.0, 1.0); }
+    #[inline] #[must_use] pub fn slot_fill_rate_eta(&self, slot_idx: usize) -> f64 { self.plasticity.slot_fill_rate_eta(slot_idx) }
+    #[inline] #[must_use] pub const fn slot_fill_obs_alpha_beta(&self, slot_idx: usize) -> (i64, i64) {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return (1_000, 1_000);
+        }
+        (self.plasticity.fill_obs_alpha_x1000[slot_idx], self.plasticity.fill_obs_beta_x1000[slot_idx])
+    }
+    #[inline] pub fn observe_passive_entry_fill(&mut self, slot_idx: usize) { self.plasticity.observe_passive_entry_fill(slot_idx); }
+    #[inline] pub fn observe_favorable_entry_miss(&mut self, slot_idx: usize) { self.plasticity.observe_favorable_entry_miss(slot_idx); }
+
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn portfolio_ewma_net_bps(&self) -> f64 {
+        (self.portfolio_ewma_net_bps_x100 as f64) / 100.0
+    }
+
+    #[inline]
+    #[allow(clippy::cast_precision_loss)]
+    fn recompute_psi_health_in_place(&mut self) -> f64 {
+        let p_tkr = (self.plasticity.portfolio_taker_prob_permille().clamp(5, 950) as f64) * 1e-3;
+        let ewma_bps = self.portfolio_ewma_net_bps();
+        let fee_rt_bps = (self.active_maker_rt_fee_bps().max(100) as f64) / 100.0;
+        let psi = crate::governor_plasticity::compute_psi_health_c1(
+            p_tkr,
+            ewma_bps,
+            fee_rt_bps,
+            self.last_daily_loss_used_ratio,
+            self.last_epoch_loss_5u_ratio,
+        );
+        self.cached_psi_health = psi;
+        psi
+    }
+
+    #[inline]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn refresh_psi_health(
+        &mut self,
+        daily_gov: &crate::governor_plasticity::DailySessionGovernor,
+        sinking_reserve_bps_x100: i64,
+        epoch_loss_1e8: i64,
+    ) -> f64 {
+        let fee_rt_sbps = self.active_maker_rt_fee_bps();
+        self.last_daily_loss_used_ratio =
+            daily_gov.daily_loss_used_ratio(sinking_reserve_bps_x100, fee_rt_sbps);
+        self.last_epoch_loss_5u_ratio = ((epoch_loss_1e8.max(0) as f64)
+            / (crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8 as f64))
+            .clamp(0.0, 2.0);
+        self.recompute_psi_health_in_place()
+    }
 
     #[inline]
     #[must_use]
@@ -576,6 +637,8 @@ impl OnlineAdaptiveGovernor {
         let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
         self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d].clamp(100, 100_000_000) * 80 + diff.saturating_mul(diff).min(25_000_000) * 20) / 100).max(2_500);
         self.ewma_net_bps_x100[slot_idx][d] = ((prev_mean * 75 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 25) / 100).clamp(-100_000, 100_000);
+        self.portfolio_ewma_net_bps_x100 = ((self.portfolio_ewma_net_bps_x100.clamp(-100_000, 100_000) * 764 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 236) / 1_000).clamp(-100_000, 100_000);
+        let _ = self.recompute_psi_health_in_place();
         self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 60), fee_rt * 60);
         self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 75), fee_rt * 30);
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
@@ -677,7 +740,32 @@ impl OnlineAdaptiveGovernor {
 
     #[inline]
     pub fn observe_entry_abort(&mut self, slot_idx: usize, side: Side, aborted_price: PriceTicks, ts_ns: TimestampNs) {
-        if slot_idx >= MAX_ACTIVE_PAIRS { return; }
+        self.observe_entry_abort_with_context(slot_idx, side, aborted_price, ts_ns, false, true);
+    }
+
+    /// Context-aware queue abort observer (V5.4.2 M2): favorable BBO miss without toxic Hawkes sweep
+    /// updates `BetaBinomialFillRate` (`beta += 1000`) and exempts punitive anti-knife cooldown,
+    /// keeping `V08 POST_ABORT_KNIFE_TRAP` 100% active on adverse/toxic aborts.
+    #[inline]
+    pub fn observe_entry_abort_with_context(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        aborted_price: PriceTicks,
+        ts_ns: TimestampNs,
+        favorable_bbo_miss: bool,
+        toxic_hawkes_sweep: bool,
+    ) {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return;
+        }
+        if favorable_bbo_miss && !toxic_hawkes_sweep {
+            self.plasticity.observe_favorable_entry_miss(slot_idx);
+            return;
+        }
+        if favorable_bbo_miss {
+            self.plasticity.observe_favorable_entry_miss(slot_idx);
+        }
         let d = Self::dir_idx(side);
         let prev_ts = self.abort_last_ts_ns[slot_idx][d];
         if prev_ts > 0 && ts_ns.0 > prev_ts && ts_ns.0.saturating_sub(prev_ts) >= (self.intrinsic_diffusion_clock_ns(slot_idx) / 5) {
@@ -742,6 +830,7 @@ impl OnlineAdaptiveGovernor {
             "cross_chop_cooldown_until_ns": self.cross_chop_cooldown_until_ns,
             "abc_chop_last_sl_ts_ns": self.abc_chop_last_sl_ts_ns,
             "abc_chop_sl_score_pm": self.abc_chop_sl_score_pm,
+            "portfolio_ewma_net_bps_x100": self.portfolio_ewma_net_bps_x100,
         });
         if let Some(map) = val.as_object_mut() { self.plasticity.write_to_scar_json_map(map); }
         val
@@ -804,7 +893,13 @@ impl OnlineAdaptiveGovernor {
         }
         self.abc_chop_last_sl_ts_ns = val.get("abc_chop_last_sl_ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0).max(0);
         self.abc_chop_sl_score_pm = val.get("abc_chop_sl_score_pm").and_then(serde_json::Value::as_i64).unwrap_or(0).clamp(0, 1_000);
+        self.portfolio_ewma_net_bps_x100 = val
+            .get("portfolio_ewma_net_bps_x100")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw())
+            .clamp(-100_000, 100_000);
         self.plasticity.apply_from_scar_json(val);
+        let _ = self.recompute_psi_health_in_place();
         Some(TimestampNs(snap_ts))
     }
 
@@ -1214,8 +1309,10 @@ impl OnlineAdaptiveGovernor {
         } else {
             1_000
         };
-        let damper_c = ((daily_damper_permille.clamp(618, 1_000) * coil_damper_pm) / 1_000).clamp(618, 1_000);
-        let eff_cadence_pm = ((cadence.kelly_lot_mult_permille * damper_c) / 1_000).clamp(550, 1_200);
+        let damper_floor = if daily_damper_permille < 618 { 382 } else { 618 };
+        let cadence_floor = if daily_damper_permille < 618 { 382 } else { 550 };
+        let damper_c = ((daily_damper_permille.clamp(damper_floor, 1_000) * coil_damper_pm) / 1_000).clamp(damper_floor, 1_000);
+        let eff_cadence_pm = ((cadence.kelly_lot_mult_permille * damper_c) / 1_000).clamp(cadence_floor, 1_200);
         let (edge_bps, _, _) = self.slot_direction_diagnostics(s_clamped, side);
         spec.compute_risk_parity_kelly_lots_with_fees(
             wallet_usdt_1e8,
@@ -1436,6 +1533,40 @@ impl OnlineAdaptiveGovernor {
         epps_signed_beta: f64,
         epps_corr: f64,
     ) -> Result<LotQty, crate::lob_shm::LastVetoCode> {
+        self.authorizes_adaptive_entry_v542(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            daily_damper_permille,
+            learned_mfe_bps,
+            candidate_snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            None,
+        )
+    }
+
+    /// Unified V5.4.2 entry gate coupling `psi_health`, `CorrectiveAbc` `chi_threat`, `BTC` lead-lag memory & Pillar-2 EV.
+    ///
+    /// # Errors
+    /// Returns the causal `LastVetoCode` when quantum EV, `ImpulseWave3`, `GEOM` or Pillar-2 EV fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorizes_adaptive_entry_v542(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        daily_damper_permille: i64,
+        learned_mfe_bps: ScaledBps,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+    ) -> Result<LotQty, crate::lob_shm::LastVetoCode> {
         use crate::lob_shm::LastVetoCode;
 
         if slot_idx >= MAX_ACTIVE_PAIRS {
@@ -1484,12 +1615,14 @@ impl OnlineAdaptiveGovernor {
         ) {
             return Err(LastVetoCode::SpoofingVeto);
         }
-        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard_with_sync(
+        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard_with_health(
             candidate_snap,
             btc_leader_snap,
             side,
             spoof_density,
             epps_corr,
+            btc_lead_aligned_override,
+            self.psi_health(),
         )?;
         let lots = self.compute_slot_entry_lots_v48(
             slot_idx,
@@ -1585,6 +1718,40 @@ impl OnlineAdaptiveGovernor {
         epps_signed_beta: f64,
         epps_corr: f64,
     ) -> Result<(i64, i64), crate::lob_shm::LastVetoCode> {
+        self.confirm_preflight_kinematics_v542(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            allocated_lots,
+            learned_mfe_bps,
+            snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            None,
+        )
+    }
+
+    /// Unified V5.4.2 preflight confirmation coupling `psi_health`, `BTC` lead-lag memory & Pillar-2 EV.
+    ///
+    /// # Errors
+    /// Returns `LastVetoCode` if BBO, `ImpulseWave3`, `GEOM`, Pillar-2 EV or preflight kinematics decay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_preflight_kinematics_v542(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        allocated_lots: LotQty,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+    ) -> Result<(i64, i64), crate::lob_shm::LastVetoCode> {
         use crate::lob_shm::LastVetoCode;
 
         if slot_idx >= MAX_ACTIVE_PAIRS {
@@ -1617,12 +1784,14 @@ impl OnlineAdaptiveGovernor {
         ) {
             return Err(LastVetoCode::SpoofingVeto);
         }
-        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard_with_sync(
+        crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard_with_health(
             snap,
             btc_leader_snap,
             side,
             spoof_density,
             epps_corr,
+            btc_lead_aligned_override,
+            self.psi_health(),
         )?;
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         if !self.passes_elastic_preflight_l1_support(slot_idx, side, entry_px, snap) {

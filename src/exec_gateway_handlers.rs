@@ -1,4 +1,4 @@
-//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V5.4.1).
+//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V5.4.2).
 #![allow(
     clippy::cast_precision_loss,
     clippy::manual_clamp,
@@ -12,7 +12,8 @@ use core::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 
 use crate::alpha_3factor::{
-    EppsBtcCorrelationTracker, EventClockAlphaModulator, OrthogonalFactorState, SignalVerdict,
+    BtcLeadLagMemory, EppsBtcCorrelationTracker, EventClockAlphaModulator, OrthogonalFactorState,
+    SignalVerdict,
 };
 use crate::bybit_client::BybitV5LiveClient;
 use crate::bybit_gateway::{
@@ -61,9 +62,13 @@ pub struct ExecRuntimeState {
     pub last_zeta_tox: [f64; MAX_ACTIVE_PAIRS],
     pub geom_adv_since_ns: [i64; MAX_ACTIVE_PAIRS],
     pub queue_flow_ema: [f64; MAX_ACTIVE_PAIRS],
+    pub btc_lead_memory: BtcLeadLagMemory,
+    pub abort_was_favorable_miss: [bool; MAX_ACTIVE_PAIRS],
+    pub next_poll_fill_ts_ns: [i64; MAX_ACTIVE_PAIRS],
     pub boot_converged: bool,
     pub entry_warmup_until_ns: i64,
     pub drain_flushed_once: bool,
+    pub total_loss_shield_latched: bool,
     pub halt_locked: bool,
     pub drain_active: bool,
 }
@@ -98,13 +103,114 @@ impl ExecRuntimeState {
             last_zeta_tox: [0.0; MAX_ACTIVE_PAIRS],
             geom_adv_since_ns: [0; MAX_ACTIVE_PAIRS],
             queue_flow_ema: [0.0; MAX_ACTIVE_PAIRS],
+            btc_lead_memory: BtcLeadLagMemory::new(),
+            abort_was_favorable_miss: [false; MAX_ACTIVE_PAIRS],
+            next_poll_fill_ts_ns: [0; MAX_ACTIVE_PAIRS],
             boot_converged: false,
             entry_warmup_until_ns: 0,
             drain_flushed_once: false,
+            total_loss_shield_latched: false,
             halt_locked: false,
             drain_active: false,
         }
     }
+}
+
+#[must_use]
+pub fn compute_open_positions_mtm_upl_1e8(
+    engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+) -> i64 {
+    let mut sum_upl_1e8 = 0_i64;
+    for s_idx in 0..MAX_ACTIVE_PAIRS {
+        if let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            open_lots,
+            ..
+        } = engines[s_idx].state
+        {
+            if avg_price_ticks.0 <= 0 || open_lots.0 <= 0 {
+                continue;
+            }
+            let snap = &cached_snaps[s_idx];
+            let mark_px = if snap.mark_price.0 > 0 {
+                snap.mark_price
+            } else if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+                PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+            } else {
+                avg_price_ticks
+            };
+            if mark_px.0 > 0 {
+                let (pnl_1e8, _, _, _) = APPROVED_SPECS[s_idx]
+                    .compute_leg_pnl_and_fee_1e8_with_schedule(
+                        side,
+                        open_lots,
+                        avg_price_ticks,
+                        mark_px,
+                        true,
+                        engines[s_idx].active_fees,
+                    );
+                sum_upl_1e8 = sum_upl_1e8.saturating_add(pnl_1e8);
+            }
+        }
+    }
+    sum_upl_1e8
+}
+
+#[must_use]
+pub fn compute_validation_epoch_loss_1e8(
+    ledger: &ParitySyncLedger,
+    live_wallet_1e8: Option<i64>,
+    open_upl_1e8: i64,
+) -> (i64, i64) {
+    let realized_loss_1e8 = (-ledger.cumulative_net_pnl_1e8).max(0);
+    let ledger_mtm_eq = ledger.current_equity_1e8().saturating_add(open_upl_1e8);
+    let effective_live_eq = match live_wallet_1e8 {
+        Some(w) if w > 0 => w.saturating_add(open_upl_1e8).min(ledger_mtm_eq),
+        _ => ledger_mtm_eq,
+    };
+    let mtm_loss_1e8 = (ledger.initial_equity_1e8 - effective_live_eq).max(0);
+    (realized_loss_1e8.max(mtm_loss_1e8), effective_live_eq)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_latch_validation_epoch_5usdt_shield(
+    now_ns: TimestampNs,
+    live_wallet_1e8: Option<i64>,
+    lock_watch: Option<&crate::vault_io::AtomicLockWatch>,
+    rt: &mut ExecRuntimeState,
+    cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+    engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    ledger: &ParitySyncLedger,
+    tg_tx: &SyncSender<String>,
+    vault_tx: &SyncSender<VaultIoCommand>,
+) -> i64 {
+    let open_upl_1e8 = compute_open_positions_mtm_upl_1e8(engines, cached_snaps);
+    let (epoch_loss_1e8, eff_eq_1e8) =
+        compute_validation_epoch_loss_1e8(ledger, live_wallet_1e8, open_upl_1e8);
+    if epoch_loss_1e8 >= crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8 {
+        rt.halt_locked = true;
+        if let Some(lw) = lock_watch {
+            lw.latch_halt_in_ram();
+        }
+        if !rt.total_loss_shield_latched {
+            rt.total_loss_shield_latched = true;
+            let _ = vault_tx.try_send(VaultIoCommand::LatchTotalLossHalt {
+                ts_ns: now_ns.0,
+                anchor_equity_1e8: ledger.initial_equity_1e8,
+                current_equity_1e8: eff_eq_1e8,
+                epoch_loss_1e8,
+            });
+            let _ = tg_tx.try_send(format!(
+                "\u{1f534} [VORTEX-OMEGA V5.4.2 TOTAL LOSS SHIELD -5.00 USDT]\n- Perdida Epoca : -{:.4} / -5.0000 USDT\n- Equity Ancla  : {:.4} -> {:.4} USDT\n- Estado        : HALTED IRREVERSIBLE (Custodia P0-B activa hasta 0 posiciones)",
+                (epoch_loss_1e8 as f64) / 100_000_000.0,
+                (ledger.initial_equity_1e8 as f64) / 100_000_000.0,
+                (eff_eq_1e8 as f64) / 100_000_000.0
+            ));
+        }
+    }
+    epoch_loss_1e8
 }
 
 #[inline]
@@ -394,10 +500,23 @@ pub fn handle_gateway_event(
                 engines[slot_idx].apply_resting_repeg(new_price, new_sl_price, now_ns);
                 let snap = cached_snaps[slot_idx];
                 let (q_new, opp_cum) = match side {
-                    Side::Bid => (if snap.bids[0].price == new_price { snap.bids[0].qty } else { LotQty(1) }, snap.cum_sell_trade_lots),
-                    Side::Ask => (if snap.asks[0].price == new_price { snap.asks[0].qty } else { LotQty(1) }, snap.cum_buy_trade_lots),
+                    Side::Bid => (
+                        if snap.bids[0].price == new_price { snap.bids[0].qty } else { LotQty(1) },
+                        snap.cum_sell_trade_lots,
+                    ),
+                    Side::Ask => (
+                        if snap.asks[0].price == new_price { snap.asks[0].qty } else { LotQty(1) },
+                        snap.cum_buy_trade_lots,
+                    ),
                 };
-                rt.init_q_ahead[slot_idx] = q_new;
+                rt.init_q_ahead[slot_idx] = if match side {
+                    Side::Bid => snap.bids[0].price.0 > 0 && new_price.0 > snap.bids[0].price.0,
+                    Side::Ask => snap.asks[0].price.0 > 0 && new_price.0 < snap.asks[0].price.0,
+                } {
+                    LotQty(0)
+                } else {
+                    q_new
+                };
                 rt.cur_q_ahead[slot_idx] = q_new;
                 rt.last_l1_q_obs[slot_idx] = q_new;
                 rt.last_opp_trades[slot_idx] = opp_cum;
@@ -415,8 +534,10 @@ pub fn handle_gateway_event(
             rt.abort_cmd_inflight[slot_idx] = false;
             rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
             rt.queue_flow_ema[slot_idx] = 0.0;
+            let fav_miss = rt.abort_was_favorable_miss[slot_idx];
+            rt.abort_was_favorable_miss[slot_idx] = false;
             if matches!(engines[slot_idx].state, OrderLifecycleState::PlacingEntryMaker { .. } | OrderLifecycleState::RestingEntryQueue { .. }) {
-                gov.observe_entry_abort(slot_idx, side, aborted_price, now_ns);
+                gov.observe_entry_abort_with_context(slot_idx, side, aborted_price, now_ns, fav_miss, !fav_miss);
                 let veto = if rt.last_abort_veto[slot_idx] != LastVetoCode::None {
                     rt.last_abort_veto[slot_idx]
                 } else {
@@ -433,12 +554,14 @@ pub fn handle_gateway_event(
             rt.slot_rpc_inflight[slot_idx] = false;
             rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
             rt.queue_flow_ema[slot_idx] = 0.0;
+            let fav_miss = rt.abort_was_favorable_miss[slot_idx];
+            rt.abort_was_favorable_miss[slot_idx] = false;
             if let OrderLifecycleState::PlacingEntryMaker { side, entry_price, .. }
             | OrderLifecycleState::RestingEntryQueue { side, entry_price, .. } = engines[slot_idx].state
             {
                 if rt.abort_cmd_inflight[slot_idx] {
                     rt.abort_cmd_inflight[slot_idx] = false;
-                    gov.observe_entry_abort(slot_idx, side, entry_price, now_ns);
+                    gov.observe_entry_abort_with_context(slot_idx, side, entry_price, now_ns, fav_miss, !fav_miss);
                     let veto = if rt.last_abort_veto[slot_idx] != LastVetoCode::None {
                         rt.last_abort_veto[slot_idx]
                     } else {
@@ -458,11 +581,13 @@ pub fn handle_gateway_event(
         GatewayEvent::EntryFilledLive { slot_idx, real_side, verified_avg, real_lots, sl_verified, tag } => {
             rt.slot_rpc_inflight[slot_idx] = false;
             rt.abort_cmd_inflight[slot_idx] = false;
+            rt.abort_was_favorable_miss[slot_idx] = false;
             rt.queue_flow_ema[slot_idx] = 0.0;
             if !matches!(engines[slot_idx].state, OrderLifecycleState::PlacingEntryMaker { .. } | OrderLifecycleState::RestingEntryQueue { .. }) {
                 return;
             }
             gov.clear_abort_streak(slot_idx, real_side);
+            gov.observe_passive_entry_fill(slot_idx);
             engines[slot_idx].sync_governor_for_side(gov, real_side);
             let prev_sl = engines[slot_idx].last_eff_sl_ticks;
             if let Some((eff_s, eff_px, eff_q)) = promote_verified_fill_state(&mut engines[slot_idx], now_ns, Some(real_side), verified_avg, Some(real_lots)) {
@@ -610,12 +735,28 @@ pub fn handle_gateway_event(
                         });
                         if new_phase != prev_phase && matches!(new_phase, DailyShieldPhase::ProfitLockArmed | DailyShieldPhase::HibernatingProfitLocked | DailyShieldPhase::HibernatingLossCap) {
                             let _ = tg_tx.try_send(format!(
-                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4.1 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4.2 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                                 new_phase.label(),
                                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
                             ));
                         }
+                        let ep_loss = maybe_latch_validation_epoch_5usdt_shield(
+                            now_ns,
+                            gateway.map(|_| rt.wallet_1e8),
+                            None,
+                            rt,
+                            cached_snaps,
+                            engines,
+                            ledger,
+                            tg_tx,
+                            vault_tx,
+                        );
+                        let _ = gov.refresh_psi_health(
+                            &rt.daily_gov,
+                            ledger.sinking_fund_reserve_bps_x100,
+                            ep_loss,
+                        );
                     }
                 }
             }
@@ -629,11 +770,13 @@ pub fn handle_gateway_event(
                 if let Some(armed_qty) = armed_qty_opt {
                     rt.slot_rpc_inflight[slot_idx] = false;
                     rt.abort_cmd_inflight[slot_idx] = false;
+                    rt.abort_was_favorable_miss[slot_idx] = false;
                     rt.queue_flow_ema[slot_idx] = 0.0;
                     if real_lots.0 < armed_qty.0 {
                         if let Some(gw) = gateway { let _ = gw.try_send(GatewayCommand::CancelResidualEntries { slot_idx }); }
                     }
                     gov.clear_abort_streak(slot_idx, real_side);
+                    gov.observe_passive_entry_fill(slot_idx);
                     engines[slot_idx].sync_governor_for_side(gov, real_side);
                     let prev_sl = engines[slot_idx].last_eff_sl_ticks;
                     if let Some((eff_s, eff_px, eff_q)) = promote_verified_fill_state(&mut engines[slot_idx], now_ns, Some(real_side), verified_avg, Some(real_lots)) {
@@ -782,7 +925,7 @@ pub fn bootstrap_live_adopt_if_enabled(
             };
             engines[s_idx].sync_to_shm_telemetry(arena);
             println!(
-                "{}\u{1f7e2} [VORTEX-OMEGA V5.4.1 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
+                "{}\u{1f7e2} [VORTEX-OMEGA V5.4.2 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
                 ANSI_GREEN, s_idx, sym_name, side_p, sz_s, bybit_avg_t.0, sl_t.0, sl_ok, t1_done, ANSI_RESET
             );
         }

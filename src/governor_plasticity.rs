@@ -15,6 +15,7 @@ const INV_PHI_PM: i64 = 618;
 const INV_PHI2_PM: i64 = 382;
 const MIN_REHAB_SNR: f64 = 0.72;
 const SHADOW_CREDITS_REQUIRED: u8 = 3;
+pub const DEFAULT_FILL_PRIOR_X1000: i64 = 1_000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GovernorPlasticityState {
@@ -25,6 +26,8 @@ pub struct GovernorPlasticityState {
     scar_eq_vol_bps: [[i64; 2]; MAX_ACTIVE_PAIRS],
     shadow_credits: [[u8; 2]; MAX_ACTIVE_PAIRS],
     last_credit_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
+    pub fill_obs_alpha_x1000: [i64; MAX_ACTIVE_PAIRS],
+    pub fill_obs_beta_x1000: [i64; MAX_ACTIVE_PAIRS],
 }
 
 impl Default for GovernorPlasticityState {
@@ -47,6 +50,8 @@ impl GovernorPlasticityState {
             scar_eq_vol_bps: [[4_800; 2]; MAX_ACTIVE_PAIRS],
             shadow_credits: [[0; 2]; MAX_ACTIVE_PAIRS],
             last_credit_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
+            fill_obs_alpha_x1000: [DEFAULT_FILL_PRIOR_X1000; MAX_ACTIVE_PAIRS],
+            fill_obs_beta_x1000: [DEFAULT_FILL_PRIOR_X1000; MAX_ACTIVE_PAIRS],
         }
     }
 
@@ -148,6 +153,48 @@ impl GovernorPlasticityState {
     #[must_use]
     pub const fn portfolio_taker_prob_permille(&self) -> i64 {
         self.portfolio_taker_prior.posterior_permille()
+    }
+
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn slot_fill_rate_eta(&self, slot_idx: usize) -> f64 {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return 0.50;
+        }
+        let a = self.fill_obs_alpha_x1000[slot_idx].max(1) as f64;
+        let b = self.fill_obs_beta_x1000[slot_idx].max(1) as f64;
+        (a / (a + b)).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    pub fn observe_passive_entry_fill(&mut self, slot_idx: usize) {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return;
+        }
+        let next_a = self.fill_obs_alpha_x1000[slot_idx].saturating_add(1_000);
+        let cur_b = self.fill_obs_beta_x1000[slot_idx].max(250);
+        if next_a.saturating_add(cur_b) > 24_000 {
+            self.fill_obs_alpha_x1000[slot_idx] = ((next_a.saturating_mul(938)) / 1_000).max(250);
+            self.fill_obs_beta_x1000[slot_idx] = ((cur_b.saturating_mul(938)) / 1_000).max(250);
+        } else {
+            self.fill_obs_alpha_x1000[slot_idx] = next_a;
+        }
+    }
+
+    #[inline]
+    pub fn observe_favorable_entry_miss(&mut self, slot_idx: usize) {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return;
+        }
+        let cur_a = self.fill_obs_alpha_x1000[slot_idx].max(250);
+        let next_b = self.fill_obs_beta_x1000[slot_idx].saturating_add(1_000);
+        if cur_a.saturating_add(next_b) > 24_000 {
+            self.fill_obs_alpha_x1000[slot_idx] = ((cur_a.saturating_mul(938)) / 1_000).max(250);
+            self.fill_obs_beta_x1000[slot_idx] = ((next_b.saturating_mul(938)) / 1_000).max(250);
+        } else {
+            self.fill_obs_beta_x1000[slot_idx] = next_b;
+        }
     }
 
     #[inline]
@@ -297,6 +344,14 @@ impl GovernorPlasticityState {
             "scar_eq_vol_bps".to_string(),
             serde_json::json!(self.scar_eq_vol_bps),
         );
+        map.insert(
+            "fill_obs_alpha_x1000".to_string(),
+            serde_json::json!(self.fill_obs_alpha_x1000),
+        );
+        map.insert(
+            "fill_obs_beta_x1000".to_string(),
+            serde_json::json!(self.fill_obs_beta_x1000),
+        );
     }
 
     pub fn apply_from_scar_json(&mut self, val: &serde_json::Value) {
@@ -346,6 +401,22 @@ impl GovernorPlasticityState {
             for cell in row.iter_mut() {
                 if *cell != 0 {
                     *cell = (*cell).clamp(1_200, 24_000);
+                }
+            }
+        }
+        self.fill_obs_alpha_x1000 = [DEFAULT_FILL_PRIOR_X1000; MAX_ACTIVE_PAIRS];
+        self.fill_obs_beta_x1000 = [DEFAULT_FILL_PRIOR_X1000; MAX_ACTIVE_PAIRS];
+        if let Some(arr_a) = val.get("fill_obs_alpha_x1000").and_then(|v| v.as_array()) {
+            for (s, c) in arr_a.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
+                if let Some(n) = c.as_i64() {
+                    self.fill_obs_alpha_x1000[s] = n.clamp(100, 500_000);
+                }
+            }
+        }
+        if let Some(arr_b) = val.get("fill_obs_beta_x1000").and_then(|v| v.as_array()) {
+            for (s, c) in arr_b.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
+                if let Some(n) = c.as_i64() {
+                    self.fill_obs_beta_x1000[s] = n.clamp(100, 500_000);
                 }
             }
         }
@@ -580,6 +651,24 @@ impl DailySessionGovernor {
         let denom = (4 * fee_rt_bps.max(100)) as f64;
         let mult = PHI_DAILY + (PHI_SQ_DAILY - PHI_DAILY) * (reserve_pos / denom).tanh();
         -((BASE_SLOT_RISK_PPM_F64 * mult).round() as i64).clamp(3_883, 6_283)
+    }
+
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn daily_loss_used_ratio(&self, sinking_reserve_bps_x100: i64, fee_rt_bps: i64) -> f64 {
+        if matches!(self.phase, DailyShieldPhase::HibernatingLossCap) {
+            return 1.0;
+        }
+        let cur_ppm = self.day_pnl_ppm();
+        if cur_ppm >= 0 {
+            return 0.0;
+        }
+        let abs_stop = self
+            .elastic_loss_stop_ppm(sinking_reserve_bps_x100, fee_rt_bps)
+            .abs()
+            .max(1) as f64;
+        (((-cur_ppm) as f64) / abs_stop).clamp(0.0, 2.0)
     }
 
     #[inline]
@@ -968,4 +1057,53 @@ impl GovernorPlasticityState {
         opp_pr.obs_alpha_x1000 = ((opp_pr.obs_alpha_x1000.saturating_mul(960)) / 1_000).saturating_add(sym_a);
         opp_pr.obs_beta_x1000 = (opp_pr.obs_beta_x1000.saturating_mul(sym_g)) / 1_000;
     }
+}
+
+/// Self-braking centrifugal operational health index `psi_health` in `[0.0, 1.0]` (`O(1)`, `C1` smooth) (V5.4.2 M4).
+#[inline]
+#[must_use]
+pub fn compute_psi_health_c1(
+    portfolio_taker_prob: f64,
+    portfolio_ewma_net_bps: f64,
+    fee_rt_mkr_bps: f64,
+    daily_loss_used_ratio: f64,
+    epoch_loss_5u_ratio: f64,
+) -> f64 {
+    const PHI_H: f64 = 1.618_033_988_749_895;
+    const INV_PHI_H: f64 = 0.618_033_988_749_895;
+    const INV_PHI_SQ_H: f64 = 0.381_966_011_250_105;
+
+    let f_tox = 1.0 - crate::wave_elliott::hermite_smoothstep_c1(portfolio_taker_prob, 0.08, 0.22);
+    let eff_fee_bps = fee_rt_mkr_bps.abs().max(1.0);
+    let f_ewma = crate::wave_elliott::hermite_smoothstep_c1(
+        portfolio_ewma_net_bps,
+        -PHI_H * eff_fee_bps,
+        0.0,
+    );
+    let f_daily = 1.0
+        - crate::wave_elliott::hermite_smoothstep_c1(
+            daily_loss_used_ratio,
+            INV_PHI_SQ_H,
+            INV_PHI_H,
+        );
+    let f_epoch = 1.0
+        - crate::wave_elliott::hermite_smoothstep_c1(
+            epoch_loss_5u_ratio,
+            INV_PHI_SQ_H,
+            INV_PHI_H,
+        );
+    (f_tox * f_ewma * f_daily * f_epoch).clamp(0.0, 1.0)
+}
+
+/// Smooth `C1` pre-limit lot damper `1.0 - INV_PHI_SQ * S_3(epoch_loss_5u_ratio; INV_PHI, 1.0)` (V5.4.2 M5).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_epoch_5u_loss_lot_damper_c1(epoch_loss_1e8: i64) -> f64 {
+    const INV_PHI_D: f64 = 0.618_033_988_749_895;
+    const INV_PHI_SQ_D: f64 = 0.381_966_011_250_105;
+    let ratio = (epoch_loss_1e8.max(0) as f64)
+        / (crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8 as f64);
+    (1.0 - INV_PHI_SQ_D * crate::wave_elliott::hermite_smoothstep_c1(ratio, INV_PHI_D, 1.0))
+        .clamp(INV_PHI_D, 1.0)
 }

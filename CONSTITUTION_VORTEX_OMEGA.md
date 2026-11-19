@@ -1,4 +1,4 @@
-# CONSTITUTION VORTEX-OMEGA (Laws I–IX & Addenda V4.1 -> V5.4.1 SSOT)
+# CONSTITUTION VORTEX-OMEGA (Laws I–IX & Addenda V4.1 -> V5.4.2 SSOT)
 
 ## Core Invariants
 1. **Compile-Time Dimensional Newtypes**: `PriceTicks`, `LotQty`, `ScaledBps`, `BoundedScore`, `SymbolId`, `TimestampNs`.
@@ -6,8 +6,9 @@
 3. **Law of Parametric Non-Regression (`SCAR-LOCK 63/63`)**: Zero scar reopening across the 2,160-state manifold; zero smoothing by silence; rehabilitation strictly requires verified regime mutation.
 4. **Exact 1:1 Twin-Production Parity & `PARITY_SYNC Drift == 0`**: Integer `1e8` accounting, live VIP `FeeSchedule` (including negative Maker rebates), 8h UTC `FUNDING_SETTLEMENT`, and `EPOCH_RESET` non-destructive ledger anchoring.
 
-## Addendum V5.0 -> V5.4.1 (Elastic C1 Self-Learning Recalibration)
+## Addendum V5.0 -> V5.4.2 (Elastic C1 Self-Learning Recalibration)
 - **V5.0 / V5.0.1 / V5.0.2**: Non-destructive `EPOCH_RESET`, 28/28 `C1` Anti-Win-Wiper Red-Team shields (Kaplan-Meier right-censoring MFE guard, signed BTC contagion, P0-A live gap flatten), and removal of legacy static scalars.
 - **V5.1 (F1..F6 Closed)**: Single-flush silent `DRAIN_MODE` standby (0 `systemd` restart loops); reversible `C1` exit unlock over intrinsic `flow_ema_slow` + `Runner` preservation + opposing `ImpulseWave3` escape; `1m` Brownian diffusive SL floor immune to `5 ms` spikes; uninflated 1-lot EV & `[OB+, OB-]` modulated `CorrectiveAbc` Hurst guard; surprise-weighted `BetaBinomialTakerPrior` + cross-side chop shield; physical L1 FIFO trade consumption vs. whale cancellation split + WS-RTT adaptive spoof/sweep shields.
 - **V5.2 -> V5.3.2**: Competing-hazards C1 Bayesian plasticity, endogenous anti-spoof TFI prior, front-of-queue FIFO & intact-wall C1 spoof immunity, unified L1 chase patience, irreversible `boot_converged` warmup latch, P0-B orphan adoption, and post-hydrate cold MFE seed unblock.
 - **V5.4 -> V5.4.1**: Pillar-2 `<->` `ExitQuoter` `OFI + BTC` propulsion coherence, offensive `PHI * fee_rt_mkr` right-censoring vs. cooled-regime scratch relaxation + `sqrt(vol / eq_vol)` diffusive MFE projection, `S_3` Maker evacuation on opposing `ImpulseWave3` pauses, universal `C1` passive Iceberg absorption penalty across all contracts, Bybit UTA V5 `reduceOnly` `Tranche 1 + Runner` deleveraged multi-lot split, and post-`Tranche 1` `Same-Side Stagger` release.
+- **V5.4.2**: Centrifugal `C1` operational health valve `psi_health`, real structural threat `chi_threat` + `PHI^4 s` `BtcLeadLagMemory` in `CorrectiveAbc`, per-slot `BetaBinomialFillRate` + agile `Re-Peg` + inside-spread `PostOnly` Penny-Jump + favorable-miss cooldown exemption, `2-Slot Epps Queue Stagger`, and irreversible `-5.00 USDT` (`MAX_VALIDATION_EPOCH_LOSS_1E8 = 500_000_000`) validation epoch shield with `P0-B` custody.

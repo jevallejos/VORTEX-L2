@@ -1,4 +1,4 @@
-//! 200Hz Zero-Jitter 12-Slot Execution Daemon (V5.4.1: Elastic Daily Shield, Quantum EV, Toxic Unwind & 8h Funding).
+//! 200Hz Zero-Jitter 12-Slot Execution Daemon (V5.4.2: Elastic C1 Throughput, Penny-Jump, FillRate & -5.00 USDT Shield).
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -21,12 +21,18 @@ use std::time::Duration;
 use crate::alpha_3factor::{EppsBtcCorrelationTracker, OrthogonalFactorState, SignalVerdict};
 use crate::bybit_client::InstrumentSpecVerification;
 use crate::bybit_gateway::{run_daemon_startup_handshake, BybitAsyncGateway, GatewayCommand, GatewayEvent};
+pub use crate::exec_gateway_handlers::{
+    compute_open_positions_mtm_upl_1e8, compute_validation_epoch_loss_1e8,
+    maybe_latch_validation_epoch_5usdt_shield,
+};
 use crate::exec_gateway_handlers::{
     bootstrap_live_adopt_if_enabled, handle_gateway_event, run_oos_520_certification_suite, ExecRuntimeState,
 };
 use crate::execution_fsm::{
-    passes_elliott_macro_coherence_guard_with_sync, passes_order_block_wall_guard_dynamic,
-    passes_stoikov_repeg_coherence_guard_with_beta, CanonicalExitQuote, ExitSubReason,
+    compute_agile_repeg_cooldown_ns_v542, compute_aligned_entry_propulsion_c1,
+    passes_cumulative_repeg_chase_cap_v542, passes_elliott_macro_coherence_guard_with_health,
+    passes_order_block_wall_guard_dynamic, passes_stoikov_repeg_coherence_guard_with_beta,
+    select_elastic_entry_maker_price_v542, CanonicalExitQuote, ExitSubReason,
     OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
 };
 use crate::exit_quoter::compute_validated_sl_ticks_with_fees;
@@ -241,17 +247,84 @@ pub fn elastic_same_side_stagger_bounds(tau_mkt_s: i64, vol_5m: ScaledBps, b3x_b
     (stagger_s.saturating_mul(1_000_000_000), eff_rt.saturating_mul(2).saturating_add(pad))
 }
 
+#[inline]
+#[must_use]
+pub const fn is_at_or_ahead_of_l1(side: Side, entry_price: PriceTicks, snap: &SymbolLobSnapshot) -> bool {
+    match side {
+        Side::Bid => snap.bids[0].price.0 > 0 && entry_price.0 >= snap.bids[0].price.0,
+        Side::Ask => snap.asks[0].price.0 > 0 && entry_price.0 <= snap.asks[0].price.0,
+    }
+}
+
 #[must_use]
 pub fn can_stage_same_direction_entry(
     candidate_slot: usize, side: Side, now_ns: TimestampNs,
     engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS], cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
 ) -> bool {
+    let neutral_epps = [EppsBtcCorrelationTracker::new(); MAX_ACTIVE_PAIRS];
+    can_stage_same_direction_entry_v542(
+        candidate_slot,
+        side,
+        now_ns,
+        engines,
+        cached_snaps,
+        &neutral_epps,
+        0.0,
+        50,
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn can_stage_same_direction_entry_v542(
+    candidate_slot: usize,
+    side: Side,
+    now_ns: TimestampNs,
+    engines: &[SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+    epps_trackers: &[EppsBtcCorrelationTracker; MAX_ACTIVE_PAIRS],
+    psi_health: f64,
+    cand_taker_prob_pm: i64,
+) -> bool {
+    let cand_corr = if candidate_slot == 0 {
+        1.0
+    } else {
+        epps_trackers[candidate_slot.min(MAX_ACTIVE_PAIRS - 1)].correlation(false)
+    };
+    let mut same_side_resting = 0_usize;
     for (s_idx, eng) in engines.iter().enumerate() {
         if s_idx == candidate_slot { continue; }
         match eng.state {
             OrderLifecycleState::Idle => {}
-            OrderLifecycleState::PlacingEntryMaker { side: s, .. } | OrderLifecycleState::RestingEntryQueue { side: s, .. } => {
+            OrderLifecycleState::PlacingEntryMaker { side: s, .. } => {
                 if s == side { return false; }
+            }
+            OrderLifecycleState::RestingEntryQueue { side: s, entry_price, .. } => {
+                if s == side {
+                    same_side_resting += 1;
+                    if same_side_resting >= 2 || psi_health <= crate::alpha_3factor::INV_PHI_SQ {
+                        return false;
+                    }
+                    let first_fav_left_behind =
+                        crate::kinematic_surface::is_bbo_favorably_past_resting_entry(
+                            s,
+                            entry_price,
+                            &cached_snaps[s_idx],
+                        );
+                    let s1_corr = if s_idx == 0 {
+                        1.0
+                    } else {
+                        epps_trackers[s_idx].correlation(false)
+                    };
+                    let max_tkr_prob =
+                        (eng.learned_taker_prob_pm.max(cand_taker_prob_pm).max(0) as f64) * 1e-3;
+                    let low_epps_and_healthy_tox = (s1_corr * cand_corr).abs()
+                        < crate::alpha_3factor::INV_PHI
+                        && max_tkr_prob < crate::alpha_3factor::INV_PHI_FOURTH;
+                    if !first_fav_left_behind && !low_epps_and_healthy_tox {
+                        return false;
+                    }
+                }
             }
             OrderLifecycleState::PositionOpenMakerExit { side: s, avg_price_ticks, tranche1_harvested, opened_ts, .. } => {
                 if s == side {
@@ -434,7 +507,13 @@ pub fn step_12_slot_daemon_tick(
     ledger: &mut ParitySyncLedger, arena: &VortexShmArena, tg_tx: &SyncSender<String>, vault_tx: &SyncSender<VaultIoCommand>,
 ) -> (usize, usize) {
     let (mut open_count, mut pending_entry_count) = (0_usize, 0_usize);
+    if let Some(lw) = lock_watch {
+        if lw.is_halt_locked() {
+            rt.halt_locked = true;
+        }
+    }
     let btc_snap = cached_snaps[0];
+    let _ = rt.btc_lead_memory.observe_btc_snapshot(&btc_snap);
     let fees = gov.active_fee_schedule();
     let live_eq = rt.wallet_1e8.max(ledger.current_equity_1e8());
     let p_day = gov.slot_temporal_cadence(0, &btc_snap).intraday_percentile;
@@ -445,16 +524,35 @@ pub fn step_12_slot_daemon_tick(
     );
     if cur_phase != prev_phase {
         let _ = vault_tx.try_send(VaultIoCommand::SaveDailyGovernor { ts_ns: now_ns.0, state: rt.daily_gov });
-        if rt.daily_gov.is_hibernating() || prev_phase.label().starts_with("SLEEP") {
+        if !rt.halt_locked
+            && (rt.daily_gov.is_hibernating() || prev_phase.label().starts_with("SLEEP"))
+        {
             let _ = tg_tx.try_send(format!(
-                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4.1 DAILY SHIELD] Transicion UTC: {} -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4.2 DAILY SHIELD] Transicion UTC: {} -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                 prev_phase.label(), cur_phase.label(),
                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
             ));
         }
     }
-    let block_new_entries = rt.halt_locked || rt.drain_active || rt.daily_gov.is_hibernating();
+    let mut epoch_loss_1e8 = maybe_latch_validation_epoch_5usdt_shield(
+        now_ns,
+        gateway.map(|_| rt.wallet_1e8),
+        lock_watch,
+        rt,
+        cached_snaps,
+        engines,
+        ledger,
+        tg_tx,
+        vault_tx,
+    );
+    let mut psi_health = gov.refresh_psi_health(
+        &rt.daily_gov,
+        ledger.sinking_fund_reserve_bps_x100,
+        epoch_loss_1e8,
+    );
+    let mut block_new_entries = rt.halt_locked || rt.drain_active || rt.daily_gov.is_hibernating();
+    let mut halt_newly_latched_mid_tick = false;
 
     for s_idx in 0..MAX_ACTIVE_PAIRS {
         if rt.slot_rpc_inflight[s_idx]
@@ -502,35 +600,74 @@ pub fn step_12_slot_daemon_tick(
                 engines[s_idx].sync_governor_dynamics(gov);
                 if now_ns.0.saturating_sub(submitted_ts.0) < engines[s_idx].elastic_preflight_window_ns(snap.realized_vol_5m) { continue; }
                 let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-                let Ok((e_kin, e_min)) = gov.confirm_preflight_kinematics_v54(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr) else {
+                let corr_sign = if s_idx > 0 && epps_corr < 0.0 { -1.0 } else { 1.0 };
+                let btc_lead_opt = (s_idx > 0).then(|| {
+                    rt.btc_lead_memory.effective_aligned_impulse(&btc_snap, corr_sign, side)
+                });
+                let Ok((e_kin, e_min)) = gov.confirm_preflight_kinematics_v542(
+                    s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr, btc_lead_opt,
+                ) else {
                     rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::PreflightDriftOrDecay);
                     continue;
                 };
-                let Ok((synced_entry_px, synced_sl_px)) = engines[s_idx].sync_preflight_l1_entry_auto_with_sync(&snap, &btc_snap, epps_corr) else {
+                let Ok((mut synced_entry_px, mut synced_sl_px)) = engines[s_idx].sync_preflight_l1_entry_auto_v542(
+                    &snap, &btc_snap, epps_corr, btc_lead_opt, psi_health,
+                ) else {
                     rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::PreflightDriftOrDecay);
                     continue;
                 };
-                let Some(pre_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(s_idx, side, qty, synced_entry_px, mfe_s, &snap, &btc_snap, epps_beta) else {
+                let cur_l1_px = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
+                let pre_ev_opt = gov
+                    .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+                        s_idx, side, qty, synced_entry_px, mfe_s, &snap, &btc_snap, epps_beta,
+                    )
+                    .or_else(|| {
+                        if synced_entry_px != cur_l1_px {
+                            if let Ok((l1_px, l1_sl)) = engines[s_idx].sync_preflight_l1_entry_auto_v542(
+                                &snap, &btc_snap, epps_corr, btc_lead_opt, 0.0,
+                            ) {
+                                synced_entry_px = l1_px;
+                                synced_sl_px = l1_sl;
+                                return gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+                                    s_idx, side, qty, synced_entry_px, mfe_s, &snap, &btc_snap, epps_beta,
+                                );
+                            }
+                        }
+                        None
+                    });
+                let Some(pre_ev_sbps) = pre_ev_opt else {
                     rt.queue_flow_ema[s_idx] = 0.0;
                     engines[s_idx].state = OrderLifecycleState::Idle;
                     engines[s_idx].sync_to_shm_telemetry(arena);
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::QueueDepthOrOversizedLot);
                     continue;
                 };
-                let (q_l1, opp_cum) = match side {
-                    Side::Bid => (snap.bids[0].qty, snap.cum_sell_trade_lots),
-                    Side::Ask => (snap.asks[0].qty, snap.cum_buy_trade_lots),
+                let inside_spread = match side {
+                    Side::Bid => snap.bids[0].price.0 > 0 && synced_entry_px.0 > snap.bids[0].price.0,
+                    Side::Ask => snap.asks[0].price.0 > 0 && synced_entry_px.0 < snap.asks[0].price.0,
+                };
+                let (q_l1_init, q_l1_cur, opp_cum) = match side {
+                    Side::Bid => (
+                        if inside_spread { LotQty(0) } else { snap.bids[0].qty },
+                        if inside_spread { LotQty(1) } else { snap.bids[0].qty },
+                        snap.cum_sell_trade_lots,
+                    ),
+                    Side::Ask => (
+                        if inside_spread { LotQty(0) } else { snap.asks[0].qty },
+                        if inside_spread { LotQty(1) } else { snap.asks[0].qty },
+                        snap.cum_buy_trade_lots,
+                    ),
                 };
                 let (dr_b, ex_b) = gov.price_drift_and_extension_scaled_bps(s_idx, &snap);
                 let (ewma_b, sl_st, win_st) = gov.slot_direction_diagnostics(s_idx, side);
                 entry_forensics[s_idx] = SlotForensicEntrySnapshot {
-                    armed_ts_ns: now_ns.0, init_q_lots: q_l1.0,
+                    armed_ts_ns: now_ns.0, init_q_lots: q_l1_init.0,
                     ofi_in: snap.factor_ofi.get(), tfi_in: snap.factor_tfi.get(), geom_in: snap.factor_geom.get(),
                     snr_in: OrthogonalFactorState::adaptive_snr_from_snapshot(&snap, spoof_d).get(),
                     vol5m_in: (snap.realized_vol_5m.raw() as f64) / 100.0,
@@ -542,11 +679,12 @@ pub fn step_12_slot_daemon_tick(
                     kin_energy_in_bps: (e_kin as f64) / 100.0, req_kin_energy_in_bps: (e_min as f64) / 100.0,
                     ev_ex_ante_bps: (pre_ev_sbps as f64) / 100.0,
                 };
-                rt.init_q_ahead[s_idx] = q_l1;
-                rt.cur_q_ahead[s_idx] = q_l1;
-                rt.last_l1_q_obs[s_idx] = q_l1;
+                rt.init_q_ahead[s_idx] = q_l1_init;
+                rt.cur_q_ahead[s_idx] = q_l1_cur;
+                rt.last_l1_q_obs[s_idx] = q_l1_cur;
                 rt.last_opp_trades[s_idx] = opp_cum;
                 rt.geom_adv_since_ns[s_idx] = 0;
+                rt.next_poll_fill_ts_ns[s_idx] = now_ns.0 + 1_200_000_000;
                 rt.queue_flow_ema[s_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                 if let Some(gw) = gateway {
                     if gw.try_send(GatewayCommand::PlaceEntry { slot_idx: s_idx, side, entry_price: synced_entry_px, qty, sl_price: synced_sl_px }) {
@@ -559,17 +697,19 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].sync_to_shm_telemetry(arena);
                 }
             }
-            OrderLifecycleState::RestingEntryQueue { side, entry_price, qty, sl_trigger_price, resting_since_ts, .. } => {
+            OrderLifecycleState::RestingEntryQueue { side, entry_price, qty, target_excursion, sl_trigger_price, resting_since_ts } => {
                 pending_entry_count += 1;
                 engines[s_idx].sync_governor_dynamics(gov);
-                let (at_l1, live_l1_q, cur_opp_cum) = match side {
+                let (exact_at_l1, live_l1_q, cur_opp_cum) = match side {
                     Side::Bid => (snap.bids[0].price == entry_price, snap.bids[0].qty, snap.cum_sell_trade_lots),
                     Side::Ask => (snap.asks[0].price == entry_price, snap.asks[0].qty, snap.cum_buy_trade_lots),
                 };
+                let at_l1 = is_at_or_ahead_of_l1(side, entry_price, &snap);
+                let fav_bbo_miss = crate::kinematic_surface::is_bbo_favorably_past_resting_entry(side, entry_price, &snap);
                 let prev_l1_obs = rt.last_l1_q_obs[s_idx];
                 let tape_delta = (cur_opp_cum.0 - rt.last_opp_trades[s_idx].0).max(0);
                 rt.last_opp_trades[s_idx] = cur_opp_cum;
-                let (next_q, opp_hit, next_obs) = step_l1_queue_ahead_lots(side, entry_price, at_l1, live_l1_q, prev_l1_obs, rt.cur_q_ahead[s_idx], tape_delta, snap.last_trade_price);
+                let (next_q, opp_hit, next_obs) = step_l1_queue_ahead_lots(side, entry_price, exact_at_l1, live_l1_q, prev_l1_obs, rt.cur_q_ahead[s_idx], tape_delta, snap.last_trade_price);
                 rt.cur_q_ahead[s_idx] = next_q;
                 rt.last_l1_q_obs[s_idx] = next_obs;
                 if let Ok(tel) = arena.telemetry(s_idx) { tel.store_queue_ahead_lots(next_q); }
@@ -591,9 +731,9 @@ pub fn step_12_slot_daemon_tick(
                 let flow_imp = raw_q_flow * side.sign_f64();
                 let signed_slow = crate::types::BoundedScore::new_clamped(rt.queue_flow_ema[s_idx] * side.sign_f64());
                 let mut q_shield = engines[s_idx].evaluate_resting_queue_shield_with_beta(side, rt.init_q_ahead[s_idx], next_q, opp_hit, &snap, &btc_snap, epps_beta);
-                let wall_collapsed = at_l1 && (crate::alpha_3factor::should_abort_l1_cancellation_collapse_v51(spec, side, prev_l1_obs, live_l1_q, opp_hit, entry_price, signed_slow, engines[s_idx].active_fees) || (opp_hit.0 == 0 && crate::alpha_3factor::should_abort_collapsed_resting_l1_wall_dynamic(spec, side, entry_price, &snap, rt.init_q_ahead[s_idx], engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)));
+                let wall_collapsed = exact_at_l1 && (crate::alpha_3factor::should_abort_l1_cancellation_collapse_v51(spec, side, prev_l1_obs, live_l1_q, opp_hit, entry_price, signed_slow, engines[s_idx].active_fees) || (opp_hit.0 == 0 && crate::alpha_3factor::should_abort_collapsed_resting_l1_wall_dynamic(spec, side, entry_price, &snap, rt.init_q_ahead[s_idx], engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)));
                 if wall_collapsed { q_shield.abort_now = true; }
-                if rt.slot_rpc_inflight[s_idx] { continue; }
+                if rt.slot_rpc_inflight[s_idx] && !block_new_entries { continue; }
                 let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
                 let total_chase_ns = now_ns.0.saturating_sub(entry_forensics[s_idx].armed_ts_ns);
                 let base_chase_ns = gov.max_total_entry_chase_ns(s_idx, snap.realized_vol_5m);
@@ -622,8 +762,12 @@ pub fn step_12_slot_daemon_tick(
                     total_chase_ns,
                 );
                 let q_timers = elastic_resting_queue_timers_ns(base_chase_ns);
-                let fast_sweep = at_l1 && evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, rt.init_q_ahead[s_idx], next_q, elapsed_ns, &snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, ws_rtt_us);
+                let fast_sweep = exact_at_l1 && evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, rt.init_q_ahead[s_idx], next_q, elapsed_ns, &snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, ws_rtt_us);
                 if fast_sweep { q_shield.abort_now = true; }
+                let corr_sign = if s_idx > 0 && epps_corr < 0.0 { -1.0 } else { 1.0 };
+                let btc_lead_opt = (s_idx > 0).then(|| {
+                    rt.btc_lead_memory.effective_aligned_impulse(&btc_snap, corr_sign, side)
+                });
                 let btc_aligned = epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
                 let q_eroded = rt.init_q_ahead[s_idx].0 > 0 && next_q.0 * 100 <= rt.init_q_ahead[s_idx].0 * 65;
                 let headwind_erosion = s_idx > 0 && elapsed_ns >= q_timers.headwind_abort_ns && q_eroded && btc_aligned < -0.08 && flow_imp < 0.15;
@@ -634,7 +778,7 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].learned_taker_prob_pm,
                     engines[s_idx].active_fees,
                 );
-                let macro_bad = opp_wave3_now || (elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard_with_sync(side, &snap, &btc_snap, epps_corr));
+                let macro_bad = opp_wave3_now || (elapsed_ns >= q_timers.macro_abort_ns && !passes_elliott_macro_coherence_guard_with_health(side, &snap, &btc_snap, epps_corr, btc_lead_opt, psi_health));
                 let ob_bad = elapsed_ns >= q_timers.macro_abort_ns && !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
                 let geom_flip = evaluate_elastic_spoof_geom_abort_with_entry_v54(
                     side,
@@ -661,7 +805,9 @@ pub fn step_12_slot_daemon_tick(
                 );
                 if block_new_entries || !instruments.is_slot_tradable(s_idx) || chase_expired || (elapsed_ns >= 25_000_000 && q_shield.abort_now) || fast_sweep || headwind_erosion || macro_bad || ob_bad || geom_flip || adverse_flow {
                     let abort_veto = if block_new_entries { LastVetoCode::WarmupOrLock } else if macro_bad { LastVetoCode::MacroElliottContradiction } else if ob_bad { LastVetoCode::OpposingOrderBlockWall } else if geom_flip { LastVetoCode::SpoofingVeto } else if headwind_erosion { LastVetoCode::BtcLeadLagHeadwind } else { LastVetoCode::HawkesStoikovQueueAbort };
+                    let toxic_hawkes_sweep = q_shield.abort_now || fast_sweep || geom_flip || adverse_flow || opp_wave3_now || headwind_erosion;
                     rt.last_abort_veto[s_idx] = abort_veto;
+                    rt.abort_was_favorable_miss[s_idx] = fav_bbo_miss && !toxic_hawkes_sweep && !block_new_entries;
                     publish_slot_veto_code(arena, s_idx, abort_veto);
                     if let Some(gw) = gateway {
                         if !rt.abort_cmd_inflight[s_idx] && gw.try_send(GatewayCommand::AbortEntry { slot_idx: s_idx, side, aborted_price: entry_price, sl_hint: sl_trigger_price }) {
@@ -670,8 +816,16 @@ pub fn step_12_slot_daemon_tick(
                             rt.abort_cmd_inflight[s_idx] = true;
                         }
                     } else {
+                        pending_entry_count = pending_entry_count.saturating_sub(1);
                         rt.queue_flow_ema[s_idx] = 0.0;
-                        gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
+                        gov.observe_entry_abort_with_context(
+                            s_idx,
+                            side,
+                            entry_price,
+                            now_ns,
+                            fav_bbo_miss && !block_new_entries,
+                            toxic_hawkes_sweep || block_new_entries,
+                        );
                         rt.markout_rings[s_idx].arm_abort_probe_v49(side, entry_price, abort_veto, TimestampNs(entry_forensics[s_idx].armed_ts_ns.max(1)), now_ns, rt.init_q_ahead[s_idx], rt.cur_q_ahead[s_idx]);
                         engines[s_idx].state = OrderLifecycleState::Idle;
                         engines[s_idx].sync_to_shm_telemetry(arena);
@@ -679,9 +833,17 @@ pub fn step_12_slot_daemon_tick(
                     continue;
                 }
                 let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
+                let prop_now = compute_aligned_entry_propulsion_c1(side, &snap, btc_lead_opt.unwrap_or(0.0));
+                let eta_fill = gov.slot_fill_rate_eta(s_idx);
+                let agile_repeg_mode = psi_health > crate::alpha_3factor::INV_PHI_SQ
+                    && fav_bbo_miss
+                    && prop_now > crate::alpha_3factor::INV_PHI_CUBE;
+                let agile_cd_ns = compute_agile_repeg_cooldown_ns_v542(u64::from(ws_rtt_us), eta_fill);
+                let eff_repeg_wait_ns = if agile_repeg_mode { agile_cd_ns } else { q_timers.repeg_wait_ns };
+                let eff_repeg_cd_ns = if agile_repeg_mode { agile_cd_ns } else { q_timers.repeg_cooldown_ns };
                 if !at_l1
-                    && elapsed_ns >= q_timers.repeg_wait_ns
-                    && total_chase_ns + q_timers.repeg_wait_ns < max_chase_ns
+                    && elapsed_ns >= eff_repeg_wait_ns
+                    && total_chase_ns + eff_repeg_wait_ns < max_chase_ns
                     && now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns
                     && !opp_wave3_now
                     && crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
@@ -693,32 +855,86 @@ pub fn step_12_slot_daemon_tick(
                         engines[s_idx].active_fees,
                     )
                     && passes_stoikov_repeg_coherence_guard_with_beta(s_idx, side, &snap, &btc_snap, epps_beta)
-                    && passes_elliott_macro_coherence_guard_with_sync(side, &snap, &btc_snap, epps_corr)
+                    && passes_elliott_macro_coherence_guard_with_health(side, &snap, &btc_snap, epps_corr, btc_lead_opt, psi_health)
                     && passes_order_block_wall_guard_dynamic(s_idx, side, &snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)
                 {
                     let new_l1 = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
+                    let cand_repeg = select_elastic_entry_maker_price_v542(side, &snap, psi_health, prop_now);
+                    let anchor_px = if engines[s_idx].original_armed_entry_price.0 > 0 {
+                        engines[s_idx].original_armed_entry_price
+                    } else {
+                        entry_price
+                    };
+                    let fee_mkr_sbps = ScaledBps(engines[s_idx].active_maker_rt_fee_bps());
                     let max_chase_ticks = spec.max_repeg_chase_ticks(entry_price, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees);
-                    let moved_away = match side { Side::Bid => new_l1.0 > entry_price.0 && (new_l1.0 - entry_price.0) <= max_chase_ticks, Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase_ticks };
-                    if moved_away && gov.confirm_preflight_kinematics_v54(s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr).is_ok() {
-                        if let Some(repeg_ev_sbps) = gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(s_idx, side, qty, new_l1, mfe_s, &snap, &btc_snap, epps_beta) {
-                            if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&snap, new_l1) {
+                    let mut chosen_repeg = if cand_repeg != new_l1
+                        && passes_cumulative_repeg_chase_cap_v542(side, anchor_px, cand_repeg, target_excursion, fee_mkr_sbps)
+                    {
+                        cand_repeg
+                    } else {
+                        new_l1
+                    };
+                    let moved_away = match side {
+                        Side::Bid => chosen_repeg.0 > entry_price.0 && (new_l1.0 - entry_price.0) <= max_chase_ticks,
+                        Side::Ask => chosen_repeg.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase_ticks,
+                    };
+                    let within_cum_cap = passes_cumulative_repeg_chase_cap_v542(
+                        side,
+                        anchor_px,
+                        chosen_repeg,
+                        target_excursion,
+                        fee_mkr_sbps,
+                    );
+                    if moved_away
+                        && within_cum_cap
+                        && gov.confirm_preflight_kinematics_v542(
+                            s_idx, side, rt.wallet_1e8, qty, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr, btc_lead_opt,
+                        ).is_ok()
+                    {
+                        let repeg_ev_opt = gov
+                            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+                                s_idx, side, qty, chosen_repeg, mfe_s, &snap, &btc_snap, epps_beta,
+                            )
+                            .or_else(|| {
+                                if chosen_repeg != new_l1
+                                    && passes_cumulative_repeg_chase_cap_v542(
+                                        side, anchor_px, new_l1, target_excursion, fee_mkr_sbps,
+                                    )
+                                {
+                                    chosen_repeg = new_l1;
+                                    return gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+                                        s_idx, side, qty, chosen_repeg, mfe_s, &snap, &btc_snap, epps_beta,
+                                    );
+                                }
+                                None
+                            });
+                        if let Some(repeg_ev_sbps) = repeg_ev_opt {
+                            if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&snap, chosen_repeg) {
                                 entry_forensics[s_idx].ofi_in = snap.factor_ofi.get();
                                 entry_forensics[s_idx].tfi_in = snap.factor_tfi.get();
                                 entry_forensics[s_idx].geom_in = snap.factor_geom.get();
                                 entry_forensics[s_idx].snr_in = OrthogonalFactorState::adaptive_snr_from_snapshot(&snap, spoof_d).get();
                                 entry_forensics[s_idx].vol5m_in = (snap.realized_vol_5m.raw() as f64) / 100.0;
                                 entry_forensics[s_idx].ev_ex_ante_bps = (repeg_ev_sbps as f64) / 100.0;
-                                engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + q_timers.repeg_cooldown_ns;
+                                engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + eff_repeg_cd_ns;
                                 if let Some(gw) = gateway {
-                                    if gw.try_send(GatewayCommand::RepegEntry { slot_idx: s_idx, side, new_price: new_l1, qty, new_sl_price: repeg_sl }) {
+                                    if gw.try_send(GatewayCommand::RepegEntry { slot_idx: s_idx, side, new_price: chosen_repeg, qty, new_sl_price: repeg_sl }) {
                                         rt.queue_flow_ema[s_idx] = raw_q_flow;
                                         rt.slot_rpc_inflight[s_idx] = true;
                                         rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
                                         continue;
                                     }
                                 } else {
+                                    let inside_repeg = match side {
+                                        Side::Bid => snap.bids[0].price.0 > 0 && chosen_repeg.0 > snap.bids[0].price.0,
+                                        Side::Ask => snap.asks[0].price.0 > 0 && chosen_repeg.0 < snap.asks[0].price.0,
+                                    };
+                                    let q_rep = if inside_repeg { LotQty(1) } else { live_l1_q.max(LotQty(1)) };
+                                    rt.init_q_ahead[s_idx] = if inside_repeg { LotQty(0) } else { q_rep };
+                                    rt.cur_q_ahead[s_idx] = q_rep;
+                                    rt.last_l1_q_obs[s_idx] = q_rep;
                                     rt.queue_flow_ema[s_idx] = raw_q_flow;
-                                    engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);
+                                    engines[s_idx].apply_resting_repeg(chosen_repeg, repeg_sl, now_ns);
                                     engines[s_idx].sync_to_shm_telemetry(arena);
                                     continue;
                                 }
@@ -727,16 +943,19 @@ pub fn step_12_slot_daemon_tick(
                     }
                 }
                 if let Some(gw) = gateway {
-                    if now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns && now_ns.0.saturating_sub(*last_rest_dispatch_ns) >= 55_000_000 {
+                    if now_ns.0 >= rt.next_poll_fill_ts_ns[s_idx] && now_ns.0.saturating_sub(*last_rest_dispatch_ns) >= 55_000_000 {
                         *last_rest_dispatch_ns = now_ns.0;
-                        engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + 1_200_000_000;
+                        rt.next_poll_fill_ts_ns[s_idx] = now_ns.0 + 1_200_000_000;
                         if gw.try_send(GatewayCommand::PollEntryFill { slot_idx: s_idx, sl_hint: sl_trigger_price }) { rt.slot_rpc_inflight[s_idx] = true; rt.slot_rpc_sent_ns[s_idx] = now_ns.0; }
                     }
                 } else {
                     let bbo_crossed = match side { Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0, Side::Ask => snap.bids[0].price.0 >= entry_price.0 };
                     if next_q.0 <= 0 || bbo_crossed {
+                        pending_entry_count = pending_entry_count.saturating_sub(1);
+                        open_count += 1;
                         rt.queue_flow_ema[s_idx] = 0.0;
                         gov.clear_abort_streak(s_idx, side);
+                        gov.observe_passive_entry_fill(s_idx);
                         engines[s_idx].sync_governor_for_side(gov, side);
                         if let Some((eff_s, eff_px, eff_q)) = crate::exec_gateway_handlers::promote_verified_fill_state(&mut engines[s_idx], now_ns, None, None, None) {
                             let mid_now = PriceTicks(i64::midpoint(snap.bids[0].price.0.max(1), snap.asks[0].price.0.max(1)));
@@ -830,8 +1049,62 @@ pub fn step_12_slot_daemon_tick(
                     let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity { ts_ns: now_ns.0, learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(engines) });
                     dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
                     let _ = tg_tx.try_send(format_telegram_close_message(spec, &summary, engines[s_idx].last_exit_sub_reason, ledger.closed_trades_count, ledger));
+                    let prev_halt = rt.halt_locked;
+                    epoch_loss_1e8 = maybe_latch_validation_epoch_5usdt_shield(
+                        now_ns,
+                        gateway.map(|_| rt.wallet_1e8),
+                        lock_watch,
+                        rt,
+                        cached_snaps,
+                        engines,
+                        ledger,
+                        tg_tx,
+                        vault_tx,
+                    );
+                    psi_health = gov.refresh_psi_health(
+                        &rt.daily_gov,
+                        ledger.sinking_fund_reserve_bps_x100,
+                        epoch_loss_1e8,
+                    );
+                    if rt.halt_locked && (!prev_halt || !block_new_entries) {
+                        block_new_entries = true;
+                        halt_newly_latched_mid_tick = true;
+                    }
                 }
                 engines[s_idx].sync_to_shm_telemetry(arena);
+            }
+        }
+    }
+
+    if halt_newly_latched_mid_tick {
+        for s_idx in 0..MAX_ACTIVE_PAIRS {
+            match engines[s_idx].state {
+                OrderLifecycleState::PlacingEntryMaker { .. } => {
+                    pending_entry_count = pending_entry_count.saturating_sub(1);
+                    rt.queue_flow_ema[s_idx] = 0.0;
+                    engines[s_idx].state = OrderLifecycleState::Idle;
+                    engines[s_idx].sync_to_shm_telemetry(arena);
+                    publish_slot_veto_code(arena, s_idx, LastVetoCode::WarmupOrLock);
+                }
+                OrderLifecycleState::RestingEntryQueue { side, entry_price, sl_trigger_price, .. } => {
+                    rt.last_abort_veto[s_idx] = LastVetoCode::WarmupOrLock;
+                    rt.abort_was_favorable_miss[s_idx] = false;
+                    publish_slot_veto_code(arena, s_idx, LastVetoCode::WarmupOrLock);
+                    if let Some(gw) = gateway {
+                        if !rt.abort_cmd_inflight[s_idx] && gw.try_send(GatewayCommand::AbortEntry { slot_idx: s_idx, side, aborted_price: entry_price, sl_hint: sl_trigger_price }) {
+                            rt.slot_rpc_inflight[s_idx] = true;
+                            rt.slot_rpc_sent_ns[s_idx] = now_ns.0;
+                            rt.abort_cmd_inflight[s_idx] = true;
+                        }
+                    } else {
+                        pending_entry_count = pending_entry_count.saturating_sub(1);
+                        rt.queue_flow_ema[s_idx] = 0.0;
+                        gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
+                        engines[s_idx].state = OrderLifecycleState::Idle;
+                        engines[s_idx].sync_to_shm_telemetry(arena);
+                    }
+                }
+                OrderLifecycleState::Idle | OrderLifecycleState::PositionOpenMakerExit { .. } => {}
             }
         }
     }
@@ -840,10 +1113,12 @@ pub fn step_12_slot_daemon_tick(
     if !block_new_entries && (open_count + pending_entry_count) < 6 {
         let mut armed_this_tick = 0_usize;
         let btc_vol = ScaledBps(btc_snap.realized_vol_5m.0.max(2_500));
-        let daily_damper_pm = rt.daily_gov.kelly_boundary_damper_permille(
+        let raw_daily_damper_pm = rt.daily_gov.kelly_boundary_damper_permille(
             ledger.sinking_fund_reserve_bps_x100, gov.active_maker_rt_fee_bps(),
             gov.portfolio_mean_eq_vol_bps(), gov.portfolio_mean_ir_x100(),
         );
+        let epoch_5u_damper = crate::governor_plasticity::compute_epoch_5u_loss_lot_damper_c1(epoch_loss_1e8);
+        let daily_damper_pm = ((raw_daily_damper_pm as f64) * epoch_5u_damper).round() as i64;
         for s_idx in 0..MAX_ACTIVE_PAIRS {
             if (open_count + pending_entry_count) >= 6 || armed_this_tick >= 1 { break; }
             if !matches!(engines[s_idx].state, OrderLifecycleState::Idle) || rt.slot_rpc_inflight[s_idx] { continue; }
@@ -873,10 +1148,16 @@ pub fn step_12_slot_daemon_tick(
             let epps_corr = if s_idx == 0 { 0.0 } else { rt.epps_trackers[s_idx].correlation(false) };
             let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &snap, &btc_snap, &rt.epps_trackers[s_idx]);
             let probe_side = if OrthogonalFactorState::adaptive_snr_from_snapshot(&snap, spoof_d).get() >= 0.0 { Side::Bid } else { Side::Ask };
+            let corr_sign = if s_idx > 0 && epps_corr < 0.0 { -1.0 } else { 1.0 };
+            let probe_btc_lead = (s_idx > 0).then(|| {
+                rt.btc_lead_memory.effective_aligned_impulse(&btc_snap, corr_sign, probe_side)
+            });
             let (probe_edge, _, _) = gov.slot_direction_diagnostics(s_idx, probe_side);
             let taker_pm = gov.slot_taker_prob_permille(s_idx, probe_side);
             let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-            let verdict = OrthogonalFactorState::evaluate_entry_signal_v54(spec, &snap, &btc_snap, mfe_s, ScaledBps(probe_edge), taker_pm, fees, spoof_d, epps_beta, epps_corr);
+            let verdict = OrthogonalFactorState::evaluate_entry_signal_v542(
+                spec, &snap, &btc_snap, mfe_s, ScaledBps(probe_edge), taker_pm, fees, spoof_d, epps_beta, epps_corr, probe_btc_lead, psi_health,
+            );
             match verdict {
                 SignalVerdict::SpoofingVeto => publish_slot_veto_code(arena, s_idx, LastVetoCode::SpoofingVeto),
                 SignalVerdict::NeutralNoAction => {
@@ -887,7 +1168,7 @@ pub fn step_12_slot_daemon_tick(
                             gov.slot_eq_vol_5m_bps(s_idx),
                             taker_pm,
                             fees,
-                        ) || !passes_elliott_macro_coherence_guard_with_sync(probe_side, &snap, &btc_snap, epps_corr)
+                        ) || !passes_elliott_macro_coherence_guard_with_health(probe_side, &snap, &btc_snap, epps_corr, probe_btc_lead, psi_health)
                         {
                             LastVetoCode::MacroElliottContradiction
                         } else {
@@ -898,25 +1179,28 @@ pub fn step_12_slot_daemon_tick(
                 }
                 SignalVerdict::AuthorizeMakerEntry { side, .. } => {
                     let s_taker_pm = gov.slot_taker_prob_permille(s_idx, side);
+                    let btc_lead_opt = (s_idx > 0).then(|| {
+                        rt.btc_lead_memory.effective_aligned_impulse(&btc_snap, corr_sign, side)
+                    });
                     let cand_px = side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price);
                     if !spec.passes_quantum_ev_growth_gate(rt.wallet_1e8, cand_px, snap.realized_vol_5m, mfe_s, s_taker_pm, fees) {
                         publish_slot_veto_code(arena, s_idx, LastVetoCode::QueueDepthOrOversizedLot);
                         continue;
                     }
-                    if !passes_elliott_macro_coherence_guard_with_sync(side, &snap, &btc_snap, epps_corr) { publish_slot_veto_code(arena, s_idx, LastVetoCode::MacroElliottContradiction); continue; }
+                    if !passes_elliott_macro_coherence_guard_with_health(side, &snap, &btc_snap, epps_corr, btc_lead_opt, psi_health) { publish_slot_veto_code(arena, s_idx, LastVetoCode::MacroElliottContradiction); continue; }
                     if !passes_order_block_wall_guard_dynamic(s_idx, side, &snap, s_taker_pm, fees) { publish_slot_veto_code(arena, s_idx, LastVetoCode::OpposingOrderBlockWall); continue; }
-                    if !can_stage_same_direction_entry(s_idx, side, now_ns, engines, cached_snaps) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
+                    if !can_stage_same_direction_entry_v542(s_idx, side, now_ns, engines, cached_snaps, &rt.epps_trackers, psi_health, s_taker_pm) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
                     let lots = gov.compute_slot_entry_lots_v48(s_idx, side, rt.wallet_1e8, &snap, daily_damper_pm);
                     let risk_ppm = slot_position_risk_ppm_with_fees(spec, rt.wallet_1e8, cand_px, lots, snap.realized_vol_5m, fees);
                     let beta_x1000 = rt.epps_trackers[s_idx].correlated_beta_x1000(s_idx == 0, snap.realized_vol_5m, btc_vol);
                     if !beta_guard.can_open_with_risk_ppm(s_idx, side, risk_ppm, beta_x1000) || !passes_elastic_daily_tail_risk_budget(s_idx, side, risk_ppm, rt.wallet_1e8, &rt.daily_gov, ledger.sinking_fund_reserve_bps_x100, engines, cached_snaps, gov) { publish_slot_veto_code(arena, s_idx, LastVetoCode::BetaOrSameSideStagger); continue; }
-                    if let Err(v49_veto) = gov.authorizes_adaptive_entry_v54(s_idx, side, rt.wallet_1e8, daily_damper_pm, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr) {
+                    if let Err(v49_veto) = gov.authorizes_adaptive_entry_v542(s_idx, side, rt.wallet_1e8, daily_damper_pm, mfe_s, &snap, &btc_snap, spoof_d, epps_beta, epps_corr, btc_lead_opt) {
                         let veto_c = if gov.audit_historical_entry_veto(s_idx, side, cand_px.0, snap.ts_local_ns.0).is_some() { LastVetoCode::ScarCooldownOrContagion } else { v49_veto };
                         publish_slot_veto_code(arena, s_idx, veto_c);
                         continue;
                     }
                     engines[s_idx].sync_governor_for_side(gov, side);
-                    if engines[s_idx].try_arm_maker_entry_with_sync(&snap, &btc_snap, verdict, lots, epps_corr).is_ok() && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. }) {
+                    if engines[s_idx].try_arm_maker_entry_v542(&snap, &btc_snap, verdict, lots, epps_corr, btc_lead_opt, psi_health).is_ok() && matches!(engines[s_idx].state, OrderLifecycleState::PlacingEntryMaker { .. }) {
                         rt.queue_flow_ema[s_idx] = 0.55 * snap.factor_ofi.get() + 0.45 * snap.factor_tfi.get();
                         rt.last_abort_veto[s_idx] = LastVetoCode::None;
                         publish_slot_veto_code(arena, s_idx, LastVetoCode::None);
@@ -960,7 +1244,15 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     }
 
     arena.exec_armed_count.store(0, Ordering::Release); arena.exec_abort_count.store(0, Ordering::Release); arena.exec_fill_count.store(0, Ordering::Release);
-    rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
+    let rehyd_halt = rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
+    if rehyd_halt
+        || lock_watch.is_halt_locked()
+        || Path::new(crate::telemetry_hud::HALT_LOCK_PATH).exists()
+    {
+        rt.halt_locked = true;
+        rt.total_loss_shield_latched = true;
+        lock_watch.latch_halt_in_ram();
+    }
     SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
     rehydrate_cold_mfe_seeds_from_scar_vault(&mut engines, Path::new(SCAR_MEMORY_VAULT_PATH));
     let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
@@ -979,7 +1271,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         gov.set_entry_warmup_until_ns(warmup_until_ns);
         rt.entry_warmup_until_ns = warmup_until_ns;
         println!(
-            "{ANSI_GREEN}\u{1f7e2} [EMA+EPPS PREWARM V5.4.1] Hydrated {prewarmed_slots}/12 EMAs, {epps_slots}/12 Epps | Live L2+WS converge gate armed ({}s floor) | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
+            "{ANSI_GREEN}\u{1f7e2} [EMA+EPPS PREWARM V5.4.2] Hydrated {prewarmed_slots}/12 EMAs, {epps_slots}/12 Epps | Live L2+WS converge gate armed ({}s floor) | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
             warmup_ns / 1_000_000_000,
             (startup_hs.fee_schedule.maker_fee_bps.raw() as f64) / 100.0,
             (startup_hs.fee_schedule.taker_fee_bps.raw() as f64) / 100.0
@@ -998,7 +1290,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     let mut last_handshake_refresh_ns = boot_ns.0;
     let mut last_rest_dispatch_ns = 0_i64;
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V5.4.1 200.0 Hz ARMED] Elastic Daily Shield + C1 EV Dominance + Anti-Spoof OFI + 8h Funding.{ANSI_RESET}"
+        "{ANSI_GREEN}\u{1f7e2} [VORTEX-OMEGA V5.4.2 200.0 Hz ARMED] Elastic C1 Throughput + Penny-Jump + FillRate + -5.00 USDT Hard Shield.{ANSI_RESET}"
     );
 
     loop {
@@ -1081,7 +1373,7 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
         let any_inflight = rt.slot_rpc_inflight.iter().any(|&b| b);
         let (flush_drain_once, drain_standby) = step_drain_standby_latch(rt.drain_active, open_count, pending_entry_count, any_inflight, &mut rt.drain_flushed_once);
         if flush_drain_once {
-            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V5.4.1 DRAIN STANDBY] 0 open positions verified (Wallet == Equity). Standing by.".to_string());
+            let _ = tg_tx.try_send("\u{1f7e2} [VORTEX-OMEGA V5.4.2 DRAIN STANDBY] 0 open positions verified (Wallet == Equity). Standing by.".to_string());
             let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
             if vault_tx.send(VaultIoCommand::FlushBarrier(ack_tx)).is_ok() {
                 let _ = ack_rx.recv_timeout(Duration::from_secs(2));
@@ -1100,7 +1392,7 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
     if args.iter().any(|a| a == "--live") {
         match MappedShmRegion::open_existing_read_only(&shm_path) {
             Ok(reg) => render_live_hud(reg.arena()),
-            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V5.4.1 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
+            Err(_) => println!("{ANSI_GRAY}\u{26aa} [VORTEX-OMEGA V5.4.2 LIVE HUD] SHM inactive ({}) \u{2014} daemons stopped.{ANSI_RESET}", shm_path.display()),
         }
         return ExitCode::SUCCESS;
     }
@@ -1110,7 +1402,7 @@ pub fn run_exec_cli_entrypoint() -> ExitCode {
     }
     let (oos_trades, maker_ratio, pf, cum_usdt, drift) = run_oos_520_certification_suite();
     let sep = "=".repeat(80);
-    println!("{sep}\n[VORTEX-EXEC OMEGA V5.4.1] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
+    println!("{sep}\n[VORTEX-EXEC OMEGA V5.4.2] 12-SLOT EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER\n{sep}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> OOS Closed Trades Verified : {oos_trades} (Gate >= 500){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Maker Exit Ratio           : {maker_ratio:.2}% (Gate >= 80.00%){ANSI_RESET}");
     println!("  {ANSI_GREEN}\u{1f7e2} -> Net Profit Factor (PostFee): {pf:.2} (Gate >= 1.35){ANSI_RESET}");

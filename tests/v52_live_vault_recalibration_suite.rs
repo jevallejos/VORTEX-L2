@@ -1950,3 +1950,754 @@ fn test_v541_scratch_uncensored_decay_iceberg_multilot_reduceonly_split_and_stag
         &stg_snaps,
     ));
 }
+
+#[test]
+fn test_v542_elastic_throughput_penny_jump_fill_rate_and_5usdt_hard_lock() {
+    use std::sync::{mpsc, Arc};
+    use vortex_rs::alpha_3factor::{
+        compute_corrective_abc_clear_lift_c1, compute_corrective_abc_structural_threat_c1,
+        compute_s_opp_ob_wall_c1, passes_corrective_abc_snapshot_guard_with_health_c1,
+        BtcLeadLagMemory, EppsBtcCorrelationTracker, OrthogonalFactorState, SignalVerdict,
+        INV_PHI, PHI_FOURTH,
+    };
+    use vortex_rs::bybit_client::InstrumentSpecVerification;
+    use vortex_rs::exec_daemon::{
+        can_stage_same_direction_entry_v542, compute_validation_epoch_loss_1e8,
+        is_safe_halt_standby, step_12_slot_daemon_tick,
+    };
+    use vortex_rs::exec_gateway_handlers::ExecRuntimeState;
+    use vortex_rs::execution_fsm::{
+        compute_agile_repeg_cooldown_ns_v542, compute_aligned_entry_propulsion_c1,
+        passes_cumulative_repeg_chase_cap_v542, passes_elliott_macro_coherence_guard_with_health,
+        select_elastic_entry_maker_price_v542, OrderLifecycleState,
+    };
+    use vortex_rs::fee_cadence_beta::MonetaryPortfolioBetaGuard;
+    use vortex_rs::fifo_sim::{FifoQueueSimulator, SimulatedOrderState, FLIGHT_LATENCY_NS};
+    use vortex_rs::forensic_parquet::ParitySyncLedger;
+    use vortex_rs::governor_plasticity::{
+        compute_epoch_5u_loss_lot_damper_c1, compute_psi_health_c1, DailyShieldPhase,
+    };
+    use vortex_rs::lob_shm::{MappedShmRegion, MAX_ACTIVE_PAIRS};
+    use vortex_rs::replay_walkforward::OmegaDigitalTwinEngine;
+    use vortex_rs::telemetry_hud::{
+        format_total_loss_shield_5u_plain, rehydrate_shadow_ledger_from_paths,
+        SlotForensicEntrySnapshot,
+    };
+    use vortex_rs::vault_io::{
+        spawn_vault_io_worker_with_lock_paths, AtomicLockWatch, VaultIoCommand,
+        MAX_VALIDATION_EPOCH_LOSS_1E8,
+    };
+
+    record_live_ws_pulse(50_000, 100);
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_344_000_000_000_000_i64; // Exact UTC day boundary + offset below
+
+    // =========================================================================
+    // (a) M1 + M3: CorrectiveAbc clear-runway unlock (chi_threat == 0), BTC short
+    //     lead-lag memory (tau = PHI^4 s), 2-Slot Epps Queue Stagger, AND 100%
+    //     blocking of all 6 historical CorrectiveAbc losses + ETH #2.
+    // =========================================================================
+    let mut btc_neutral = mk_vault_snap(0, 652_000, 2_800, 0.06, 0.08, 0.05, t0);
+    btc_neutral.bids[0].qty = LotQty(1_800);
+    btc_neutral.asks[0].qty = LotQty(1_750);
+    btc_neutral.refresh_deep_l1_l5_totals();
+
+    let mut link_clear = mk_vault_snap(9, 14_250, 1_650, 0.68, 0.72, 0.56, t0);
+    link_clear.ob_bull_efficacy_pm = 530;
+    link_clear.ob_bear_efficacy_pm = 520;
+    link_clear.ob_bull_score = BoundedScore::new_clamped(0.62);
+    link_clear.ob_dist_bull_bps = ScaledBps(1_800);
+    link_clear.ob_bear_score = BoundedScore::ZERO;
+    link_clear.ob_dist_bear_bps = ScaledBps(0);
+    link_clear.set_wave_observables(WaveObservables {
+        regime: WaveRegime::CorrectiveAbc,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.78),
+        macro_phase: BoundedScore::new_clamped(0.10),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(0),
+    });
+    let s_opp_clear = compute_s_opp_ob_wall_c1(Side::Bid, &link_clear, 2_400, 50, fees);
+    assert!(s_opp_clear.abs() <= 1e-12);
+    let chi_clear = compute_corrective_abc_structural_threat_c1(s_opp_clear, 0.10);
+    assert!(chi_clear.abs() <= 1e-12);
+    let dh_clear = compute_corrective_abc_clear_lift_c1(1.0, 0.68, chi_clear, 0.0);
+    assert!(dh_clear > 0.35);
+
+    // At psi_health == 0.0 (V5.4.1 selectivity with low Epps=0.25 & neutral BTC): blocked!
+    assert!(!passes_corrective_abc_snapshot_guard_with_health_c1(
+        Side::Bid,
+        &link_clear,
+        0.25,
+        0.05,
+        0.0,
+    ));
+    // At psi_health == 1.0 with clear runway (chi_threat == 0.0): unlocked including low-vol breakout!
+    assert!(passes_corrective_abc_snapshot_guard_with_health_c1(
+        Side::Bid,
+        &link_clear,
+        0.25,
+        0.05,
+        1.0,
+    ));
+    assert!(passes_elliott_macro_coherence_guard_with_health(
+        Side::Bid,
+        &link_clear,
+        &btc_neutral,
+        0.25,
+        None,
+        1.0,
+    ));
+    assert!(matches!(
+        OrthogonalFactorState::evaluate_entry_signal_v542(
+            APPROVED_SPECS[9],
+            &link_clear,
+            &btc_neutral,
+            ScaledBps(860),
+            ScaledBps(140),
+            50,
+            fees,
+            0.0,
+            0.25,
+            0.25,
+            None,
+            1.0,
+        ),
+        SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+    ));
+
+    // Short exponential BTC Lead-Lag Memory (tau = PHI^4 s = 6.8541 s) captures lagged altcoin sync:
+    assert!((PHI_FOURTH - 6.854_101_966_249_685).abs() < 1e-12);
+    let mut btc_mem = BtcLeadLagMemory::new();
+    let mut btc_burst = mk_vault_snap(0, 654_000, 3_600, 0.88, 0.92, 0.84, t0);
+    btc_burst.bids[0].qty = LotQty(3_400);
+    btc_burst.asks[0].qty = LotQty(1_200);
+    btc_burst.refresh_deep_l1_l5_totals();
+    let ema_t0 = btc_mem.observe_btc_snapshot(&btc_burst);
+    assert!(ema_t0 > 0.75);
+    let mut btc_pause_3s = btc_neutral;
+    btc_pause_3s.ts_local_ns = TimestampNs(t0 + 3_000_000_000);
+    let _ = btc_mem.observe_btc_snapshot(&btc_pause_3s);
+    let eff_lagged_btc = btc_mem.effective_aligned_impulse(&btc_pause_3s, 1.0, Side::Bid);
+    assert!(eff_lagged_btc > 0.50);
+    let mut tao_lagged = link_clear;
+    tao_lagged.symbol_id = APPROVED_SPECS[4].symbol_id;
+    tao_lagged.bids[0].price = PriceTicks(19_600);
+    tao_lagged.asks[0].price = PriceTicks(19_601);
+    tao_lagged.mark_price = PriceTicks(19_600);
+    tao_lagged.set_wave_observables(WaveObservables {
+        regime: WaveRegime::CorrectiveAbc,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.76),
+        macro_phase: BoundedScore::new_clamped(-0.30),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(0),
+    });
+    assert!(passes_corrective_abc_snapshot_guard_with_health_c1(
+        Side::Bid,
+        &tao_lagged,
+        0.86,
+        eff_lagged_btc,
+        0.40,
+    ));
+
+    // All 6 historical CorrectiveAbc losses (#18, #19, #22, #23, #27, #30) + ETH #2 remain 100% blocked even at psi_health == 1.0:
+    #[derive(Copy, Clone)]
+    struct HistAbcCase {
+        slot: usize, px: i64, vol: i64, ofi: f64, tfi: f64, geom: f64, btc_c: f64,
+        side: Side, h_val: f64, m_ph: f64, bull_pm: u16, bear_pm: u16, opp_sc: f64, opp_dist: i64,
+    }
+    let hist_cases = [
+        HistAbcCase { slot: 1, px: 179_267, vol: 1_725, ofi: 0.57, tfi: 0.93, geom: 0.09, btc_c: 0.10, side: Side::Bid, h_val: 0.696, m_ph: 0.45, bull_pm: 438, bear_pm: 415, opp_sc: 0.50, opp_dist: 5_572 },
+        HistAbcCase { slot: 5, px: 7_316, vol: 1_582, ofi: -0.75, tfi: -0.84, geom: -0.17, btc_c: -0.55, side: Side::Ask, h_val: 0.748, m_ph: -0.45, bull_pm: 522, bear_pm: 478, opp_sc: 0.57, opp_dist: 9_670 },
+        HistAbcCase { slot: 3, px: 7_156, vol: 1_873, ofi: -0.49, tfi: -0.95, geom: -0.20, btc_c: -0.21, side: Side::Ask, h_val: 0.637, m_ph: -0.45, bull_pm: 465, bear_pm: 471, opp_sc: 0.60, opp_dist: 3_908 },
+        HistAbcCase { slot: 4, px: 19_691, vol: 2_428, ofi: 0.65, tfi: 0.86, geom: 0.36, btc_c: 0.36, side: Side::Bid, h_val: 0.729, m_ph: -0.30, bull_pm: 564, bear_pm: 516, opp_sc: 0.44, opp_dist: 4_984 },
+        HistAbcCase { slot: 1, px: 179_552, vol: 1_890, ofi: 0.48, tfi: 0.84, geom: 0.93, btc_c: 0.43, side: Side::Bid, h_val: 0.715, m_ph: 0.45, bull_pm: 443, bear_pm: 441, opp_sc: 0.39, opp_dist: 6_337 },
+        HistAbcCase { slot: 4, px: 19_038, vol: 3_023, ofi: -0.72, tfi: -0.67, geom: -0.27, btc_c: -0.32, side: Side::Ask, h_val: 0.744, m_ph: -0.45, bull_pm: 476, bear_pm: 548, opp_sc: 0.64, opp_dist: 8_861 },
+        HistAbcCase { slot: 1, px: 177_485, vol: 5_800, ofi: -0.22, tfi: -0.62, geom: -0.92, btc_c: -0.14, side: Side::Ask, h_val: 0.700, m_ph: -0.35, bull_pm: 509, bear_pm: 532, opp_sc: 0.67, opp_dist: 1_133 },
+    ];
+    for c in hist_cases {
+        let mut s_loss = mk_vault_snap(c.slot, c.px, c.vol, c.ofi, c.tfi, c.geom, t0);
+        s_loss.ob_bull_efficacy_pm = i64::from(c.bull_pm);
+        s_loss.ob_bear_efficacy_pm = i64::from(c.bear_pm);
+        match c.side {
+            Side::Bid => {
+                s_loss.ob_bear_score = BoundedScore::new_clamped(c.opp_sc);
+                s_loss.ob_dist_bear_bps = ScaledBps(c.opp_dist);
+            }
+            Side::Ask => {
+                s_loss.ob_bull_score = BoundedScore::new_clamped(c.opp_sc);
+                s_loss.ob_dist_bull_bps = ScaledBps(c.opp_dist);
+            }
+        }
+        s_loss.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(c.h_val),
+            macro_phase: BoundedScore::new_clamped(c.m_ph),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        let s_opp_loss = compute_s_opp_ob_wall_c1(c.side, &s_loss, 2_400, 50, fees);
+        assert!((s_opp_loss - 1.0).abs() < 1e-9);
+        let btc_al = c.btc_c * c.side.sign_f64();
+        let blocked_abc = !passes_corrective_abc_snapshot_guard_with_health_c1(
+            c.side, &s_loss, 0.82, btc_al, 1.0,
+        );
+        let blocked_ev = APPROVED_SPECS[c.slot]
+            .evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+                LotQty(if c.slot == 1 { 1 } else { 12 }),
+                PriceTicks(c.px),
+                ScaledBps(c.vol),
+                647,
+                50,
+                c.geom * c.side.sign_f64(),
+                c.bull_pm,
+                c.bear_pm,
+                c.side,
+                fees,
+                c.ofi * c.side.sign_f64(),
+                btc_al,
+            )
+            .is_none();
+        assert!(blocked_abc || blocked_ev);
+    }
+
+    // M3: 2-Slot Epps Queue Stagger (max 2 RestingEntryQueue on same side, max 1 PlacingEntryMaker):
+    let mut m3_engines = SlotExecutionEngine::new_12_slot_array();
+    let mut m3_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    m3_snaps[5] = mk_vault_snap(5, 7_200, 2_600, 0.65, 0.70, 0.50, t0);
+    m3_snaps[4] = mk_vault_snap(4, 19_500, 2_800, 0.68, 0.72, 0.55, t0);
+    m3_snaps[3] = mk_vault_snap(3, 8_150, 2_600, 0.66, 0.70, 0.52, t0);
+    m3_engines[5].state = OrderLifecycleState::RestingEntryQueue {
+        side: Side::Bid,
+        entry_price: PriceTicks(7_200),
+        qty: LotQty(15),
+        target_excursion: ScaledBps(700),
+        sl_trigger_price: PriceTicks(7_120),
+        resting_since_ts: TimestampNs(t0),
+    };
+    let epps_low = [EppsBtcCorrelationTracker::new(); MAX_ACTIVE_PAIRS]; // cold seed = 0.618 -> 0.618*0.618 = 0.3819 < INV_PHI!
+    let mut beta_g = MonetaryPortfolioBetaGuard::new();
+    assert!(beta_g.can_open_with_risk_ppm(5, Side::Bid, 2_500, 618));
+    beta_g.register_slot_open(5, Side::Bid, 2_500, 618);
+    assert!(beta_g.can_open_with_risk_ppm(4, Side::Bid, 2_500, 618));
+    assert!(can_stage_same_direction_entry_v542(
+        4, Side::Bid, TimestampNs(t0 + 100_000_000), &m3_engines, &m3_snaps, &epps_low, 0.95, 50,
+    ));
+    // 3rd same-side resting order is strictly blocked (cap == 2):
+    m3_engines[4].state = OrderLifecycleState::RestingEntryQueue {
+        side: Side::Bid,
+        entry_price: PriceTicks(19_500),
+        qty: LotQty(1),
+        target_excursion: ScaledBps(700),
+        sl_trigger_price: PriceTicks(19_300),
+        resting_since_ts: TimestampNs(t0),
+    };
+    assert!(!can_stage_same_direction_entry_v542(
+        3, Side::Bid, TimestampNs(t0 + 100_000_000), &m3_engines, &m3_snaps, &epps_low, 0.95, 50,
+    ));
+    // PlacingEntryMaker on same side blocks staging a second entry on the same tick:
+    m3_engines[4].state = OrderLifecycleState::Idle;
+    m3_engines[5].state = OrderLifecycleState::PlacingEntryMaker {
+        side: Side::Bid,
+        entry_price: PriceTicks(7_200),
+        qty: LotQty(15),
+        target_excursion: ScaledBps(700),
+        sl_trigger_price: PriceTicks(7_120),
+        submitted_ts: TimestampNs(t0),
+    };
+    assert!(!can_stage_same_direction_entry_v542(
+        4, Side::Bid, TimestampNs(t0 + 5_000_000), &m3_engines, &m3_snaps, &epps_low, 0.95, 50,
+    ));
+
+    // =========================================================================
+    // (b) M2: Inside-Spread PostOnly Penny-Jump + BetaBinomialFillRate + Agile
+    //     Re-Peg + Favorable Miss Cooldown Exemption (V08 intact on toxic abort).
+    // =========================================================================
+    let mut wide_eth = mk_vault_snap(1, 180_000, 3_600, 0.78, 0.82, 0.65, t0);
+    wide_eth.bids[0] = BookLevel { price: PriceTicks(180_000), qty: LotQty(400) };
+    wide_eth.asks[0] = BookLevel { price: PriceTicks(180_003), qty: LotQty(400) };
+    wide_eth.refresh_deep_l1_l5_totals();
+    let prop_bid = compute_aligned_entry_propulsion_c1(Side::Bid, &wide_eth, 0.45);
+    assert!(prop_bid > INV_PHI);
+    let pj_bid = select_elastic_entry_maker_price_v542(Side::Bid, &wide_eth, 0.95, prop_bid);
+    assert_eq!(pj_bid, PriceTicks(180_001));
+    assert!(pj_bid > wide_eth.bids[0].price && pj_bid < wide_eth.asks[0].price);
+
+    let mut wide_eth_ask = mk_vault_snap(1, 180_000, 3_600, -0.78, -0.82, -0.65, t0);
+    wide_eth_ask.bids[0] = BookLevel { price: PriceTicks(180_000), qty: LotQty(400) };
+    wide_eth_ask.asks[0] = BookLevel { price: PriceTicks(180_003), qty: LotQty(400) };
+    let prop_ask = compute_aligned_entry_propulsion_c1(Side::Ask, &wide_eth_ask, -0.45);
+    let pj_ask = select_elastic_entry_maker_price_v542(Side::Ask, &wide_eth_ask, 0.95, prop_ask);
+    assert_eq!(pj_ask, PriceTicks(180_002));
+    assert!(pj_ask < wide_eth_ask.asks[0].price && pj_ask > wide_eth_ask.bids[0].price);
+
+    // 1-tick spread never crosses BBO (0 PostOnly rejects):
+    let mut tight_eth = wide_eth;
+    tight_eth.asks[0] = BookLevel { price: PriceTicks(180_001), qty: LotQty(400) };
+    assert_eq!(
+        select_elastic_entry_maker_price_v542(Side::Bid, &tight_eth, 0.95, prop_bid),
+        PriceTicks(180_000)
+    );
+
+    // FIFO Simulator verifies 0 PostOnly rejects, #1 queue priority (queue_ahead == 0), and no phantom L2 wipe:
+    let mut fifo = FifoQueueSimulator::new();
+    fifo.submit_post_only(Side::Bid, pj_bid, LotQty(1), TimestampNs(t0));
+    let mut wide_eth_arrive = wide_eth;
+    wide_eth_arrive.ts_local_ns = TimestampNs(t0 + FLIGHT_LATENCY_NS);
+    fifo.on_lob_snapshot(&wide_eth_arrive);
+    assert!(matches!(
+        fifo.state,
+        SimulatedOrderState::RestingInFifoQueue { queue_ahead_qty: LotQty(0), .. }
+    ));
+    assert_eq!(fifo.total_post_only_rejects, 0);
+    // Subsequent L2 snapshot with best_bid=180_000 (< 180_001) and best_ask=180_003 (> 180_001) keeps resting cleanly:
+    wide_eth_arrive.ts_local_ns = TimestampNs(t0 + FLIGHT_LATENCY_NS + 2_000_000);
+    fifo.on_lob_snapshot(&wide_eth_arrive);
+    assert!(matches!(
+        fifo.state,
+        SimulatedOrderState::RestingInFifoQueue { queue_ahead_qty: LotQty(0), .. }
+    ));
+    // First 1-lot aggressive sell print at 180_001 fills immediately as Maker:
+    fifo.on_trade_print(
+        TimestampNs(t0 + FLIGHT_LATENCY_NS + 5_000_000),
+        Side::Ask,
+        pj_bid,
+        LotQty(1),
+    );
+    assert!(matches!(
+        fifo.state,
+        SimulatedOrderState::FilledMaker { fill_price: PriceTicks(180_001), .. }
+    ));
+
+    // BetaBinomialFillRate neutral seed (1000/1000 -> 0.50), GOV_SCAR_SNAPSHOT roundtrip, and agile Re-Peg:
+    let mut gov_fill = OnlineAdaptiveGovernor::new();
+    assert_eq!(gov_fill.slot_fill_obs_alpha_beta(4), (1_000, 1_000));
+    assert!((gov_fill.slot_fill_rate_eta(4) - 0.50).abs() < 1e-12);
+    let cd_neutral = compute_agile_repeg_cooldown_ns_v542(50_000, gov_fill.slot_fill_rate_eta(4));
+
+    // Favorable BBO miss raises beta -> lowers eta_fill -> shortens agile Re-Peg cooldown AND sets 0 anti-knife cooldown!
+    gov_fill.observe_entry_abort_with_context(
+        4,
+        Side::Bid,
+        PriceTicks(19_500),
+        TimestampNs(t0),
+        true,
+        false,
+    );
+    gov_fill.observe_favorable_entry_miss(4);
+    let tao_dip = mk_vault_snap(4, 19_495, 2_800, 0.55, 0.60, 0.45, t0 + 1_000_000_000);
+    assert_eq!(
+        gov_fill.audit_scar64_entry_and_sweep_shield(4, Side::Bid, &tao_dip, 0.40),
+        Ok(())
+    );
+    assert!(gov_fill.slot_fill_rate_eta(4) < 0.50);
+    let cd_missed = compute_agile_repeg_cooldown_ns_v542(50_000, gov_fill.slot_fill_rate_eta(4));
+    assert!(cd_missed < cd_neutral);
+
+    // Passive fills raise alpha -> raises eta_fill:
+    for _ in 0..5 {
+        gov_fill.observe_passive_entry_fill(2);
+    }
+    assert!(gov_fill.slot_fill_rate_eta(2) > 0.65);
+
+    // Adverse / toxic abort keeps V08 POST_ABORT_KNIFE_TRAP cooldown 100% active:
+    gov_fill.observe_entry_abort_with_context(
+        3,
+        Side::Bid,
+        PriceTicks(8_150),
+        TimestampNs(t0),
+        false,
+        true,
+    );
+    let avax_dip = mk_vault_snap(3, 8_145, 2_800, 0.55, 0.60, 0.45, t0 + 1_000_000_000);
+    assert_eq!(
+        gov_fill.audit_scar64_entry_and_sweep_shield(3, Side::Bid, &avax_dip, 0.40),
+        Err("VETO_POST_ABORT_ADVERSE_SWEEP")
+    );
+
+    // Cumulative Re-Peg chase cap (< INV_PHI_SQ * (target_gross - fee_rt_mkr)):
+    // target_gross = 900 sbps, fee_rt_mkr = 400 sbps -> headroom = 500 sbps -> cap = 190.98 sbps (~1.91 bp)
+    assert!(passes_cumulative_repeg_chase_cap_v542(
+        Side::Bid,
+        PriceTicks(100_000),
+        PriceTicks(100_015), // +1.50 bps < 1.91 bps
+        ScaledBps(900),
+        ScaledBps(400),
+    ));
+    assert!(!passes_cumulative_repeg_chase_cap_v542(
+        Side::Bid,
+        PriceTicks(100_000),
+        PriceTicks(100_022), // +2.20 bps >= 1.91 bps -> blocked to preserve EV > 0!
+        ScaledBps(900),
+        ScaledBps(400),
+    ));
+
+    // Temp dir for isolated persistence checks (never touches data/vault/*):
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "vortex_v542_cert_{}_{}",
+        std::process::id(),
+        t0
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    assert!(std::fs::create_dir_all(&tmp_dir).is_ok());
+
+    let scar_p = tmp_dir.join("scar_v542.jsonl");
+    let loss_p = tmp_dir.join("loss_v542.jsonl");
+    let foren_p = tmp_dir.join("foren_v542.jsonl");
+    assert!(std::fs::write(
+        &scar_p,
+        format!("{}\n", gov_fill.to_scar_snapshot_json(TimestampNs(t0 + 1_000_000)))
+    )
+    .is_ok());
+    assert!(std::fs::write(&loss_p, "").is_ok());
+    assert!(std::fs::write(&foren_p, "").is_ok());
+    let mut gov_rehyd = OnlineAdaptiveGovernor::new();
+    let _ = gov_rehyd.rehydrate_from_scar_and_loss_files(&scar_p, &loss_p, Some(&foren_p));
+    assert_eq!(gov_rehyd.slot_fill_obs_alpha_beta(2), gov_fill.slot_fill_obs_alpha_beta(2));
+    assert_eq!(gov_rehyd.slot_fill_obs_alpha_beta(4), gov_fill.slot_fill_obs_alpha_beta(4));
+
+    // =========================================================================
+    // (c) M4: Centrifugal Operational Health Valve psi_health in [0.0, 1.0]
+    //     contracts M1..M3 smoothly when toxicity or drawdown rises.
+    // =========================================================================
+    let psi_healthy = compute_psi_health_c1(0.045, 2.5, 4.0, 0.0, 0.0);
+    assert!((psi_healthy - 1.0).abs() < 1e-12);
+    let psi_mid = compute_psi_health_c1(0.15, -2.0, 4.0, 0.45, 0.45);
+    assert!(psi_mid > 0.0 && psi_mid < 0.50);
+    let psi_toxic = compute_psi_health_c1(0.25, 1.0, 4.0, 0.0, 0.0);
+    assert!(psi_toxic.abs() <= 1e-12);
+    let psi_5u_drawdown = compute_psi_health_c1(0.05, 1.5, 4.0, 0.0, 0.65);
+    assert!(psi_5u_drawdown.abs() <= 1e-12);
+
+    // Contracted psi_health immediately shuts off M1 clear-runway lift, M2 Penny-Jump, and M3 2-slot stagger:
+    assert!(!passes_corrective_abc_snapshot_guard_with_health_c1(
+        Side::Bid,
+        &link_clear,
+        0.25,
+        0.05,
+        psi_5u_drawdown,
+    ));
+    assert_eq!(
+        select_elastic_entry_maker_price_v542(Side::Bid, &wide_eth, psi_5u_drawdown, prop_bid),
+        PriceTicks(180_000)
+    );
+    m3_engines[5].state = OrderLifecycleState::RestingEntryQueue {
+        side: Side::Bid,
+        entry_price: PriceTicks(7_200),
+        qty: LotQty(15),
+        target_excursion: ScaledBps(700),
+        sl_trigger_price: PriceTicks(7_120),
+        resting_since_ts: TimestampNs(t0),
+    };
+    assert!(!can_stage_same_direction_entry_v542(
+        4,
+        Side::Bid,
+        TimestampNs(t0 + 100_000_000),
+        &m3_engines,
+        &m3_snaps,
+        &epps_low,
+        psi_5u_drawdown,
+        50,
+    ));
+
+    // =========================================================================
+    // (d) M5: Irreversible -5.00 USDT (MAX_VALIDATION_EPOCH_LOSS_1E8 = 500_000_000)
+    //     Hard Shield, temp HALTED_ON_LOSS.lock persistence, 00:00 UTC rollover
+    //     immunity, startup rehydration, P0-B custody, and Digital Twin parity.
+    // =========================================================================
+    assert_eq!(MAX_VALIDATION_EPOCH_LOSS_1E8, 500_000_000);
+    assert!(core::mem::size_of::<VaultIoCommand>() <= 512);
+
+    // Pre-limit C1 lot damper: 1.0 below INV_PHI * 5 USDT, smooth contraction in (INV_PHI, 1.0), INV_PHI at 5 USDT:
+    assert!((compute_epoch_5u_loss_lot_damper_c1(250_000_000) - 1.0).abs() < 1e-12);
+    let d_4u = compute_epoch_5u_loss_lot_damper_c1(400_000_000);
+    assert!(d_4u < 1.0 && d_4u > INV_PHI);
+    assert!((compute_epoch_5u_loss_lot_damper_c1(500_000_000) - INV_PHI).abs() < 1e-12);
+
+    // MtM + Realized max loss combiner:
+    let mut led_mtm = ParitySyncLedger::new(6_500_000_000);
+    led_mtm.record_closed_trade_with_sinking_split(-320_000_000, 5_000_000, ScaledBps(-1_600));
+    let (mtm_breach_1e8, _) = compute_validation_epoch_loss_1e8(&led_mtm, None, -185_000_000);
+    assert_eq!(mtm_breach_1e8, 505_000_000);
+
+    // Ephemeral SHM + temp lock paths + VaultIo worker test:
+    let shm_p = MappedShmRegion::ephemeral_self_test_path("v542_5usdt_shield");
+    let shm_res = MappedShmRegion::open_or_create(&shm_p, true);
+    assert!(shm_res.is_ok());
+    let Ok(shm_reg) = shm_res else { return };
+    let tmp_halt_lock = tmp_dir.join("HALTED_ON_LOSS.lock");
+    let tmp_drain_lock = tmp_dir.join("DRAIN_MODE.lock");
+    let lock_watch = Arc::new(AtomicLockWatch::new(false, false));
+    let worker_tx = spawn_vault_io_worker_with_lock_paths(
+        Arc::clone(&lock_watch),
+        tmp_halt_lock.clone(),
+        tmp_drain_lock,
+    );
+    let (tg_tx, tg_rx) = mpsc::sync_channel::<String>(16);
+    let (vault_tx, vault_rx) = mpsc::sync_channel::<VaultIoCommand>(32);
+
+    let inst = InstrumentSpecVerification::baseline_from_specs(&APPROVED_SPECS);
+    let day1_ns = TimestampNs(t0 + 18 * 3_600_000_000_000);
+    let mut rt = ExecRuntimeState::new();
+    rt.wallet_1e8 = 6_500_000_000;
+    let _ = rt.daily_gov.sync_utc_day(day1_ns, rt.wallet_1e8);
+
+    let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    snaps[0] = mk_vault_snap(0, 652_000, 2_800, 0.15, 0.18, 0.12, day1_ns.0);
+    snaps[3] = mk_vault_snap(3, 8_200, 3_000, 0.55, 0.60, 0.45, day1_ns.0);
+    snaps[5] = mk_vault_snap(5, 7_203, 2_600, 0.30, 0.32, 0.25, day1_ns.0);
+
+    let mut entry_f = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+    entry_f[3].armed_ts_ns = day1_ns.0;
+    entry_f[3].geom_in = 0.45;
+    entry_f[5].armed_ts_ns = day1_ns.0;
+    let mut engines = SlotExecutionEngine::new_12_slot_array();
+    // Slot 3 in RestingEntryQueue (must be cancelled immediately on -5.00 USDT breach):
+    engines[3].state = OrderLifecycleState::RestingEntryQueue {
+        side: Side::Bid,
+        entry_price: PriceTicks(8_200),
+        qty: LotQty(12),
+        target_excursion: ScaledBps(750),
+        sl_trigger_price: PriceTicks(8_120),
+        resting_since_ts: day1_ns,
+    };
+    rt.init_q_ahead[3] = LotQty(900);
+    rt.cur_q_ahead[3] = LotQty(900);
+    rt.last_l1_q_obs[3] = LotQty(900);
+
+    // Slot 5 in PositionOpenMakerExit (must remain under P0-B custody until closed):
+    assert!(engines[5]
+        .adopt_live_open_position(
+            Side::Bid,
+            PriceTicks(7_200),
+            LotQty(10),
+            LotQty(10),
+            false,
+            PriceTicks(7_212),
+            PriceTicks(7_120),
+            day1_ns,
+            &snaps[5],
+        )
+        .is_ok());
+
+    let mut gov_d = OnlineAdaptiveGovernor::new();
+    let mut ledger = ParitySyncLedger::new(6_500_000_000);
+    let mut last_rest = 0_i64;
+
+    // 1) At -4.99999999 USDT (-499_999_999): ARMED, not halted, RestingEntryQueue preserved!
+    ledger.record_closed_trade_with_sinking_split(-499_999_999, 10_000_000, ScaledBps(-2_500));
+    let (open_pre, pend_pre) = step_12_slot_daemon_tick(
+        day1_ns,
+        None,
+        inst,
+        Some(&lock_watch),
+        &mut rt,
+        &mut last_rest,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert!(!rt.halt_locked && !lock_watch.is_halt_locked());
+    assert_eq!((open_pre, pend_pre), (1, 1));
+    assert!(matches!(engines[3].state, OrderLifecycleState::RestingEntryQueue { .. }));
+
+    // 2) Cross exact -5.00000000 USDT (-500_000_000): immediate 0 ns halt, RestingEntryQueue cancelled, P0-B active!
+    ledger.record_closed_trade_with_sinking_split(-1, 0, ScaledBps(0));
+    assert_eq!(ledger.cumulative_net_pnl_1e8, -500_000_000);
+    let tick_breach_ns = TimestampNs(day1_ns.0 + 5_000_000);
+    let (open_br, pend_br) = step_12_slot_daemon_tick(
+        tick_breach_ns,
+        None,
+        inst,
+        Some(&lock_watch),
+        &mut rt,
+        &mut last_rest,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert!(rt.halt_locked && lock_watch.is_halt_locked());
+    assert_eq!((open_br, pend_br), (1, 0));
+    assert!(matches!(engines[3].state, OrderLifecycleState::Idle));
+    assert!(matches!(engines[5].state, OrderLifecycleState::PositionOpenMakerExit { .. }));
+    assert!(!is_safe_halt_standby(rt.halt_locked, open_br, pend_br, false));
+
+    // Forward emitted LatchTotalLossHalt command to the real VaultIo worker targeting ephemeral tmp_halt_lock:
+    let mut saw_latch_cmd = false;
+    while let Ok(cmd) = vault_rx.try_recv() {
+        if matches!(cmd, VaultIoCommand::LatchTotalLossHalt { epoch_loss_1e8: 500_000_000, .. }) {
+            saw_latch_cmd = true;
+            assert!(worker_tx.send(cmd).is_ok());
+        }
+    }
+    assert!(saw_latch_cmd);
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+    assert!(worker_tx.send(VaultIoCommand::FlushBarrier(ack_tx)).is_ok());
+    assert!(ack_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+    assert!(tmp_halt_lock.exists());
+    let lock_body = std::fs::read_to_string(&tmp_halt_lock).unwrap_or_default();
+    assert!(
+        lock_body.contains("\"event\":\"TOTAL_LOSS_SHIELD_5USDT_HALT\"")
+            && lock_body.contains("\"epoch_loss_1e8\":500000000")
+    );
+
+    // Verify exact 1 single Telegram alert (zero duplicate spam on subsequent ticks):
+    let tg_msg = tg_rx.try_recv().unwrap_or_default();
+    assert!(tg_msg.contains("\u{1f534} [VORTEX-OMEGA V5.4.2 TOTAL LOSS SHIELD -5.00 USDT]"));
+    assert!(tg_rx.try_recv().is_err());
+
+    // 3) Advance across 00:00 UTC rollover: DailySessionGovernor wakes up, YET -5.00 USDT halt stays 100% latched!
+    rt.daily_gov.phase = DailyShieldPhase::HibernatingLossCap;
+    let day2_ns = TimestampNs(day1_ns.0 + 86_400_000_000_000);
+    snaps[0].ts_local_ns = day2_ns;
+    snaps[3].ts_local_ns = day2_ns;
+    snaps[5].ts_local_ns = day2_ns;
+    let (open_d2, pend_d2) = step_12_slot_daemon_tick(
+        day2_ns,
+        None,
+        inst,
+        Some(&lock_watch),
+        &mut rt,
+        &mut last_rest,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert_eq!(rt.daily_gov.phase, DailyShieldPhase::ActiveHunting);
+    assert!(rt.halt_locked && lock_watch.is_halt_locked() && tmp_halt_lock.exists());
+    assert_eq!((open_d2, pend_d2), (1, 0));
+    assert!(tg_rx.try_recv().is_err());
+
+    // 4) Close open position passively under P0-B custody (Tranche 1 + Runner) -> open_count == 0 -> safe halt standby!
+    snaps[5].bids[0] = BookLevel { price: PriceTicks(7_212), qty: LotQty(900) };
+    snaps[5].asks[0] = BookLevel { price: PriceTicks(7_213), qty: LotQty(900) };
+    snaps[5].mark_price = PriceTicks(7_212);
+    snaps[5].last_trade_price = PriceTicks(7_213);
+    snaps[5].cum_buy_trade_lots = LotQty(5_000);
+    snaps[5].ts_local_ns = TimestampNs(day2_ns.0 + 5_000_000);
+    let _ = step_12_slot_daemon_tick(
+        TimestampNs(day2_ns.0 + 5_000_000),
+        None,
+        inst,
+        Some(&lock_watch),
+        &mut rt,
+        &mut last_rest,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    snaps[5].bids[0] = BookLevel { price: PriceTicks(7_260), qty: LotQty(900) };
+    snaps[5].asks[0] = BookLevel { price: PriceTicks(7_261), qty: LotQty(900) };
+    snaps[5].mark_price = PriceTicks(7_260);
+    snaps[5].last_trade_price = PriceTicks(7_261);
+    snaps[5].cum_buy_trade_lots = LotQty(10_000);
+    snaps[5].ts_local_ns = TimestampNs(day2_ns.0 + 10_000_000);
+    let (open_done, pend_done) = step_12_slot_daemon_tick(
+        TimestampNs(day2_ns.0 + 10_000_000),
+        None,
+        inst,
+        Some(&lock_watch),
+        &mut rt,
+        &mut last_rest,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert_eq!((open_done, pend_done), (0, 0));
+    assert!(is_safe_halt_standby(rt.halt_locked, open_done, pend_done, false));
+
+    // 5) Startup rehydrate_shadow_ledger_from_paths latches halt from cumulative_net_pnl_1e8 <= -500_000_000 OR lock file:
+    let foren_breach = tmp_dir.join("foren_5u_breach.jsonl");
+    let missing_lock = tmp_dir.join("nonexistent_halt.lock");
+    let breach_row = serde_json::json!({
+        "event": "TRADE_CLOSE", "schema": "V5.4.2", "ts_ns": day1_ns.0,
+        "symbol": "AVAXUSDT", "side": "Bid", "entry_ticks": 8200, "exit_ticks": 8000,
+        "net_bps": -250.0, "fee_bps": 7.5, "net_pnl_1e8": -500_000_000_i64, "fee_1e8": 15_000_000_i64,
+        "maker_exit": false
+    });
+    assert!(std::fs::write(&foren_breach, format!("{breach_row}\n")).is_ok());
+    let mut led_boot1 = ParitySyncLedger::new(6_500_000_000);
+    let mut eng_boot1 = SlotExecutionEngine::new_12_slot_array();
+    let mut gov_boot1 = OnlineAdaptiveGovernor::new();
+    assert!(rehydrate_shadow_ledger_from_paths(
+        &mut led_boot1,
+        &mut eng_boot1,
+        &mut gov_boot1,
+        shm_reg.arena(),
+        &scar_p,
+        &loss_p,
+        &foren_breach,
+        &missing_lock,
+    ));
+
+    let mut led_boot2 = ParitySyncLedger::new(6_500_000_000);
+    let mut eng_boot2 = SlotExecutionEngine::new_12_slot_array();
+    let mut gov_boot2 = OnlineAdaptiveGovernor::new();
+    assert!(rehydrate_shadow_ledger_from_paths(
+        &mut led_boot2,
+        &mut eng_boot2,
+        &mut gov_boot2,
+        shm_reg.arena(),
+        &scar_p,
+        &loss_p,
+        &foren_p,
+        &tmp_halt_lock,
+    ));
+
+    // 6) Dashboard formatting & 1:1 OmegaDigitalTwinEngine -5.00 USDT parity:
+    assert_eq!(
+        format_total_loss_shield_5u_plain(125_000_000, false),
+        "Escudo Total 5$ : -1.2500 / -5.0000 USDT (25.0%) | Restante: 3.7500 USDT | ARMED"
+    );
+    assert_eq!(
+        format_total_loss_shield_5u_plain(500_000_000, true),
+        "Escudo Total 5$ : -5.0000 / -5.0000 USDT (100.0%) | Restante: 0.0000 USDT | HALTED"
+    );
+    let mut twin = OmegaDigitalTwinEngine::new();
+    twin.ledger.record_closed_trade_with_sinking_split(-500_000_000, 5_000_000, ScaledBps(-2_500));
+    let par2_row = vortex_rs::forensic_parquet::ColumnarMarketRow::from_lob_snapshot(
+        &snaps[0],
+        vortex_rs::forensic_parquet::MarketEventKind::L2BookSnapshot,
+        Side::Bid,
+        PriceTicks(652_000),
+        LotQty(1_500),
+    );
+    twin.ingest_par2_row(&par2_row);
+    assert!(twin.halt_locked);
+
+    drop(worker_tx);
+    drop(shm_reg);
+    let _ = std::fs::remove_file(&shm_p);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    assert!(!std::path::Path::new("data/vault/HALTED_ON_LOSS.lock").exists());
+}
