@@ -99,7 +99,7 @@ UNIT_TAP
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<UNIT_EXEC
 [Unit]
-Description=VORTEX-OMEGA V4.9 200Hz Zero-Jitter 12-Slot Execution Daemon (SHM v15)
+Description=VORTEX-OMEGA V5.2 200Hz Zero-Jitter 12-Slot Execution Daemon (SHM v15)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -108,7 +108,6 @@ Type=simple
 User=ubuntu
 WorkingDirectory=${VORTEX_DIR}
 EnvironmentFile=-${VORTEX_DIR}/.env
-ExecStartPre=-/usr/bin/python3 ${VORTEX_DIR}/deploy/prewarm_emas_bybit.py
 ExecStart=${VORTEX_DIR}/bin/vortex_exec --daemon --live-capital
 Restart=always
 RestartSec=2

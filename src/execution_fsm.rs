@@ -84,19 +84,32 @@ pub fn passes_order_block_wall_guard(slot_idx: usize, side: Side, snap: &SymbolL
 #[inline]
 #[must_use]
 pub fn evaluate_macro_coherence_surface_c1(side: Side, snap: &SymbolLobSnapshot) -> f64 {
+    if crate::alpha_3factor::is_opposing_impulse_wave3_hazard(side, snap) {
+        return 1.0;
+    }
     let w = snap.wave_observables();
     let base_c1 = crate::wave_elliott::evaluate_elliott_hurst_coherence_penalty_c1(side, w);
     let dir_s = side.sign_f64();
     let h_t = w.hurst_exponent();
     let macro_aligned = w.macro_phase.get() * dir_s;
-    let fib_aligned_bps = (w.fib_proj_bps.raw() as f64 / 100.0) * dir_s;
+    let fib_aligned_sbps = (w.fib_proj_bps.raw() as f64) * dir_s;
+    let (b3x_sbps, eq_vol_sbps) =
+        crate::alpha_3factor::endogenous_b3x_and_eq_vol_sbps(snap, 0, 50, FeeSchedule::VIP0_DEFAULT);
+    let fib_cut_sbps = (crate::alpha_3factor::PHI * (b3x_sbps as f64))
+        .max(crate::alpha_3factor::INV_PHI * (eq_vol_sbps as f64));
     let oi_inv = crate::wave_elliott::hermite_smoothstep_c1(h_t, 0.494, 0.506)
         * crate::wave_elliott::hermite_smoothstep_c1(-0.20 - macro_aligned, 0.0, 0.08);
     let fib_br = if matches!(w.regime, WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5) {
-        crate::wave_elliott::hermite_smoothstep_c1(-35.0 - fib_aligned_bps, 0.0, 25.0)
-            * crate::wave_elliott::hermite_smoothstep_c1(h_t, 0.488, 0.508)
-    } else { 0.0 };
-    base_c1.max(oi_inv).max(fib_br).clamp(0.0, 1.0)
+        crate::wave_elliott::hermite_smoothstep_c1(
+            -fib_cut_sbps - fib_aligned_sbps,
+            0.0,
+            (crate::alpha_3factor::INV_PHI * fib_cut_sbps).max(100.0),
+        )
+    } else {
+        0.0
+    };
+    let abc_pen = crate::alpha_3factor::evaluate_corrective_abc_fractal_penalty_c1(side, snap);
+    base_c1.max(oi_inv).max(fib_br).max(abc_pen).clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -444,6 +457,44 @@ impl SlotExecutionEngine {
         self.observe_mfe_sample_with_fee_rt(gross_mfe_scaled_bps, self.active_maker_rt_fee_bps());
     }
 
+    /// Buckley-James / Kaplan-Meier right-censored MFE plasticity for passive Limit TP fills.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn observe_censored_close_mfe_plasticity(
+        &mut self,
+        side: Side,
+        gross_close_sbps: i64,
+        is_maker_exit: bool,
+    ) {
+        let eff_rt = self.active_maker_rt_fee_bps();
+        let m_obs = self.last_closed_mfe_bps.max(gross_close_sbps);
+        let is_defensive_scratch = matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
+            || m_obs < (eff_rt * 13) / 10;
+        if (is_defensive_scratch && m_obs < self.learned_mfe_bps)
+            || !crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, eff_rt)
+        {
+            return;
+        }
+        let m_km = if is_maker_exit
+            && m_obs >= (eff_rt * 13) / 10
+            && !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape)
+        {
+            let mu_exit = self.flow_ema_fast * side.sign_f64();
+            let s_flow = crate::wave_elliott::hermite_smoothstep_c1(
+                mu_exit,
+                0.145_898_033_750_315,
+                0.618_033_988_749_895,
+            );
+            let sigma_1m = (self.open_vol_5m_bps.raw().max(1_200) as f64) / 2.236_067_977_499_79;
+            let headroom = (0.618_033_988_749_895 * sigma_1m - (m_obs as f64)).max(0.0);
+            let overshoot = (0.381_966_011_250_105 * s_flow * headroom).round() as i64;
+            m_obs.saturating_add(overshoot)
+        } else {
+            m_obs
+        };
+        self.observe_mfe_sample_with_fee_rt(m_km, eff_rt);
+    }
+
     #[inline]
     pub fn compute_fill_or_adopt_sl_ticks_for_slot(&self, side: Side, verified_avg_price: PriceTicks, snap: &SymbolLobSnapshot) -> Result<PriceTicks, VortexError> {
         compute_validated_sl_ticks_with_fees(side, verified_avg_price, snap, self.active_fees)
@@ -583,8 +634,31 @@ impl SlotExecutionEngine {
     pub fn try_arm_maker_entry(&mut self, snap: &SymbolLobSnapshot, verdict: SignalVerdict, qty: LotQty) -> Result<OrderLifecycleState, VortexError> {
         if !matches!(self.state, OrderLifecycleState::Idle) || snap.ts_local_ns.0 < self.cooldown_until_ns.0 { return Ok(self.state); }
         let SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps } = verdict else { return Ok(self.state); };
-        if !passes_elliott_macro_coherence_guard(side, snap)
+        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+            side,
+            snap,
+            self.open_vol_5m_bps.raw(),
+            self.learned_taker_prob_pm,
+            self.active_fees,
+        )
+            || !passes_elliott_macro_coherence_guard(side, snap)
             || !passes_order_block_wall_guard_dynamic(self.slot_idx, side, snap, self.learned_taker_prob_pm, self.active_fees)
+        {
+            return Ok(self.state);
+        }
+        let has_live_factors = snap.sequence_id > 0
+            || snap.factor_ofi.get().abs() > 0.0
+            || snap.factor_tfi.get().abs() > 0.0
+            || snap.factor_geom.get().abs() > 0.0;
+        if has_live_factors
+            && !crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
+                side,
+                snap,
+                self.hawkes_tracker.spoof_density_ewma,
+                self.learned_taker_prob_pm,
+                self.open_vol_5m_bps.raw(),
+                self.active_fees,
+            )
         {
             return Ok(self.state);
         }
@@ -603,8 +677,31 @@ impl SlotExecutionEngine {
 
     pub fn sync_preflight_l1_entry(&mut self, snap: &SymbolLobSnapshot, max_drift_ticks: i64) -> Result<(PriceTicks, PriceTicks), VortexError> {
         let OrderLifecycleState::PlacingEntryMaker { side, entry_price: armed_px, .. } = self.state else { return Err(VortexError::InvalidPriceOrTickSpec); };
-        if !passes_elliott_macro_coherence_guard(side, snap)
+        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+            side,
+            snap,
+            self.open_vol_5m_bps.raw(),
+            self.learned_taker_prob_pm,
+            self.active_fees,
+        )
+            || !passes_elliott_macro_coherence_guard(side, snap)
             || !passes_order_block_wall_guard_dynamic(self.slot_idx, side, snap, self.learned_taker_prob_pm, self.active_fees)
+        {
+            return Err(VortexError::InvalidPriceOrTickSpec);
+        }
+        let has_live_factors = snap.sequence_id > 0
+            || snap.factor_ofi.get().abs() > 0.0
+            || snap.factor_tfi.get().abs() > 0.0
+            || snap.factor_geom.get().abs() > 0.0;
+        if has_live_factors
+            && !crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
+                side,
+                snap,
+                self.hawkes_tracker.spoof_density_ewma,
+                self.learned_taker_prob_pm,
+                self.open_vol_5m_bps.raw(),
+                self.active_fees,
+            )
         {
             return Err(VortexError::InvalidPriceOrTickSpec);
         }
@@ -908,17 +1005,50 @@ impl SlotExecutionEngine {
         ))
     }
 
+    #[inline]
+    fn compute_post_close_cooldown_until_ns(&self, closed_ts: TimestampNs, is_maker_exit: bool, net_scaled_bps: ScaledBps) -> TimestampNs {
+        let tau_ns = self.intrinsic_tau_mkt_s.max(90).saturating_mul(1_000_000_000);
+        if is_maker_exit && net_scaled_bps.raw() < 0 {
+            let fee_rt = self.active_maker_rt_fee_bps();
+            let sl_sbps = PairSpec::elastic_server_sl_distance_bps_with_fees(self.open_vol_5m_bps, self.active_fees);
+            let w_bail = crate::governor_plasticity::compute_fractional_maker_bailout_scar_weight_c1(
+                net_scaled_bps,
+                ScaledBps(fee_rt),
+                sl_sbps,
+            );
+            let cd_ns = ((tau_ns as f64) * (crate::alpha_3factor::INV_PHI_CUBE + crate::alpha_3factor::INV_PHI * w_bail)).round() as i64;
+            TimestampNs(closed_ts.0.saturating_add(cd_ns.max(tau_ns / 100)))
+        } else {
+            TimestampNs(closed_ts.0.saturating_add(tau_ns / 100))
+        }
+    }
+
     #[must_use]
     pub fn compute_canonical_exit_quote(&self, snap: &SymbolLobSnapshot) -> Option<CanonicalExitQuote> {
         let ctx = self.open_exit_context()?;
-        let mut quote = compute_canonical_exit_quote_omega(&ctx, self.shadow_runner_kinematics(), snap)?;
         let adv_f_sbps = self.accrued_open_adverse_funding_sbps(snap);
+        let (ws_rtt_us, _) = read_live_ws_pulse();
+        let mut quote = crate::exit_quoter::compute_canonical_exit_quote_omega_v52(
+            &ctx,
+            self.shadow_runner_kinematics(),
+            snap,
+            Some(self.wald_sprt.log_likelihood),
+            adv_f_sbps,
+            ws_rtt_us,
+        )?;
         if adv_f_sbps > 0 {
-            let f_fl = defensive_zero_loss_maker_exit_price_with_funding(ctx.side, ctx.avg_price_ticks, self.active_fees, adv_f_sbps);
-            quote.target_price = match ctx.side {
-                Side::Bid => PriceTicks(quote.target_price.0.max(f_fl.0)),
-                Side::Ask => PriceTicks(quote.target_price.0.min(f_fl.0).max(1)),
+            let z_px = defensive_zero_loss_maker_exit_price_with_fees(ctx.side, ctx.avg_price_ticks, self.active_fees);
+            let is_maker_bailout = match ctx.side {
+                Side::Bid => quote.target_price.0 < z_px.0,
+                Side::Ask => quote.target_price.0 > z_px.0,
             };
+            if !is_maker_bailout {
+                let f_fl = defensive_zero_loss_maker_exit_price_with_funding(ctx.side, ctx.avg_price_ticks, self.active_fees, adv_f_sbps);
+                quote.target_price = match ctx.side {
+                    Side::Bid => PriceTicks(quote.target_price.0.max(f_fl.0)),
+                    Side::Ask => PriceTicks(quote.target_price.0.min(f_fl.0).max(1)),
+                };
+            }
         }
         Some(quote)
     }
@@ -948,8 +1078,8 @@ impl SlotExecutionEngine {
         };
         self.fold_price_into_excursions(side, entry_price, exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, net_scaled_bps);
-        { let m_obs = self.last_closed_mfe_bps.max(gross_scaled_bps.raw()); let km_uncensored = !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape) || m_obs >= self.learned_mfe_bps; if km_uncensored && crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
-        self.cooldown_until_ns = TimestampNs(closed_ts.0 + (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100);
+        self.observe_censored_close_mfe_plasticity(side, gross_scaled_bps.raw(), is_maker_exit);
+        self.cooldown_until_ns = self.compute_post_close_cooldown_until_ns(closed_ts, is_maker_exit, net_scaled_bps);
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
         self.last_flow_sample_ts_ns = 0;
@@ -992,8 +1122,8 @@ impl SlotExecutionEngine {
         self.fold_price_into_excursions(side, avg_price_ticks, tranche1_exit_price);
         self.fold_price_into_excursions(side, avg_price_ticks, leg2_exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, ScaledBps(net_bps));
-        { let m_obs = self.last_closed_mfe_bps.max(gross_bps); let km_uncensored = !matches!(self.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape) || m_obs >= self.learned_mfe_bps; if km_uncensored && crate::bayesian_governor::should_update_mfe_plasticity(is_maker_exit, m_obs, self.active_maker_rt_fee_bps()) { self.observe_mfe_sample(m_obs); } }
-        self.cooldown_until_ns = TimestampNs(closed_ts.0 + (self.intrinsic_tau_mkt_s.max(90) * 1_000_000_000) / 100);
+        self.observe_censored_close_mfe_plasticity(side, gross_bps, is_maker_exit);
+        self.cooldown_until_ns = self.compute_post_close_cooldown_until_ns(closed_ts, is_maker_exit, ScaledBps(net_bps));
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
         self.last_flow_sample_ts_ns = 0;

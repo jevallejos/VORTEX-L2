@@ -19,6 +19,7 @@ const SHADOW_CREDITS_REQUIRED: u8 = 3;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GovernorPlasticityState {
     active_fees: FeeSchedule,
+    portfolio_taker_prior: BetaBinomialTakerPrior,
     taker_priors: [[BetaBinomialTakerPrior; 2]; MAX_ACTIVE_PAIRS],
     scar_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
     scar_eq_vol_bps: [[i64; 2]; MAX_ACTIVE_PAIRS],
@@ -40,6 +41,7 @@ impl GovernorPlasticityState {
         let seed_prior = BetaBinomialTakerPrior::new_seeded(5);
         Self {
             active_fees: FeeSchedule::VIP0_DEFAULT,
+            portfolio_taker_prior: seed_prior,
             taker_priors: [[seed_prior; 2]; MAX_ACTIVE_PAIRS],
             scar_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
             scar_eq_vol_bps: [[4_800; 2]; MAX_ACTIVE_PAIRS],
@@ -79,13 +81,73 @@ impl GovernorPlasticityState {
     }
 
     #[inline]
+    const fn hermite_s3_const(x: f64, lo: f64, hi: f64) -> f64 {
+        if hi <= lo {
+            return if x >= hi { 1.0 } else { 0.0 };
+        }
+        let raw_u = (x - lo) / (hi - lo);
+        let u = if raw_u < 0.0 {
+            0.0
+        } else if raw_u > 1.0 {
+            1.0
+        } else {
+            raw_u
+        };
+        u * u * (3.0 - 2.0 * u)
+    }
+
+    #[inline]
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
     pub const fn slot_taker_prob_permille(&self, slot_idx: usize, side: Side) -> i64 {
+        const PHI_P1: f64 = 1.618_033_988_749_895;
+        const PHI_CUBE_P1: f64 = 4.236_067_977_499_79;
+        const INV_PHI2_P1: f64 = 0.381_966_011_250_105;
+
         if slot_idx >= MAX_ACTIVE_PAIRS {
             return 50;
         }
         let d = Self::dir_idx(side);
-        self.taker_priors[slot_idx][d].posterior_permille()
+        let cell_pr = self.taker_priors[slot_idx][d];
+        let p_cell = cell_pr.posterior_permille();
+        let mut scar_slots = 0_i64;
+        let mut i = 0_usize;
+        while i < MAX_ACTIVE_PAIRS {
+            if self.taker_priors[i][0].obs_alpha_x1000 >= 800
+                || self.taker_priors[i][1].obs_alpha_x1000 >= 800
+            {
+                scar_slots += 1;
+            }
+            i += 1;
+        }
+        if scar_slots <= 1 {
+            return if p_cell < 20 { 20 } else if p_cell > 450 { 450 } else { p_cell };
+        }
+        let sys_df = if scar_slots >= 3 { 1.0 } else { 0.50 };
+        let p_port = self.portfolio_taker_prior.posterior_permille() as f64;
+        let raw_pt = cell_pr.prior_alpha_x1000.saturating_add(cell_pr.prior_beta_x1000);
+        let prior_tot = if raw_pt > 1 { raw_pt } else { 1 };
+        let p_0 = ((cell_pr.prior_alpha_x1000 as f64) * 1_000.0) / (prior_tot as f64);
+        let p_cell_f = p_cell as f64;
+        let raw_n = cell_pr.obs_alpha_x1000.saturating_add(cell_pr.obs_beta_x1000);
+        let n_cell = ((if raw_n > 0 { raw_n } else { 0 }) as f64) * 1e-3;
+        let s_n = Self::hermite_s3_const(n_cell, PHI_P1, PHI_CUBE_P1);
+        let s_clean = Self::hermite_s3_const(p_0 - p_cell_f, 0.0, 0.5 * p_0);
+        let raw_imm = 1.0 - s_n * s_clean;
+        let clean_immunity = if raw_imm < 0.0 { 0.0 } else if raw_imm > 1.0 { 1.0 } else { raw_imm };
+        let shrink_w = (PHI_CUBE_P1 / (PHI_CUBE_P1 + n_cell)) * clean_immunity;
+        let ex_port = if p_port > p_cell_f { p_port - p_cell_f } else { 0.0 };
+        let lift_pm = ex_port * INV_PHI2_P1 * shrink_w * sys_df;
+        let surv_raw = 1_000 - p_cell;
+        let surv_cell = ((if surv_raw > 0 { surv_raw } else { 0 }) as f64) * 1e-3;
+        let eff_pm = (p_cell_f + surv_cell * lift_pm + 0.5) as i64;
+        if eff_pm < 20 { 20 } else if eff_pm > 450 { 450 } else { eff_pm }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn portfolio_taker_prob_permille(&self) -> i64 {
+        self.portfolio_taker_prior.posterior_permille()
     }
 
     #[inline]
@@ -112,6 +174,7 @@ impl GovernorPlasticityState {
         }
         let d = Self::dir_idx(side);
         self.taker_priors[slot_idx][d].observe_exit(is_adverse_taker_sl);
+        self.portfolio_taker_prior.observe_exit(is_adverse_taker_sl);
         if is_adverse_taker_sl {
             self.scar_ts_ns[slot_idx][d] = ts_ns;
             self.scar_eq_vol_bps[slot_idx][d] = eq_vol_bps.max(1_200);
@@ -193,6 +256,8 @@ impl GovernorPlasticityState {
             self.scar_eq_vol_bps[slot_idx][d] = cur_eq_vol_bps.max(1_200);
             self.taker_priors[slot_idx][d].obs_alpha_x1000 =
                 (self.taker_priors[slot_idx][d].obs_alpha_x1000.saturating_mul(INV_PHI_PM)) / 1_000;
+            self.portfolio_taker_prior.obs_alpha_x1000 =
+                (self.portfolio_taker_prior.obs_alpha_x1000.saturating_mul(854)) / 1_000;
             true
         } else {
             self.shadow_credits[slot_idx][d] = next_c;
@@ -219,6 +284,14 @@ impl GovernorPlasticityState {
         );
         map.insert("taker_obs_alpha_x1000".to_string(), serde_json::json!(obs_a));
         map.insert("taker_obs_beta_x1000".to_string(), serde_json::json!(obs_b));
+        map.insert(
+            "portfolio_obs_alpha_x1000".to_string(),
+            serde_json::json!(self.portfolio_taker_prior.obs_alpha_x1000),
+        );
+        map.insert(
+            "portfolio_obs_beta_x1000".to_string(),
+            serde_json::json!(self.portfolio_taker_prior.obs_beta_x1000),
+        );
         map.insert("scar_ts_ns".to_string(), serde_json::json!(self.scar_ts_ns));
         map.insert(
             "scar_eq_vol_bps".to_string(),
@@ -256,6 +329,12 @@ impl GovernorPlasticityState {
                     }
                 }
             }
+        }
+        if let Some(pa) = val.get("portfolio_obs_alpha_x1000").and_then(|v| v.as_i64()) {
+            self.portfolio_taker_prior.obs_alpha_x1000 = pa.clamp(0, 500_000);
+        }
+        if let Some(pb) = val.get("portfolio_obs_beta_x1000").and_then(|v| v.as_i64()) {
+            self.portfolio_taker_prior.obs_beta_x1000 = pb.clamp(0, 500_000);
         }
         crate::kinematic_surface::extract_matrix_i64_12x2(val, "scar_ts_ns", &mut self.scar_ts_ns);
         crate::kinematic_surface::extract_matrix_i64_12x2(
@@ -748,6 +827,28 @@ pub fn observe_outcome_surprise_weighted(
     prior.posterior_permille()
 }
 
+/// Continuous `C1` fractional adverse evidence weight in `[0.0, 1.0]` for Maker Bailouts closing with `net_bps < 0`.
+/// Anchored to `S_3(-net_bps; 0.5 * C_RT_mkr, SL_bps)` with smooth `C1` sub-fee tail `(0, 0.5 * C_RT_mkr]`.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_fractional_maker_bailout_scar_weight_c1(
+    net_bps: ScaledBps,
+    fee_rt_mkr: ScaledBps,
+    sl_bps: ScaledBps,
+) -> f64 {
+    const INV_PHI4_B: f64 = 0.145_898_033_750_315;
+    if net_bps.raw() >= 0 {
+        return 0.0;
+    }
+    let loss_sbps = (-net_bps.raw()) as f64;
+    let half_fee = 0.5 * (fee_rt_mkr.raw().max(100) as f64);
+    let sl_hi = (sl_bps.raw() as f64).max(half_fee + 100.0);
+    let s_core = crate::wave_elliott::hermite_smoothstep_c1(loss_sbps, half_fee, sl_hi);
+    let s_tail = crate::wave_elliott::hermite_smoothstep_c1(loss_sbps, 0.0, half_fee);
+    (INV_PHI4_B * s_tail + (1.0 - INV_PHI4_B) * s_core).clamp(0.0, 1.0)
+}
+
 impl GovernorPlasticityState {
     #[inline]
     pub fn observe_exit_outcome_with_mfe(
@@ -759,10 +860,83 @@ impl GovernorPlasticityState {
         ts_ns: i64,
         eq_vol_bps: i64,
     ) {
+        let synth_net = if is_adverse_taker_sl { ScaledBps(-2_000) } else { ScaledBps(200) };
+        self.observe_exit_outcome_with_net_and_mfe(
+            slot_idx,
+            side,
+            is_adverse_taker_sl,
+            synth_net,
+            mfe_bps,
+            ts_ns,
+            eq_vol_bps,
+        );
+    }
+
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn observe_exit_outcome_with_net_and_mfe(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        is_adverse_taker_sl: bool,
+        net_bps: ScaledBps,
+        mfe_bps: ScaledBps,
+        ts_ns: i64,
+        eq_vol_bps: i64,
+    ) {
+        const INV_PHI2_S: f64 = 0.381_966_011_250_105;
+        const INV_PHI3_S: f64 = 0.236_067_977_499_79;
         if slot_idx >= MAX_ACTIVE_PAIRS { return; }
         let d = Self::dir_idx(side);
-        let fee_rt = ScaledBps(self.maker_round_trip_fee_bps());
+        let fee_rt_raw = self.maker_round_trip_fee_bps();
+        let fee_rt = ScaledBps(fee_rt_raw);
+        if !is_adverse_taker_sl && net_bps.raw() < 0 {
+            let sl_bps = crate::types::PairSpec::elastic_server_sl_distance_bps_with_fees(
+                ScaledBps(eq_vol_bps.max(1_200)),
+                self.active_fees,
+            );
+            let w_scar = compute_fractional_maker_bailout_scar_weight_c1(net_bps, fee_rt, sl_bps);
+            let a_add = (1_000.0 * w_scar).round() as i64;
+            let b_add = (1_000.0 * (1.0 - w_scar) * INV_PHI2_S).round() as i64;
+            let pr = &mut self.taker_priors[slot_idx][d];
+            pr.obs_alpha_x1000 = ((pr.obs_alpha_x1000.saturating_mul(960)) / 1_000).saturating_add(a_add);
+            pr.obs_beta_x1000 = ((pr.obs_beta_x1000.saturating_mul(960)) / 1_000).saturating_add(b_add);
+            self.portfolio_taker_prior.obs_alpha_x1000 =
+                ((self.portfolio_taker_prior.obs_alpha_x1000.saturating_mul(985)) / 1_000).saturating_add(a_add / 2);
+            self.portfolio_taker_prior.obs_beta_x1000 =
+                ((self.portfolio_taker_prior.obs_beta_x1000.saturating_mul(985)) / 1_000).saturating_add(b_add);
+            self.scar_ts_ns[slot_idx][d] = ts_ns;
+            self.scar_eq_vol_bps[slot_idx][d] = eq_vol_bps.max(1_200);
+            self.shadow_credits[slot_idx][d] = 0;
+            self.last_credit_ts_ns[slot_idx][d] = ts_ns;
+            return;
+        }
+        let is_stressed_scratch = !is_adverse_taker_sl
+            && net_bps.raw() >= 0
+            && net_bps.raw() < fee_rt_raw / 4
+            && mfe_bps.raw() < (fee_rt_raw * 13) / 10;
+        if is_stressed_scratch {
+            let gap = ((fee_rt_raw * 13) / 10 - mfe_bps.raw().max(0)).max(0) as f64;
+            let s_stress = crate::wave_elliott::hermite_smoothstep_c1(gap, 0.0, fee_rt_raw.max(100) as f64);
+            let a_add = (1_000.0 * INV_PHI3_S * s_stress).round() as i64;
+            let b_add = (1_000 - a_add).max(382);
+            let pr = &mut self.taker_priors[slot_idx][d];
+            pr.obs_alpha_x1000 = ((pr.obs_alpha_x1000.saturating_mul(960)) / 1_000).saturating_add(a_add);
+            pr.obs_beta_x1000 = ((pr.obs_beta_x1000.saturating_mul(960)) / 1_000).saturating_add(b_add);
+            self.portfolio_taker_prior.obs_alpha_x1000 =
+                ((self.portfolio_taker_prior.obs_alpha_x1000.saturating_mul(985)) / 1_000).saturating_add(a_add / 2);
+            self.portfolio_taker_prior.obs_beta_x1000 =
+                ((self.portfolio_taker_prior.obs_beta_x1000.saturating_mul(985)) / 1_000).saturating_add(b_add);
+            self.shadow_credits[slot_idx][d] = 0;
+            return;
+        }
         let _ = observe_outcome_surprise_weighted(&mut self.taker_priors[slot_idx][d], is_adverse_taker_sl, mfe_bps, fee_rt);
+        self.portfolio_taker_prior.obs_alpha_x1000 =
+            (self.portfolio_taker_prior.obs_alpha_x1000.saturating_mul(985)) / 1_000
+                + if is_adverse_taker_sl { 1_000 } else { 0 };
+        self.portfolio_taker_prior.obs_beta_x1000 =
+            (self.portfolio_taker_prior.obs_beta_x1000.saturating_mul(985)) / 1_000
+                + if is_adverse_taker_sl { 0 } else { 1_000 };
         if is_adverse_taker_sl {
             self.scar_ts_ns[slot_idx][d] = ts_ns;
             self.scar_eq_vol_bps[slot_idx][d] = eq_vol_bps.max(1_200);

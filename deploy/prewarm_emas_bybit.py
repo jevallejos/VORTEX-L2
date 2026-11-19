@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VORTEX-OMEGA V5.1 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
+"""VORTEX-OMEGA V5.2 Persistent 20s/300s EMA & 5m Parkinson Volatility Prewarmer (3x HTTP Retry)."""
 import json
 import math
 import os
@@ -102,7 +102,7 @@ def main() -> int:
         hydrated += 1
 
     if hydrated == 0:
-        print("[PREWARM V5.1 WARN] 0/12 pares hidratados desde Bybit REST.")
+        print("[PREWARM V5.2 WARN] 0/12 pares hidratados desde Bybit REST.")
         return 1
     now_ns = time.time_ns()
     payload = {
@@ -119,7 +119,7 @@ def main() -> int:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp_path, out_path)
-    print(f"[PREWARM V5.1 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
+    print(f"[PREWARM V5.2 OK] {hydrated}/12 pares hidratados (90m 1m klines) -> {out_path}")
     return 0
 
 

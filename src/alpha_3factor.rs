@@ -17,13 +17,23 @@ use crate::types::{
 pub const OFI_DEPTH: usize = 5;
 pub const GEOM_DEPTH: usize = 10;
 
+pub const PHI: f64 = 1.618_033_988_749_895;
+pub const PHI_SQ: f64 = 2.618_033_988_749_895;
+pub const PHI_CUBE: f64 = 4.236_067_977_499_79;
+pub const INV_PHI: f64 = 0.618_033_988_749_895;
+pub const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
+pub const INV_PHI_CUBE: f64 = 0.236_067_977_499_79;
+pub const INV_PHI_FOURTH: f64 = 0.145_898_033_750_315;
+pub const INV_PHI_FIFTH: f64 = 0.090_169_943_749_47;
+pub const ONE_MINUS_INV_PHI_FOURTH: f64 = 0.854_101_966_249_685;
+
 const VOL_5M_HORIZON_NS: i64 = 300_000_000_000;
 const BASE_VOL_WIN_NS: i64 = VOL_5M_HORIZON_NS / 60;
 const GAUSSIAN_MAD_TO_SIGMA: f64 = 1.253_314_14;
 const PARKINSON_HL_TO_SIGMA: f64 = 0.600_561_20;
-const V45_PHI: f64 = 1.618_033_988_749_895;
-const V45_INV_PHI: f64 = 0.618_033_988_749_895;
-const V45_INV_PHI_SQ: f64 = 0.381_966_011_250_105;
+const V45_PHI: f64 = PHI;
+const V45_INV_PHI: f64 = INV_PHI;
+const V45_INV_PHI_SQ: f64 = INV_PHI_SQ;
 const V45_EPPS_BUCKET_NS: i64 = 5_000_000_000;
 const V45_EPPS_TAU_SECS: f64 = 120.0;
 const V45_EPPS_PRIOR_VAR_BPS2: f64 = 25.0;
@@ -467,6 +477,12 @@ impl OrthogonalFactorState {
             if ofi >= -0.15 || tfi >= -0.12 || geom > 0.0 { return SignalVerdict::NeutralNoAction; }
             Side::Ask
         };
+        if is_opposing_impulse_wave3_hazard_dynamic(side, snap, 0, taker_prob_pm, fees) {
+            return SignalVerdict::NeutralNoAction;
+        }
+        if !passes_elastic_anti_spoof_ofi_guard(side, snap, spoof_density, taker_prob_pm, 0, fees) {
+            return SignalVerdict::SpoofingVeto;
+        }
         let dir_sign = side.sign_f64();
         let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
         let beta_c = epps_signed_beta.clamp(-V45_PHI, V45_PHI);
@@ -489,7 +505,7 @@ impl OrthogonalFactorState {
             Side::Bid => (snap.ob_bull_efficacy_pm, snap.ob_bear_efficacy_pm),
             Side::Ask => (snap.ob_bear_efficacy_pm, snap.ob_bull_efficacy_pm),
         };
-        if !passes_corrective_abc_fractal_guard_c1(side, w_entry, al_ob_pm, op_ob_pm) {
+        if !passes_corrective_abc_snapshot_guard_c1(side, snap) {
             return SignalVerdict::NeutralNoAction;
         }
         let raw_vol = snap.realized_vol_5m.raw() as f64;
@@ -693,6 +709,22 @@ impl EppsBtcCorrelationTracker {
         self.last_bucket_ts_ns = ts_ns.0;
         self.prev_own_mid_ticks = own_mid.0;
         self.prev_btc_mid_ticks = btc_mid.0;
+    }
+
+    #[inline]
+    pub fn seed_correlation_permille(&mut self, is_btc_slot: bool, corr_pm: i16) {
+        if is_btc_slot {
+            self.var_own_bps2 = PHI_CUBE * V45_EPPS_PRIOR_VAR_BPS2;
+            self.var_btc_bps2 = PHI_CUBE * V45_EPPS_PRIOR_VAR_BPS2;
+            self.cov_own_btc_bps2 = PHI_CUBE * V45_EPPS_PRIOR_VAR_BPS2;
+            return;
+        }
+        let rho = (f64::from(corr_pm) * 1e-3).clamp(-0.98, 0.98);
+        let v_seed = PHI_CUBE * V45_EPPS_PRIOR_VAR_BPS2;
+        self.var_own_bps2 = v_seed;
+        self.var_btc_bps2 = v_seed;
+        self.cov_own_btc_bps2 = rho * (v_seed + V45_EPPS_PRIOR_VAR_BPS2)
+            - V45_INV_PHI * V45_EPPS_PRIOR_VAR_BPS2;
     }
 
     #[inline]
@@ -980,17 +1012,9 @@ pub fn passes_elastic_geom_and_macro_impulse_guard(
 
     let dir_s = side.sign_f64();
     let w_obs = snap.wave_observables();
-    let signed_macro = dir_s * w_obs.macro_phase.get();
-    if matches!(w_obs.regime, crate::wave_elliott::WaveRegime::ImpulseWave3)
-        && signed_macro < -INV_PHI
+    if is_opposing_impulse_wave3_hazard(side, snap)
+        || !passes_corrective_abc_snapshot_guard_c1(side, snap)
     {
-        return Err(crate::lob_shm::LastVetoCode::MacroElliottContradiction);
-    }
-    let (al_pm_i, op_pm_i) = match side {
-        crate::types::Side::Bid => (snap.ob_bull_efficacy_pm, snap.ob_bear_efficacy_pm),
-        crate::types::Side::Ask => (snap.ob_bear_efficacy_pm, snap.ob_bull_efficacy_pm),
-    };
-    if !passes_corrective_abc_fractal_guard_c1(side, w_obs, al_pm_i, op_pm_i) {
         return Err(crate::lob_shm::LastVetoCode::MacroElliottContradiction);
     }
 
@@ -1209,6 +1233,289 @@ pub fn passes_corrective_abc_fractal_guard_c1(
     }
     let s_pos_m = crate::wave_elliott::hermite_smoothstep_c1(aligned_macro, INV_PHI3_C, INV_PHI_C); let h_crit = 0.50 + INV_PHI3_C * s_ob + 0.090_169_943_749_47 * s_pos_m - INV_PHI3_C * s_adv_macro;
     wave.hurst_exponent() <= h_crit
+}
+
+/// Resolves endogenous `(B_3x, eq_vol_5m_bps)` in `ScaledBps` (`1 bp = 100`) from live snapshot & fees.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn endogenous_b3x_and_eq_vol_sbps(
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_override_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> (i64, i64) {
+    let spec = spec_from_symbol_id(snap.symbol_id).unwrap_or(crate::types::APPROVED_SPECS[0]);
+    let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+        PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+    } else if snap.mark_price.0 > 0 {
+        snap.mark_price
+    } else {
+        PriceTicks(10_000)
+    };
+    let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
+    let b3x_sbps = spec
+        .three_x_friction_barrier_bps_dynamic(mid_px, taker_prob_pm, fees)
+        .raw()
+        .max(min_v);
+    let phi_sq_b3x = (PHI_SQ * (b3x_sbps as f64)).round() as i64;
+    let eq_vol_sbps = eq_vol_override_sbps
+        .max(snap.realized_vol_5m.raw())
+        .max(phi_sq_b3x);
+    (b3x_sbps, eq_vol_sbps)
+}
+
+/// Immediate hazard detector for opposing `ImpulseWave3` sweeps (entry veto, preflight, `RepegEntry` & `0 ms` resting queue abort).
+/// Strictly independent of `wave_hurst` and anchored to `-max(PHI * B_3x(t), INV_PHI * eq_vol_5m_bps(t))`.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn is_opposing_impulse_wave3_hazard_dynamic(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> bool {
+    let w = snap.wave_observables();
+    if !matches!(w.regime, crate::wave_elliott::WaveRegime::ImpulseWave3) {
+        return false;
+    }
+    let (b3x_sbps, eq_vol_sbps) =
+        endogenous_b3x_and_eq_vol_sbps(snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let fib_cut_sbps = (PHI * (b3x_sbps as f64)).max(INV_PHI * (eq_vol_sbps as f64));
+    let dir_s = side.sign_f64();
+    let macro_aligned = w.macro_phase.get() * dir_s;
+    let fib_aligned_sbps = (w.fib_proj_bps.raw() as f64) * dir_s;
+    macro_aligned < -INV_PHI || (macro_aligned < -INV_PHI_SQ && fib_aligned_sbps <= -fib_cut_sbps)
+}
+
+#[inline]
+#[must_use]
+pub fn is_opposing_impulse_wave3_hazard(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+) -> bool {
+    is_opposing_impulse_wave3_hazard_dynamic(side, snap, 0, 50, FeeSchedule::VIP0_DEFAULT)
+}
+
+/// Continuous `C1` Order-Block alignment ratio `[0.0, 1.0]` combining Bayesian efficacy & endogenous `PHI * max(eq_vol, B_3x)` proximity.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_ob_alignment_ratio_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> f64 {
+    let (ob_align_pm, ob_opp_pm, own_sc, opp_sc, own_dist, opp_dist) = match side {
+        crate::types::Side::Bid => (
+            snap.ob_bull_efficacy_pm,
+            snap.ob_bear_efficacy_pm,
+            snap.ob_bull_score.get(),
+            snap.ob_bear_score.get(),
+            snap.ob_dist_bull_bps.raw(),
+            snap.ob_dist_bear_bps.raw(),
+        ),
+        crate::types::Side::Ask => (
+            snap.ob_bear_efficacy_pm,
+            snap.ob_bull_efficacy_pm,
+            snap.ob_bear_score.get(),
+            snap.ob_bull_score.get(),
+            snap.ob_dist_bear_bps.raw(),
+            snap.ob_dist_bull_bps.raw(),
+        ),
+    };
+    let (b3x_sbps, eq_vol_sbps) =
+        endogenous_b3x_and_eq_vol_sbps(snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let prox_div_sbps = (PHI * (eq_vol_sbps.max(b3x_sbps) as f64)).max(100.0);
+    let own_eff = if own_dist > 0 && own_sc > 0.0 {
+        own_sc / (1.0 + (own_dist as f64) / prox_div_sbps)
+    } else {
+        0.0
+    };
+    let opp_eff = if opp_dist > 0 && opp_sc > 0.0 {
+        opp_sc / (1.0 + (opp_dist as f64) / prox_div_sbps)
+    } else {
+        0.0
+    };
+    let rho_pm = if ob_align_pm > 0 || ob_opp_pm > 0 {
+        let a = (ob_align_pm.max(382)) as f64;
+        let b = (ob_opp_pm.max(382)) as f64;
+        (a / (a + b)).clamp(0.0, 1.0)
+    } else {
+        0.50
+    };
+    let tot_wall = own_eff + opp_eff;
+    if tot_wall > INV_PHI_FOURTH {
+        let rho_wall = (own_eff / tot_wall).clamp(0.0, 1.0);
+        let s_opp_dom = crate::wave_elliott::hermite_smoothstep_c1(
+            opp_eff - own_eff,
+            INV_PHI_FOURTH,
+            INV_PHI_SQ,
+        );
+        ((1.0 - s_opp_dom) * rho_pm.max(rho_wall) + s_opp_dom * rho_pm.min(rho_wall))
+            .clamp(0.0, 1.0)
+    } else {
+        rho_pm
+    }
+}
+
+/// Elastic anti-spoof minimum own-OFI coherence floor `Phi_ofi_min(t)` (`C1`).
+/// `Phi_ofi_min(t) = INV_PHI_CUBE * (1 + INV_PHI * spoof_density + INV_PHI * p_eff) * (1 - INV_PHI_SQ * S_3(rho_ob_align; INV_PHI, 0.8541))`
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_elastic_anti_spoof_ofi_floor(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    spoof_density: f64,
+    taker_prob_pm: i64,
+    eq_vol_5m_sbps: i64,
+    fees: FeeSchedule,
+) -> f64 {
+    let sp = if spoof_density.is_finite() {
+        spoof_density.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let p_eff = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    let rho_ob_align =
+        compute_ob_alignment_ratio_c1(side, snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let s_ob = crate::wave_elliott::hermite_smoothstep_c1(
+        rho_ob_align,
+        INV_PHI,
+        ONE_MINUS_INV_PHI_FOURTH,
+    );
+    INV_PHI_CUBE * (1.0 + INV_PHI * sp + INV_PHI * p_eff) * (1.0 - INV_PHI_SQ * s_ob)
+}
+
+#[inline]
+#[must_use]
+pub fn passes_elastic_anti_spoof_ofi_guard(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    spoof_density: f64,
+    taker_prob_pm: i64,
+    eq_vol_5m_sbps: i64,
+    fees: FeeSchedule,
+) -> bool {
+    let signed_ofi = snap.factor_ofi.get() * side.sign_f64();
+    signed_ofi.is_finite()
+        && signed_ofi
+            >= compute_elastic_anti_spoof_ofi_floor(
+                side,
+                snap,
+                spoof_density,
+                taker_prob_pm,
+                eq_vol_5m_sbps,
+                fees,
+            )
+}
+
+/// Continuous `C1` `CorrectiveAbc` fractal + live Order-Block wall dominance penalty in `[0.0, 1.0]`.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn evaluate_corrective_abc_fractal_penalty_c1_dynamic(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> f64 {
+    let wave = snap.wave_observables();
+    if !matches!(wave.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc) {
+        return 0.0;
+    }
+    let (ob_align_pm, ob_opp_pm, own_sc, opp_sc, own_dist, opp_dist) = match side {
+        crate::types::Side::Bid => (
+            snap.ob_bull_efficacy_pm,
+            snap.ob_bear_efficacy_pm,
+            snap.ob_bull_score.get(),
+            snap.ob_bear_score.get(),
+            snap.ob_dist_bull_bps.raw(),
+            snap.ob_dist_bear_bps.raw(),
+        ),
+        crate::types::Side::Ask => (
+            snap.ob_bear_efficacy_pm,
+            snap.ob_bull_efficacy_pm,
+            snap.ob_bear_score.get(),
+            snap.ob_bull_score.get(),
+            snap.ob_dist_bear_bps.raw(),
+            snap.ob_dist_bull_bps.raw(),
+        ),
+    };
+    let (b3x_sbps, eq_vol_sbps) =
+        endogenous_b3x_and_eq_vol_sbps(snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let prox_div_sbps = (PHI * (eq_vol_sbps.max(b3x_sbps) as f64)).max(100.0);
+    let own_eff = if own_dist > 0 && own_sc > 0.0 {
+        own_sc / (1.0 + (own_dist as f64) / prox_div_sbps)
+    } else {
+        0.0
+    };
+    let opp_eff = if opp_dist > 0 && opp_sc > 0.0 {
+        opp_sc / (1.0 + (opp_dist as f64) / prox_div_sbps)
+    } else {
+        0.0
+    };
+    let s_opp_wall =
+        crate::wave_elliott::hermite_smoothstep_c1(opp_eff - own_eff, INV_PHI_FOURTH, INV_PHI_SQ);
+    let s_own_wall =
+        crate::wave_elliott::hermite_smoothstep_c1(own_eff - opp_eff, INV_PHI_FIFTH, INV_PHI_CUBE);
+    let rho_ob = if ob_align_pm > 0 || ob_opp_pm > 0 {
+        let a = (ob_align_pm.max(382)) as f64;
+        let b = (ob_opp_pm.max(382)) as f64;
+        (a / (a + b)).clamp(0.0, 1.0)
+    } else {
+        0.50
+    };
+    let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob, INV_PHI_SQ, INV_PHI);
+    let s_ob_eff = (s_ob * (1.0 - s_opp_wall)).max(s_own_wall);
+    let aligned_macro = side.sign_f64() * wave.macro_phase.get();
+    let s_adv_macro = crate::wave_elliott::hermite_smoothstep_c1(-aligned_macro, 0.0, INV_PHI);
+    let macro_floor = -INV_PHI_CUBE * (0.50 + s_ob_eff);
+    let s_pos_m = crate::wave_elliott::hermite_smoothstep_c1(aligned_macro, INV_PHI_CUBE, INV_PHI);
+    let h_crit = 0.50 + INV_PHI_CUBE * s_ob_eff + INV_PHI_FIFTH * s_pos_m
+        - INV_PHI_CUBE * s_adv_macro
+        - INV_PHI_FOURTH * s_opp_wall;
+    let pen_macro = crate::wave_elliott::hermite_smoothstep_c1(
+        macro_floor - aligned_macro,
+        -0.023_144,
+        0.016_856,
+    );
+    let pen_hurst = crate::wave_elliott::hermite_smoothstep_c1(
+        wave.hurst_exponent() - h_crit,
+        -0.023_144,
+        0.016_856,
+    );
+    pen_macro.max(pen_hurst).clamp(0.0, 1.0)
+}
+
+#[inline]
+#[must_use]
+pub fn evaluate_corrective_abc_fractal_penalty_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+) -> f64 {
+    evaluate_corrective_abc_fractal_penalty_c1_dynamic(
+        side,
+        snap,
+        0,
+        50,
+        FeeSchedule::VIP0_DEFAULT,
+    )
+}
+
+#[inline]
+#[must_use]
+pub fn passes_corrective_abc_snapshot_guard_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+) -> bool {
+    evaluate_corrective_abc_fractal_penalty_c1(side, snap) < 0.618_033_988_749_895
 }
 
 #[cfg(test)]

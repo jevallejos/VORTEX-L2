@@ -437,6 +437,36 @@ impl Vip0WsRateGovernor {
 
     #[inline]
     #[must_use]
+    pub const fn bucket_available_quota_pct(&self, op: WsMutationOp, now_ns: i64) -> u16 {
+        let idx = op as usize;
+        let cap = if self.learned_limit_per_sec[idx] > 1 {
+            self.learned_limit_per_sec[idx]
+        } else {
+            1
+        };
+        let avail = self.available_tokens(op, now_ns);
+        if avail <= 0 {
+            0
+        } else if avail >= cap {
+            100
+        } else {
+            let pct = (avail * 100 + cap / 2) / cap;
+            if pct <= 0 { 0 } else if pct >= 100 { 100 } else { pct as u16 }
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn min_available_quota_pct(&self, now_ns: i64) -> u16 {
+        let q0 = self.bucket_available_quota_pct(WsMutationOp::Create, now_ns);
+        let q1 = self.bucket_available_quota_pct(WsMutationOp::Amend, now_ns);
+        let q2 = self.bucket_available_quota_pct(WsMutationOp::Cancel, now_ns);
+        let m01 = if q0 < q1 { q0 } else { q1 };
+        if m01 < q2 { m01 } else { q2 }
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn available_tokens(&self, op: WsMutationOp, now_ns: i64) -> i64 {
         let idx = op as usize;
         let base = if now_ns >= self.reset_ts_ns[idx] {
@@ -548,10 +578,12 @@ mod tests {
 
         let mut rg = Vip0WsRateGovernor::new();
         let t0 = 1_000_000_000_i64;
+        assert_eq!(rg.min_available_quota_pct(t0), 100);
         for _ in 0..8 {
             assert!(rg.authorizes_mutation(WsMutationOp::Amend, false, t0));
             rg.on_dispatch(WsMutationOp::Amend, t0);
         }
+        assert_eq!(rg.min_available_quota_pct(t0), 20);
         assert!(!rg.authorizes_mutation(WsMutationOp::Amend, false, t0));
         assert!(rg.authorizes_mutation(WsMutationOp::Amend, true, t0));
 
@@ -559,6 +591,7 @@ mod tests {
         rg.on_ack_headers(WsMutationOp::Amend, Some(49), Some(1_500));
         assert!(rg.limit_per_sec(WsMutationOp::Amend) >= 50);
         assert!(rg.available_tokens(WsMutationOp::Amend, t0) > 40);
+        assert!(rg.min_available_quota_pct(t0) >= 73);
         assert!(rg.authorizes_mutation(WsMutationOp::Amend, false, t0));
     }
 }

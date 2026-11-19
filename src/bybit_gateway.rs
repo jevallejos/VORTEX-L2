@@ -203,8 +203,24 @@ pub const fn should_repeg_resting_exit_tp(
     let rt_raw = fees.round_trip_maker_exit_bps().raw();
     let rt_eff = if rt_raw > 100 { rt_raw } else { 100 };
     let fee_cushion_bps = rt_eff / 2;
+    let denom_mid = if ref_mid.0 > 1 { ref_mid.0 } else { 1 };
+    let resting_dist_mid_bps = ((resting_tp.0 - ref_mid.0)
+        .saturating_mul(side.sign_i64())
+        .saturating_mul(1_000_000))
+        / denom_mid;
+    let tau_tick_sbps = match spec.tick_to_price_scaled_bps(PriceTicks(denom_mid)) {
+        Ok(b) if b.0 > 0 => b.0,
+        _ => 1,
+    };
+    let safe_outward_buf = if rt_eff / 3 > tau_tick_sbps {
+        rt_eff / 3
+    } else {
+        tau_tick_sbps
+    };
+    let allow_outward = !defensive_lock
+        && (cur_gross_bps < fee_cushion_bps || resting_dist_mid_bps >= safe_outward_buf);
     (moving_closer && diff >= 1 && (defensive_lock || diff >= close_step))
-        || (!moving_closer && cur_gross_bps < fee_cushion_bps && diff >= amend_step)
+        || (!moving_closer && allow_outward && diff >= amend_step)
 }
 
 /// Parses Bybit V5 private WS frames (wallet, position & order PostOnly cancellations).
@@ -724,25 +740,9 @@ impl BybitAsyncGateway {
             loop {
                 match cmd_rx.recv_timeout(Duration::from_secs(8)) {
                     Ok(cmd) => {
-                        let is_mut = matches!(
-                            cmd,
-                            GatewayCommand::PlaceEntry { .. }
-                                | GatewayCommand::RepegEntry { .. }
-                                | GatewayCommand::AbortEntry { .. }
-                                | GatewayCommand::SyncOpenSlot { .. }
-                                | GatewayCommand::EmergencyFlattenSlot { .. }
-                        );
-                        let t0 = crate::types::now_epoch_ns().0;
                         process_gateway_command(&mut client, cmd, &evt_tx);
+                        client.refresh_ws_quota_pulse();
                         let t1 = crate::types::now_epoch_ns().0;
-                        if is_mut {
-                            let dt_us = (t1.saturating_sub(t0) / 1_000).clamp(1, 5_000_000);
-                            let quota_rem = client.ws_min_available_quota();
-                            crate::execution_fsm::record_live_ws_pulse(
-                                u32::try_from(dt_us).unwrap_or(1_000),
-                                quota_rem,
-                            );
-                        }
                         if t1.saturating_sub(last_hb_ns) >= 8_000_000_000 {
                             client.maintain_ws_trade_heartbeat();
                             last_hb_ns = t1;

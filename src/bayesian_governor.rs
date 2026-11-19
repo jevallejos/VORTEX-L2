@@ -238,22 +238,7 @@ impl OnlineAdaptiveGovernor {
         wallet_usdt_1e8: i64,
         snap: &SymbolLobSnapshot,
     ) -> LotQty {
-        let s_clamped = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
-        let spec = APPROVED_SPECS[s_clamped];
-        let entry_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
-            side.select_entry_bbo_price(snap.bids[0].price, snap.asks[0].price)
-        } else {
-            snap.mark_price
-        };
-        let cadence = self.slot_temporal_cadence_for_side(s_clamped, Some(side), snap);
-        let (edge_bps, _, _) = self.slot_direction_diagnostics(s_clamped, side);
-        spec.compute_risk_parity_kelly_lots_with_fees(
-            wallet_usdt_1e8, entry_px, snap.realized_vol_5m, edge_bps,
-            self.slot_information_ratio_x100(s_clamped, side),
-            cadence.kelly_lot_mult_permille,
-            self.is_in_scar_debt(s_clamped, side),
-            self.active_fee_schedule(),
-        )
+        self.compute_slot_entry_lots_v48(slot_idx, side, wallet_usdt_1e8, snap, 1_000)
     }
 
     #[inline]
@@ -361,6 +346,13 @@ impl OnlineAdaptiveGovernor {
             }
         }
         loaded
+    }
+
+    #[inline] #[must_use]
+    pub const fn is_slot_ema_converged(&self, slot_idx: usize) -> bool {
+        slot_idx < MAX_ACTIVE_PAIRS
+            && self.ewma_fast_px_1e4[slot_idx] > 0
+            && self.ewma_slow_px_1e4[slot_idx] > 0
     }
 
     #[inline] #[must_use]
@@ -564,8 +556,22 @@ impl OnlineAdaptiveGovernor {
         let d = Self::dir_idx(side);
         let fee_rt = self.active_maker_rt_fee_bps();
         let adv_sl = !is_maker_exit && net_scaled_bps.raw() < 0;
-        let eff_mfe = mfe_opt.unwrap_or(ScaledBps(fee_rt));
-        self.plasticity.observe_exit_outcome_with_mfe(slot_idx, side, adv_sl, eff_mfe, ts_ns.0, self.eq_vol_5m_bps[slot_idx]);
+        let eff_mfe = mfe_opt.unwrap_or_else(|| {
+            if net_scaled_bps.raw() > 0 {
+                ScaledBps(net_scaled_bps.raw().saturating_add(fee_rt))
+            } else {
+                ScaledBps(0)
+            }
+        });
+        self.plasticity.observe_exit_outcome_with_net_and_mfe(
+            slot_idx,
+            side,
+            adv_sl,
+            net_scaled_bps,
+            eff_mfe,
+            ts_ns.0,
+            self.eq_vol_5m_bps[slot_idx],
+        );
         let prev_mean = self.ewma_net_bps_x100[slot_idx][d].clamp(-100_000, 100_000);
         let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
         self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d].clamp(100, 100_000_000) * 80 + diff.saturating_mul(diff).min(25_000_000) * 20) / 100).max(2_500);
@@ -574,7 +580,30 @@ impl OnlineAdaptiveGovernor {
         self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 75), fee_rt * 30);
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
         let ir_x100 = self.slot_information_ratio_x100(slot_idx, side).clamp(-50, 100);
-        if !is_maker_exit || net_scaled_bps.raw() < -(fee_rt / 8) {
+        if is_maker_exit && net_scaled_bps.raw() < 0 {
+            let sl_sbps = PairSpec::elastic_server_sl_distance_bps_with_fees(
+                ScaledBps(self.eq_vol_5m_bps[slot_idx].max(1_200)),
+                self.active_fee_schedule(),
+            );
+            let w_bail = crate::governor_plasticity::compute_fractional_maker_bailout_scar_weight_c1(
+                net_scaled_bps,
+                ScaledBps(fee_rt),
+                sl_sbps,
+            );
+            self.win_streak[slot_idx][d] = 0;
+            self.wave_anchor_px_1e4[slot_idx][d] = 0;
+            self.wave_anchor_ts_ns[slot_idx][d] = 0;
+            if w_bail >= crate::alpha_3factor::INV_PHI_SQ {
+                self.sl_streak[slot_idx][d] = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
+            }
+            if ts_ns.0 > 0 {
+                let bail_cd = ((tau_ns as f64)
+                    * (crate::alpha_3factor::INV_PHI_CUBE + crate::alpha_3factor::PHI * w_bail))
+                    .round() as i64;
+                self.directional_cooldown_until_ns[slot_idx][d] = self.directional_cooldown_until_ns[slot_idx][d]
+                    .max(ts_ns.0.saturating_add(bail_cd));
+            }
+        } else if !is_maker_exit {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
@@ -975,6 +1004,7 @@ impl OnlineAdaptiveGovernor {
             }
         }
         let mut snap_ts_ns = epoch_reset_ts_ns;
+        let mut plasticity_snap_ts_ns = 0_i64;
         if let Ok(s_file) = std::fs::File::open(scar_path) {
             let mut latest_snap: Option<serde_json::Value> = None;
             for line in std::io::BufReader::new(s_file).lines().map_while(Result::ok) {
@@ -982,23 +1012,54 @@ impl OnlineAdaptiveGovernor {
                     if val.get("event").and_then(serde_json::Value::as_str) == Some("GOV_SCAR_SNAPSHOT") { latest_snap = Some(val); }
                 }
             }
-            if let Some(ref sv) = latest_snap { if sv.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0) >= epoch_reset_ts_ns { if let Some(restored) = self.apply_scar_snapshot_json(sv) { snap_ts_ns = snap_ts_ns.max(restored.0); } } }
+            if let Some(ref sv) = latest_snap {
+                let sv_ts = sv.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                if sv_ts >= epoch_reset_ts_ns {
+                    if let Some(restored) = self.apply_scar_snapshot_json(sv) {
+                        snap_ts_ns = snap_ts_ns.max(restored.0);
+                        plasticity_snap_ts_ns = restored.0;
+                    }
+                } else {
+                    self.plasticity.apply_from_scar_json(sv);
+                    plasticity_snap_ts_ns = sv_ts;
+                }
+            }
         }
-        let mut dedup: std::collections::BTreeMap<ScarEventKey, ScarEventPayload> = std::collections::BTreeMap::new();
+        let mut all_dedup: std::collections::BTreeMap<ScarEventKey, ScarEventPayload> = std::collections::BTreeMap::new();
         let mut paths = [scar_path, red_loss_path, scar_path];
         let cnt = if let Some(vp) = session_vault_path { paths[2] = vp; 3_usize } else { 2_usize };
         for p in &paths[..cnt] {
             let Ok(file) = std::fs::File::open(p) else { continue };
             for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some((k, pl)) = Self::parse_historical_trade_scar_tuple(&val, snap_ts_ns) { dedup.entry(k).or_insert(pl); }
+                    if let Some((k, pl)) = Self::parse_historical_trade_scar_tuple(&val, 0) {
+                        all_dedup.entry(k).or_insert(pl);
+                    }
                 }
             }
         }
-        let (mut max_ts, ingested) = (snap_ts_ns, dedup.len());
-        for (&(ts_ns, s_idx, d_u8), &(en_t, net_sc, mkr)) in &dedup {
-            self.observe_closed_trade_at_entry(s_idx, if d_u8 == 1 { Side::Ask } else { Side::Bid }, en_t, net_sc, mkr, TimestampNs(ts_ns));
-            if ts_ns > max_ts { max_ts = ts_ns; }
+        // Preserve multi-epoch Bayesian Taker priors across EPOCH_RESET (never suffer prior amnesia):
+        if epoch_reset_ts_ns > 0 {
+            let fee_rt = self.active_maker_rt_fee_bps();
+            for (&(ts_ns, s_idx, d_u8), &(_, net_sc, mkr)) in &all_dedup {
+                if ts_ns > plasticity_snap_ts_ns && ts_ns <= snap_ts_ns && s_idx < MAX_ACTIVE_PAIRS {
+                    let side = if d_u8 == 1 { Side::Ask } else { Side::Bid };
+                    let adv = !mkr && net_sc.raw() < 0;
+                    let mfe_est = if net_sc.raw() > 0 { ScaledBps(net_sc.raw().saturating_add(fee_rt)) } else { ScaledBps(0) };
+                    self.plasticity.observe_exit_outcome_with_net_and_mfe(
+                        s_idx, side, adv, net_sc, mfe_est, ts_ns, self.eq_vol_5m_bps[s_idx],
+                    );
+                }
+            }
+        }
+        let mut max_ts = snap_ts_ns;
+        let mut ingested = 0_usize;
+        for (&(ts_ns, s_idx, d_u8), &(en_t, net_sc, mkr)) in &all_dedup {
+            if ts_ns > snap_ts_ns {
+                ingested += 1;
+                self.observe_closed_trade_at_entry(s_idx, if d_u8 == 1 { Side::Ask } else { Side::Bid }, en_t, net_sc, mkr, TimestampNs(ts_ns));
+                if ts_ns > max_ts { max_ts = ts_ns; }
+            }
         }
         (max_ts, ingested)
     }
@@ -1336,6 +1397,25 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, candidate_snap) {
             return Err(LastVetoCode::KinematicSurfaceOrCadence);
         }
+        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+            side,
+            candidate_snap,
+            self.eq_vol_5m_bps[slot_idx],
+            taker_pm,
+            fees,
+        ) {
+            return Err(LastVetoCode::MacroElliottContradiction);
+        }
+        if !crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
+            side,
+            candidate_snap,
+            spoof_density,
+            taker_pm,
+            self.eq_vol_5m_bps[slot_idx],
+            fees,
+        ) {
+            return Err(LastVetoCode::SpoofingVeto);
+        }
         crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
             candidate_snap,
             side,
@@ -1348,21 +1428,17 @@ impl OnlineAdaptiveGovernor {
             candidate_snap,
             daily_damper_permille,
         );
-        let signed_geom = side.sign_f64() * candidate_snap.factor_geom.get();
-        let bull_u16 = clamp_ob_permille_u16(candidate_snap.ob_bull_efficacy_pm);
-        let bear_u16 = clamp_ob_permille_u16(candidate_snap.ob_bear_efficacy_pm);
-        if !spec.passes_single_lot_asymmetry_ev_gate(
-            lots,
-            entry_px,
-            candidate_snap.realized_vol_5m,
-            learned_mfe_bps.raw(),
-            taker_pm,
-            signed_geom,
-            bull_u16,
-            bear_u16,
-            side,
-            fees,
-        ) {
+        if self
+            .evaluate_slot_pilar2_ex_ante_ev_sbps(
+                slot_idx,
+                side,
+                lots,
+                entry_px,
+                learned_mfe_bps,
+                candidate_snap,
+            )
+            .is_none()
+        {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
         if !self.authorizes_adaptive_entry_v48(
@@ -1408,6 +1484,27 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, snap) {
             return Err(LastVetoCode::PreflightDriftOrDecay);
         }
+        let taker_pm = self.slot_taker_prob_permille(slot_idx, side);
+        let fees = self.active_fee_schedule();
+        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+            side,
+            snap,
+            self.eq_vol_5m_bps[slot_idx],
+            taker_pm,
+            fees,
+        ) {
+            return Err(LastVetoCode::MacroElliottContradiction);
+        }
+        if !crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
+            side,
+            snap,
+            spoof_density,
+            taker_pm,
+            self.eq_vol_5m_bps[slot_idx],
+            fees,
+        ) {
+            return Err(LastVetoCode::SpoofingVeto);
+        }
         crate::alpha_3factor::passes_elastic_geom_and_macro_impulse_guard(
             snap,
             side,
@@ -1417,22 +1514,17 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_elastic_preflight_l1_support(slot_idx, side, entry_px, snap) {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
-        let spec = APPROVED_SPECS[slot_idx];
-        let signed_geom = side.sign_f64() * snap.factor_geom.get();
-        let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
-        let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
-        if !spec.passes_single_lot_asymmetry_ev_gate(
-            allocated_lots,
-            entry_px,
-            snap.realized_vol_5m,
-            learned_mfe_bps.raw(),
-            self.slot_taker_prob_permille(slot_idx, side),
-            signed_geom,
-            bull_u16,
-            bear_u16,
-            side,
-            self.active_fee_schedule(),
-        ) {
+        if self
+            .evaluate_slot_pilar2_ex_ante_ev_sbps(
+                slot_idx,
+                side,
+                allocated_lots,
+                entry_px,
+                learned_mfe_bps,
+                snap,
+            )
+            .is_none()
+        {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
         self.confirm_preflight_kinematics_v48(
@@ -1519,6 +1611,50 @@ mod v49_governor_asymmetry_tests {
 }
 
 impl OnlineAdaptiveGovernor {
+    #[inline]
+    #[must_use]
+    pub const fn slot_eq_vol_5m_bps(&self, slot_idx: usize) -> i64 {
+        if slot_idx < MAX_ACTIVE_PAIRS {
+            self.eq_vol_5m_bps[slot_idx]
+        } else {
+            ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw() * 4
+        }
+    }
+
+    /// Evaluates Pillar-2 ex-ante Expected Value (`ScaledBps`, `1 bp = 100`) at `entry_px` and `allocated_lots`.
+    /// Returns `Some(ev_sbps)` strictly when `ev_sbps > 0` and both Pillar-2 asymmetry gates pass.
+    #[inline]
+    #[must_use]
+    pub fn evaluate_slot_pilar2_ex_ante_ev_sbps(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+    ) -> Option<i64> {
+        if slot_idx >= MAX_ACTIVE_PAIRS || entry_px.0 <= 0 {
+            return None;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let signed_geom = side.sign_f64() * snap.factor_geom.get();
+        let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
+        let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
+        spec.evaluate_pilar2_asymmetry_ev_sbps(
+            allocated_lots,
+            entry_px,
+            snap.realized_vol_5m,
+            learned_mfe_bps.raw(),
+            self.slot_taker_prob_permille(slot_idx, side),
+            signed_geom,
+            bull_u16,
+            bear_u16,
+            side,
+            self.active_fee_schedule(),
+        )
+    }
+
     /// Continuous C1 pre-funding cliff survival gate coupled to self-learned `tau_mkt`, `MFE`, `IR` & `p_Taker`.
     #[inline]
     #[must_use]

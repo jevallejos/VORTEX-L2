@@ -339,6 +339,20 @@ impl BybitV5LiveClient {
         self.ws_trade.min_available_quota(now_epoch_ns().0)
     }
 
+    #[must_use]
+    pub const fn ws_ewma_rtt_us(&self) -> u32 {
+        self.ws_trade.ewma_rtt_us()
+    }
+
+    pub fn observe_authenticated_ws_rtt_ns(&mut self, rtt_ns: i64) -> u32 {
+        self.ws_trade
+            .observe_authenticated_ws_rtt_ns(rtt_ns, now_epoch_ns().0)
+    }
+
+    pub fn refresh_ws_quota_pulse(&self) {
+        self.ws_trade.refresh_quota_pulse(now_epoch_ns().0);
+    }
+
     pub fn place_order_ws_or_rest(
         &mut self,
         spec: PairSpec,

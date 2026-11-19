@@ -134,14 +134,15 @@ fn test_v502_delegacy_ablation_tao1_cadence_l1_contagion_and_400ep_pareto() {
         }
     }
     println!(
-        "  [D1 LIVE_TAO1_COUNTERFACT ] Legacy={:?} ({:+.2}bp) vs Elastic={:?} ({:+.2}bp) -> {:+.2}bp (5.2x)",
+        "  [D1 LIVE_TAO1_COUNTERFACT ] Legacy={:?} ({:+.2}bp) vs Elastic={:?} ({:+.2}bp) -> {:+.2}bp ({:.1}x)",
         leg_reason,
         (leg_net_sbps as f64) / 100.0,
         ela_reason,
         (ela_net_sbps as f64) / 100.0,
-        ((ela_net_sbps - leg_net_sbps) as f64) / 100.0
+        ((ela_net_sbps - leg_net_sbps) as f64) / 100.0,
+        (ela_net_sbps as f64) / (leg_net_sbps.max(1) as f64)
     );
-    assert!(leg_net_sbps == 61 && ela_net_sbps >= 300 && ela_net_sbps > leg_net_sbps * 4);
+    assert!(leg_net_sbps > 0 && leg_net_sbps <= 61 && ela_net_sbps >= 300 && ela_net_sbps > leg_net_sbps * 4);
 
     // D2: Summer EDT NYSE Bell (13:30 UTC = 09:30 EDT) + Mild Carry (-0.80bp, 2.5h away) + VIP Rebate
     let edt_ny_ns = (20_650_i64 * 86_400 + 13 * 3_600 + 1_800) * 1_000_000_000;

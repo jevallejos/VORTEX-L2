@@ -320,7 +320,7 @@ pub fn build_funding_settlement_vault_json(task: &FundingSettlementPersistTask) 
     let notional = task.position_notional_1e8.max(1);
     let funding_bps = ((task.funding_net_1e8 as f64) * 10_000.0) / (notional as f64);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "FUNDING_SETTLEMENT", "schema": "V4.9", "ts_ns": task.ts_ns,
+        "event": "FUNDING_SETTLEMENT", "schema": "V5.2", "ts_ns": task.ts_ns,
         "funding_cut_id": task.funding_cut_id, "slot_idx": task.slot_idx,
         "symbol": spec.symbol_id.name(), "side": side_str,
         "funding_rate_bps": (task.funding_rate_scaled_bps as f64) / 100.0,
@@ -338,7 +338,7 @@ pub fn build_queue_abort_vault_json(rec: &QueueAbortRecord) -> String {
     let wait_ms = rec.aborted_ts_ns.0.saturating_sub(rec.armed_ts_ns.0).max(0) / 1_000_000;
     let saved_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (rec.saved_tox_bps[k].raw() as f64) / 100.0);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "QUEUE_ABORTED", "schema": "V4.9", "ts_ns": rec.aborted_ts_ns.0,
+        "event": "QUEUE_ABORTED", "schema": "V5.2", "ts_ns": rec.aborted_ts_ns.0,
         "armed_ts_ns": rec.armed_ts_ns.0, "queue_wait_ms": wait_ms,
         "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
         "veto_code": rec.veto_code as u8, "veto_name": format!("{:?}", rec.veto_code),
@@ -362,7 +362,7 @@ pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String 
     }
     let m5_f: [f64; MARKOUT_HORIZONS_V49] = core::array::from_fn(|k| (path_sum.markout_5h.samples_bps[k] as f64) / 100.0);
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "POSITION_PATH_1HZ", "schema": "V4.9", "trade_id": path_sum.trade_id,
+        "event": "POSITION_PATH_1HZ", "schema": "V5.2", "trade_id": path_sum.trade_id,
         "slot_idx": s_idx, "symbol": spec.symbol_id.name(), "side": side_str,
         "opened_ts_ns": path_sum.opened_ts_ns.0, "closed_ts_ns": path_sum.closed_ts_ns.0,
         "entry_ticks": path_sum.entry_ticks.0, "exit_ticks": path_sum.exit_ticks.0,
@@ -377,11 +377,65 @@ pub fn build_position_path_vault_json(path_sum: &PositionPathSummary) -> String 
 #[must_use]
 pub fn build_plasticity_audit_vault_json(snap: &PlasticityAuditSnapshot) -> String {
     stamp_fnv1a64_json(serde_json::json!({
-        "event": "PLASTICITY_AUDIT_V49", "schema": "V4.9", "ts_ns": snap.ts_ns,
+        "event": "PLASTICITY_AUDIT_V49", "schema": "V5.2", "ts_ns": snap.ts_ns,
         "taker_prob_pm": snap.taker_prob_pm, "learned_mfe_bps": snap.learned_mfe_bps,
         "ob_bull_pm": snap.ob_bull_pm, "ob_bear_pm": snap.ob_bear_pm,
         "epps_corr_pm": snap.epps_corr_pm, "ws_rtt_us": snap.ws_rtt_us, "ws_quota_rem": snap.ws_quota_rem,
     }))
+}
+
+/// Rehydrates recent 12-pair Epps 5s BTC correlations (`epps_corr_pm`) from `vortex_plasticity_audit.jsonl`,
+/// preferring converged warm snapshots over un-warmed cold boot rows (`[1000, 618, ...]`).
+pub fn rehydrate_epps_trackers_from_audit_path(
+    trackers: &mut [crate::alpha_3factor::EppsBtcCorrelationTracker; MAX_ACTIVE_PAIRS],
+    path: &Path,
+    now_ns: TimestampNs,
+) -> usize {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = File::open(path) else {
+        return 0;
+    };
+    let max_age_ns = (crate::alpha_3factor::PHI_CUBE * 3_600_000_000_000.0).round() as i64;
+    let mut latest_any: Option<[i16; MAX_ACTIVE_PAIRS]> = None;
+    let mut latest_warm: Option<[i16; MAX_ACTIVE_PAIRS]> = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let row_ts = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        if row_ts <= 0 || (now_ns.0 > row_ts && now_ns.0.saturating_sub(row_ts) > max_age_ns) {
+            continue;
+        }
+        let Some(arr) = val.get("epps_corr_pm").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if arr.len() < MAX_ACTIVE_PAIRS {
+            continue;
+        }
+        let mut parsed = [618_i16; MAX_ACTIVE_PAIRS];
+        parsed[0] = 1_000;
+        let mut has_warm_follower = false;
+        for (idx, cell) in arr.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
+            if let Some(v) = cell.as_i64() {
+                let c = v.clamp(-980, 1_000) as i16;
+                parsed[idx] = if idx == 0 { 1_000 } else { c };
+                if idx > 0 && c != 618 {
+                    has_warm_follower = true;
+                }
+            }
+        }
+        latest_any = Some(parsed);
+        if has_warm_follower {
+            latest_warm = Some(parsed);
+        }
+    }
+    let Some(chosen) = latest_warm.or(latest_any) else {
+        return 0;
+    };
+    for (idx, trk) in trackers.iter_mut().enumerate() {
+        trk.seed_correlation_permille(idx == 0, chosen[idx]);
+    }
+    MAX_ACTIVE_PAIRS
 }
 
 pub fn persist_funding_settlement_sync(task: &FundingSettlementPersistTask) {

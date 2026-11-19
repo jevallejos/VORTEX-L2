@@ -24,7 +24,7 @@ use crate::exec_daemon::{
     slot_position_risk_ppm_with_fees,
 };
 use crate::execution_fsm::{
-    check_queue_depletion_velocity_abort, is_chandelier_profit_locked_sl_with_fees,
+    is_chandelier_profit_locked_sl_with_fees,
     passes_elliott_macro_coherence_guard, passes_order_block_wall_guard_dynamic,
     passes_stoikov_repeg_coherence_guard_with_beta, ClosedTradeKind, ExitOrderRole, ExitSubReason,
     OnlineAdaptiveGovernor, OrderLifecycleState, SlotExecutionEngine,
@@ -289,6 +289,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
             let btc_snap = snaps[0];
             let spec = APPROVED_SPECS[s_idx];
             let spoof_d = spoof_clocks[s_idx].spoofing_density();
+            engines[s_idx].hawkes_tracker.set_spoof_density(spoof_d);
             let evt_dil = spoof_clocks[s_idx].event_clock_dilation();
             let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &cur_snap, &btc_snap, &epps_trackers[s_idx]);
 
@@ -433,12 +434,20 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             let btc_aligned = epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
                             let q_eroded = init_q_ahead[s_idx].0 > 0 && queue_ahead_qty.0 * 100 <= init_q_ahead[s_idx].0 * 65;
                             let headwind_erosion = s_idx > 0 && elapsed_ns >= q_timers.headwind_abort_ns && q_eroded && btc_aligned < -0.08 && flow_imp < 0.15;
-                            let macro_contradiction = elapsed_ns >= q_timers.macro_abort_ns
-                                && (!passes_elliott_macro_coherence_guard(side, &cur_snap)
-                                    || !passes_order_block_wall_guard_dynamic(s_idx, side, &cur_snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees));
+                            let opp_wave3_now = crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+                                side,
+                                &cur_snap,
+                                gov.slot_eq_vol_5m_bps(s_idx),
+                                engines[s_idx].learned_taker_prob_pm,
+                                engines[s_idx].active_fees,
+                            );
+                            let macro_contradiction = opp_wave3_now
+                                || (elapsed_ns >= q_timers.macro_abort_ns
+                                    && (!passes_elliott_macro_coherence_guard(side, &cur_snap)
+                                        || !passes_order_block_wall_guard_dynamic(s_idx, side, &cur_snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)));
                             let chase_expired = (!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
                             let dq_abort = block_new_entries || fast_sweep || headwind_erosion || macro_contradiction
-                                || (elapsed_ns >= 25_000_000 && at_l1 && check_queue_depletion_velocity_abort(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap))
+                                || (elapsed_ns >= 25_000_000 && at_l1 && crate::kinematic_surface::check_queue_depletion_velocity_abort_with_spoof(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap, spoof_d))
                                 || flow_imp <= -0.48;
                             if chase_expired || dq_abort {
                                 gov.observe_entry_abort(s_idx, side, entry_price, cur_snap.ts_local_ns);
@@ -450,6 +459,15 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                             } else if !at_l1
                                 && elapsed_ns >= q_timers.repeg_wait_ns
                                 && total_chase_ns + q_timers.repeg_wait_ns < max_chase_ns
+                                && !opp_wave3_now
+                                && crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
+                                    side,
+                                    &cur_snap,
+                                    spoof_d,
+                                    engines[s_idx].learned_taker_prob_pm,
+                                    gov.slot_eq_vol_5m_bps(s_idx),
+                                    engines[s_idx].active_fees,
+                                )
                                 && passes_stoikov_repeg_coherence_guard_with_beta(s_idx, side, &cur_snap, &btc_snap, epps_beta)
                                 && passes_elliott_macro_coherence_guard(side, &cur_snap)
                                 && passes_order_block_wall_guard_dynamic(s_idx, side, &cur_snap, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees)
@@ -462,7 +480,10 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase_ticks,
                                 };
                                 let mfe_s = ScaledBps(engines[s_idx].learned_mfe_bps);
-                                if moved_away && gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, qty, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok() {
+                                if moved_away
+                                    && gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, qty, mfe_s, &cur_snap, &btc_snap, spoof_d, epps_beta).is_ok()
+                                    && gov.evaluate_slot_pilar2_ex_ante_ev_sbps(s_idx, side, qty, new_l1, mfe_s, &cur_snap).is_some()
+                                {
                                     if let Ok(repeg_sl) = engines[s_idx].compute_repeg_sl_trigger(&cur_snap, new_l1) {
                                         engines[s_idx].next_peg_allowed_ts_ns = cur_snap.ts_local_ns.0 + q_timers.repeg_cooldown_ns;
                                         engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, cur_snap.ts_local_ns);
@@ -786,6 +807,7 @@ pub mod omega_twin {
             self.epps_trackers[s_idx].observe_5s_pair(ev.snap.ts_local_ns, s_idx == 0, mid_now, mid_btc);
             let epps_beta = OrthogonalFactorState::epps_correlated_lead_lag_beta(s_idx, &ev.snap, &btc_snap, &self.epps_trackers[s_idx]);
             let spoof_d = self.spoof_clocks[s_idx].spoofing_density();
+            self.engines[s_idx].hawkes_tracker.set_spoof_density(spoof_d);
             let evt_dil = self.spoof_clocks[s_idx].event_clock_dilation();
             let now_ns = ev.snap.ts_local_ns;
             let spec = APPROVED_SPECS[s_idx];
@@ -905,9 +927,17 @@ pub mod omega_twin {
                         let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
                         let max_chase_ns = self.gov.max_total_entry_chase_ns(s_idx, ev.snap.realized_vol_5m);
                         let q_timers = elastic_resting_queue_timers_ns(max_chase_ns);
-                        let macro_contradiction = elapsed_ns >= q_timers.macro_abort_ns
-                            && (!passes_elliott_macro_coherence_guard(side, &ev.snap)
-                                || !passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, self.engines[s_idx].learned_taker_prob_pm, self.engines[s_idx].active_fees));
+                        let opp_wave3_now = crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+                            side,
+                            &ev.snap,
+                            self.gov.slot_eq_vol_5m_bps(s_idx),
+                            self.engines[s_idx].learned_taker_prob_pm,
+                            self.engines[s_idx].active_fees,
+                        );
+                        let macro_contradiction = opp_wave3_now
+                            || (elapsed_ns >= q_timers.macro_abort_ns
+                                && (!passes_elliott_macro_coherence_guard(side, &ev.snap)
+                                    || !passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, self.engines[s_idx].learned_taker_prob_pm, self.engines[s_idx].active_fees)));
                         let at_l1 = match side { Side::Bid => ev.snap.bids[0].price == entry_price, Side::Ask => ev.snap.asks[0].price == entry_price };
                         let chase_expired = (!at_l1 && elapsed_ns >= (max_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns;
                         if block_new_entries || chase_expired || (elapsed_ns >= 25_000_000 && q_verdict.abort_now) || macro_contradiction {
@@ -922,6 +952,15 @@ pub mod omega_twin {
                         if !at_l1
                             && elapsed_ns >= q_timers.repeg_wait_ns
                             && now_ns.0 >= self.engines[s_idx].next_peg_allowed_ts_ns
+                            && !opp_wave3_now
+                            && crate::alpha_3factor::passes_elastic_anti_spoof_ofi_guard(
+                                side,
+                                &ev.snap,
+                                spoof_d,
+                                self.engines[s_idx].learned_taker_prob_pm,
+                                self.gov.slot_eq_vol_5m_bps(s_idx),
+                                self.engines[s_idx].active_fees,
+                            )
                             && passes_elliott_macro_coherence_guard(side, &ev.snap)
                             && passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, self.engines[s_idx].learned_taker_prob_pm, self.engines[s_idx].active_fees)
                             && passes_stoikov_repeg_coherence_guard_with_beta(s_idx, side, &ev.snap, &btc_snap, epps_beta)
@@ -933,7 +972,11 @@ pub mod omega_twin {
                                 Side::Ask => new_l1.0 < entry_price.0 && (entry_price.0 - new_l1.0) <= max_chase,
                             };
                             let mfe_s = ScaledBps(self.engines[s_idx].learned_mfe_bps);
-                            if moved_away && self.gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, match self.engines[s_idx].state { OrderLifecycleState::RestingEntryQueue { qty: q, .. } => q, _ => LotQty(1) }, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok() {
+                            let cur_qty = match self.engines[s_idx].state { OrderLifecycleState::RestingEntryQueue { qty: q, .. } => q, _ => LotQty(1) };
+                            if moved_away
+                                && self.gov.confirm_preflight_kinematics_v49(s_idx, side, eq_now, cur_qty, mfe_s, &ev.snap, &btc_snap, spoof_d, epps_beta).is_ok()
+                                && self.gov.evaluate_slot_pilar2_ex_ante_ev_sbps(s_idx, side, cur_qty, new_l1, mfe_s, &ev.snap).is_some()
+                            {
                                 if let Ok(repeg_sl) = self.engines[s_idx].compute_repeg_sl_trigger(&ev.snap, new_l1) {
                                     self.engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + q_timers.repeg_cooldown_ns;
                                     self.engines[s_idx].apply_resting_repeg(new_l1, repeg_sl, now_ns);

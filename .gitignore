@@ -16,3 +16,4 @@ data/vault/*.json
 data/vault/*.lock
 *.csv
 .env.*
+.vscode/

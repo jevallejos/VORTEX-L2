@@ -44,11 +44,15 @@ cp -a "$VAULT_DIR/." "$BACKUP_DIR/vault/" 2>/dev/null || true
 chmod -R a-w "$BACKUP_DIR/vault" 2>/dev/null || true
 echo "[OK] Respaldo sellado en: $BACKUP_DIR"
 
-echo "=== [5/5] INSTALACION ATOMICA + REAPERTURA ZERO-RESTART VORTEX-OMEGA V5.1 ==="
+echo "=== [5/5] INSTALACION ATOMICA + REAPERTURA ZERO-RESTART VORTEX-OMEGA V5.2 ==="
 install -m 0755 target/release/vortex_tap "$VORTEX_DIR/bin/vortex_tap"
 install -m 0755 target/release/vortex_replay "$VORTEX_DIR/bin/vortex_replay"
 install -m 0755 target/release/vortex_exec "$VORTEX_DIR/bin/vortex_exec"
 install -m 0755 target/release/vortex_web "$VORTEX_DIR/bin/vortex_web"
+if [ -f /etc/systemd/system/vortex-exec.service ]; then
+  sudo sed -i '/prewarm_emas_bybit\.py/d' /etc/systemd/system/vortex-exec.service || true
+  sudo systemctl daemon-reload || true
+fi
 sha256sum "$VORTEX_DIR/bin/vortex_tap" "$VORTEX_DIR/bin/vortex_replay" "$VORTEX_DIR/bin/vortex_exec" "$VORTEX_DIR/bin/vortex_web"
 rm -f "$VAULT_DIR/DRAIN_MODE.lock" "$VAULT_DIR/HALTED_ON_LOSS.lock"
 

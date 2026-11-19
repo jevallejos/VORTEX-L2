@@ -22,5 +22,8 @@ install -m 0755 target/release/vortex_replay /home/ubuntu/vortex-rs/bin/vortex_r
 install -m 0755 target/release/vortex_exec /home/ubuntu/vortex-rs/bin/vortex_exec
 install -m 0755 target/release/vortex_web /home/ubuntu/vortex-rs/bin/vortex_web
 sudo install -m 0644 /home/ubuntu/vortex-rs/deploy/vortex-web.service /etc/systemd/system/vortex-web.service
+if [ -f /etc/systemd/system/vortex-exec.service ]; then
+  sudo sed -i '/prewarm_emas_bybit\.py/d' /etc/systemd/system/vortex-exec.service || true
+fi
 sudo systemctl daemon-reload
-echo "[OK] VORTEX-OMEGA V5.1 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."
+echo "[OK] VORTEX-OMEGA V5.2 (4 Binarios LTO Fat + SHM v15 + VKL1 + PAR2Z + Web 127.0.0.1:8787) instalado."

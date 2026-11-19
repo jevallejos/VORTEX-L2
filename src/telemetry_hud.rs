@@ -94,7 +94,7 @@ pub struct SlotForensicEntrySnapshot {
     pub geom_in: f64, pub snr_in: f64, pub vol5m_in: f64, pub spread_in: i64,
     pub btc_comp_in: f64, pub gov_ewma_bps: f64, pub win_streak: u32, pub sl_streak: u32,
     pub drift_bps: f64, pub ext_bps: f64, pub kin_accel_net_bps: f64,
-    pub kin_energy_in_bps: f64, pub req_kin_energy_in_bps: f64,
+    pub kin_energy_in_bps: f64, pub req_kin_energy_in_bps: f64, pub ev_ex_ante_bps: f64,
 }
 
 #[must_use]
@@ -146,6 +146,7 @@ pub fn serialize_open_positions_state(
                 "gov_ewma_bps": ef.gov_ewma_bps, "win_streak": ef.win_streak, "sl_streak": ef.sl_streak,
                 "drift_bps": ef.drift_bps, "ext_bps": ef.ext_bps, "kin_accel_net_bps": ef.kin_accel_net_bps,
                 "kin_energy_in_bps": ef.kin_energy_in_bps, "req_kin_energy_in_bps": ef.req_kin_energy_in_bps,
+                "ev_ex_ante_bps": ef.ev_ex_ante_bps,
             }));
         }
     }
@@ -188,6 +189,7 @@ pub fn restore_entry_forensics_from_json(saved: &serde_json::Value, opened_ns: i
         gov_ewma_bps: f64_at("gov_ewma_bps"), win_streak: u32_at("win_streak"), sl_streak: u32_at("sl_streak"),
         drift_bps: f64_at("drift_bps"), ext_bps: f64_at("ext_bps"), kin_accel_net_bps: f64_at("kin_accel_net_bps"),
         kin_energy_in_bps: f64_at("kin_energy_in_bps"), req_kin_energy_in_bps: f64_at("req_kin_energy_in_bps"),
+        ev_ex_ante_bps: f64_at("ev_ex_ante_bps"),
     }
 }
 
@@ -215,7 +217,7 @@ pub fn record_and_notify_entry_fill(
     );
     let _ = tg_tx.try_send(format!(
         concat!(
-            "\u{1f7e1} [VORTEX-OMEGA V5.0 {}]\n",
+            "\u{1f7e1} [VORTEX-OMEGA V5.2 {}]\n",
             "\u{2022} Par y Lado : {} ({:?}) | Lote: {}\n",
             "\u{2022} Entrada L1 : {}.{:04} USDT ({}t) | Cola: {} ms\n",
             "\u{2022} Techos/SL  : WIN Floor: {}.{:04} USDT | SL: {}.{:04} USDT\n",
@@ -277,7 +279,7 @@ pub fn format_telegram_close_message(
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
-            "{} [VORTEX-OMEGA V5.0 {} #{} \u{2014} {:?}]\n",
+            "{} [VORTEX-OMEGA V5.2 {} #{} \u{2014} {:?}]\n",
             "- Ganancia : {:+.2}% @10x | {:+.4} USDT\n",
             "- Par y Lado : {} ({:?}) qty={} ({}L) | Maker: {}\n",
             "- Precios    : {}.{:04} -> {}.{:04} USDT ({}t -> {}t)\n",
@@ -348,7 +350,7 @@ pub fn rehydrate_shadow_ledger(
     ledger.closed_trades_count = l3_vault_count;
     arena.exec_closed_count.store(l3_vault_count, Ordering::Release);
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.0] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns}){ANSI_RESET}",
+        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.2] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns}){ANSI_RESET}",
         (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
         (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
     );
@@ -440,7 +442,7 @@ fn build_closed_trade_vault_json_v48_core(
         (markout_curve.samples_bps[2] as f64) / 100.0, (markout_curve.samples_bps[3] as f64) / 100.0,
     ];
     let mut base_val = serde_json::json!({
-        "event": "TRADE_CLOSE", "schema": "V5.0", "trade_id": ledger.closed_trades_count,
+        "event": "TRADE_CLOSE", "schema": "V5.2", "trade_id": ledger.closed_trades_count,
         "armed_ts_ns": entry_f.armed_ts_ns, "opened_ts_ns": eng.last_opened_ts.0, "ts_ns": ts_ns.0,
         "queue_wait_ms": q_wait_ms, "hold_ms": hold_ms, "symbol": sym, "slot_idx": slot_idx, "side": side_str,
         "closed_lots": summary.closed_lots.0, "legs_consolidated": summary.legs_consolidated,
@@ -630,7 +632,7 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
         DailyShieldPhase::HibernatingLossCap => ANSI_ORANGE,
     };
     let sec_title = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.1 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
+        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.2 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
         arena.version()
     )];
     let sec_hdr = vec![concat!(
@@ -828,7 +830,10 @@ pub fn evaluate_capital_scaling_semaphore(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
-            let is_v48 = matches!(v.get("schema").and_then(serde_json::Value::as_str), Some("V4.8" | "V4.9" | "V5.0"));
+            let is_v48 = matches!(
+                v.get("schema").and_then(serde_json::Value::as_str),
+                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2")
+            );
             match v.get("event").and_then(serde_json::Value::as_str) {
                 Some("EPOCH_RESET") => {
                     v48_trades = 0; v48_maker_closes = 0; v48_profit_1e8 = 0; v48_loss_1e8 = 0; catastrophic_breaches = 0;
@@ -997,10 +1002,10 @@ pub fn render_capital_scaling_semaphore(
         )
     };
     let sec_hdr = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.0 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
+        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.2 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
     )];
     let sec_gates = vec![
-        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.0", g1_c2, g1_c3),
+        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.2", g1_c2, g1_c3),
         fmt_gate(2, rep.gate2_ok, "EN PROGRESO", "Expectativa & Cap.", g2_c2, g2_c3),
         fmt_gate(3, rep.gate3_ok, g3_tag, "Ejecucion Maker", g3_c2, g3_c3),
         fmt_gate(4, rep.gate4_ok, "EN PROGRESO", "Resiliencia Escudo", g4_c2, g4_c3),
@@ -1081,7 +1086,7 @@ pub fn render_trades_and_executive_dashboard() {
         }
     }
     if rows_out.is_empty() {
-        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.0...{ANSI_RESET}"));
+        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.2...{ANSI_RESET}"));
     }
     let mut live_client = BybitV5LiveClient::from_env_if_enabled(true);
     let fb_w = (DEFAULT_WALLET_EQUITY_1E8 as f64) / 100_000_000.0;
@@ -1111,7 +1116,7 @@ pub fn render_trades_and_executive_dashboard() {
     let parity_drift_1e8 = (dash_ledger.cumulative_net_pnl_1e8 - sum_cashflow_1e8).abs();
     let halt_active = Path::new(HALT_LOCK_PATH).exists();
 
-    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.0 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
+    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.2 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
     let sec_kpi = vec![
         fmt_3col(
             format!("Wallet: {w_usdt:.4} USDT (Eq: {eq_usdt:.4} | Avail: {av_usdt:.4})"),
@@ -1278,11 +1283,15 @@ pub fn build_closed_trade_vault_json(
         * 1_000.0)
         .round()
         / 1_000.0;
-    let ev_bps = (compute_ex_ante_ev_scaled_bps(eng, exit_snap) as f64) / 100.0;
+    let ev_bps = if entry_f.ev_ex_ante_bps.abs() > 1e-9 {
+        (entry_f.ev_ex_ante_bps * 100.0).round() / 100.0
+    } else {
+        (compute_ex_ante_ev_scaled_bps(eng, exit_snap) as f64) / 100.0
+    };
     let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
     if let Some(obj) = val.as_object_mut() {
         let _ = obj.remove("fnv1a64_hex");
-        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.0"));
+        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.2"));
         obj.insert(
             "markout_resolved_mask".to_string(),
             serde_json::json!(markout_curve.resolved_mask),
@@ -1416,7 +1425,7 @@ mod v49_hud_telemetry_tests {
             140,
             TimestampNs(1_794_920_000_000_000_000),
         );
-        assert!(line.contains("\"telemetry_rev\":\"V5.0\""));
+        assert!(line.contains("\"telemetry_rev\":\"V5.2\""));
         assert!(line.contains("\"markout_resolved_mask\":31"));
         assert!(line.contains("\"markout_5h_bps\":[-0.35,-0.8,1.4,4.2,9.1]"));
         assert!(line.contains("\"ws_rtt_us\":1310") && line.contains("\"fnv1a64_hex\":\"0x"));

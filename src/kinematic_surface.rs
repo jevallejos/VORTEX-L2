@@ -37,6 +37,35 @@ pub fn check_queue_depletion_velocity_abort(
     current_queue_ahead: LotQty,
     snap: &SymbolLobSnapshot,
 ) -> bool {
+    check_queue_depletion_velocity_abort_with_spoof(
+        side,
+        init_queue_ahead,
+        current_queue_ahead,
+        snap,
+        0.0,
+    )
+}
+
+#[inline]
+#[must_use]
+pub fn check_queue_depletion_velocity_abort_with_spoof(
+    side: Side,
+    init_queue_ahead: LotQty,
+    current_queue_ahead: LotQty,
+    snap: &SymbolLobSnapshot,
+    spoof_density_ewma: f64,
+) -> bool {
+    const INV_PHI_Q: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_Q: f64 = 0.381_966_011_250_105;
+    const INV_PHI3_Q: f64 = 0.236_067_977_499_79;
+    const INV_PHI4_Q: f64 = 0.145_898_033_750_315;
+    const INV_PHI5_Q: f64 = 0.090_169_943_749_47;
+
+    let sp = if spoof_density_ewma.is_finite() {
+        spoof_density_ewma.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let dir_s = side.sign_f64();
     let signed_ofi = snap.factor_ofi.get() * dir_s;
     let signed_tfi = snap.factor_tfi.get() * dir_s;
@@ -50,15 +79,23 @@ pub fn check_queue_depletion_velocity_abort(
     }
     let ref_px = snap.bids[0].price.0.max(snap.asks[0].price.0).max(1);
     let b3x_raw = crate::types::spec_from_symbol_id(snap.symbol_id)
-        .and_then(|sp| sp.required_3x_barrier_bps(PriceTicks(ref_px)).ok())
+        .and_then(|sp_spec| sp_spec.required_3x_barrier_bps(PriceTicks(ref_px)).ok())
         .unwrap_or(ScaledBps::MIN_REQUIRED_VOL_5M_BPS)
         .raw();
     let nu_sigma = ((snap.realized_vol_5m.raw().max(b3x_raw) as f64) / ((b3x_raw.saturating_mul(4)).max(1) as f64))
         .sqrt()
         .clamp(0.80, 1.35);
     let depleted_frac = ((init_queue_ahead.0 - current_queue_ahead.0).max(0) as f64) / (init_queue_ahead.0 as f64);
-    let sweep_book_weak = flow_impulse <= (-0.04 * nu_sigma) || signed_ofi <= 0.02 || signed_geom <= -0.10;
-    let tail_exposed = depleted_frac >= (0.78 * nu_sigma).min(0.88) && signed_ofi < 0.14;
+    let req_fifo_tfi = INV_PHI2_Q * (1.0 + INV_PHI_Q * sp);
+    let req_fifo_imp = INV_PHI4_Q * (1.0 + INV_PHI_Q * sp);
+    let min_fifo_geom = -INV_PHI4_Q * INV_PHI4_Q * (1.0 - sp) + INV_PHI4_Q * sp;
+    let tail_tfi_floor = (INV_PHI2_Q + INV_PHI5_Q) * (1.0 + INV_PHI3_Q * sp);
+    let ofi_weak = signed_ofi <= INV_PHI4_Q * INV_PHI4_Q
+        && !(signed_tfi >= req_fifo_tfi && flow_impulse >= req_fifo_imp && signed_geom >= min_fifo_geom);
+    let sweep_book_weak = flow_impulse <= (-0.04 * nu_sigma) || ofi_weak || signed_geom <= -0.10;
+    let tail_exposed = depleted_frac >= (0.78 * nu_sigma).min(0.88)
+        && signed_ofi < req_fifo_imp
+        && signed_tfi < tail_tfi_floor;
     (depleted_frac >= (0.50 * nu_sigma) && sweep_book_weak) || tail_exposed
 }
 
@@ -352,11 +389,17 @@ pub fn audit_unified_63_losses_and_2160_manifold() -> (usize, usize) {
 pub struct HawkesQueueTracker {
     pub excitation: f64,
     pub last_update_ts_ns: i64,
+    pub spoof_density_ewma: f64,
 }
 
 impl HawkesQueueTracker {
-    #[inline] #[must_use] pub const fn new() -> Self { Self { excitation: 0.0, last_update_ts_ns: 0 } }
+    #[inline] #[must_use] pub const fn new() -> Self { Self { excitation: 0.0, last_update_ts_ns: 0, spoof_density_ewma: 0.0 } }
     #[inline] pub fn reset(&mut self) { self.excitation = 0.0; self.last_update_ts_ns = 0; }
+    #[inline] pub fn set_spoof_density(&mut self, spoof_density: f64) {
+        if spoof_density.is_finite() {
+            self.spoof_density_ewma = spoof_density.clamp(0.0, 1.0);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -403,6 +446,15 @@ pub fn evaluate_moallemi_stoikov_queue_shield_with_beta(
     if tracker.last_update_ts_ns > 0 && now_ns > tracker.last_update_ts_ns {
         let dt_s = ((now_ns - tracker.last_update_ts_ns) as f64 * 1e-9).clamp(0.0, 10.0);
         tracker.excitation *= (-HAWKES_BETA_DECAY_PER_S * dt_s).exp();
+        let ofi_f = snap.factor_ofi.get();
+        let tfi_f = snap.factor_tfi.get();
+        let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05) || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08) {
+            1.0
+        } else {
+            0.0
+        };
+        let alpha_sp = 1.0 - (-dt_s / 15.0).exp();
+        tracker.spoof_density_ewma = ((1.0 - alpha_sp) * tracker.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
     }
     if now_ns > 0 { tracker.last_update_ts_ns = now_ns; }
     let init_den = (init_q_ahead.0.max(1)) as f64;
@@ -430,7 +482,13 @@ pub fn evaluate_moallemi_stoikov_queue_shield_with_beta(
     let abort_now = crit_tail_sweep
         || stoikov_collapse
         || moallemi_toxicity >= HAWKES_INV_PHI
-        || check_queue_depletion_velocity_abort(side, init_q_ahead, cur_q_ahead, snap);
+        || check_queue_depletion_velocity_abort_with_spoof(
+            side,
+            init_q_ahead,
+            cur_q_ahead,
+            snap,
+            tracker.spoof_density_ewma,
+        );
     QueueShieldVerdict { abort_now, stoikov_skew, adverse_micro_ticks, hawkes_lambda_ratio, moallemi_toxicity }
 }
 

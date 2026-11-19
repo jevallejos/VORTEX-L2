@@ -657,6 +657,72 @@ pub fn parse_ws_trade_ack_frame(
     Some((rc, lim_status, rst_ms, false))
 }
 
+/// Heap-free asymmetric Golden-Ratio EWMA estimator for authenticated WebSocket RTT (`us`).
+/// Fed strictly from `wss://stream.bybit.com/v5/trade` frames (`auth`, `ping/pong`, `order.*` ACKs),
+/// never from HTTP REST endpoints or passive `read_timeout` events.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct OnlineWsRttEstimator {
+    ewma_rtt_us: u32,
+    samples: u32,
+}
+
+impl OnlineWsRttEstimator {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ewma_rtt_us: 0,
+            samples: 0,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn ewma_rtt_us(&self) -> u32 {
+        self.ewma_rtt_us
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn sample_count(&self) -> u32 {
+        self.samples
+    }
+
+    #[inline]
+    pub fn observe_ws_rtt_ns(&mut self, rtt_ns: i64) -> u32 {
+        if rtt_ns <= 0 {
+            return self.ewma_rtt_us;
+        }
+        let obs_us = u32::try_from((rtt_ns / 1_000).clamp(1, 5_000_000)).unwrap_or(1);
+        if self.samples == 0 || self.ewma_rtt_us == 0 {
+            self.ewma_rtt_us = obs_us;
+        } else {
+            let cur = f64::from(self.ewma_rtt_us);
+            let obs = f64::from(obs_us);
+            let alpha = if obs > cur {
+                crate::alpha_3factor::INV_PHI_SQ
+            } else {
+                crate::alpha_3factor::INV_PHI_CUBE
+            };
+            let blended = (cur + alpha * (obs - cur)).round().clamp(1.0, 5_000_000.0);
+            self.ewma_rtt_us = blended as u32;
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.ewma_rtt_us
+    }
+}
+
+#[inline]
+#[must_use]
+pub fn is_ws_pong_frame(txt: &str) -> bool {
+    txt.contains("\"op\":\"pong\"")
+        || txt.contains("\"op\": \"pong\"")
+        || txt.contains("\"retMsg\":\"pong\"")
+        || txt.contains("\"retMsg\": \"pong\"")
+        || txt.contains("\"ret_msg\":\"pong\"")
+        || txt.contains("\"ret_msg\": \"pong\"")
+}
+
 #[cfg(target_os = "linux")]
 type WsTradeStream =
     tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
@@ -666,6 +732,7 @@ pub struct WsTradeTunnel {
     ws_url: String,
     req_seq: u32,
     rate_gov: Vip0WsRateGovernor,
+    rtt_estimator: OnlineWsRttEstimator,
     #[cfg(target_os = "linux")]
     socket: Option<WsTradeStream>,
     #[cfg(target_os = "linux")]
@@ -680,6 +747,7 @@ impl std::fmt::Debug for WsTradeTunnel {
             .field("enabled", &self.enabled)
             .field("ws_url", &self.ws_url)
             .field("req_seq", &self.req_seq)
+            .field("ewma_rtt_us", &self.rtt_estimator.ewma_rtt_us())
             .finish_non_exhaustive()
     }
 }
@@ -692,6 +760,7 @@ impl WsTradeTunnel {
             ws_url: String::new(),
             req_seq: 0,
             rate_gov: Vip0WsRateGovernor::new(),
+            rtt_estimator: OnlineWsRttEstimator::new(),
             #[cfg(target_os = "linux")]
             socket: None,
             #[cfg(target_os = "linux")]
@@ -713,10 +782,34 @@ impl WsTradeTunnel {
             .authorizes_mutation(op, is_defensive_or_abort, now_ns)
     }
 
+    /// Continuous normalized WS bucket availability `[0..=100]%` (`10/10` tokens => `100%`).
     #[inline]
     #[must_use]
     pub const fn min_available_quota(&self, now_ns: i64) -> u16 {
-        self.rate_gov.min_available_tokens(now_ns)
+        self.rate_gov.min_available_quota_pct(now_ns)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn ewma_rtt_us(&self) -> u32 {
+        self.rtt_estimator.ewma_rtt_us()
+    }
+
+    #[inline]
+    pub fn observe_authenticated_ws_rtt_ns(&mut self, rtt_ns: i64, now_ns: i64) -> u32 {
+        let ewma_us = self.rtt_estimator.observe_ws_rtt_ns(rtt_ns);
+        if ewma_us > 0 {
+            crate::execution_fsm::record_live_ws_pulse(ewma_us, self.min_available_quota(now_ns));
+        }
+        ewma_us
+    }
+
+    #[inline]
+    pub fn refresh_quota_pulse(&self, now_ns: i64) {
+        let ewma_us = self.rtt_estimator.ewma_rtt_us();
+        if ewma_us > 0 {
+            crate::execution_fsm::record_live_ws_pulse(ewma_us, self.min_available_quota(now_ns));
+        }
     }
 
     pub fn enable_with_url(&mut self, ws_url: String, api_key: &str, api_secret: &str) {
@@ -757,7 +850,8 @@ impl WsTradeTunnel {
         let Some(mut sock) = connect_ws_with_timeout(self.ws_url.as_str(), 2_200, 2_000) else {
             return false;
         };
-        let exp_ms = (now_ns / 1_000_000).max(1) + 10_000;
+        let t_auth_send = now_epoch_ns().0;
+        let exp_ms = (t_auth_send / 1_000_000).max(1) + 10_000;
         let sig = sign_bybit_v5_hmac_sha256(api_secret, &format!("GET/realtime{exp_ms}"));
         let auth_msg = serde_json::json!({
             "op": "auth",
@@ -775,6 +869,11 @@ impl WsTradeTunnel {
                             == Some(0)
                             || v.get("success").and_then(serde_json::Value::as_bool) == Some(true);
                         if ok_auth {
+                            let t_auth_ack = now_epoch_ns().0;
+                            self.observe_authenticated_ws_rtt_ns(
+                                t_auth_ack.saturating_sub(t_auth_send),
+                                t_auth_ack,
+                            );
                             println!(
                                 concat!(
                                     "{}\u{1f7e2} [BYBIT V5 WS TRADE TUNNEL] ",
@@ -782,7 +881,7 @@ impl WsTradeTunnel {
                                 ),
                                 ANSI_GREEN, self.ws_url, ANSI_RESET
                             );
-                            self.last_ping_ns = now_ns;
+                            self.last_ping_ns = t_auth_ack;
                             self.socket = Some(sock);
                             return true;
                         }
@@ -809,12 +908,14 @@ impl WsTradeTunnel {
             return;
         }
         let now_ns = now_epoch_ns().0;
-        if now_ns.saturating_sub(self.last_ping_ns) < 12_000_000_000 {
+        if now_ns.saturating_sub(self.last_ping_ns) < 7_500_000_000 {
+            self.refresh_quota_pulse(now_ns);
             return;
         }
         let Some(mut sock) = self.socket.take() else {
             return;
         };
+        let t_ping_send = now_epoch_ns().0;
         if sock
             .send(tungstenite::Message::Text("{\"op\":\"ping\"}".to_string()))
             .is_err()
@@ -822,9 +923,25 @@ impl WsTradeTunnel {
             return;
         }
         let mut closed = false;
-        Self::set_stream_read_timeout(&mut sock, 25);
+        Self::set_stream_read_timeout(&mut sock, 250);
         for _ in 0..4 {
             match sock.read() {
+                Ok(tungstenite::Message::Text(ref txt)) if is_ws_pong_frame(txt) => {
+                    let t_pong = now_epoch_ns().0;
+                    self.observe_authenticated_ws_rtt_ns(
+                        t_pong.saturating_sub(t_ping_send),
+                        t_pong,
+                    );
+                    break;
+                }
+                Ok(tungstenite::Message::Pong(_)) => {
+                    let t_pong = now_epoch_ns().0;
+                    self.observe_authenticated_ws_rtt_ns(
+                        t_pong.saturating_sub(t_ping_send),
+                        t_pong,
+                    );
+                    break;
+                }
                 Ok(tungstenite::Message::Ping(p)) => {
                     if sock.send(tungstenite::Message::Pong(p)).is_err() {
                         closed = true;
@@ -836,7 +953,10 @@ impl WsTradeTunnel {
                     break;
                 }
                 Ok(_) => {}
-                Err(ref err) if is_ws_timeout_err(err) => break,
+                Err(ref err) if is_ws_timeout_err(err) => {
+                    self.refresh_quota_pulse(now_epoch_ns().0);
+                    break;
+                }
                 Err(_) => {
                     closed = true;
                     break;
@@ -845,7 +965,7 @@ impl WsTradeTunnel {
         }
         Self::set_stream_read_timeout(&mut sock, 2_200);
         if !closed {
-            self.last_ping_ns = now_ns;
+            self.last_ping_ns = now_epoch_ns().0;
             self.socket = Some(sock);
         }
     }
@@ -886,23 +1006,28 @@ impl WsTradeTunnel {
             return None;
         }
         let mut sock = self.socket.take()?;
-        let now_ns = now_epoch_ns().0;
+        let t_send_ns = now_epoch_ns().0;
         self.req_seq = self.req_seq.wrapping_add(1);
         let req_id = format_ws_trade_req_id(boot_session_hash32(), self.req_seq);
-        let ts_ms = (now_ns / 1_000_000).max(1);
+        let ts_ms = (t_send_ns / 1_000_000).max(1);
         let frame = build_ws_trade_envelope_json(&req_id, ts_ms, recv_window_ms, op_name, arg_obj);
-        self.rate_gov.on_dispatch(op, now_ns);
+        self.rate_gov.on_dispatch(op, t_send_ns);
         if sock.send(tungstenite::Message::Text(frame)).is_err() {
             self.rate_gov.on_ack_headers(op, None, None);
             return None;
         }
-        self.last_ping_ns = now_ns;
+        self.last_ping_ns = t_send_ns;
         for _ in 0..64 {
             match sock.read() {
                 Ok(tungstenite::Message::Text(txt)) => {
                     if let Some((rc, lim, rst, is_maint)) = parse_ws_trade_ack_frame(&txt, &req_id)
                     {
+                        let t_ack_ns = now_epoch_ns().0;
                         self.rate_gov.on_ack_headers(op, lim, rst);
+                        self.observe_authenticated_ws_rtt_ns(
+                            t_ack_ns.saturating_sub(t_send_ns),
+                            t_ack_ns,
+                        );
                         self.socket = Some(sock);
                         if is_maint {
                             return None;
@@ -918,6 +1043,7 @@ impl WsTradeTunnel {
             }
         }
         self.rate_gov.on_ack_headers(op, None, None);
+        self.refresh_quota_pulse(now_epoch_ns().0);
         None
     }
 }
