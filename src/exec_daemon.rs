@@ -37,9 +37,10 @@ use crate::lob_shm::{LastVetoCode, MappedShmRegion, SymbolLobSnapshot, VortexShm
 use crate::replay_walkforward::settle_crossed_funding_boundary;
 use crate::telemetry_hud::{
     dispatch_closed_trade_logs_with_locks, dispatch_open_positions_state, format_telegram_close_message,
-    rehydrate_daily_governor_from_vault, rehydrate_shadow_ledger, render_live_hud,
-    render_trades_and_executive_dashboard, spawn_bounded_telegram_notifier, SlotForensicEntrySnapshot,
-    DEFAULT_WALLET_EQUITY_1E8,
+    rehydrate_cold_mfe_seeds_from_scar_vault, rehydrate_daily_governor_from_vault,
+    rehydrate_shadow_ledger, render_live_hud, render_trades_and_executive_dashboard,
+    spawn_bounded_telegram_notifier, SlotForensicEntrySnapshot, DEFAULT_WALLET_EQUITY_1E8,
+    SCAR_MEMORY_VAULT_PATH,
 };
 use crate::types::{
     now_epoch_ns, LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, ANSI_GRAY,
@@ -52,6 +53,8 @@ use crate::vault_io::{
 
 const STAGGER_BAR_TO_FLOW_PM: i64 = 200;
 const HOURLY_HANDSHAKE_REFRESH_NS: i64 = 3_600_000_000_000;
+pub const SHM_HEARTBEAT_DROP_NS: u64 = 5_000_000_000;
+const LIVE_BOOT_WS_CONVERGE_TIMEOUT_NS: i64 = 75_000_000_000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ElasticQueueTimersNs {
@@ -315,52 +318,85 @@ pub fn settle_live_8h_funding_cuts(
     settle_live_8h_funding_cuts_v48(engines, cached_snaps, last_funding_cut, ledger, None, None)
 }
 
-/// Live startup convergence gate: requires healthy authenticated WS pulse (`ws_rtt_us > 0`, `ws_quota_rem >= 62`),
-/// converged governor EMAs, and active SHM v15 L2 + trade flow on both BTC leader (`slot 0`) and candidate slot,
-/// preventing cold boot shots (such as `SUI #4` at 19s with `btc_comp_in = 0.01`).
+/// Live startup convergence gate (V5.3.2): requires warmup floor (`now_ns >= entry_warmup_until_ns`),
+/// live L2 book on BTC leader (`slot 0`) + EMA convergence + at least `MAX_ACTIVE_PAIRS / 2` active L2 slots,
+/// and authenticated WS pulse (`ws_rtt_us > 0`, `ws_quota_rem >= 62`) or convergence timeout.
+/// Does NOT require `factor_tfi != 0.0` across all 12 slots (quiet altcoins legitimately decay to `0.00`).
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn passes_live_boot_shm_and_ws_convergence_gate(
-    slot_idx: usize,
+    now_ns: TimestampNs,
+    entry_warmup_until_ns: i64,
     cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
     gov: &OnlineAdaptiveGovernor,
     ws_rtt_us: u32,
     ws_quota_rem: u16,
 ) -> bool {
-    if slot_idx >= MAX_ACTIVE_PAIRS {
+    if entry_warmup_until_ns > 0 && now_ns.0 < entry_warmup_until_ns {
         return false;
     }
     let min_ws_quota_pct = (crate::alpha_3factor::INV_PHI * 100.0).round() as u16;
-    if ws_rtt_us == 0 || ws_quota_rem < min_ws_quota_pct {
+    let ws_pulse_ok = ws_rtt_us > 0 && ws_quota_rem >= min_ws_quota_pct;
+    let converge_timeout_ok = entry_warmup_until_ns > 0
+        && now_ns.0 >= entry_warmup_until_ns.saturating_add(LIVE_BOOT_WS_CONVERGE_TIMEOUT_NS);
+    if !ws_pulse_ok && !converge_timeout_ok {
         return false;
     }
-    let min_vol = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
     let btc = &cached_snaps[0];
     if btc.sequence_id == 0
         || btc.bids[0].price.0 <= 0
         || btc.asks[0].price.0 <= btc.bids[0].price.0
-        || btc.realized_vol_5m.raw() < min_vol
         || !gov.is_slot_ema_converged(0)
     {
         return false;
     }
-    if slot_idx > 0 {
-        let btc_trades = btc.cum_buy_trade_lots.0.saturating_add(btc.cum_sell_trade_lots.0);
-        let btc_comp_abs = OrthogonalFactorState::snr_composite_score(btc).abs();
-        if (btc_trades <= 0 && btc.factor_tfi.get().abs() < crate::alpha_3factor::INV_PHI_FIFTH)
-            || btc_comp_abs < crate::alpha_3factor::INV_PHI_FIFTH
-        {
+    let mut live_l2_slots = 0_usize;
+    for s in cached_snaps {
+        if s.sequence_id > 0 && s.bids[0].price.0 > 0 && s.asks[0].price.0 > s.bids[0].price.0 {
+            live_l2_slots += 1;
+        }
+    }
+    live_l2_slots >= (MAX_ACTIVE_PAIRS / 2)
+}
+
+/// Irreversible boot convergence latch (V5.3.2): once `passes_live_boot_shm_and_ws_convergence_gate`
+/// succeeds for the first time, `*boot_converged` latches to `true` for the lifetime of the process.
+/// Post-boot, only a real SHM producer drop (`hb_age > 5s`) or an uninitialized slot
+/// (`sequence_id == 0` or `bids[0].price <= 0`) can block entry with `WarmupOrLock`.
+#[must_use]
+pub fn evaluate_live_boot_convergence_with_latch(
+    boot_converged: &mut bool,
+    slot_idx: usize,
+    now_ns: TimestampNs,
+    entry_warmup_until_ns: i64,
+    cached_snaps: &[SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+    gov: &OnlineAdaptiveGovernor,
+    ws_rtt_us: u32,
+    ws_quota_rem: u16,
+    shm_hb_age_ns: Option<u64>,
+) -> bool {
+    if slot_idx >= MAX_ACTIVE_PAIRS {
+        return false;
+    }
+    if shm_hb_age_ns.is_some_and(|age_ns| age_ns > SHM_HEARTBEAT_DROP_NS) {
+        return false;
+    }
+    if !*boot_converged {
+        if passes_live_boot_shm_and_ws_convergence_gate(
+            now_ns,
+            entry_warmup_until_ns,
+            cached_snaps,
+            gov,
+            ws_rtt_us,
+            ws_quota_rem,
+        ) {
+            *boot_converged = true;
+        } else {
             return false;
         }
     }
     let cand = &cached_snaps[slot_idx];
-    let cand_trades = cand.cum_buy_trade_lots.0.saturating_add(cand.cum_sell_trade_lots.0);
-    cand.sequence_id > 0
-        && cand.bids[0].price.0 > 0
-        && cand.asks[0].price.0 > cand.bids[0].price.0
-        && cand.realized_vol_5m.raw() >= min_vol
-        && gov.is_slot_ema_converged(slot_idx)
-        && (cand_trades > 0 || cand.factor_tfi.get().abs() >= crate::alpha_3factor::INV_PHI_FOURTH)
+    cand.sequence_id > 0 && cand.bids[0].price.0 > 0
 }
 
 #[inline]
@@ -441,7 +477,17 @@ pub fn step_12_slot_daemon_tick(
                 if rt.slot_rpc_inflight[s_idx] { pending_entry_count += 1; continue; }
                 let live_unconverged = gateway.is_some() && {
                     let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
-                    !passes_live_boot_shm_and_ws_convergence_gate(s_idx, cached_snaps, gov, ws_rtt_us, ws_quota_rem)
+                    !evaluate_live_boot_convergence_with_latch(
+                        &mut rt.boot_converged,
+                        s_idx,
+                        now_ns,
+                        rt.entry_warmup_until_ns,
+                        cached_snaps,
+                        gov,
+                        ws_rtt_us,
+                        ws_quota_rem,
+                        arena.heartbeat_age_ns(now_ns),
+                    )
                 };
                 if block_new_entries || !instruments.is_slot_tradable(s_idx) || live_unconverged {
                     rt.queue_flow_ema[s_idx] = 0.0;
@@ -558,22 +604,21 @@ pub fn step_12_slot_daemon_tick(
                     q_shield.hawkes_lambda_ratio,
                     signed_slow,
                 );
-                let max_chase_ns = if at_l1 {
-                    compute_resting_l1_max_chase_ns_v531(
-                        gov,
-                        s_idx,
-                        side,
-                        snap.realized_vol_5m,
-                        evt_dil,
-                        hwk_lam,
-                        signed_slow,
-                        rt.init_q_ahead[s_idx],
-                        next_q,
-                        base_chase_ns,
-                    )
-                } else {
-                    base_chase_ns
-                };
+                let (max_chase_ns, chase_expired) = evaluate_resting_queue_chase_budget_v532(
+                    gov,
+                    s_idx,
+                    side,
+                    snap.realized_vol_5m,
+                    evt_dil,
+                    hwk_lam,
+                    signed_slow,
+                    rt.init_q_ahead[s_idx],
+                    next_q,
+                    base_chase_ns,
+                    at_l1,
+                    elapsed_ns,
+                    total_chase_ns,
+                );
                 let q_timers = elastic_resting_queue_timers_ns(base_chase_ns);
                 let fast_sweep = at_l1 && evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, rt.init_q_ahead[s_idx], next_q, elapsed_ns, &snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, ws_rtt_us);
                 if fast_sweep { q_shield.abort_now = true; }
@@ -611,7 +656,6 @@ pub fn step_12_slot_daemon_tick(
                     engines[s_idx].learned_ir_x100,
                     spoof_d,
                 );
-                let chase_expired = (!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
                 if block_new_entries || !instruments.is_slot_tradable(s_idx) || chase_expired || (elapsed_ns >= 25_000_000 && q_shield.abort_now) || fast_sweep || headwind_erosion || macro_bad || ob_bad || geom_flip || adverse_flow {
                     let abort_veto = if block_new_entries { LastVetoCode::WarmupOrLock } else if macro_bad { LastVetoCode::MacroElliottContradiction } else if ob_bad { LastVetoCode::OpposingOrderBlockWall } else if geom_flip { LastVetoCode::SpoofingVeto } else if headwind_erosion { LastVetoCode::BtcLeadLagHeadwind } else { LastVetoCode::HawkesStoikovQueueAbort };
                     rt.last_abort_veto[s_idx] = abort_veto;
@@ -804,7 +848,17 @@ pub fn step_12_slot_daemon_tick(
             if snap.sequence_id == 0 { continue; }
             if gateway.is_some() {
                 let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
-                if !passes_live_boot_shm_and_ws_convergence_gate(s_idx, cached_snaps, gov, ws_rtt_us, ws_quota_rem) {
+                if !evaluate_live_boot_convergence_with_latch(
+                    &mut rt.boot_converged,
+                    s_idx,
+                    now_ns,
+                    rt.entry_warmup_until_ns,
+                    cached_snaps,
+                    gov,
+                    ws_rtt_us,
+                    ws_quota_rem,
+                    arena.heartbeat_age_ns(now_ns),
+                ) {
                     publish_slot_veto_code(arena, s_idx, LastVetoCode::WarmupOrLock);
                     continue;
                 }
@@ -904,6 +958,11 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     arena.exec_armed_count.store(0, Ordering::Release); arena.exec_abort_count.store(0, Ordering::Release); arena.exec_fill_count.store(0, Ordering::Release);
     rehydrate_shadow_ledger(&mut ledger, &mut engines, &mut gov, arena);
     SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
+    rehydrate_cold_mfe_seeds_from_scar_vault(&mut engines, Path::new(SCAR_MEMORY_VAULT_PATH));
+    let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
+        ts_ns: boot_ns.0,
+        learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
+    });
     let epps_slots = crate::vault_io::rehydrate_epps_trackers_from_audit_path(
         &mut rt.epps_trackers,
         Path::new(crate::vault_io::PLASTICITY_AUDIT_VAULT_PATH),
@@ -912,7 +971,9 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
     let prewarmed_slots = gov.load_ema_prewarm_file(boot_ns);
     if live_capital {
         let warmup_ns = if prewarmed_slots >= MAX_ACTIVE_PAIRS { 15_000_000_000_i64 } else { 75_000_000_000_i64 };
-        gov.set_entry_warmup_until_ns(boot_ns.0.saturating_add(warmup_ns));
+        let warmup_until_ns = boot_ns.0.saturating_add(warmup_ns);
+        gov.set_entry_warmup_until_ns(warmup_until_ns);
+        rt.entry_warmup_until_ns = warmup_until_ns;
         println!(
             "{ANSI_GREEN}\u{1f7e2} [EMA+EPPS PREWARM V5.2] Hydrated {prewarmed_slots}/12 EMAs, {epps_slots}/12 Epps | Live L2+WS converge gate armed ({}s floor) | Fees: {:+.2}/{:.2}bp{ANSI_RESET}",
             warmup_ns / 1_000_000_000,
@@ -1488,6 +1549,56 @@ pub fn compute_resting_l1_max_chase_ns_v531(
     } else {
         pat_l1
     }
+}
+
+/// Elastic resting-entry chase budget & expiration predicate (V5.3.2):
+/// Eliminates the rigid `(!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4)` (`4.200s + ~156ms RTT = 4,356ms`)
+/// cutoff when slow flow is non-adverse (`signed_flow_slow >= -INV_PHI_FOURTH`) and no toxic Hawkes burst is
+/// active (`hawkes_lambda_ratio <= PHI`), preserving full elastic L1 patience (~10..28s scaling with `tau_mkt_s`
+/// and FIFO progress) while retaining fast aborts under adverse flow or Hawkes sweeps.
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_resting_queue_chase_budget_v532(
+    gov: &OnlineAdaptiveGovernor,
+    slot_idx: usize,
+    side: Side,
+    realized_vol_5m: ScaledBps,
+    event_dilation: f64,
+    hawkes_lambda_ratio: f64,
+    signed_flow_slow: crate::types::BoundedScore,
+    init_q: LotQty,
+    rem_q: LotQty,
+    base_chase_ns: i64,
+    at_l1: bool,
+    elapsed_ns: i64,
+    total_chase_ns: i64,
+) -> (i64, bool) {
+    let healthy_flow = signed_flow_slow.get() >= -crate::alpha_3factor::INV_PHI_FOURTH;
+    let no_toxic_burst = hawkes_lambda_ratio <= crate::alpha_3factor::PHI;
+    let l1_patience_ns = compute_resting_l1_max_chase_ns_v531(
+        gov,
+        slot_idx,
+        side,
+        realized_vol_5m,
+        event_dilation,
+        hawkes_lambda_ratio,
+        signed_flow_slow,
+        init_q,
+        rem_q,
+        base_chase_ns,
+    );
+    let keep_elastic_patience = at_l1 || (healthy_flow && no_toxic_burst);
+    let max_chase_ns = if keep_elastic_patience {
+        l1_patience_ns
+    } else {
+        base_chase_ns.min(l1_patience_ns)
+    };
+    let off_l1_expired = !keep_elastic_patience && elapsed_ns >= (base_chase_ns * 3) / 4;
+    let chase_expired = off_l1_expired
+        || elapsed_ns >= max_chase_ns
+        || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
+    (max_chase_ns, chase_expired)
 }
 
 #[inline]

@@ -710,3 +710,273 @@ fn test_v531_thick_book_tfi_front_of_queue_immunity_and_diffusive_ev() {
         )
         .is_some_and(|ev_sbps| ev_sbps > 0));
 }
+
+#[test]
+fn test_v532_warmup_latch_no_4356ms_truncation_intact_wall_and_mfe_order() {
+    let t0 = 1_795_090_000_000_000_000_i64;
+    let warmup_until = t0 + 15_000_000_000;
+
+    // (a) Irreversible boot_converged latch: once converged, quiet altcoins (ORDI=slot 6, WIF=slot 8)
+    // decaying to factor_tfi == 0.0 (and BTC SNR passing through 0.0) NEVER re-trigger WARMUP_LOCK;
+    // only a real SHM drop (hb_age > 5s) or an uninitialized slot (seq==0 / bid==0) blocks.
+    let mut rt = vortex_rs::exec_gateway_handlers::ExecRuntimeState::new();
+    assert!(!rt.boot_converged);
+    let mut gov_boot = OnlineAdaptiveGovernor::new();
+    let mut snaps = [SymbolLobSnapshot::new_empty(); vortex_rs::lob_shm::MAX_ACTIVE_PAIRS];
+    for (s_idx, snap_slot) in snaps.iter_mut().enumerate() {
+        *snap_slot = mk_vault_snap(s_idx, 10_000 + (s_idx as i64) * 100, 2_950, 0.35, 0.40, 0.25, warmup_until + 1_000_000_000);
+        gov_boot.seed_prewarm_slot_emas(
+            s_idx,
+            (10_000 + (s_idx as i64) * 100) * 10_000,
+            (10_000 + (s_idx as i64) * 100) * 10_000,
+            2_950,
+            t0,
+        );
+    }
+    // Before warmup floor: gate blocks and latch remains false.
+    assert!(!vortex_rs::exec_daemon::evaluate_live_boot_convergence_with_latch(
+        &mut rt.boot_converged,
+        1,
+        TimestampNs(t0 + 5_000_000_000),
+        warmup_until,
+        &snaps,
+        &gov_boot,
+        69_700,
+        100,
+        Some(50_000_000),
+    ));
+    assert!(!rt.boot_converged);
+
+    // After warmup floor with live L2 & WS pulse (69.7ms, quota 100): gate passes and latches irreversibly.
+    let t_live = TimestampNs(warmup_until + 1_000_000_000);
+    assert!(vortex_rs::exec_daemon::evaluate_live_boot_convergence_with_latch(
+        &mut rt.boot_converged,
+        1,
+        t_live,
+        warmup_until,
+        &snaps,
+        &gov_boot,
+        69_700,
+        100,
+        Some(50_000_000),
+    ));
+    assert!(rt.boot_converged);
+
+    // 4h42m later: ORDI (slot 6) & WIF (slot 8) decay to TFI=0.00 and BTC SNR passes through 0.00 -> still converged!
+    let t_4h42m = TimestampNs(t_live.0 + (4 * 3_600 + 42 * 60) * 1_000_000_000);
+    snaps[6].factor_tfi = BoundedScore::ZERO;
+    snaps[6].cum_buy_trade_lots = LotQty(0);
+    snaps[6].cum_sell_trade_lots = LotQty(0);
+    snaps[8].factor_tfi = BoundedScore::ZERO;
+    snaps[8].cum_buy_trade_lots = LotQty(0);
+    snaps[8].cum_sell_trade_lots = LotQty(0);
+    snaps[0].factor_ofi = BoundedScore::ZERO;
+    snaps[0].factor_tfi = BoundedScore::ZERO;
+    snaps[0].factor_geom = BoundedScore::ZERO;
+    for s_idx in 0..vortex_rs::lob_shm::MAX_ACTIVE_PAIRS {
+        assert!(vortex_rs::exec_daemon::evaluate_live_boot_convergence_with_latch(
+            &mut rt.boot_converged,
+            s_idx,
+            t_4h42m,
+            warmup_until,
+            &snaps,
+            &gov_boot,
+            69_700,
+            100,
+            Some(25_000_000),
+        ));
+    }
+    assert!(rt.boot_converged);
+    // Real SHM drop (hb_age > 5s) blocks safely; uninitialized slot blocks only that slot.
+    assert!(!vortex_rs::exec_daemon::evaluate_live_boot_convergence_with_latch(
+        &mut rt.boot_converged,
+        1,
+        t_4h42m,
+        warmup_until,
+        &snaps,
+        &gov_boot,
+        69_700,
+        100,
+        Some(5_500_000_000),
+    ));
+    snaps[11].bids[0].price = PriceTicks(0);
+    assert!(!vortex_rs::exec_daemon::evaluate_live_boot_convergence_with_latch(
+        &mut rt.boot_converged,
+        11,
+        t_4h42m,
+        warmup_until,
+        &snaps,
+        &gov_boot,
+        69_700,
+        100,
+        Some(25_000_000),
+    ));
+    assert!(vortex_rs::exec_daemon::evaluate_live_boot_convergence_with_latch(
+        &mut rt.boot_converged,
+        1,
+        t_4h42m,
+        warmup_until,
+        &snaps,
+        &gov_boot,
+        69_700,
+        100,
+        Some(25_000_000),
+    ));
+
+    // (b) No rigid 4,357 ms truncation for ETH Ask (10801 -> 5889 lots) & PENDLE Ask (147 -> 147 lots)
+    // under healthy slow flow (even when !at_l1 ticks 1 tick away), while adverse flow / Hawkes still aborts fast;
+    // and intact L1 wall (ETH Ask 13,979/13,979 at 872 ms) + neutral flow does NOT fire false SpoofingVeto.
+    let mut gov_q = OnlineAdaptiveGovernor::new();
+    gov_q.seed_prewarm_slot_emas(1, 176_285 * 10_000, 176_285 * 10_000, 2_926, t0);
+    gov_q.seed_prewarm_slot_emas(7, 14_360 * 10_000, 14_360 * 10_000, 3_630, t0);
+    let eth_base_chase = gov_q.max_total_entry_chase_ns(1, ScaledBps(2_200));
+    let pendle_base_chase = gov_q.max_total_entry_chase_ns(7, ScaledBps(2_600));
+    let wait_4357_ns = 4_357_000_000_i64;
+    for at_l1 in [true, false] {
+        let (eth_max_ns, eth_expired) = vortex_rs::exec_daemon::evaluate_resting_queue_chase_budget_v532(
+            &gov_q,
+            1,
+            Side::Ask,
+            ScaledBps(2_200),
+            1.0,
+            1.0,
+            BoundedScore::new_clamped(0.05),
+            LotQty(10_801),
+            LotQty(5_889),
+            eth_base_chase,
+            at_l1,
+            wait_4357_ns,
+            wait_4357_ns,
+        );
+        assert!(eth_max_ns >= 10_000_000_000 && !eth_expired);
+
+        let (pendle_max_ns, pendle_expired) = vortex_rs::exec_daemon::evaluate_resting_queue_chase_budget_v532(
+            &gov_q,
+            7,
+            Side::Ask,
+            ScaledBps(2_600),
+            1.0,
+            1.0,
+            BoundedScore::new_clamped(0.0),
+            LotQty(147),
+            LotQty(147),
+            pendle_base_chase,
+            at_l1,
+            wait_4357_ns,
+            wait_4357_ns,
+        );
+        assert!(pendle_max_ns >= 10_000_000_000 && !pendle_expired);
+    }
+    // Adverse slow flow + off-L1 STILL expires quickly at 4,357 ms.
+    let (_, adv_off_l1_expired) = vortex_rs::exec_daemon::evaluate_resting_queue_chase_budget_v532(
+        &gov_q,
+        1,
+        Side::Ask,
+        ScaledBps(2_200),
+        1.4,
+        3.5,
+        BoundedScore::new_clamped(-0.45),
+        LotQty(10_801),
+        LotQty(5_889),
+        eth_base_chase,
+        false,
+        wait_4357_ns,
+        wait_4357_ns,
+    );
+    assert!(adv_off_l1_expired);
+
+    // Intact L1 wall (13,979 / 13,979 at 872 ms) + neutral flow does NOT fire false SpoofingVeto,
+    // while V06 (170 ms) and mid-queue wall collapse (60% remaining) STILL fire SpoofingVeto.
+    let eth_intact = mk_vault_snap(1, 176_285, 2_400, 0.05, 0.0, 0.65, t0 + 872_000_000);
+    let mut adv_intact = 0_i64;
+    assert!(!vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        Side::Ask,
+        &eth_intact,
+        -0.30,
+        872_000_000,
+        BoundedScore::ZERO,
+        0.15,
+        1.0,
+        50,
+        69_700,
+        t0 + 872_000_000,
+        &mut adv_intact,
+        LotQty(13_979),
+        LotQty(13_979),
+    ));
+    let mut adv_v06 = 0_i64;
+    assert!(vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        Side::Ask,
+        &eth_intact,
+        -0.30,
+        170_000_000,
+        BoundedScore::ZERO,
+        0.15,
+        1.0,
+        50,
+        69_700,
+        t0 + 170_000_000,
+        &mut adv_v06,
+        LotQty(13_979),
+        LotQty(13_979),
+    ));
+    let mut adv_mid_collapse = 0_i64;
+    assert!(vortex_rs::exec_daemon::evaluate_elastic_spoof_geom_abort_with_queue_v531(
+        Side::Ask,
+        &eth_intact,
+        -0.30,
+        872_000_000,
+        BoundedScore::ZERO,
+        0.15,
+        1.0,
+        50,
+        69_700,
+        t0 + 872_000_000,
+        &mut adv_mid_collapse,
+        LotQty(13_979),
+        LotQty(8_400),
+    ));
+
+    // (c) Boot MFE order: rehydrate_cold_mfe_seeds_from_scar_vault executed AFTER hydrate_12_slot_mfe_from_path
+    // preserves rehydrated > 613 values instead of overwriting them back to 613.
+    let mut engines = SlotExecutionEngine::new_12_slot_array();
+    let mfe_vault = std::path::Path::new(vortex_rs::vault_io::MFE_PLASTICITY_VAULT_PATH);
+    SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, mfe_vault);
+    engines[2].learned_mfe_bps = vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS;
+    engines[7].learned_mfe_bps = vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS;
+    engines[1].learned_mfe_bps = 647;
+    let scar_fixture = concat!(
+        "{\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":8.40}\n",
+        "{\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":9.10}\n",
+        "{\"symbol\":\"PENDLEUSDT\",\"maker_exit\":true,\"mfe_bps\":7.85}\n",
+        "{\"symbol\":\"ETHUSDT\",\"maker_exit\":true,\"mfe_bps\":12.00}\n"
+    );
+    vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_reader(
+        &mut engines,
+        std::io::Cursor::new(scar_fixture.as_bytes()),
+    );
+    assert!(engines[2].learned_mfe_bps > vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS);
+    assert!(engines[7].learned_mfe_bps > vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS);
+    assert!(engines[2].learned_mfe_bps <= vortex_rs::telemetry_hud::SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);
+    assert_eq!(engines[1].learned_mfe_bps, 647);
+
+    // Also verify live vault read-only order if vault files exist on disk (zero temp files created).
+    let scar_vault = std::path::Path::new(vortex_rs::telemetry_hud::SCAR_MEMORY_VAULT_PATH);
+    if mfe_vault.exists() && scar_vault.exists() {
+        let mut live_eng = SlotExecutionEngine::new_12_slot_array();
+        SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut live_eng, mfe_vault);
+        let before = SlotExecutionEngine::extract_12_slot_mfe_array(&live_eng);
+        vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_scar_vault(&mut live_eng, scar_vault);
+        let after = SlotExecutionEngine::extract_12_slot_mfe_array(&live_eng);
+        for s_idx in 0..vortex_rs::lob_shm::MAX_ACTIVE_PAIRS {
+            if before[s_idx] != vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS {
+                assert_eq!(after[s_idx], before[s_idx]);
+            } else {
+                assert!(
+                    after[s_idx] >= vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS
+                        && after[s_idx] <= vortex_rs::telemetry_hud::SCAR_MFE_REHYDRATE_CAP_SCALED_BPS
+                );
+            }
+        }
+    }
+}

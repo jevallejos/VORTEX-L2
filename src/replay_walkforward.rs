@@ -234,6 +234,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
         );
         for eng in &mut engines { eng.sync_governor_dynamics(&gov); }
         SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, Path::new(MFE_PLASTICITY_VAULT_PATH));
+        crate::telemetry_hud::rehydrate_cold_mfe_seeds_from_scar_vault(&mut engines, Path::new(SCAR_MEMORY_VAULT_PATH));
     }
     let fees_init = gov.active_fee_schedule();
     let mut ledger = ParitySyncLedger::new(INITIAL_REPLAY_EQUITY_1E8);
@@ -488,8 +489,8 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 q_shield.hawkes_lambda_ratio,
                                 signed_slow,
                             );
-                            let max_chase_ns = if at_l1 {
-                                crate::exec_daemon::compute_resting_l1_max_chase_ns_v531(
+                            let (max_chase_ns, chase_expired) =
+                                crate::exec_daemon::evaluate_resting_queue_chase_budget_v532(
                                     &gov,
                                     s_idx,
                                     side,
@@ -500,10 +501,10 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     init_q_ahead[s_idx],
                                     queue_ahead_qty,
                                     base_chase_ns,
-                                )
-                            } else {
-                                base_chase_ns
-                            };
+                                    at_l1,
+                                    elapsed_ns,
+                                    total_chase_ns,
+                                );
                             let fast_sweep = at_l1 && crate::exec_daemon::evaluate_toxic_sweep_velocity_abort_v51(spec, side, entry_price, init_q_ahead[s_idx], queue_ahead_qty, elapsed_ns, &cur_snap, evt_dil, engines[s_idx].learned_taker_prob_pm, engines[s_idx].active_fees, 75_000);
                             let btc_aligned = epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
                             let q_eroded = init_q_ahead[s_idx].0 > 0 && queue_ahead_qty.0 * 100 <= init_q_ahead[s_idx].0 * 65;
@@ -534,7 +535,6 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                 init_q_ahead[s_idx],
                                 queue_ahead_qty,
                             );
-                            let chase_expired = (!at_l1 && elapsed_ns >= (base_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns || total_chase_ns >= max_chase_ns.saturating_add(base_chase_ns / 2);
                             let dq_abort = block_new_entries || fast_sweep || headwind_erosion || macro_contradiction || geom_flip
                                 || (elapsed_ns >= 25_000_000 && at_l1 && (q_shield.abort_now || crate::kinematic_surface::check_queue_depletion_velocity_abort_with_spoof(side, init_q_ahead[s_idx], queue_ahead_qty, &cur_snap, spoof_d)))
                                 || crate::exec_daemon::should_abort_queue_on_adverse_flow_c1(
@@ -1044,8 +1044,8 @@ pub mod omega_twin {
                             side, init_queue_ahead, queue_ahead_lots, opp_tape_lots, &ev.snap, &btc_snap, epps_beta,
                         );
                         let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
-                        let max_chase_ns = self.gov.max_total_entry_chase_ns(s_idx, ev.snap.realized_vol_5m);
-                        let q_timers = elastic_resting_queue_timers_ns(max_chase_ns);
+                        let base_chase_ns = self.gov.max_total_entry_chase_ns(s_idx, ev.snap.realized_vol_5m);
+                        let q_timers = elastic_resting_queue_timers_ns(base_chase_ns);
                         let opp_wave3_now = crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
                             side,
                             &ev.snap,
@@ -1058,7 +1058,33 @@ pub mod omega_twin {
                                 && (!passes_elliott_macro_coherence_guard(side, &ev.snap)
                                     || !passes_order_block_wall_guard_dynamic(s_idx, side, &ev.snap, self.engines[s_idx].learned_taker_prob_pm, self.engines[s_idx].active_fees)));
                         let at_l1 = match side { Side::Bid => ev.snap.bids[0].price == entry_price, Side::Ask => ev.snap.asks[0].price == entry_price };
-                        let chase_expired = (!at_l1 && elapsed_ns >= (max_chase_ns * 3) / 4) || elapsed_ns >= max_chase_ns;
+                        let signed_slow = BoundedScore::new_clamped(
+                            (0.55 * ev.snap.factor_ofi.get() + 0.45 * ev.snap.factor_tfi.get()) * side.sign_f64(),
+                        );
+                        let dt_s = ((elapsed_ns.max(5_000_000) as f64) * 1e-9).max(0.05);
+                        let hwk_lam = crate::exec_daemon::compute_resting_l1_hawkes_lambda_v531(
+                            evt_dil,
+                            opp_tape_lots,
+                            init_queue_ahead,
+                            dt_s,
+                            q_verdict.hawkes_lambda_ratio,
+                            signed_slow,
+                        );
+                        let (_, chase_expired) = crate::exec_daemon::evaluate_resting_queue_chase_budget_v532(
+                            &self.gov,
+                            s_idx,
+                            side,
+                            ev.snap.realized_vol_5m,
+                            evt_dil,
+                            hwk_lam,
+                            signed_slow,
+                            init_queue_ahead,
+                            queue_ahead_lots,
+                            base_chase_ns,
+                            at_l1,
+                            elapsed_ns,
+                            elapsed_ns,
+                        );
                         if block_new_entries || chase_expired || (elapsed_ns >= 25_000_000 && q_verdict.abort_now) || macro_contradiction {
                             self.entry_fifo[s_idx].cancel();
                             self.gov.observe_entry_abort(s_idx, side, entry_price, now_ns);
