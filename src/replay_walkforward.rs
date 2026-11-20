@@ -94,9 +94,21 @@ fn store_has_any_vkl1(store: &PerpetualCandleStore) -> bool {
     })
 }
 
-fn resolve_walk_forward_candle_store(data_dir: &Path) -> (Option<PerpetualCandleStore>, bool) {
+fn resolve_walk_forward_candle_store(
+    data_dir: &Path,
+    verbose: bool,
+) -> (Option<PerpetualCandleStore>, bool) {
+    let colocated_sub = data_dir.join("candles");
+    if colocated_sub.is_dir() {
+        let store = PerpetualCandleStore::new(colocated_sub);
+        if store_has_any_vkl1(&store) {
+            return (Some(store), true);
+        }
+    }
+    if !verbose {
+        return (None, false);
+    }
     let colocated_candidates = [
-        Some(data_dir.join("candles")),
         Some(data_dir.to_path_buf()),
         data_dir.parent().map(|p| p.join("candles")),
     ];
@@ -427,12 +439,11 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
     let mut spoof_clocks = [EventClockAlphaModulator::new(); MAX_ACTIVE_PAIRS];
     let mut last_funding_cut = [0_i64; MAX_ACTIVE_PAIRS];
 
-    let (vkl1_store_opt, vkl1_is_colocated) = resolve_walk_forward_candle_store(data_dir);
-    let has_vkl1 = vkl1_store_opt.is_some();
-    if verbose || has_vkl1 || Path::new(HANDSHAKE_VAULT_CACHE_PATH).exists() {
-        gov.set_active_fee_schedule(crate::telemetry_hud::load_hud_fee_schedule());
-    }
+    let (vkl1_store_opt, vkl1_is_colocated) = resolve_walk_forward_candle_store(data_dir, verbose);
     if verbose {
+        if Path::new(HANDSHAKE_VAULT_CACHE_PATH).exists() {
+            gov.set_active_fee_schedule(crate::telemetry_hud::load_hud_fee_schedule());
+        }
         let _ = gov.rehydrate_from_scar_and_loss_files(
             Path::new(SCAR_MEMORY_VAULT_PATH), Path::new(RED_LOSS_BOX_PATH),
             Some(Path::new("data/vault/vortex_ai_forensic_vault.jsonl")),
@@ -3434,6 +3445,52 @@ mod v49_par2z_walkforward_tests {
                 .is_ok());
         }
 
+        struct HermeticCwdVkl1Fixture {
+            created_data_dir: bool,
+            created_candles_dir: bool,
+        }
+        impl Drop for HermeticCwdVkl1Fixture {
+            fn drop(&mut self) {
+                if self.created_candles_dir {
+                    let _ = fs::remove_dir_all("data/candles");
+                }
+                if self.created_data_dir {
+                    let _ = fs::remove_dir("data");
+                }
+            }
+        }
+        let cwd_data_existed = Path::new("data").exists();
+        let cwd_candles_existed = Path::new("data/candles").exists();
+        let cwd_guard = HermeticCwdVkl1Fixture {
+            created_data_dir: !cwd_data_existed,
+            created_candles_dir: !cwd_candles_existed,
+        };
+        if !cwd_candles_existed {
+            let cwd_store = PerpetualCandleStore::default_store();
+            let mut list = Vec::with_capacity(64);
+            for k in (1..=64_i64).rev() {
+                let open_ms = ((t0 - k * 300_000_000_000) / 1_000_000).to_string();
+                let px_hi = 28.50_f64 - (64 - k) as f64 * 0.14;
+                let px_lo = px_hi - 0.35;
+                list.push(serde_json::json!([
+                    open_ms,
+                    format!("{px_hi:.4}"),
+                    format!("{:.4}", px_hi + 0.05),
+                    format!("{px_lo:.4}"),
+                    format!("{:.4}", px_lo + 0.02),
+                    "25000.0",
+                    "600000.0"
+                ]));
+            }
+            let adv_bundle = serde_json::json!({ "result": { "list": list } });
+            let _ = cwd_store.backfill_from_bybit_kline_json(
+                3,
+                CandleTimeframe::Min5,
+                &adv_bundle,
+            );
+            assert!(store_has_any_vkl1(&cwd_store));
+        }
+
         let seg_p = dir.join("vortex_l2_segment_000001.parquet");
         assert!(batch.write_to_file(&seg_p).is_ok());
         let rep = run_parquet_walk_forward_on_dir(&dir, false);
@@ -3441,6 +3498,7 @@ mod v49_par2z_walkforward_tests {
         assert!(rep.armed >= 1 && rep.fills >= 1 && rep.closed >= 1);
         assert_eq!(rep.losses, 0);
         assert!(rep.cum_net_pnl_1e8 > 0 && rep.cum_net_bps_x100 > 0);
+        drop(cwd_guard);
         let _ = fs::remove_dir_all(&dir);
     }
 }
