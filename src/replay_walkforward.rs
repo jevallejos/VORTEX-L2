@@ -1062,13 +1062,15 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                     );
                                     let btc_aligned =
                                         epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
-                                    let q_eroded =
-                                        init_q_ahead[s_idx].0 > 0 && queue_ahead_qty.0 * 100 <= init_q_ahead[s_idx].0 * 65;
-                                    let headwind_erosion = s_idx > 0
-                                        && elapsed_ns >= q_timers.headwind_abort_ns
-                                        && q_eroded
-                                        && btc_aligned < -0.08
-                                        && flow_imp < 0.15;
+                                    let headwind_erosion = crate::kinematic_surface::is_headwind_queue_erosion_c1(
+                                        s_idx,
+                                        elapsed_ns,
+                                        q_timers.headwind_abort_ns,
+                                        init_q_ahead[s_idx],
+                                        queue_ahead_qty,
+                                        btc_aligned,
+                                        flow_imp,
+                                    );
                                     let btc_w3 = crate::alpha_3factor::compute_btc_leader_aligned_score(
                                         side,
                                         &cur_snap,
@@ -1130,16 +1132,7 @@ pub fn run_parquet_walk_forward_on_dir(data_dir: &Path, verbose: bool) -> WalkFo
                                         || geom_flip
                                         || adv_fl_abort
                                         || opp_wave3_now
-                                        || (elapsed_ns >= 25_000_000
-                                            && exact_at_l1
-                                            && (q_shield.abort_now
-                                                || crate::kinematic_surface::check_queue_depletion_velocity_abort_with_spoof(
-                                                    side,
-                                                    init_q_ahead[s_idx],
-                                                    queue_ahead_qty,
-                                                    &cur_snap,
-                                                    spoof_d,
-                                                )));
+                                        || (elapsed_ns >= 25_000_000 && exact_at_l1 && q_shield.abort_now);
                                     let dq_abort = block_new_entries || macro_contradiction || toxic_q;
                                     if chase_expired || dq_abort {
                                         gov.observe_entry_abort_with_context(

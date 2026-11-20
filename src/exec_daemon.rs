@@ -944,8 +944,7 @@ pub fn step_12_slot_daemon_tick(
                     rt.btc_lead_memory.effective_aligned_impulse(&btc_snap, corr_sign, side)
                 });
                 let btc_aligned = epps_beta * (OrthogonalFactorState::snr_composite_score(&btc_snap) * side.sign_f64());
-                let q_eroded = rt.init_q_ahead[s_idx].0 > 0 && next_q.0 * 100 <= rt.init_q_ahead[s_idx].0 * 65;
-                let headwind_erosion = s_idx > 0 && elapsed_ns >= q_timers.headwind_abort_ns && q_eroded && btc_aligned < -0.08 && flow_imp < 0.15;
+                let headwind_erosion = crate::kinematic_surface::is_headwind_queue_erosion_c1(s_idx, elapsed_ns, q_timers.headwind_abort_ns, rt.init_q_ahead[s_idx], next_q, btc_aligned, flow_imp);
                 let btc_w3 = crate::alpha_3factor::compute_btc_leader_aligned_score(
                     side,
                     &snap,

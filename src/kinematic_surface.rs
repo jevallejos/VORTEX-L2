@@ -556,23 +556,106 @@ pub fn evaluate_moallemi_stoikov_queue_shield_with_beta(
     } else {
         0.0
     };
-    let moallemi_toxicity = 0.45 * tracker.excitation * (0.25 / q_ratio.max(0.12))
-        + 0.55 * (-stoikov_skew).max(0.0)
+    let (foq_w, deep_skew) = compute_foq_deep_book_immunity_c1(side, init_q_ahead, q_ratio, own_flow, btc_drag, snap);
+    let eff_skew = (1.0 - foq_w) * stoikov_skew + foq_w * deep_skew;
+    let eff_adv_ticks = (1.0 - foq_w) * adverse_micro_ticks + foq_w * (0.5 * (1.0 - deep_skew)).clamp(0.0, 1.0);
+    let eff_exc = tracker.excitation * (1.0 - HAWKES_INV_PHI * foq_w);
+    let eff_q_floor = q_ratio.max(0.12 + 0.38 * foq_w);
+    let moallemi_toxicity = 0.45 * eff_exc * (0.25 / eff_q_floor)
+        + 0.55 * (-eff_skew).max(0.0)
         + btc_drag
         - 0.50 * own_flow.max(0.0);
-    let crit_tail_sweep = init_q_ahead.0 > 0 && q_ratio < 0.15 && tracker.excitation >= HAWKES_INV_PHI;
-    let stoikov_collapse = (stoikov_skew <= -0.68 && own_flow < 0.15) || (adverse_micro_ticks >= 0.75 && own_flow < 0.20);
+    let crit_tail_sweep = init_q_ahead.0 > 0
+        && q_ratio < 0.15
+        && eff_exc >= HAWKES_INV_PHI * (1.0 + HAWKES_PHI * foq_w);
+    let stoikov_collapse = (eff_skew <= -0.68 && own_flow < 0.15) || (eff_adv_ticks >= 0.75 && own_flow < 0.20);
     let abort_now = crit_tail_sweep
         || stoikov_collapse
         || moallemi_toxicity >= HAWKES_INV_PHI
-        || check_queue_depletion_velocity_abort_with_spoof(
-            side,
-            init_q_ahead,
-            cur_q_ahead,
-            snap,
-            tracker.spoof_density_ewma,
-        );
+        || (foq_w < HAWKES_INV_PHI
+            && check_queue_depletion_velocity_abort_with_spoof(
+                side,
+                init_q_ahead,
+                cur_q_ahead,
+                snap,
+                tracker.spoof_density_ewma,
+            ));
     QueueShieldVerdict { abort_now, stoikov_skew, adverse_micro_ticks, hawkes_lambda_ratio, moallemi_toxicity }
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn compute_foq_deep_book_immunity_c1(
+    side: Side,
+    init_q_ahead: LotQty,
+    q_ratio: f64,
+    own_flow: f64,
+    btc_drag: f64,
+    snap: &SymbolLobSnapshot,
+) -> (f64, f64) {
+    const INV_PHI: f64 = 0.618_033_988_749_895;
+    const INV_PHI2: f64 = 0.381_966_011_250_105;
+    const INV_PHI3: f64 = 0.236_067_977_499_790;
+    const INV_PHI4: f64 = 0.145_898_033_750_315;
+    let (own_l1, opp_l1, raw_own_deep, raw_opp_deep) = match side {
+        Side::Bid => (
+            snap.bids[0].qty.0.max(0),
+            snap.asks[0].qty.0.max(0),
+            snap.deep_bid_lots_l1_l5.0,
+            snap.deep_ask_lots_l1_l5.0,
+        ),
+        Side::Ask => (
+            snap.asks[0].qty.0.max(0),
+            snap.bids[0].qty.0.max(0),
+            snap.deep_ask_lots_l1_l5.0,
+            snap.deep_bid_lots_l1_l5.0,
+        ),
+    };
+    let own_deep = raw_own_deep.max(own_l1);
+    let opp_deep = raw_opp_deep.max(opp_l1);
+    let deep_den = (own_deep.saturating_add(opp_deep)).max(1) as f64;
+    let deep_skew = ((own_deep - opp_deep) as f64 / deep_den).clamp(-1.0, 1.0);
+    if init_q_ahead.0 <= 0 {
+        return (0.0, deep_skew);
+    }
+    let own_l2_l5 = own_deep.saturating_sub(own_l1);
+    if own_l2_l5 <= 0 {
+        return (0.0, deep_skew);
+    }
+    let rho_l2_l5 = (own_l2_l5 as f64) / ((own_l2_l5.saturating_add(opp_deep.max(1))) as f64);
+    let s_prog = crate::wave_elliott::hermite_smoothstep_c1(1.0 - q_ratio.clamp(0.0, 1.0), INV_PHI2, 1.0 - INV_PHI4);
+    let s_deep = crate::wave_elliott::hermite_smoothstep_c1(rho_l2_l5, INV_PHI3, INV_PHI);
+    let s_flow = crate::wave_elliott::hermite_smoothstep_c1(own_flow - 2.0 * btc_drag, -INV_PHI4, INV_PHI3);
+    ((s_prog * s_deep * s_flow).clamp(0.0, 1.0), deep_skew)
+}
+
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn is_headwind_queue_erosion_c1(
+    slot_idx: usize,
+    elapsed_ns: i64,
+    headwind_abort_ns: i64,
+    init_q_ahead: LotQty,
+    cur_q_ahead: LotQty,
+    btc_aligned: f64,
+    flow_imp: f64,
+) -> bool {
+    const PHI: f64 = 1.618_033_988_749_895;
+    const INV_PHI: f64 = 0.618_033_988_749_895;
+    const INV_PHI4: f64 = 0.145_898_033_750_315;
+    if slot_idx == 0 || elapsed_ns < headwind_abort_ns || init_q_ahead.0 <= 0 {
+        return false;
+    }
+    if cur_q_ahead.0.saturating_mul(100) > init_q_ahead.0.saturating_mul(65) {
+        return false;
+    }
+    let q_rem = ((cur_q_ahead.0.max(0) as f64) / (init_q_ahead.0.max(1) as f64)).clamp(0.0, 1.0);
+    let s_foq = crate::wave_elliott::hermite_smoothstep_c1(1.0 - q_rem, INV_PHI, 1.0 - INV_PHI4);
+    let btc_crit = -0.08 - 0.30 * s_foq;
+    let flow_crit = 0.15 * (1.0 - PHI * s_foq);
+    btc_aligned < btc_crit && flow_imp < flow_crit
 }
 
 #[must_use]
@@ -727,5 +810,42 @@ mod tests {
         let (sl_vip0, _) = compute_wald_v2_contracted_sl_bps_with_fees(ScaledBps(6_500), &wald, FeeSchedule::VIP0_DEFAULT);
         let (sl_vip_reb, _) = compute_wald_v2_contracted_sl_bps_with_fees(ScaledBps(6_500), &wald, vip_rebate);
         assert!(sl_vip_reb < sl_vip0 && sl_vip_reb >= 1_350);
+    }
+}
+
+#[cfg(test)]
+mod v5533_foq_shield_tests {
+    use super::*;
+    use crate::lob_shm::BookLevel;
+    use crate::types::{BoundedScore, PriceTicks, TimestampNs};
+
+    #[test]
+    fn test_v5533_sui_14lots_and_link_259lots_foq_survival_vs_hollow_sweep() {
+        let mut sui = SymbolLobSnapshot::new_empty();
+        sui.ts_local_ns = TimestampNs(2_308_000_000);
+        sui.bids[0] = BookLevel { price: PriceTicks(6_576), qty: LotQty(1_900) };
+        sui.asks[0] = BookLevel { price: PriceTicks(6_577), qty: LotQty(36) };
+        sui.deep_bid_lots_l1_l5 = LotQty(8_400);
+        sui.deep_ask_lots_l1_l5 = LotQty(9_200);
+        sui.factor_ofi = BoundedScore::new_clamped(-0.22);
+        sui.factor_tfi = BoundedScore::new_clamped(-0.18);
+        let btc = SymbolLobSnapshot::new_empty();
+        let mut trk = HawkesQueueTracker::new();
+        let v_sui = evaluate_moallemi_stoikov_queue_shield_with_beta(
+            &mut trk, Side::Ask, LotQty(2_270), LotQty(14), LotQty(2_256), &sui, &btc, 5, 0.85,
+        );
+        assert!(!v_sui.abort_now);
+
+        assert!(!is_headwind_queue_erosion_c1(9, 7_663_000_000, 2_200_000_000, LotQty(4_903), LotQty(259), -0.11, 0.10));
+        assert!(is_headwind_queue_erosion_c1(9, 7_663_000_000, 2_200_000_000, LotQty(4_903), LotQty(259), -0.45, -0.15));
+
+        let mut hollow = sui;
+        hollow.deep_ask_lots_l1_l5 = LotQty(180);
+        hollow.deep_bid_lots_l1_l5 = LotQty(8_400);
+        let mut trk2 = HawkesQueueTracker::new();
+        let v_hollow = evaluate_moallemi_stoikov_queue_shield_with_beta(
+            &mut trk2, Side::Ask, LotQty(500), LotQty(40), LotQty(460), &hollow, &btc, 5, 0.85,
+        );
+        assert!(v_hollow.abort_now);
     }
 }
