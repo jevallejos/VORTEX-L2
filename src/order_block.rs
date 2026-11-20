@@ -1,5 +1,7 @@
 //! Zero-Alloc Bi-Directional Order Block Engine (OB+ / OB-) with Distance-Weighted Eviction & Live VIP Fees (V4.8).
 #![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
     clippy::manual_clamp,
     clippy::manual_range_contains,
     clippy::needless_range_loop,
@@ -13,8 +15,11 @@ use crate::fee_cadence_beta::FeeSchedule;
 use crate::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side};
 
 const PHI: f64 = 1.618_033_988_749_895;
+const PHI_SQ: f64 = 2.618_033_988_749_895;
 const INV_PHI: f64 = 0.618_033_988_749_895;
+const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
 pub const MAX_OB_ZONES_PER_SIDE: usize = 4;
+const MAX_WARM_START_STAGED_BARS: usize = 512;
 const BAR_RING_CAP: usize = 20;
 const SEED_EFFICACY_PM: i64 = 618;
 const MIN_EFFICACY_PM: i64 = 382;
@@ -390,6 +395,19 @@ impl BarRing {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+struct StagedKlineBar {
+    close_ms: i64,
+    is_5m: bool,
+    bucket_id: i64,
+    op: PriceTicks,
+    hi: PriceTicks,
+    lo: PriceTicks,
+    cl: PriceTicks,
+    turn_1e8: i64,
+    bar_oi: i64,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct CausalOrderBlockEngine {
     bull_zones: [OrderBlockZone; MAX_OB_ZONES_PER_SIDE],
@@ -674,7 +692,11 @@ impl CausalOrderBlockEngine {
             .three_x_friction_barrier_bps_dynamic(px, self.taker_prob_pm, self.active_fees)
             .raw()
             .max(400);
-        let mut bull_b = (PriceTicks(0), i64::MAX, 0.0_f64);
+        let reach_bps = (PHI_SQ * ((b3x as f64) * 0.01))
+            .max(INV_PHI * ((self.last_vol_5m.raw().max(0) as f64) * 0.01))
+            .clamp(18.0, 62.0);
+        let reach_denom = reach_bps.max(1.0);
+        let mut bull_b = (PriceTicks(0), i64::MAX, 0.0_f64, 0.0_f64);
         for z in &mut self.bull_zones {
             if z.state == ObLifecycleState::Empty { continue; }
             if px.0 < z.low_ticks.0 || (z.state == ObLifecycleState::MitigatedShallow && px.0 < z.eq_ticks.0) {
@@ -700,14 +722,29 @@ impl CausalOrderBlockEngine {
             let (bull_pm, _) = self.plasticity.directional_efficacy_pm();
             let eff_bull_pm = bull_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
             let dist = ((px.0 - z.high_ticks.0).saturating_mul(1_000_000)) / px.0.max(1);
-            let sc = ((z.strength_pm as f64) * 1e-3)
-                * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI })
-                * ((eff_bull_pm as f64) / (SEED_EFFICACY_PM as f64));
-            if dist >= -b3x && dist < bull_b.1 {
-                bull_b = (z.high_ticks, dist, sc.clamp(0.0, 1.0));
+            let base_score = (((z.strength_pm as f64) * 1e-3)
+                * ((eff_bull_pm as f64) / (SEED_EFFICACY_PM as f64)))
+                .clamp(0.0, 1.0);
+            let sc = (base_score * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI }))
+                .clamp(0.0, 1.0);
+            let mu_state = match z.state {
+                ObLifecycleState::Virgin => 1.0,
+                ObLifecycleState::MitigatedShallow => INV_PHI_SQ,
+                ObLifecycleState::Empty => 0.0,
+            };
+            let mu_tf = match z.horizon {
+                ObHorizon::Structural5m => PHI,
+                ObHorizon::Tactical1m => 1.0,
+            };
+            let d_bps = (dist.max(0) as f64) * 0.01;
+            let w_zone = (base_score * mu_state * mu_tf) / (1.0 + d_bps / reach_denom);
+            if dist >= -b3x
+                && (w_zone > bull_b.3 || ((w_zone - bull_b.3).abs() <= 1e-12 && dist < bull_b.1))
+            {
+                bull_b = (z.high_ticks, dist, sc, w_zone);
             }
         }
-        let mut bear_b = (PriceTicks(0), i64::MAX, 0.0_f64);
+        let mut bear_b = (PriceTicks(0), i64::MAX, 0.0_f64, 0.0_f64);
         for z in &mut self.bear_zones {
             if z.state == ObLifecycleState::Empty { continue; }
             if px.0 > z.high_ticks.0 || (z.state == ObLifecycleState::MitigatedShallow && px.0 > z.eq_ticks.0) {
@@ -733,11 +770,26 @@ impl CausalOrderBlockEngine {
             let (_, bear_pm) = self.plasticity.directional_efficacy_pm();
             let eff_bear_pm = bear_pm.clamp(OB_DIRECTIONAL_MIN_PM, OB_DIRECTIONAL_MAX_PM);
             let dist = ((z.low_ticks.0 - px.0).saturating_mul(1_000_000)) / px.0.max(1);
-            let sc = ((z.strength_pm as f64) * 1e-3)
-                * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI })
-                * ((eff_bear_pm as f64) / (SEED_EFFICACY_PM as f64));
-            if dist >= -b3x && dist < bear_b.1 {
-                bear_b = (z.low_ticks, dist, sc.clamp(0.0, 1.0));
+            let base_score = (((z.strength_pm as f64) * 1e-3)
+                * ((eff_bear_pm as f64) / (SEED_EFFICACY_PM as f64)))
+                .clamp(0.0, 1.0);
+            let sc = (base_score * (if z.state == ObLifecycleState::Virgin { 1.0 } else { INV_PHI }))
+                .clamp(0.0, 1.0);
+            let mu_state = match z.state {
+                ObLifecycleState::Virgin => 1.0,
+                ObLifecycleState::MitigatedShallow => INV_PHI_SQ,
+                ObLifecycleState::Empty => 0.0,
+            };
+            let mu_tf = match z.horizon {
+                ObHorizon::Structural5m => PHI,
+                ObHorizon::Tactical1m => 1.0,
+            };
+            let d_bps = (dist.max(0) as f64) * 0.01;
+            let w_zone = (base_score * mu_state * mu_tf) / (1.0 + d_bps / reach_denom);
+            if dist >= -b3x
+                && (w_zone > bear_b.3 || ((w_zone - bear_b.3).abs() <= 1e-12 && dist < bear_b.1))
+            {
+                bear_b = (z.low_ticks, dist, sc, w_zone);
             }
         }
         self.cached_obs = OrderBlockObservables {
@@ -816,11 +868,17 @@ impl CausalOrderBlockEngine {
                 }
             }
         }
-        let mut staged = Vec::new();
+        let mut staged = [StagedKlineBar::default(); MAX_WARM_START_STAGED_BARS];
+        let mut staged_len = 0_usize;
+        let max_per_tf = MAX_WARM_START_STAGED_BARS / 2;
         for (is_5m, k_opt) in [(true, kline_5m), (false, kline_1m)] {
             let Some(rows) = k_opt.and_then(|v| v.get("result")).and_then(|r| r.get("list")).and_then(serde_json::Value::as_array) else { continue };
             let div_ms = if is_5m { 300_000_i64 } else { 60_000_i64 };
-            for row in rows.iter().rev() {
+            let take_n = rows.len().min(max_per_tf);
+            for row in rows[..take_n].iter().rev() {
+                if staged_len >= MAX_WARM_START_STAGED_BARS {
+                    break;
+                }
                 let Some(arr) = row.as_array() else { continue };
                 if arr.len() < 7 { continue; }
                 let ts_ms = arr[0].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
@@ -835,15 +893,25 @@ impl CausalOrderBlockEngine {
                     if o_ts <= ts_ms { bar_oi = o_val; }
                 }
                 let turn_f = arr[6].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(100.0);
-                staged.push((ts_ms.saturating_add(div_ms), is_5m, ts_ms / div_ms, op, hi, lo, cl, (turn_f.max(1.0) * 1e8).round() as i64, bar_oi));
+                staged[staged_len] = StagedKlineBar {
+                    close_ms: ts_ms.saturating_add(div_ms),
+                    is_5m,
+                    bucket_id: ts_ms / div_ms,
+                    op,
+                    hi,
+                    lo,
+                    cl,
+                    turn_1e8: (turn_f.max(1.0) * 1e8).round() as i64,
+                    bar_oi,
+                };
+                staged_len += 1;
             }
         }
-        staged.sort_by_key(|&(close_ms, is_5m, _, _, _, _, _, _, _)| (close_ms, !is_5m));
-        let count = staged.len();
-        for (_, is_5m, bucket_id, op, hi, lo, cl, turn_1e8, bar_oi) in staged {
-            self.ingest_closed_bar(spec, is_5m, bucket_id, op, hi, lo, cl, turn_1e8, bar_oi);
+        staged[..staged_len].sort_unstable_by_key(|b| (b.close_ms, !b.is_5m, b.bucket_id));
+        for b in &staged[..staged_len] {
+            self.ingest_closed_bar(spec, b.is_5m, b.bucket_id, b.op, b.hi, b.lo, b.cl, b.turn_1e8, b.bar_oi);
         }
-        count
+        staged_len
     }
 }
 

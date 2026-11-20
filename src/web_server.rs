@@ -48,12 +48,20 @@ pub const DEFAULT_WEB_PORT: u16 = 8787;
 pub const CSRF_HEADER_NAME: &str = "x-vortex-csrf";
 const MAX_CONCURRENT_WEB_CLIENTS: usize = 32;
 
-#[derive(Copy, Clone, Debug, Default)]
-struct CachedForensicSummary {
-    file_len: u64,
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
     mtime_ns: u128,
+    ino: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedForensicSummary {
+    loaded: bool,
+    stamp: FileStamp,
     maker_fee_bps: i64,
     taker_fee_bps: i64,
+    rows: std::sync::Arc<[serde_json::Value]>,
     ledger: Option<ParitySyncLedger>,
     total: usize,
     wins: usize,
@@ -112,8 +120,36 @@ pub struct VortexWebContext {
     pub csrf_token: String,
     pub lab_running: AtomicBool,
     active_conns: AtomicUsize,
-    shm_cache: Mutex<Option<(u128, ReadOnlyShmRegion)>>,
+    shm_cache: Mutex<Option<(FileStamp, ReadOnlyShmRegion)>>,
     vault_cache: Mutex<CachedForensicSummary>,
+    handshake_cache: Mutex<Option<(Option<FileStamp>, Option<FileStamp>, FeeSchedule)>>,
+    daily_gov_cache: Mutex<Option<(FileStamp, crate::governor_plasticity::DailySessionGovernor)>>,
+}
+
+#[must_use]
+pub fn is_valid_loopback_origin(origin: &str) -> bool {
+    let s = origin.trim();
+    let Some(rest) = s
+        .strip_prefix("http://127.0.0.1")
+        .or_else(|| s.strip_prefix("http://localhost"))
+        .or_else(|| s.strip_prefix("http://[::1]"))
+    else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with('/') {
+        return true;
+    }
+    let Some(after_colon) = rest.strip_prefix(':') else {
+        return false;
+    };
+    let (port_str, tail) = match after_colon.find('/') {
+        Some(idx) => (&after_colon[..idx], &after_colon[idx..]),
+        None => (after_colon, ""),
+    };
+    (1..=5).contains(&port_str.len())
+        && port_str.bytes().all(|b| b.is_ascii_digit())
+        && port_str.parse::<u16>().is_ok_and(|p| p >= 1)
+        && (tail.is_empty() || tail.starts_with('/'))
 }
 
 impl VortexWebContext {
@@ -127,14 +163,15 @@ impl VortexWebContext {
             active_conns: AtomicUsize::new(0),
             shm_cache: Mutex::new(None),
             vault_cache: Mutex::new(CachedForensicSummary::default()),
+            handshake_cache: Mutex::new(None),
+            daily_gov_cache: Mutex::new(None),
         }
     }
 
     pub fn verify_csrf_header(&self, headers: &[(String, String)]) -> Result<(), WebApiError> {
         for (k, v) in headers {
-            if k.eq_ignore_ascii_case("origin") {
-                let ok_orig = v.starts_with("http://127.0.0.1") || v.starts_with("http://localhost");
-                if !ok_orig { return Err(WebApiError::CsrfRejected); }
+            if k.eq_ignore_ascii_case("origin") && !is_valid_loopback_origin(v) {
+                return Err(WebApiError::CsrfRejected);
             }
         }
         let provided = headers
@@ -180,25 +217,107 @@ fn read_jsonl_rows(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn file_len_and_mtime_ns(path: &Path) -> Option<(u64, u128)> {
+fn file_stamp(path: &Path) -> Option<FileStamp> {
     let md = fs::metadata(path).ok()?;
-    let mt = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
-    Some((md.len(), mt))
+    let mtime_ns = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        md.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = md
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64);
+    Some(FileStamp { len: md.len(), mtime_ns, ino })
 }
 
 fn load_web_fee_schedule(ctx: &VortexWebContext) -> FeeSchedule {
     let p = ctx.cfg.vault_dir.join("vortex_bybit_handshake.json");
-    if let Ok(txt) = fs::read_to_string(p) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
-            if let (Some(m), Some(t)) = (
-                val.get("maker_fee_scaled_bps").and_then(serde_json::Value::as_i64),
-                val.get("taker_fee_scaled_bps").and_then(serde_json::Value::as_i64),
-            ) {
-                return FeeSchedule::from_live_rates_clamped(ScaledBps(m), ScaledBps(t));
+    let st_local = file_stamp(&p);
+    let st_global = file_stamp(Path::new(crate::bybit_client::HANDSHAKE_VAULT_CACHE_PATH));
+    if let Ok(guard) = ctx.handshake_cache.lock() {
+        if let Some((prev_loc, prev_glob, cached_fees)) = *guard {
+            if prev_loc == st_local && prev_glob == st_global {
+                return cached_fees;
             }
         }
     }
-    load_hud_fee_schedule()
+    let resolved = if st_local.is_some() {
+        fs::read_to_string(&p)
+            .ok()
+            .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+            .and_then(|val| {
+                Some(FeeSchedule::from_live_rates_clamped(
+                    ScaledBps(val.get("maker_fee_scaled_bps")?.as_i64()?),
+                    ScaledBps(val.get("taker_fee_scaled_bps")?.as_i64()?),
+                ))
+            })
+            .unwrap_or_else(|| if st_global.is_some() { load_hud_fee_schedule() } else { FeeSchedule::VIP0_DEFAULT })
+    } else if st_global.is_some() {
+        load_hud_fee_schedule()
+    } else {
+        FeeSchedule::VIP0_DEFAULT
+    };
+    if let Ok(mut guard) = ctx.handshake_cache.lock() {
+        *guard = Some((st_local, st_global, resolved));
+    }
+    resolved
+}
+
+fn load_cached_forensic_vault_rows(
+    ctx: &VortexWebContext,
+    vault_path: &Path,
+) -> (FileStamp, std::sync::Arc<[serde_json::Value]>) {
+    let st = file_stamp(vault_path).unwrap_or_default();
+    if let Ok(mut vc) = ctx.vault_cache.lock() {
+        if !vc.loaded || vc.stamp != st {
+            let parsed = if st.len > 0 {
+                std::sync::Arc::<[serde_json::Value]>::from(read_jsonl_rows(vault_path))
+            } else {
+                std::sync::Arc::<[serde_json::Value]>::from(Vec::new())
+            };
+            vc.loaded = true;
+            vc.stamp = st;
+            vc.rows = parsed;
+            vc.ledger = None;
+        }
+        return (vc.stamp, std::sync::Arc::clone(&vc.rows));
+    }
+    let fallback = if st.len > 0 {
+        std::sync::Arc::<[serde_json::Value]>::from(read_jsonl_rows(vault_path))
+    } else {
+        std::sync::Arc::<[serde_json::Value]>::from(Vec::new())
+    };
+    (st, fallback)
+}
+
+fn load_cached_daily_governor(
+    ctx: &VortexWebContext,
+    eq_1e8: i64,
+) -> crate::governor_plasticity::DailySessionGovernor {
+    let dg_path = ctx.cfg.vault_dir.join("vortex_daily_governor.json");
+    let Some(st) = file_stamp(&dg_path) else {
+        return crate::governor_plasticity::DailySessionGovernor::new(eq_1e8);
+    };
+    if let Ok(guard) = ctx.daily_gov_cache.lock() {
+        if let Some((prev_st, cached_dg)) = *guard {
+            if prev_st == st {
+                return cached_dg;
+            }
+        }
+    }
+    let loaded = load_daily_governor_from_path(&dg_path, eq_1e8);
+    if let Ok(mut guard) = ctx.daily_gov_cache.lock() {
+        *guard = Some((st, loaded));
+    }
+    loaded
 }
 
 #[must_use]
@@ -215,10 +334,16 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
     let mut raw_slots = [(SymbolLobSnapshot::new_empty(), SlotTelemetrySnapshot::default()); MAX_ACTIVE_PAIRS];
 
     if let Ok(mut guard) = ctx.shm_cache.lock() {
-        if let Some((_, mt)) = file_len_and_mtime_ns(&ctx.cfg.shm_path) {
-            let need_reopen = guard.as_ref().is_none_or(|(prev_mt, _)| *prev_mt == 0 && mt > 0);
+        if let Some(st) = file_stamp(&ctx.cfg.shm_path) {
+            let need_reopen = guard.as_ref().is_none_or(|(prev, _)| {
+                (prev.mtime_ns == 0 && st.mtime_ns > 0)
+                    || prev.ino != st.ino
+                    || prev.len != st.len
+            });
             if need_reopen {
-                *guard = MappedShmRegion::open_existing_read_only(&ctx.cfg.shm_path).ok().map(|r| (mt.max(1), r));
+                *guard = MappedShmRegion::open_existing_read_only(&ctx.cfg.shm_path)
+                    .ok()
+                    .map(|r| (FileStamp { len: st.len, mtime_ns: st.mtime_ns.max(1), ino: st.ino }, r));
             }
         } else {
             *guard = None;
@@ -238,63 +363,71 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
     }
 
     let vault_path = ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl");
-    let (f_len, f_mt) = file_len_and_mtime_ns(&vault_path).unwrap_or((0, 0));
+    let (v_stamp, vault_rows) = load_cached_forensic_vault_rows(ctx, &vault_path);
+    let f_len = v_stamp.len;
     let (ledger, total, wins, partials, scratches, losses, mkr_cnt, ws_rtt_us) = if let Ok(mut vc) = ctx.vault_cache.lock() {
-        let hit = vc.ledger.is_some()
-            && vc.file_len == f_len
-            && vc.mtime_ns == f_mt
+        let hit = vc.loaded
+            && vc.stamp == v_stamp
+            && vc.ledger.is_some()
             && vc.maker_fee_bps == fees.maker_fee_bps.0
             && vc.taker_fee_bps == fees.taker_fee_bps.0;
         if !hit {
             let mut led = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
             led.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
             let (mut tot, mut wn, mut pt, mut sc, mut ls, mut mk, mut rtt) = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_u64);
-            if f_len > 0 {
-                for v in read_jsonl_rows(&vault_path) {
-                    match v.get("event").and_then(serde_json::Value::as_str) {
-                        Some("EPOCH_RESET") => {
-                            let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
-                            led = ParitySyncLedger::new(eq_a);
-                            led.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
-                            tot = 0; wn = 0; pt = 0; sc = 0; ls = 0; mk = 0; rtt = 0;
-                        }
-                        Some("FUNDING_SETTLEMENT") => {
-                            let f = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                            let n = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
-                            if f != 0 { led.record_funding_settlement(f, n); }
-                        }
-                        Some("TRADE_CLOSE") => {
-                            tot += 1;
-                            let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-                            let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-                            let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                            let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(4.0);
-                            let sub_r = v.get("exit_sub_reason").and_then(serde_json::Value::as_str).unwrap_or("");
-                            if v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true) { mk += 1; }
-                            if let Some(r) = v.get("ws_rtt_us").and_then(serde_json::Value::as_u64) { rtt = r; }
-                            if is_partial_harvest_sub_reason_str(sub_r) && n_bps < 1.00 {
-                                pt += 1;
-                            } else if n_bps >= 1.00 {
-                                wn += 1;
-                            } else if n_bps >= -0.50 {
-                                sc += 1;
-                            } else {
-                                ls += 1;
-                            }
-                            let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(
-                                &v, slot_from_symbol_name(sym), side_from_str(side_s),
-                                ScaledBps((n_bps * 100.0).round() as i64), ScaledBps((f_bps * 100.0).round() as i64), fees,
-                            );
-                            led.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, ScaledBps((n_bps * 100.0).round() as i64));
-                        }
-                        _ => {}
+            for v in vault_rows.iter() {
+                match v.get("event").and_then(serde_json::Value::as_str) {
+                    Some("EPOCH_RESET") => {
+                        let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
+                        led = ParitySyncLedger::new(eq_a);
+                        led.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
+                        tot = 0; wn = 0; pt = 0; sc = 0; ls = 0; mk = 0; rtt = 0;
                     }
+                    Some("FUNDING_SETTLEMENT") => {
+                        let f = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                        let n = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
+                        if f != 0 { led.record_funding_settlement(f, n); }
+                    }
+                    Some("TRADE_CLOSE") => {
+                        tot += 1;
+                        let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                        let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                        let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(4.0);
+                        let sub_r = v.get("exit_sub_reason").and_then(serde_json::Value::as_str).unwrap_or("");
+                        if v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true) { mk += 1; }
+                        if let Some(r) = v.get("ws_rtt_us").and_then(serde_json::Value::as_u64) { rtt = r; }
+                        if is_partial_harvest_sub_reason_str(sub_r) && n_bps < 1.00 {
+                            pt += 1;
+                        } else if n_bps >= 1.00 {
+                            wn += 1;
+                        } else if n_bps >= -0.50 {
+                            sc += 1;
+                        } else {
+                            ls += 1;
+                        }
+                        let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(
+                            v, slot_from_symbol_name(sym), side_from_str(side_s),
+                            ScaledBps((n_bps * 100.0).round() as i64), ScaledBps((f_bps * 100.0).round() as i64), fees,
+                        );
+                        led.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, ScaledBps((n_bps * 100.0).round() as i64));
+                    }
+                    _ => {}
                 }
             }
-            *vc = CachedForensicSummary {
-                file_len: f_len, mtime_ns: f_mt, maker_fee_bps: fees.maker_fee_bps.0, taker_fee_bps: fees.taker_fee_bps.0,
-                ledger: Some(led), total: tot, wins: wn, partials: pt, scratches: sc, losses: ls, mkr_cnt: mk, ws_rtt_us: rtt,
-            };
+            vc.loaded = true;
+            vc.stamp = v_stamp;
+            vc.rows = std::sync::Arc::clone(&vault_rows);
+            vc.maker_fee_bps = fees.maker_fee_bps.0;
+            vc.taker_fee_bps = fees.taker_fee_bps.0;
+            vc.ledger = Some(led);
+            vc.total = tot;
+            vc.wins = wn;
+            vc.partials = pt;
+            vc.scratches = sc;
+            vc.losses = ls;
+            vc.mkr_cnt = mk;
+            vc.ws_rtt_us = rtt;
         }
         let led_out = vc.ledger.unwrap_or_else(|| ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8));
         (led_out, vc.total, vc.wins, vc.partials, vc.scratches, vc.losses, vc.mkr_cnt, vc.ws_rtt_us)
@@ -303,7 +436,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
     };
 
     let mut eq_1e8 = ledger.current_equity_1e8();
-    let mut dg = load_daily_governor_from_path(&ctx.cfg.vault_dir.join("vortex_daily_governor.json"), eq_1e8);
+    let mut dg = load_cached_daily_governor(ctx, eq_1e8);
     if f_len == 0 && dg.day_open_equity_1e8 > 100_000_000 {
         eq_1e8 = dg.day_open_equity_1e8.saturating_add(dg.day_realized_pnl_1e8);
     }
@@ -403,8 +536,8 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
     let mkr_pct = if total > 0 { (mkr_cnt as f64 * 100.0) / (total as f64) } else { 100.0 };
     let v70_bps = (ledger.vault_locked_profit_bps_x100 as f64) / 100.0;
     let r30_bps = (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0;
-    let sem_rep = crate::telemetry_hud::evaluate_capital_scaling_semaphore(
-        &vault_path, eq_1e8, ledger.vault_locked_profit_bps_x100, mkr_pct, 0, halt_effective, &dg, fees,
+    let sem_rep = crate::telemetry_hud::evaluate_capital_scaling_semaphore_from_rows(
+        &vault_rows, eq_1e8, ledger.vault_locked_profit_bps_x100, mkr_pct, 0, halt_effective, &dg, fees,
     );
     let (g1, g2, g3, g4) = (sem_rep.gate1_ok, sem_rep.gate2_ok, sem_rep.gate3_ok, sem_rep.gate4_ok);
 
@@ -479,7 +612,10 @@ pub fn query_candles_json(
 pub fn query_recent_trades_json(ctx: &VortexWebContext, limit: usize) -> serde_json::Value {
     let mut closes = Vec::new();
     let mut seq_id = 0_u64;
-    for mut v in read_jsonl_rows(&ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl")) {
+    let vault_path = ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl");
+    let (_, vault_rows) = load_cached_forensic_vault_rows(ctx, &vault_path);
+    for raw_v in vault_rows.iter() {
+        let mut v = raw_v.clone();
         if v.get("event").and_then(serde_json::Value::as_str) == Some("EPOCH_RESET") { closes.clear(); seq_id = 0; continue; }
         if v.get("event").and_then(serde_json::Value::as_str) == Some("TRADE_CLOSE") {
             seq_id += 1;
@@ -663,11 +799,19 @@ pub fn handle_drain_mode_toggle(ctx: &VortexWebContext, enable: bool) -> Result<
     Ok(serde_json::json!({ "ok": true, "drain_mode": lock_path.exists(), "open_slots": st["open_slots"] }))
 }
 
+struct LabRunningGuard<'a>(&'a AtomicBool);
+impl Drop for LabRunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub fn run_autonomous_lab_gate(ctx: &VortexWebContext, lab_id: u8) -> Result<serde_json::Value, WebApiError> {
     if !(1..=4).contains(&lab_id) { return Err(WebApiError::MalformedRequest); }
     if ctx.lab_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return Err(WebApiError::LabAlreadyRunning);
     }
+    let _lab_guard = LabRunningGuard(&ctx.lab_running);
     let res = match lab_id {
         1 => {
             let wf = crate::replay_walkforward::run_parquet_walk_forward_on_dir(&ctx.cfg.data_dir, false);
@@ -703,7 +847,6 @@ pub fn run_autonomous_lab_gate(ctx: &VortexWebContext, lab_id: u8) -> Result<ser
             serde_json::json!({ "lab_id": 4, "name": "DIGITAL_TWIN_4ARM_GATE", "ok": ok })
         }
     };
-    ctx.lab_running.store(false, Ordering::Release);
     Ok(res)
 }
 
@@ -780,7 +923,8 @@ pub fn stream_sse_5hz_loop(
     let _ = stream.set_nodelay(true);
     let hdr = concat!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n",
-        "Cache-Control: no-cache\r\nConnection: keep-alive\r\nX-Frame-Options: DENY\r\n\r\n"
+        "Cache-Control: no-cache\r\nConnection: keep-alive\r\n",
+        "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'\r\n\r\n"
     );
     stream.write_all(hdr.as_bytes())?;
     let mut sent = 0_usize;
@@ -850,7 +994,7 @@ fn handle_tcp_client(ctx: std::sync::Arc<VortexWebContext>, mut stream: std::net
         500 => "Internal Server Error", _ => "Not Found",
     };
     let head = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Vortex-Csrf: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'\r\nX-Vortex-Csrf: {}\r\nConnection: close\r\n\r\n",
         resp_body.len(), ctx.csrf_token
     );
     let _ = stream.write_all(head.as_bytes());

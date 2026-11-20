@@ -57,7 +57,7 @@ for unit_f in /etc/systemd/system/vortex-exec.service /etc/systemd/system/vortex
 done
 sudo systemctl daemon-reload || true
 sha256sum "$VORTEX_DIR/bin/vortex_tap" "$VORTEX_DIR/bin/vortex_replay" "$VORTEX_DIR/bin/vortex_exec" "$VORTEX_DIR/bin/vortex_web"
-rm -f "$VAULT_DIR/DRAIN_MODE.lock" "$VAULT_DIR/HALTED_ON_LOSS.lock"
+rm -f "$VAULT_DIR/DRAIN_MODE.lock"
 
 sudo systemctl start vortex-exec.service
 sudo systemctl start vortex-web.service

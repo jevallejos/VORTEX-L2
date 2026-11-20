@@ -32,7 +32,7 @@ use crate::telemetry_hud::{
 };
 use crate::types::{LotQty, PriceTicks, ScaledBps, Side, TimestampNs, VortexError, APPROVED_SPECS};
 
-pub const VAULT_IO_QUEUE_CAP: usize = 64;
+pub const VAULT_IO_QUEUE_CAP: usize = 512;
 pub const MAX_INTRA_TRADE_SAMPLES: usize = 128;
 /// Hard irreversible operator validation epoch loss ceiling: `5.00000000 USDT` (`1e8` integer scale).
 pub const MAX_VALIDATION_EPOCH_LOSS_1E8: i64 = 500_000_000;
@@ -217,21 +217,24 @@ pub struct FundingSettlementPersistTask {
     pub cum_net_pnl_1e8: i64,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EmaPrewarmPayload {
+    pub ts_ns: i64,
+    pub fast_px_1e4: [i64; 12],
+    pub slow_px_1e4: [i64; 12],
+    pub eq_vol_5m_bps: [i64; 12],
+}
+
 #[derive(Clone, Debug)]
 pub enum VaultIoCommand {
     SaveOpenPositions(Box<OpenPositionsPersistTask>),
     RecordClosedTrade(Box<ClosedTradePersistTask>),
     RecordFundingSettlement(FundingSettlementPersistTask),
-    RecordQueueAbort(Box<QueueAbortRecord>),
+    RecordQueueAbort(QueueAbortRecord),
     RecordPositionPath(Box<PositionPathSummary>),
     SavePlasticityAudit(Box<PlasticityAuditSnapshot>),
     SaveDailyGovernor { ts_ns: i64, state: DailySessionGovernor },
-    SaveEmaPrewarm {
-        ts_ns: i64,
-        fast_px_1e4: [i64; 12],
-        slow_px_1e4: [i64; 12],
-        eq_vol_5m_bps: [i64; 12],
-    },
+    SaveEmaPrewarm(Box<EmaPrewarmPayload>),
     SaveObPlasticity { ts_ns: i64, bull_pm: [i64; 12], bear_pm: [i64; 12] },
     SaveMfePlasticity { ts_ns: i64, learned_mfe_bps: [i64; 12] },
     LatchTotalLossHalt {
@@ -243,7 +246,8 @@ pub enum VaultIoCommand {
     FlushBarrier(SyncSender<()>),
 }
 
-const _: () = assert!(core::mem::size_of::<VaultIoCommand>() <= 512);
+const _: () = assert!(core::mem::size_of::<QueueAbortRecord>() <= 88);
+const _: () = assert!(core::mem::size_of::<VaultIoCommand>() <= 256);
 
 /// Pure resolver returning `Some(root)` ONLY when `cwd` contains neither `data/vault` nor `Cargo.toml`,
 /// `exe_path` resides directly inside a `bin/` directory, and the parent of `bin/` (`root`) contains
@@ -542,7 +546,7 @@ pub fn persist_total_loss_halt_to_path_atomic(
     }
     let payload = serde_json::json!({
         "event": "TOTAL_LOSS_SHIELD_5USDT_HALT",
-        "version": "5.5.2",
+        "version": "5.5.3",
         "ts_ns": ts_ns,
         "anchor_equity_1e8": anchor_equity_1e8,
         "current_equity_1e8": current_equity_1e8,
@@ -582,10 +586,10 @@ fn handle_vault_io_cmd(
         VaultIoCommand::SaveDailyGovernor { ts_ns, state } => {
             let _ = save_daily_governor_to_path_atomic(Path::new(DAILY_GOVERNOR_VAULT_PATH), TimestampNs(ts_ns), &state);
         }
-        VaultIoCommand::SaveEmaPrewarm { ts_ns, fast_px_1e4, slow_px_1e4, eq_vol_5m_bps } => {
+        VaultIoCommand::SaveEmaPrewarm(pre) => {
             let payload = serde_json::json!({
-                "event": "EMA_PREWARM_V43", "ts_ns": ts_ns,
-                "ewma_fast_px_1e4": fast_px_1e4, "ewma_slow_px_1e4": slow_px_1e4, "eq_vol_5m_bps": eq_vol_5m_bps,
+                "event": "EMA_PREWARM_V43", "ts_ns": pre.ts_ns,
+                "ewma_fast_px_1e4": pre.fast_px_1e4, "ewma_slow_px_1e4": pre.slow_px_1e4, "eq_vol_5m_bps": pre.eq_vol_5m_bps,
             });
             if let Ok(s) = serde_json::to_string(&payload) {
                 let _ = atomic_write_bytes_sync(Path::new(EMA_PREWARM_PATH), s.as_bytes());
@@ -657,7 +661,7 @@ mod tests {
     #[test]
     fn test_atomic_write_tmp_rename_jsonl_fnv_and_zero_ns_lock_watch() {
         let cmd_bytes = std::hint::black_box(core::mem::size_of::<VaultIoCommand>());
-        assert!(cmd_bytes <= 512);
+        assert!(cmd_bytes <= 256);
         assert!(!is_catastrophic_loss_breach(-30_211_283, 6_543_090_000));
         assert!(is_catastrophic_loss_breach(-120_000_000, 6_543_090_000));
         let dir = std::env::temp_dir().join(format!("vortex_vault_io_v49_{}", std::process::id()));

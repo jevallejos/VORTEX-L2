@@ -5,7 +5,10 @@
     clippy::module_name_repetitions
 )]
 
-use crate::forensic_parquet::ColumnarParquetBatch;
+use crate::forensic_parquet::{
+    ColumnarParquetBatch, COLUMNAR_BATCH_CAP, PAR1_L3_ROW_BYTES, PAR1_LEGACY_V1_ROW_BYTES,
+    PAR2_LOSSLESS_ROW_BYTES, PAR2_MAGIC_HEADER, PARQUET_MAGIC_HEADER,
+};
 use crate::types::VortexError;
 
 pub const VPZ1_MAGIC: [u8; 4] = *b"VPZ1";
@@ -224,6 +227,51 @@ pub fn prune_cold_par2z_archive(archive_root: &Path, max_hourly_files: usize) ->
     removed
 }
 
+fn verify_segment_bytes_and_first_ts_ns(raw: &[u8]) -> Result<i64, VortexError> {
+    if raw.len() < 20 {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    let head = &raw[0..4];
+    let tail = &raw[raw.len() - 4..];
+    let is_par2 = if head == PAR2_MAGIC_HEADER && tail == PAR2_MAGIC_HEADER {
+        true
+    } else if head == PARQUET_MAGIC_HEADER && tail == PARQUET_MAGIC_HEADER {
+        false
+    } else {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    };
+    let payload_end = raw.len() - 12;
+    let mut c_bytes = [0_u8; 8];
+    c_bytes.copy_from_slice(&raw[payload_end..payload_end + 8]);
+    let stored_checksum = u64::from_le_bytes(c_bytes);
+    if stored_checksum != ColumnarParquetBatch::compute_fnv1a64(&raw[..payload_end]) {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    let n = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    if n > COLUMNAR_BATCH_CAP {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    let valid_len = if n == 0 {
+        raw.len() == 20
+    } else if is_par2 {
+        raw.len() == 8 + n * PAR2_LOSSLESS_ROW_BYTES + 12
+    } else {
+        raw.len() == 8 + n * PAR1_L3_ROW_BYTES + 12
+            || raw.len() == 8 + n * PAR1_LEGACY_V1_ROW_BYTES + 12
+    };
+    if !valid_len {
+        return Err(VortexError::ColumnarFormatCorrupted);
+    }
+    if n == 0 {
+        return Ok(0);
+    }
+    let mut ex_b = [0_u8; 8];
+    let mut loc_b = [0_u8; 8];
+    ex_b.copy_from_slice(&raw[20..28]);
+    loc_b.copy_from_slice(&raw[28..36]);
+    Ok(i64::from_le_bytes(loc_b).max(i64::from_le_bytes(ex_b)))
+}
+
 /// Archives one verified `.parquet` segment into `YYYY-MM-DD/vortex_par2_HH.par2z` before ring pruning,
 /// invoking rolling cold-archive pruning whenever a new hourly `.par2z` file is created or every 64 segments.
 ///
@@ -231,9 +279,8 @@ pub fn prune_cold_par2z_archive(archive_root: &Path, max_hourly_files: usize) ->
 /// Returns `VortexError` if segment verification or `.par2z` append fails.
 pub fn archive_parquet_segment_file(seg_path: &Path, archive_root: &Path) -> Result<PathBuf, VortexError> {
     static ARCHIVE_CALL_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let (batch, _) = ColumnarParquetBatch::read_from_file(seg_path)?;
     let raw = fs::read(seg_path).map_err(|_| VortexError::ColumnarIoFailure)?;
-    let ts_ns = batch.get_row(0).map_or(0, |r| r.ts_local_ns.0.max(r.ts_exchange_ns.0));
+    let ts_ns = verify_segment_bytes_and_first_ts_ns(&raw)?;
     let (y, m, d, hh) = utc_ymd_hour_from_ns(ts_ns);
     let day_dir = archive_root.join(format!("{y:04}-{m:02}-{d:02}"));
     fs::create_dir_all(&day_dir).map_err(|_| VortexError::ColumnarIoFailure)?;
@@ -248,6 +295,7 @@ pub fn archive_parquet_segment_file(seg_path: &Path, archive_root: &Path) -> Res
             .open(&target)
             .map_err(|_| VortexError::ColumnarIoFailure)?;
         f.write_all(&frame).map_err(|_| VortexError::ColumnarIoFailure)?;
+        f.sync_data().map_err(|_| VortexError::ColumnarIoFailure)?;
     }
     let call_n = ARCHIVE_CALL_SEQ
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
@@ -261,7 +309,7 @@ pub fn archive_parquet_segment_file(seg_path: &Path, archive_root: &Path) -> Res
     Ok(target)
 }
 
-/// Restores up to `max_segments` chronological segments from `.par2z` archives into `out_dir`.
+/// Restores up to `max_segments` most recent chronological segments from `.par2z` archives into `out_dir`.
 ///
 /// # Errors
 /// Returns `VortexError` on I/O failure or `FNV-1a` frame corruption.
@@ -276,7 +324,7 @@ pub fn restore_par2z_archive_to_dir(
         .filter(|p| p.is_dir())
         .collect();
     day_dirs.sort();
-    let mut restored = 0_usize;
+    let mut par2z_files: Vec<PathBuf> = Vec::new();
     for d_dir in day_dirs {
         let mut files: Vec<PathBuf> = fs::read_dir(&d_dir)
             .map_err(|_| VortexError::ColumnarIoFailure)?
@@ -284,16 +332,31 @@ pub fn restore_par2z_archive_to_dir(
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("par2z"))
             .collect();
         files.sort();
-        for p_file in files {
-            let bytes = fs::read(&p_file).map_err(|_| VortexError::ColumnarIoFailure)?;
-            for (seq, raw) in decode_vpz1_stream(&bytes)? {
-                let id = if seq > 0 { seq } else { restored as u64 + 1 };
-                let dst = out_dir.join(format!("vortex_l2_segment_{id:09}.parquet"));
-                fs::write(&dst, &raw).map_err(|_| VortexError::ColumnarIoFailure)?;
-                restored += 1;
-                if restored >= max_segments { return Ok(restored); }
-            }
+        par2z_files.extend(files);
+    }
+    let mut tail_chunks: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+    let mut collected_len = 0_usize;
+    for p_file in par2z_files.into_iter().rev() {
+        let bytes = fs::read(&p_file).map_err(|_| VortexError::ColumnarIoFailure)?;
+        let chunk = decode_vpz1_stream(&bytes)?;
+        collected_len = collected_len.saturating_add(chunk.len());
+        tail_chunks.push(chunk);
+        if collected_len >= max_segments {
+            break;
         }
+    }
+    tail_chunks.reverse();
+    let mut chronological: Vec<(u64, Vec<u8>)> = Vec::with_capacity(collected_len);
+    for chunk in tail_chunks {
+        chronological.extend(chunk);
+    }
+    let start = chronological.len().saturating_sub(max_segments);
+    let mut restored = 0_usize;
+    for (seq, raw) in &chronological[start..] {
+        let id = if *seq > 0 { *seq } else { restored as u64 + 1 };
+        let dst = out_dir.join(format!("vortex_l2_segment_{id:09}.parquet"));
+        fs::write(&dst, raw).map_err(|_| VortexError::ColumnarIoFailure)?;
+        restored += 1;
     }
     Ok(restored)
 }
@@ -421,6 +484,13 @@ mod tests {
         assert!(!rst_dir.join("vortex_l2_segment_000000003.parquet").exists());
         assert!(rst_dir.join("vortex_l2_segment_000000004.parquet").exists());
         assert!(rst_dir.join("vortex_l2_segment_000000015.parquet").exists());
+
+        let rst_tail3 = root.join("rst_tail3");
+        assert_eq!(restore_par2z_archive_to_dir(&arc_dir, &rst_tail3, 3), Ok(3));
+        assert!(!rst_tail3.join("vortex_l2_segment_000000012.parquet").exists());
+        assert!(rst_tail3.join("vortex_l2_segment_000000013.parquet").exists());
+        assert!(rst_tail3.join("vortex_l2_segment_000000014.parquet").exists());
+        assert!(rst_tail3.join("vortex_l2_segment_000000015.parquet").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

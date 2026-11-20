@@ -163,6 +163,9 @@ pub struct VerifiedCloseResolution {
     pub closed_lots: LotQty,
     pub legs_count: u32,
     pub exchange_closed_pnl_1e8: Option<i64>,
+    pub exact_fee_1e8: Option<i64>,
+    pub maker_closed_lots: LotQty,
+    pub taker_closed_lots: LotQty,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -408,6 +411,44 @@ pub fn compute_tranche1_split_lots_core(slot_idx: usize, open_lots: LotQty, exit
     }
 }
 
+/// Validates `SPLIT_LEG_MIN_NOTIONAL_1E8` on `T2` and `T3 = open_lots - t2_lots` without creating `1-lot` sub-notional dust orphans (`[F-10]`).
+#[inline]
+#[must_use]
+pub fn compute_tranche2_split_lots_core(
+    slot_idx: usize,
+    open_lots: LotQty,
+    exit_price: PriceTicks,
+) -> Option<LotQty> {
+    if open_lots.0 < 2 || exit_price.0 <= 0 {
+        return None;
+    }
+    let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let one_lot_1e8 = spec.lot_notional_1e8(LotQty(1), exit_price);
+    if one_lot_1e8 <= 0 {
+        return None;
+    }
+    let full_leg_lots = ((SPLIT_LEG_MIN_NOTIONAL_1E8 + one_lot_1e8 - 1) / one_lot_1e8).max(1);
+    let min_leg_lots = if open_lots.0 >= full_leg_lots.saturating_mul(2) {
+        full_leg_lots
+    } else if one_lot_1e8 >= SPLIT_LEG_MIN_NOTIONAL_1E8 {
+        1
+    } else {
+        2
+    };
+    if open_lots.0 < min_leg_lots.saturating_mul(2) {
+        return None;
+    }
+    let raw_t2 = ((INV_PHI * (open_lots.0 as f64)).round() as i64)
+        .clamp(min_leg_lots, open_lots.0 - min_leg_lots);
+    let t2_lots = LotQty(raw_t2);
+    let t3_lots = LotQty(open_lots.0 - t2_lots.0);
+    if t2_lots.0 < min_leg_lots || t3_lots.0 < min_leg_lots {
+        None
+    } else {
+        Some(t2_lots)
+    }
+}
+
 #[inline]
 pub fn compute_validated_sl_ticks_with_fees(
     side: Side,
@@ -522,12 +563,24 @@ fn parse_pnl_decimal_1e8(raw: &str) -> Option<i64> {
     i64::try_from(if neg { -mag } else { mag }).ok()
 }
 
+#[inline]
 #[must_use]
 pub fn reconcile_closed_pnl_core(
     ctx: &OpenExitContext,
     payload: &serde_json::Value,
     vac_level_hint: usize,
     allow_partial_lot_coverage: bool,
+) -> ClosedPnlQueryOutcome {
+    reconcile_closed_pnl_core_v553(ctx, payload, vac_level_hint, allow_partial_lot_coverage, false)
+}
+
+#[must_use]
+pub fn reconcile_closed_pnl_core_v553(
+    ctx: &OpenExitContext,
+    payload: &serde_json::Value,
+    vac_level_hint: usize,
+    allow_partial_lot_coverage: bool,
+    chandelier_profit_sl_armed: bool,
 ) -> ClosedPnlQueryOutcome {
     if payload.get("retCode").and_then(serde_json::Value::as_i64) != Some(0) {
         return ClosedPnlQueryOutcome::TransportOrApiError;
@@ -538,10 +591,16 @@ pub fn reconcile_closed_pnl_core(
     if list.is_empty() { return ClosedPnlQueryOutcome::PendingIndexerRetry; }
     let spec = APPROVED_SPECS[ctx.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
     let expected_sym = spec.symbol_id.name();
-    let expected_lots = if ctx.tranche1_harvested { ctx.initial_lots.0.max(ctx.open_lots.0).max(1) } else { ctx.open_lots.0.max(1) };
+    let expected_lots = if ctx.tranche1_harvested || ctx.tranche1_lots.0 > 0 {
+        ctx.initial_lots.0.max(ctx.open_lots.0).max(1)
+    } else {
+        ctx.open_lots.0.max(1)
+    };
     let min_ms = if ctx.opened_ts.0 >= MIN_VALID_UTC_EPOCH_NS { (ctx.opened_ts.0 / 1_000_000).saturating_sub(1_500) } else { 0 };
     let (mut acc_lots, mut w_en, mut w_ex, mut w_lots, mut sum_pnl, mut has_pnl, mut legs_count, mut saw_mkt_sl, mut saw_limit_exit) =
         (0_i64, 0_i128, 0_i128, 0_i128, 0_i64, false, 0_u32, false, false);
+    let (mut exact_fee_sum_1e8, mut typed_fee_lots, mut maker_lots_acc, mut taker_lots_acc) =
+        (0_i64, 0_i64, 0_i64, 0_i64);
     for row in list {
         if acc_lots >= expected_lots { break; }
         let r_sym = row.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -558,14 +617,41 @@ pub fn reconcile_closed_pnl_core(
         if let Some(p1e8) = pnl_opt { sum_pnl = sum_pnl.saturating_add(p1e8); has_pnl = true; }
         let ord_t = row.get("orderType").and_then(serde_json::Value::as_str).unwrap_or("");
         let exec_t = row.get("execType").and_then(serde_json::Value::as_str).unwrap_or("");
-        if ord_t.eq_ignore_ascii_case("Market") || exec_t.eq_ignore_ascii_case("BustTrade") || exec_t.eq_ignore_ascii_case("AdlTrade") {
+        let row_is_mkt = ord_t.eq_ignore_ascii_case("Market")
+            || exec_t.eq_ignore_ascii_case("BustTrade")
+            || exec_t.eq_ignore_ascii_case("AdlTrade");
+        let row_is_limit = ord_t.eq_ignore_ascii_case("Limit");
+        if row_is_mkt {
             saw_mkt_sl = true;
         }
-        if ord_t.eq_ignore_ascii_case("Limit") {
+        if row_is_limit {
             saw_limit_exit = true;
         }
-        let eff_q = q_lots.0.max(1);
-        if q_lots.0 > 0 { acc_lots = acc_lots.saturating_add(q_lots.0); }
+        let rem_cap = (expected_lots - acc_lots).max(1);
+        let eff_q = if q_lots.0 > 0 { q_lots.0.min(rem_cap) } else { 1 };
+        if q_lots.0 > 0 { acc_lots = acc_lots.saturating_add(eff_q); }
+        if row_is_mkt || row_is_limit {
+            let leg_en = en_opt.unwrap_or_else(|| ctx.avg_price_ticks.max(PriceTicks(1)));
+            let leg_ex = ex_opt.unwrap_or_else(|| {
+                if row_is_mkt {
+                    if ctx.last_eff_sl_ticks.0 > 0 { ctx.last_eff_sl_ticks } else { ctx.sl_trigger_price.max(leg_en) }
+                } else if ctx.resting_exit_price.0 > 0 {
+                    ctx.resting_exit_price
+                } else {
+                    defensive_zero_loss_maker_exit_price_with_fees(ctx.side, leg_en, ctx.active_fees)
+                }
+            });
+            let (_, leg_fee_1e8, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+                ctx.side, LotQty(eff_q), leg_en, leg_ex, !row_is_mkt, ctx.active_fees,
+            );
+            exact_fee_sum_1e8 = exact_fee_sum_1e8.saturating_add(leg_fee_1e8);
+            typed_fee_lots = typed_fee_lots.saturating_add(eff_q);
+            if row_is_mkt {
+                taker_lots_acc = taker_lots_acc.saturating_add(eff_q);
+            } else {
+                maker_lots_acc = maker_lots_acc.saturating_add(eff_q);
+            }
+        }
         if let (Some(en_px), Some(ex_px)) = (en_opt, ex_opt) {
             w_en += (eff_q as i128) * (en_px.0 as i128);
             w_ex += (eff_q as i128) * (ex_px.0 as i128);
@@ -588,12 +674,21 @@ pub fn reconcile_closed_pnl_core(
         defensive_zero_loss_maker_exit_price_with_fees(ctx.side, verified_entry_price, ctx.active_fees)
     };
     let rt_mkr = ctx.active_fees.round_trip_maker_exit_bps().raw();
+    let rt_tkr = ctx.active_fees.round_trip_taker_exit_bps().raw();
+    let eff_rt_bps = if typed_fee_lots > 0 {
+        (((maker_lots_acc as i128) * (rt_mkr as i128) + (taker_lots_acc as i128) * (rt_tkr as i128))
+            / (typed_fee_lots as i128)) as i64
+    } else if saw_mkt_sl {
+        rt_tkr
+    } else {
+        rt_mkr
+    };
     let notional_1e8 = spec.lot_notional_1e8(final_lots, verified_entry_price).max(1);
     let est_net_bps = if has_pnl {
         ((sum_pnl as i128 * 1_000_000) / (notional_1e8 as i128)) as i64
     } else {
         ((verified_exit_price.0 - verified_entry_price.0).saturating_mul(ctx.side.sign_i64()).saturating_mul(1_000_000))
-            / verified_entry_price.0.max(1) - rt_mkr
+            / verified_entry_price.0.max(1) - eff_rt_bps
     };
     let kind = if saw_mkt_sl {
         ClosedTradeKind::ServerMarkPriceStopLoss
@@ -605,7 +700,7 @@ pub fn reconcile_closed_pnl_core(
             ctx.active_fees,
         )
         .raw() as f64;
-        let endo_tkr_cut = -((PHI * (ctx.active_fees.round_trip_taker_exit_bps().raw().max(50) as f64))
+        let endo_tkr_cut = -((PHI * (rt_tkr.max(50) as f64))
             .max(INV_PHI_SQ * sl_ref)
             .round() as i64);
         if est_net_bps <= endo_tkr_cut {
@@ -616,39 +711,70 @@ pub fn reconcile_closed_pnl_core(
     };
     let sub_reason = match kind {
         ClosedTradeKind::ServerMarkPriceStopLoss => {
-            if est_net_bps > 0 || is_chandelier_profit_locked_sl_with_fees(ctx.side, verified_entry_price, verified_exit_price, ctx.active_fees) {
+            if chandelier_profit_sl_armed {
                 ExitSubReason::ChandelierProfitLockSl
             } else {
                 ExitSubReason::WaldBaseStopLoss
             }
         }
         ClosedTradeKind::MakerPassiveUnwind => classify_maker_exit_sub_reason_with_fees(
-            est_net_bps.saturating_add(rt_mkr), vac_level_hint, ctx.tranche1_harvested, false, false, ctx.active_fees,
+            est_net_bps.saturating_add(eff_rt_bps), vac_level_hint, ctx.tranche1_harvested, false, false, ctx.active_fees,
         ),
+    };
+    let exact_fee_1e8 = if typed_fee_lots >= final_lots.0 && final_lots.0 > 0 {
+        Some(exact_fee_sum_1e8)
+    } else {
+        None
     };
     ClosedPnlQueryOutcome::Verified(VerifiedCloseResolution {
         kind, sub_reason, verified_entry_price, verified_exit_price,
         closed_lots: final_lots, legs_count, exchange_closed_pnl_1e8: if has_pnl { Some(sum_pnl) } else { None },
+        exact_fee_1e8, maker_closed_lots: LotQty(maker_lots_acc), taker_closed_lots: LotQty(taker_lots_acc),
     })
 }
 
+#[inline]
 #[must_use]
-pub fn resolve_fallback_unverified_close_core(ctx: &OpenExitContext, snap: &SymbolLobSnapshot, vac_level_hint: usize) -> VerifiedCloseResolution {
+pub fn resolve_fallback_unverified_close_core(
+    ctx: &OpenExitContext,
+    snap: &SymbolLobSnapshot,
+    vac_level_hint: usize,
+) -> VerifiedCloseResolution {
+    resolve_fallback_unverified_close_core_v553(ctx, snap, vac_level_hint, false)
+}
+
+#[must_use]
+pub fn resolve_fallback_unverified_close_core_v553(
+    ctx: &OpenExitContext,
+    snap: &SymbolLobSnapshot,
+    vac_level_hint: usize,
+    chandelier_profit_sl_armed: bool,
+) -> VerifiedCloseResolution {
     let en_px = ctx.avg_price_ticks.max(PriceTicks(1));
     let eff_sl = if ctx.last_eff_sl_ticks.0 > 0 { ctx.last_eff_sl_ticks } else { ctx.sl_trigger_price };
     let ref_mk = if snap.mark_price.0 > 0 { snap.mark_price } else { en_px };
     let sl_crossed = eff_sl.0 > 0 && match ctx.side { Side::Bid => ref_mk.0 <= eff_sl.0, Side::Ask => ref_mk.0 >= eff_sl.0 };
-    let tot_lots = LotQty(if ctx.tranche1_harvested { ctx.initial_lots.0.max(ctx.open_lots.0).max(1) } else { ctx.open_lots.0.max(1) });
+    let tot_lots = LotQty(if ctx.tranche1_harvested || ctx.tranche1_lots.0 > 0 {
+        ctx.initial_lots.0.max(ctx.open_lots.0).max(1)
+    } else {
+        ctx.open_lots.0.max(1)
+    });
     if sl_crossed {
-        let sl_reason = if is_chandelier_profit_locked_sl_with_fees(ctx.side, en_px, eff_sl, ctx.active_fees) {
+        let sl_reason = if chandelier_profit_sl_armed {
             ExitSubReason::ChandelierProfitLockSl
         } else {
             ExitSubReason::WaldBaseStopLoss
         };
+        let mkr_l = if ctx.tranche1_harvested || ctx.tranche1_lots.0 > 0 {
+            (tot_lots.0 - ctx.open_lots.0.max(1)).max(0)
+        } else {
+            0
+        };
         return VerifiedCloseResolution {
             kind: ClosedTradeKind::ServerMarkPriceStopLoss, sub_reason: sl_reason,
             verified_entry_price: en_px, verified_exit_price: eff_sl, closed_lots: tot_lots,
-            legs_count: if ctx.tranche1_harvested { 2 } else { 1 }, exchange_closed_pnl_1e8: None,
+            legs_count: if mkr_l > 0 { 2 } else { 1 }, exchange_closed_pnl_1e8: None,
+            exact_fee_1e8: None, maker_closed_lots: LotQty(mkr_l), taker_closed_lots: LotQty((tot_lots.0 - mkr_l).max(1)),
         };
     }
     let fb_exit = if ctx.resting_exit_price.0 > 0 {
@@ -666,6 +792,7 @@ pub fn resolve_fallback_unverified_close_core(ctx: &OpenExitContext, snap: &Symb
         sub_reason: classify_maker_exit_sub_reason_with_fees(gross_bps, vac_level_hint, ctx.tranche1_harvested, w_obs.climax_active, aligned_fib, ctx.active_fees),
         verified_entry_price: en_px, verified_exit_price: fb_exit, closed_lots: tot_lots,
         legs_count: if ctx.tranche1_harvested { 2 } else { 1 }, exchange_closed_pnl_1e8: None,
+        exact_fee_1e8: None, maker_closed_lots: tot_lots, taker_closed_lots: LotQty(0),
     }
 }
 
@@ -1283,11 +1410,12 @@ pub fn compute_canonical_exit_quote_omega_v55(
             );
             let final_tick_gap = (target_price.0 - t2_px.0).saturating_mul(d_sign);
             let final_sbps_gap = (final_tick_gap.saturating_mul(1_000_000)) / avg_denom;
-            if final_tick_gap >= 2 && final_sbps_gap >= min_ext_sbps {
-                let t2_lots = LotQty(
-                    ((INV_PHI * (ctx.open_lots.0 as f64)).round() as i64)
-                        .clamp(1, ctx.open_lots.0 - 1),
-                );
+            let opt_t2_lots = if final_tick_gap >= 2 && final_sbps_gap >= min_ext_sbps {
+                compute_tranche2_split_lots_core(ctx.slot_idx, ctx.open_lots, t2_px)
+            } else {
+                None
+            };
+            if let Some(t2_lots) = opt_t2_lots {
                 return Some(CanonicalExitQuote {
                     role: ExitOrderRole::Tranche2HarvestPhi,
                     target_price: t2_px,

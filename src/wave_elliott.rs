@@ -1,5 +1,6 @@
 //! Causal 6-Pivot Elliott Wave v2.0 Automaton, Endogenous Liquidation Floor & C1 Hermite Surface (V4.8).
 #![allow(
+    clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::manual_clamp,
     clippy::manual_range_contains,
@@ -14,6 +15,9 @@ const PHI: f64 = 1.618_033_988_749_895;
 const PHI_SQ: f64 = 2.618_033_988_749_895;
 const PHI_CU: f64 = 4.236_067_977_499_79;
 const INV_PHI: f64 = 0.618_033_988_749_895;
+const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
+const INV_PHI_CUBE: f64 = 0.236_067_977_499_790;
+const INV_PHI_FOURTH: f64 = 0.145_898_033_750_315;
 const GP_STRICT_HI: f64 = 0.650;
 const GP_CENTER: f64 = f64::midpoint(INV_PHI, GP_STRICT_HI);
 const GP_HALF_WIDTH: f64 = 0.5 * (GP_STRICT_HI - INV_PHI);
@@ -476,7 +480,7 @@ impl CausalElliottWaveState {
         }
     }
 
-    fn update_hurst_vr(&mut self, px: PriceTicks, ts_ns: i64) -> f64 {
+    fn update_hurst_vr(&mut self, spec: PairSpec, px: PriceTicks, ts_ns: i64) -> f64 {
         if self.last_var_sample_px.0 <= 0 {
             self.last_var_sample_px = px;
             self.last_var_sample_ts_ns = ts_ns;
@@ -487,17 +491,24 @@ impl CausalElliottWaveState {
             return self.cached_obs.hurst_exponent();
         }
         let prev = self.last_var_sample_px.0.max(1) as f64;
-        let ret_bps = (((px.0 - self.last_var_sample_px.0) as f64) * 10_000.0) / prev;
+        let raw_ret_bps = (((px.0 - self.last_var_sample_px.0) as f64) * 10_000.0) / prev;
+        let ret_bps = if raw_ret_bps.abs() < 1e-6 { 0.0 } else { raw_ret_bps };
         self.last_var_sample_px = px;
         self.last_var_sample_ts_ns = ts_ns;
-        if ret_bps.abs() < 1e-6 { return self.cached_obs.hurst_exponent(); }
         let idx = (self.ring_idx as usize) & 3;
         self.ring_ret4_bps[idx] = ret_bps;
         self.ring_idx = self.ring_idx.wrapping_add(1);
         let sum4 = self.ring_ret4_bps[0] + self.ring_ret4_bps[1] + self.ring_ret4_bps[2] + self.ring_ret4_bps[3];
-        self.ewma_var1_bps2 = 0.92 * self.ewma_var1_bps2 + 0.08 * (ret_bps * ret_bps).clamp(0.01, 250_000.0);
-        self.ewma_var4_bps2 = 0.92 * self.ewma_var4_bps2 + 0.08 * (sum4 * sum4).clamp(0.04, 1_000_000.0);
-        let vr4 = (self.ewma_var4_bps2 / (4.0 * self.ewma_var1_bps2).max(0.04)).clamp(0.35, 2.65);
+        let tau_tick_bps = spec
+            .tick_to_price_scaled_bps(px)
+            .map_or(0.50, |s| (s.raw().max(1) as f64) * 0.01)
+            .max(10_000.0 / prev);
+        let min_var1_bps2 = (INV_PHI_CUBE * tau_tick_bps).powi(2).max(0.01);
+        self.ewma_var1_bps2 = 0.92 * self.ewma_var1_bps2 + 0.08 * (ret_bps * ret_bps).clamp(0.0, 250_000.0);
+        self.ewma_var4_bps2 = 0.92 * self.ewma_var4_bps2 + 0.08 * (sum4 * sum4).clamp(0.0, 1_000_000.0);
+        let vr4 = ((self.ewma_var4_bps2 + 4.0 * min_var1_bps2)
+            / (4.0 * (self.ewma_var1_bps2 + min_var1_bps2)).max(0.04))
+            .clamp(0.35, 2.65);
         (0.50 + vr4.ln() / (2.0 * 4.0_f64.ln())).clamp(0.25, 0.85)
     }
 
@@ -637,7 +648,7 @@ impl CausalElliottWaveState {
         self.ensure_floor_seeded(spec, mid_px);
         self.last_mid_px = mid_px;
         self.decay_liquidation_state(ts_ns);
-        let h_val = self.update_hurst_vr(mid_px, ts_ns);
+        let h_val = self.update_hurst_vr(spec, mid_px, ts_ns);
         self.step_zigzag(spec, mid_px, ts_ns, realized_vol_5m);
         self.recompute_observables(h_val)
     }
@@ -810,9 +821,22 @@ impl CausalElliottWaveState {
                 def_horizon_permille_mult: 900, tranche1_permille_delta: 50, fib_target_bps: ScaledBps(0),
             }),
             WaveRegime::CorrectiveAbc => {
-                if signed_phase < -0.35 && btc_signed_snr < 0.15 { Err("VETO_WAVE_ABC_STRUCTURAL_HEADWIND") } else {
-                    Ok(WaveEntryModulation { snr_threshold_delta: if signed_phase < 0.0 { 0.025 } else { 0.0 }, def_horizon_permille_mult: 880, tranche1_permille_delta: 60, fib_target_bps: ScaledBps(0) })
-                }
+                let s_neg_phase = hermite_smoothstep_c1(-signed_phase, 0.0, INV_PHI_FOURTH);
+                let s_phase_headwind =
+                    hermite_smoothstep_c1(-signed_phase, INV_PHI_FOURTH, INV_PHI_SQ);
+                let s_btc_unsup =
+                    1.0 - hermite_smoothstep_c1(btc_signed_snr, INV_PHI_FOURTH, INV_PHI_SQ);
+                let s_headwind = s_phase_headwind * s_btc_unsup;
+                let snr_delta = INV_PHI_FOURTH * INV_PHI_FOURTH * s_neg_phase
+                    + INV_PHI_FOURTH * s_headwind;
+                let horizon_drag = (1_000.0 * INV_PHI_FOURTH * INV_PHI * s_headwind).round() as i64;
+                let t1_boost = (1_000.0 * INV_PHI_FOURTH * INV_PHI_SQ * s_headwind).round() as i64;
+                Ok(WaveEntryModulation {
+                    snr_threshold_delta: snr_delta,
+                    def_horizon_permille_mult: 880 - horizon_drag,
+                    tranche1_permille_delta: 60 + t1_boost,
+                    fib_target_bps: ScaledBps(0),
+                })
             }
         }
     }

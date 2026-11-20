@@ -164,7 +164,8 @@ pub fn serialize_open_positions_state(
             initial_lots, open_lots, tranche1_harvested, tranche1_lots, tranche1_exit_price,
             defensive_floor_locked, structural_tp_price, resting_exit_price, sl_trigger_price, opened_ts, ..
         } = eng.state {
-            let ef = entry_forensics[eng.slot_idx];
+            let safe_idx = eng.slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+            let ef = entry_forensics[safe_idx];
             arr.push(serde_json::json!({
                 "slot_idx": eng.slot_idx, "side": if matches!(side, Side::Ask) { "Ask" } else { "Bid" },
                 "entry_ticks": entry_price.0, "avg_ticks": avg_price_ticks.0,
@@ -200,7 +201,8 @@ pub fn dispatch_open_positions_state(
             engines: engines.clone(),
             entry_forensics: *entry_forensics,
         }));
-        if tx.try_send(cmd).is_ok() { return; }
+        let _ = tx.try_send(cmd);
+        return;
     }
     if let Some(txt) = serialize_open_positions_state(engines, entry_forensics) {
         let _ = atomic_write_bytes_sync(Path::new(OPEN_POS_STATE_PATH), txt.as_bytes());
@@ -230,29 +232,36 @@ pub fn restore_entry_forensics_from_json(saved: &serde_json::Value, opened_ns: i
     }
 }
 
-pub fn record_and_notify_entry_fill(
+#[allow(clippy::too_many_arguments)]
+pub fn record_and_notify_entry_fill_opt(
     s_idx: usize, spec: PairSpec, engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
     entry_forensics: &[SlotForensicEntrySnapshot; MAX_ACTIVE_PAIRS], arena: &VortexShmArena,
-    tg_tx: &SyncSender<String>, vault_tx: &SyncSender<VaultIoCommand>, now_ns: TimestampNs,
+    tg_tx: Option<&SyncSender<String>>, vault_tx: &SyncSender<VaultIoCommand>, now_ns: TimestampNs,
     eff_side: Side, eff_entry_px: PriceTicks, eff_qty: LotQty, tag: &str,
 ) {
-    let entry_f = &entry_forensics[s_idx];
+    use core::fmt::Write as _;
+    let idx = s_idx.min(MAX_ACTIVE_PAIRS - 1);
     arena.exec_fill_count.fetch_add(1, Ordering::Relaxed);
-    engines[s_idx].sync_to_shm_telemetry(arena);
+    engines[idx].sync_to_shm_telemetry(arena);
     dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
+    let Some(tx) = tg_tx else {
+        return;
+    };
+    let entry_f = &entry_forensics[idx];
     let sym_name = spec.symbol_id.name();
     let (en_w, en_f) = spec.format_price_usdt_parts(eff_entry_px);
-    let eff_win_floor = compute_elastic_offensive_win_floor_bps(engines[s_idx].active_maker_rt_fee_bps(), engines[s_idx].open_vol_5m_bps);
+    let eff_win_floor = compute_elastic_offensive_win_floor_bps(
+        engines[idx].active_maker_rt_fee_bps(),
+        engines[idx].open_vol_5m_bps,
+    );
     let win_fl_t = dynamic_maker_floor_price(eff_side, eff_entry_px, eff_win_floor);
     let (tp_w, tp_f) = spec.format_price_usdt_parts(win_fl_t);
-    let (sl_w, sl_f) = spec.format_price_usdt_parts(engines[s_idx].last_eff_sl_ticks);
+    let (sl_w, sl_f) = spec.format_price_usdt_parts(engines[idx].last_eff_sl_ticks);
     let q_ms = (now_ns.0.saturating_sub(entry_f.armed_ts_ns)).max(0) / 1_000_000;
     let qty_s = spec.format_lot_qty_str(eff_qty);
-    println!(
-        "{ANSI_YELLOW}\u{1f7e1} [{tag}] {sym_name} {eff_side:?} qty={qty_s} filled passively @ {en_w}.{en_f:04} USDT ({}t | WIN_TP: {tp_w}.{tp_f:04} | SL: {sl_w}.{sl_f:04} | Wait: {q_ms}ms){ANSI_RESET}",
-        eff_entry_px.0
-    );
-    let _ = tg_tx.try_send(format!(
+    let mut msg = String::with_capacity(280);
+    let _ = write!(
+        msg,
         concat!(
             "\u{1f7e1} [VORTEX-OMEGA V5.5 {}]\n",
             "\u{2022} Par y Lado : {} ({:?}) | Lote: {}\n",
@@ -262,7 +271,21 @@ pub fn record_and_notify_entry_fill(
         ),
         tag, sym_name, eff_side, qty_s, en_w, en_f, eff_entry_px.0, q_ms, tp_w, tp_f,
         sl_w, sl_f, entry_f.ofi_in, entry_f.tfi_in, entry_f.geom_in, entry_f.snr_in, entry_f.vol5m_in
-    ));
+    );
+    let _ = tx.try_send(msg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_and_notify_entry_fill(
+    s_idx: usize, spec: PairSpec, engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
+    entry_forensics: &[SlotForensicEntrySnapshot; MAX_ACTIVE_PAIRS], arena: &VortexShmArena,
+    tg_tx: &SyncSender<String>, vault_tx: &SyncSender<VaultIoCommand>, now_ns: TimestampNs,
+    eff_side: Side, eff_entry_px: PriceTicks, eff_qty: LotQty, tag: &str,
+) {
+    record_and_notify_entry_fill_opt(
+        s_idx, spec, engines, entry_forensics, arena, Some(tg_tx), vault_tx, now_ns,
+        eff_side, eff_entry_px, eff_qty, tag,
+    );
 }
 
 #[must_use]
@@ -278,9 +301,8 @@ pub fn extract_vault_row_pnl_and_fee_1e8(
     ) {
         return (pnl, fee, en_t);
     }
-    if let Some(s_idx) = s_idx_opt {
+    if let Some(&spec) = s_idx_opt.and_then(|idx| APPROVED_SPECS.get(idx)) {
         if en_t.0 > 0 && ex_t.0 > 0 {
-            let spec = APPROVED_SPECS[s_idx];
             let lots_raw = v.get("closed_lots").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let lots = if lots_raw > 0 {
                 LotQty(lots_raw)
@@ -705,17 +727,23 @@ pub fn dispatch_closed_trade_logs_with_locks(
         *halt_locked = true;
         if let Some(lw) = locks_opt { lw.latch_halt_in_ram(); }
     }
+    let safe_slot = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
     let task = Box::new(ClosedTradePersistTask {
-        slot_idx, summary: *summary, eng: eng.clone(), entry_forensics: *entry_f,
+        slot_idx: safe_slot, summary: *summary, eng: eng.clone(), entry_forensics: *entry_f,
         exit_snap: *exit_snap, ledger: *ledger, gov: gov.clone(),
         markout_curve: *markout_curve, lvr_5s_scaled_bps, is_catastrophic_halt, ts_ns,
     });
-    if let Err(mpsc::TrySendError::Full(cmd) | mpsc::TrySendError::Disconnected(cmd)) =
-        vault_tx.try_send(VaultIoCommand::RecordClosedTrade(task))
-    {
-        if let VaultIoCommand::RecordClosedTrade(fb_task) = cmd {
+    match vault_tx.try_send(VaultIoCommand::RecordClosedTrade(task)) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(VaultIoCommand::RecordClosedTrade(fb_task))) => {
+            thread::spawn(move || {
+                crate::vault_io::persist_closed_trade_bundle_sync(&fb_task, None);
+            });
+        }
+        Err(mpsc::TrySendError::Disconnected(VaultIoCommand::RecordClosedTrade(fb_task))) => {
             crate::vault_io::persist_closed_trade_bundle_sync(&fb_task, locks_opt);
         }
+        Err(_) => {}
     }
 }
 
@@ -1000,8 +1028,9 @@ impl ScalingSemaphoreReport {
 }
 
 #[must_use]
-pub fn evaluate_capital_scaling_semaphore(
-    vault_path: &Path,
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_capital_scaling_semaphore_from_rows(
+    rows: &[serde_json::Value],
     wallet_1e8: i64,
     vault_locked_bps_x100: i64,
     global_mkr_pct: f64,
@@ -1017,67 +1046,65 @@ pub fn evaluate_capital_scaling_semaphore(
     let mut v48_loss_1e8 = 0_i64;
     let mut catastrophic_breaches = 0_usize;
     let mut v48_days_set = BTreeSet::new();
-    type DailyCashflowSample = (i64, i64, bool, bool, bool); let mut day_events: BTreeMap<i64, Vec<DailyCashflowSample>> = BTreeMap::new();
+    type DailyCashflowSample = (i64, i64, bool, bool, bool);
+    let mut day_events: BTreeMap<i64, Vec<DailyCashflowSample>> = BTreeMap::new();
     if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY {
         v48_days_set.insert(live_dg.utc_day_idx);
     }
     let def_fee_f = (fees.round_trip_maker_exit_bps().raw() as f64) / 100.0;
     let mut sim_ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
     sim_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
-    if let Ok(file) = File::open(vault_path) {
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
-            let is_v48 = matches!(
-                v.get("schema").and_then(serde_json::Value::as_str),
-                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5" | "V5.5.1" | "V5.5.2")
-            );
-            match v.get("event").and_then(serde_json::Value::as_str) {
-                Some("EPOCH_RESET") => {
-                    v48_trades = 0; v48_maker_closes = 0; v48_profit_1e8 = 0; v48_loss_1e8 = 0; catastrophic_breaches = 0;
-                    v48_days_set.clear(); day_events.clear();
-                    if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY { v48_days_set.insert(live_dg.utc_day_idx); }
-                    let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
-                    sim_ledger = ParitySyncLedger::new(eq_a);
-                    sim_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
-                }
-                Some("TRADE_CLOSE") => {
-                    let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("UNKNOWN");
-                    let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-                    let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                    let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(def_fee_f);
-                    let mkr = v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
-                    let net_sc = ScaledBps((n_bps * 100.0).round() as i64);
-                    let fee_sc = ScaledBps((f_bps * 100.0).round() as i64);
-                    let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(&v, slot_from_symbol_name(sym), side_from_str(side_s), net_sc, fee_sc, fees);
-                    let eq_before = sim_ledger.current_equity_1e8();
-                    sim_ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
-                    if is_v48 {
-                        v48_trades += 1;
-                        if mkr { v48_maker_closes += 1; }
-                        if pnl_1e8 >= 0 { v48_profit_1e8 = v48_profit_1e8.saturating_add(pnl_1e8); }
-                        else { v48_loss_1e8 = v48_loss_1e8.saturating_add(pnl_1e8.abs()); }
-                        if u_day > 0 { v48_days_set.insert(u_day); }
-                    }
-                    if u_day >= V48_INCEPTION_UTC_DAY {
-                        if is_catastrophic_loss_breach(pnl_1e8, eq_before) { catastrophic_breaches += 1; }
-                        day_events.entry(u_day).or_default().push((ts, pnl_1e8, true, n_bps >= 1.0, n_bps < -0.50));
-                    }
-                }
-                Some("FUNDING_SETTLEMENT") => {
-                    let f_1e8 = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    let n_1e8 = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
-                    if f_1e8 != 0 {
-                        sim_ledger.record_funding_settlement(f_1e8, n_1e8);
-                        if is_v48 && u_day > 0 { v48_days_set.insert(u_day); }
-                        if u_day >= V48_INCEPTION_UTC_DAY {
-                            day_events.entry(u_day).or_default().push((ts, f_1e8, false, false, false));
-                        }
-                    }
-                }
-                _ => {}
+    for v in rows {
+        let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
+        let is_v48 = matches!(
+            v.get("schema").and_then(serde_json::Value::as_str),
+            Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5" | "V5.5.1" | "V5.5.2" | "V5.5.3")
+        );
+        match v.get("event").and_then(serde_json::Value::as_str) {
+            Some("EPOCH_RESET") => {
+                v48_trades = 0; v48_maker_closes = 0; v48_profit_1e8 = 0; v48_loss_1e8 = 0; catastrophic_breaches = 0;
+                v48_days_set.clear(); day_events.clear();
+                if live_dg.utc_day_idx >= V48_INCEPTION_UTC_DAY { v48_days_set.insert(live_dg.utc_day_idx); }
+                let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
+                sim_ledger = ParitySyncLedger::new(eq_a);
+                sim_ledger.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
             }
+            Some("TRADE_CLOSE") => {
+                let sym = v.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("UNKNOWN");
+                let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(def_fee_f);
+                let mkr = v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let net_sc = ScaledBps((n_bps * 100.0).round() as i64);
+                let fee_sc = ScaledBps((f_bps * 100.0).round() as i64);
+                let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(v, slot_from_symbol_name(sym), side_from_str(side_s), net_sc, fee_sc, fees);
+                let eq_before = sim_ledger.current_equity_1e8();
+                sim_ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
+                if is_v48 {
+                    v48_trades += 1;
+                    if mkr { v48_maker_closes += 1; }
+                    if pnl_1e8 >= 0 { v48_profit_1e8 = v48_profit_1e8.saturating_add(pnl_1e8); }
+                    else { v48_loss_1e8 = v48_loss_1e8.saturating_add(pnl_1e8.abs()); }
+                    if u_day > 0 { v48_days_set.insert(u_day); }
+                }
+                if u_day >= V48_INCEPTION_UTC_DAY {
+                    if is_catastrophic_loss_breach(pnl_1e8, eq_before) { catastrophic_breaches += 1; }
+                    day_events.entry(u_day).or_default().push((ts, pnl_1e8, true, n_bps >= 1.0, n_bps < -0.50));
+                }
+            }
+            Some("FUNDING_SETTLEMENT") => {
+                let f_1e8 = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let n_1e8 = v.get("notional_1e8").and_then(serde_json::Value::as_i64).unwrap_or(FALLBACK_NOTIONAL_1E8);
+                if f_1e8 != 0 {
+                    sim_ledger.record_funding_settlement(f_1e8, n_1e8);
+                    if is_v48 && u_day > 0 { v48_days_set.insert(u_day); }
+                    if u_day >= V48_INCEPTION_UTC_DAY {
+                        day_events.entry(u_day).or_default().push((ts, f_1e8, false, false, false));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     let mut defended_set = BTreeSet::new();
@@ -1112,6 +1139,38 @@ pub fn evaluate_capital_scaling_semaphore(
         wallet_usdt: (wallet_1e8 as f64) / 100_000_000.0, vault_70_ok, defended_days,
         catastrophic_breaches, parity_drift_1e8, halt_active, gate1_ok, gate2_ok, gate3_ok, gate4_ok, gates_passed,
     }
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_capital_scaling_semaphore(
+    vault_path: &Path,
+    wallet_1e8: i64,
+    vault_locked_bps_x100: i64,
+    global_mkr_pct: f64,
+    parity_drift_1e8: i64,
+    halt_active: bool,
+    live_dg: &DailySessionGovernor,
+    fees: FeeSchedule,
+) -> ScalingSemaphoreReport {
+    let rows: Vec<serde_json::Value> = match File::open(vault_path) {
+        Ok(file) => BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|ln| serde_json::from_str::<serde_json::Value>(&ln).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    evaluate_capital_scaling_semaphore_from_rows(
+        &rows,
+        wallet_1e8,
+        vault_locked_bps_x100,
+        global_mkr_pct,
+        parity_drift_1e8,
+        halt_active,
+        live_dg,
+        fees,
+    )
 }
 // === VORTEX_V48_DASHBOARD_SPLIT_ANCHOR ===
 

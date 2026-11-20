@@ -13,6 +13,8 @@ RestartSec=3
 Nice=19
 IOSchedulingClass=idle
 OOMScoreAdjust=200
+MemoryMax=128M
+LimitNOFILE=4096
 NoNewPrivileges=true
 
 [Install]

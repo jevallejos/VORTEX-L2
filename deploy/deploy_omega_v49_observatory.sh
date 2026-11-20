@@ -128,7 +128,7 @@ sudo systemctl enable vortex-tap.service vortex-exec.service vortex-web.service 
 
 echo "=== [5/6] RECREACION LIMPIA SHM v15 + ARRANQUE 3 DEMONIOS ==="
 rm -f /dev/shm/vortex_lob.mmap
-rm -f "$VAULT_DIR/DRAIN_MODE.lock" "$VAULT_DIR/HALTED_ON_LOSS.lock"
+rm -f "$VAULT_DIR/DRAIN_MODE.lock"
 
 sudo systemctl start vortex-tap.service || exit 1
 echo "Hidratando SHM v15 + VKL1 (1s..1d) + Elliott C1 + [OB+, OB-]..."

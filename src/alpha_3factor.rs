@@ -75,6 +75,8 @@ pub struct OrthogonalFactorState {
     learned_l1_depth_lots: f64,
     learned_trade_lots: f64,
     learned_flow_lots: f64,
+    fast_ewma_events: f64,
+    eq_ewma_events: f64,
     spoof_density_ewma: f64,
     last_ofi: BoundedScore,
     last_tfi: BoundedScore,
@@ -113,6 +115,8 @@ impl OrthogonalFactorState {
             learned_l1_depth_lots: 0.0,
             learned_trade_lots: 0.0,
             learned_flow_lots: 0.0,
+            fast_ewma_events: V45_SEED_RATE_HZ * V45_FAST_RATE_TAU_SECS,
+            eq_ewma_events: V45_SEED_RATE_HZ * V45_EQ_RATE_TAU_SECS,
             spoof_density_ewma: 0.0,
             last_ofi: BoundedScore::ZERO,
             last_tfi: BoundedScore::ZERO,
@@ -124,6 +128,15 @@ impl OrthogonalFactorState {
     #[must_use]
     pub const fn spoofing_density(&self) -> f64 {
         self.spoof_density_ewma
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn event_clock_dilation(&self) -> f64 {
+        (((self.fast_ewma_events / V45_FAST_RATE_TAU_SECS).max(0.05))
+            / ((self.eq_ewma_events / V45_EQ_RATE_TAU_SECS).max(1.0)))
+        .sqrt()
+        .clamp(V45_INV_PHI, V45_PHI)
     }
 
     #[inline]
@@ -144,6 +157,8 @@ impl OrthogonalFactorState {
         self.ofi_pos_slow = 1.0;
         self.ofi_neg_slow = 1.0;
         self.learned_l1_depth_lots = 0.0;
+        self.fast_ewma_events = V45_SEED_RATE_HZ * V45_FAST_RATE_TAU_SECS;
+        self.eq_ewma_events = V45_SEED_RATE_HZ * V45_EQ_RATE_TAU_SECS;
         self.last_ofi = BoundedScore::ZERO;
         self.last_geom = BoundedScore::ZERO;
     }
@@ -410,10 +425,23 @@ impl OrthogonalFactorState {
         );
         self.last_geom = Self::compute_book_geometry(snap);
         if dt_s > 0.0 {
+            self.fast_ewma_events =
+                self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
+            self.eq_ewma_events =
+                self.eq_ewma_events * (-dt_s / V45_EQ_RATE_TAU_SECS).exp() + 1.0;
             let ofi_f = self.last_ofi.get();
             let tfi_f = self.last_tfi.get();
-            let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05) || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08) {
+            let i_spoof = if ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05 {
                 1.0
+            } else if ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08 {
+                if (ofi_f * tfi_f) < 0.0 {
+                    1.0
+                } else {
+                    let eta_lat =
+                        compute_tick_lattice_granularity_eta(snap, FeeSchedule::VIP0_DEFAULT);
+                    let kappa_evt = self.event_clock_dilation();
+                    evaluate_silent_tape_spoof_weight_c1(eta_lat, kappa_evt)
+                }
             } else {
                 0.0
             };
@@ -475,11 +503,44 @@ impl OrthogonalFactorState {
 
     #[inline]
     #[must_use]
+    pub fn adaptive_snr_from_snapshot_with_fees(
+        snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        fees: FeeSchedule,
+    ) -> BoundedScore {
+        let (mut w_ofi, mut w_tfi, w_geom) = Self::adaptive_weights_from_spoof_density(spoof_density);
+        let ofi = snap.factor_ofi.get();
+        let tfi = snap.factor_tfi.get();
+        if (ofi * tfi) >= 0.0 {
+            let eta_lat = compute_tick_lattice_granularity_eta(snap, fees);
+            let s_lat = crate::wave_elliott::hermite_smoothstep_c1(eta_lat, INV_PHI_SQ, PHI);
+            if s_lat > 0.0 {
+                let s_ofi = crate::wave_elliott::hermite_smoothstep_c1(
+                    ofi.abs(),
+                    INV_PHI,
+                    1.0 - INV_PHI_CUBE,
+                );
+                let s_pause =
+                    1.0 - crate::wave_elliott::hermite_smoothstep_c1(tfi.abs(), 0.0, INV_PHI_CUBE);
+                let sp_c = if spoof_density.is_finite() {
+                    spoof_density.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let s_clean =
+                    1.0 - crate::wave_elliott::hermite_smoothstep_c1(sp_c, INV_PHI_FOURTH, INV_PHI);
+                let dw_lat = INV_PHI * w_tfi * s_lat * s_ofi * s_pause * s_clean;
+                w_ofi += dw_lat;
+                w_tfi -= dw_lat;
+            }
+        }
+        BoundedScore::new_clamped(w_ofi * ofi + w_tfi * tfi + w_geom * snap.factor_geom.get())
+    }
+
+    #[inline]
+    #[must_use]
     pub fn adaptive_snr_from_snapshot(snap: &SymbolLobSnapshot, spoof_density: f64) -> BoundedScore {
-        let (w_ofi, w_tfi, w_geom) = Self::adaptive_weights_from_spoof_density(spoof_density);
-        BoundedScore::new_clamped(
-            w_ofi * snap.factor_ofi.get() + w_tfi * snap.factor_tfi.get() + w_geom * snap.factor_geom.get(),
-        )
+        Self::adaptive_snr_from_snapshot_with_fees(snap, spoof_density, FeeSchedule::VIP0_DEFAULT)
     }
 
     /// V4.6 Island 1A: Entry evaluator coupled to anti-spoof GEOM weights, dynamic 3x VIP barrier & signed Epps beta.
@@ -597,6 +658,42 @@ impl OrthogonalFactorState {
         psi_health: f64,
         lead_lag_ignition_bonus: f64,
     ) -> SignalVerdict {
+        Self::evaluate_entry_signal_v553(
+            spec,
+            snap,
+            leader_btc_snap,
+            learned_mfe_bps,
+            learned_dir_edge_bps,
+            taker_prob_pm,
+            fees,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            psi_health,
+            lead_lag_ignition_bonus,
+            PHI,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_entry_signal_v553(
+        spec: PairSpec,
+        snap: &SymbolLobSnapshot,
+        leader_btc_snap: &SymbolLobSnapshot,
+        learned_mfe_bps: ScaledBps,
+        learned_dir_edge_bps: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+        lead_lag_ignition_bonus: f64,
+        kappa_evt: f64,
+    ) -> SignalVerdict {
         let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
@@ -616,16 +713,20 @@ impl OrthogonalFactorState {
         if snap.realized_vol_5m.raw() < b3x_barrier.raw() {
             return SignalVerdict::NeutralNoAction;
         }
-        let p_exc_pm = (taker_prob_pm.clamp(20, 450) - 50).max(0);
-        let tox_div_x10 = 100 + p_exc_pm * 4;
-        let elastic_max_tick = (snap.realized_vol_5m.raw().saturating_mul(10)) / tox_div_x10;
+        let p_hat = (taker_prob_pm.clamp(20, 450) as f64) * 1e-3;
+        let p_t_mult =
+            1.0 + INV_PHI * crate::wave_elliott::hermite_smoothstep_c1(p_hat, 0.05, INV_PHI_SQ);
+        let elastic_max_tick =
+            ((snap.realized_vol_5m.raw().max(0) as f64) / (10.0 * p_t_mult)).floor() as i64;
         if raw_tick_bps.raw() > elastic_max_tick {
             return SignalVerdict::NeutralNoAction;
         }
+        let c_mkr_rt_sbps = fees.round_trip_maker_exit_bps().raw().max(1) as f64;
+        let eta_lat = (raw_tick_bps.raw().max(0) as f64) / c_mkr_rt_sbps;
         let ofi = snap.factor_ofi.get();
         let tfi = snap.factor_tfi.get();
         let geom = snap.factor_geom.get();
-        if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08) || (ofi.abs() > 0.55 && tfi.abs() < 0.08) {
+        if is_opposing_or_silent_spoof_veto_c1(ofi, tfi, eta_lat, kappa_evt) {
             return SignalVerdict::SpoofingVeto;
         }
         let bonus = if lead_lag_ignition_bonus.is_finite() {
@@ -637,19 +738,37 @@ impl OrthogonalFactorState {
         let nu_sigma = ((snap.realized_vol_5m.raw().max(b3x_barrier.raw()) as f64) / eq_vol_anchor).sqrt().clamp(0.82, 1.25);
         let edge_relief = ((learned_dir_edge_bps.raw().clamp(0, 450) as f64) / 10_000.0).min(0.04);
         let elastic_snr_floor = (0.40 * nu_sigma - edge_relief).clamp(0.34, 0.48);
-        let composite = Self::adaptive_snr_from_snapshot(snap, spoof_density).get();
+        let composite = Self::adaptive_snr_from_snapshot_with_fees(snap, spoof_density, fees).get();
         if composite.abs() + bonus < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
         let min_ofi_dir = 0.15 * (1.0 - bonus);
         let min_tfi_dir = 0.12 * (1.0 - bonus);
-        let side = if composite > 0.0 {
-            if ofi <= min_ofi_dir || tfi <= min_tfi_dir || geom < 0.0 { return SignalVerdict::NeutralNoAction; }
-            Side::Bid
+        let cand_side = if composite > 0.0 { Side::Bid } else { Side::Ask };
+        let s_cand = cand_side.sign_f64();
+        let ofi_al = ofi * s_cand;
+        let tfi_al = tfi * s_cand;
+        let geom_al = geom * s_cand;
+        let s_lat = crate::wave_elliott::hermite_smoothstep_c1(eta_lat, INV_PHI_SQ, PHI);
+        let s_ofi_lat =
+            crate::wave_elliott::hermite_smoothstep_c1(ofi_al, INV_PHI, 1.0 - INV_PHI_CUBE);
+        let relaxed_tfi_floor = min_tfi_dir * (1.0 - s_lat * s_ofi_lat);
+        let tfi_ok = if s_lat * s_ofi_lat > 0.0 {
+            tfi_al >= 0.0 && tfi_al >= relaxed_tfi_floor
         } else {
-            if ofi >= -min_ofi_dir || tfi >= -min_tfi_dir || geom > 0.0 { return SignalVerdict::NeutralNoAction; }
-            Side::Ask
+            tfi_al > min_tfi_dir
         };
+        let min_geom_al = if ofi_al >= INV_PHI {
+            -INV_PHI_FOURTH * s_lat
+        } else {
+            -INV_PHI_FOURTH
+                * s_lat
+                * crate::wave_elliott::hermite_smoothstep_c1(ofi_al, INV_PHI_SQ, INV_PHI)
+        };
+        if ofi_al <= min_ofi_dir || !tfi_ok || geom_al < min_geom_al {
+            return SignalVerdict::NeutralNoAction;
+        }
+        let side = cand_side;
         let dir_sign = side.sign_f64();
         let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
         let eff_epps_corr = if is_follower { epps_corr } else { 0.0 };
@@ -1409,14 +1528,80 @@ pub fn passes_elastic_geom_and_macro_impulse_guard_with_health(
         0.0
     };
 
+    let eta_lat = compute_tick_lattice_granularity_eta(snap, FeeSchedule::VIP0_DEFAULT);
+    let s_lat_geom = if tfi_al >= 0.0 {
+        crate::wave_elliott::hermite_smoothstep_c1(eta_lat, INV_PHI2, PHI)
+            * crate::wave_elliott::hermite_smoothstep_c1(ofi_al, INV_PHI2, INV_PHI)
+            * (1.0 - h_sp)
+            * (1.0 - h_liq)
+    } else {
+        0.0
+    };
+    let min_geom_floor = 0.05 - (0.05 + INV_PHI4) * s_lat_geom;
     let req_geom = (INV_PHI4 + INV_PHI3 * h_sp + INV_PHI3 * h_ob_adv + INV_PHI2 * h_liq
-        - 0.5 * INV_PHI4 * h_ob_fav.max(s_flow_btc_sync))
-        .clamp(0.05, INV_PHI);
+        - 0.5 * INV_PHI4 * h_ob_fav.max(s_flow_btc_sync)
+        - 2.0 * INV_PHI4 * s_lat_geom)
+        .clamp(min_geom_floor, INV_PHI);
     let signed_geom = dir_s * snap.factor_geom.get();
     if !signed_geom.is_finite() || signed_geom < req_geom {
         return Err(crate::lob_shm::LastVetoCode::SpoofingVeto);
     }
     Ok(())
+}
+
+/// Dimensionless tick-lattice granularity `eta_lat = tau_tick_sbps / max(c_mkr_rt_sbps, 1)` (`V5.5.3`).
+#[inline]
+#[must_use]
+pub fn compute_tick_lattice_granularity_eta(
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    fees: FeeSchedule,
+) -> f64 {
+    let ref_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+        PriceTicks(i64::midpoint(snap.bids[0].price.0, snap.asks[0].price.0))
+    } else if snap.mark_price.0 > 0 {
+        snap.mark_price
+    } else {
+        snap.last_trade_price
+    };
+    let Some(spec) = spec_from_symbol_id(snap.symbol_id) else {
+        return 0.0;
+    };
+    let Ok(tau_tick) = spec.tick_to_price_scaled_bps(ref_px) else {
+        return 0.0;
+    };
+    let c_mkr_rt = fees.round_trip_maker_exit_bps().raw().max(1) as f64;
+    (tau_tick.raw().max(0) as f64) / c_mkr_rt
+}
+
+/// Continuous `C1` silent-tape spoofing weight `(1 - S_3(eta_lat; INV_PHI_SQ, PHI)) * S_3(kappa_evt; 1.0, PHI)` (`V5.5.3`).
+#[inline]
+#[must_use]
+pub fn evaluate_silent_tape_spoof_weight_c1(eta_lat: f64, kappa_evt: f64) -> f64 {
+    let eta_c = if eta_lat.is_finite() { eta_lat.max(0.0) } else { 0.0 };
+    let kap_c = if kappa_evt.is_finite() { kappa_evt.max(0.0) } else { PHI };
+    (1.0 - crate::wave_elliott::hermite_smoothstep_c1(eta_c, INV_PHI_SQ, PHI))
+        * crate::wave_elliott::hermite_smoothstep_c1(kap_c, 1.0, PHI)
+}
+
+/// Unified `C1` opposing-tape or fine-tick rapid silent-tape `SpoofingVeto` predicate (`V5.5.3`).
+#[inline]
+#[must_use]
+pub fn is_opposing_or_silent_spoof_veto_c1(
+    ofi: f64,
+    tfi: f64,
+    eta_lat: f64,
+    kappa_evt: f64,
+) -> bool {
+    if ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08 {
+        return true;
+    }
+    if ofi.abs() > 0.55 && tfi.abs() < 0.08 {
+        if (ofi * tfi) < 0.0 {
+            return true;
+        }
+        return evaluate_silent_tape_spoof_weight_c1(eta_lat, kappa_evt) >= INV_PHI;
+    }
+    false
 }
 
 /// Aborts a resting passive order when its supporting BBO wall evaporates with adverse OFI flip.

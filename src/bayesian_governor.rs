@@ -60,6 +60,46 @@ fn aligned_ob_for_side(side: Side, snap: &SymbolLobSnapshot) -> OrderBlockObserv
     obs
 }
 
+#[repr(transparent)]
+struct SharedAtomicI64(std::sync::atomic::AtomicI64);
+
+impl SharedAtomicI64 {
+    #[inline]
+    const fn new(val: i64) -> Self {
+        Self(std::sync::atomic::AtomicI64::new(val))
+    }
+
+    #[inline]
+    fn load(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn store(&self, val: i64) {
+        self.0.store(val, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for SharedAtomicI64 {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::new(self.load())
+    }
+}
+
+impl Default for SharedAtomicI64 {
+    #[inline]
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl core::fmt::Debug for SharedAtomicI64 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.load(), f)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; MAX_ACTIVE_PAIRS],
@@ -69,10 +109,11 @@ pub struct OnlineAdaptiveGovernor {
     sl_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     win_streak: [[u32; 2]; MAX_ACTIVE_PAIRS],
     directional_cooldown_until_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
-    global_dir_debt_bps_x100: [i64; 2],
+    global_dir_debt_bps_x100: [SharedAtomicI64; 2],
     global_dir_sl_streak: [u32; 2],
     global_dir_win_streak: [u32; 2],
-    global_dir_cooldown_until_ns: [i64; 2],
+    global_dir_cooldown_until_ns: [SharedAtomicI64; 2],
+    global_debt_decay_ts_ns: [SharedAtomicI64; 2],
     last_global_win_dir: u8,
     ewma_fast_px_1e4: [i64; MAX_ACTIVE_PAIRS],
     ewma_slow_px_1e4: [i64; MAX_ACTIVE_PAIRS],
@@ -114,10 +155,11 @@ impl OnlineAdaptiveGovernor {
             sl_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             win_streak: [[0; 2]; MAX_ACTIVE_PAIRS],
             directional_cooldown_until_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
-            global_dir_debt_bps_x100: [0; 2],
+            global_dir_debt_bps_x100: [SharedAtomicI64::new(0), SharedAtomicI64::new(0)],
             global_dir_sl_streak: [0; 2],
             global_dir_win_streak: [0; 2],
-            global_dir_cooldown_until_ns: [0; 2],
+            global_dir_cooldown_until_ns: [SharedAtomicI64::new(0), SharedAtomicI64::new(0)],
+            global_debt_decay_ts_ns: [SharedAtomicI64::new(0), SharedAtomicI64::new(0)],
             last_global_win_dir: 255,
             ewma_fast_px_1e4: [0; MAX_ACTIVE_PAIRS],
             ewma_slow_px_1e4: [0; MAX_ACTIVE_PAIRS],
@@ -164,6 +206,35 @@ impl OnlineAdaptiveGovernor {
     }
     #[inline] #[must_use] pub const fn directional_cooldown_until_ns_for(&self, slot_idx: usize, side: Side) -> i64 {
         if slot_idx >= MAX_ACTIVE_PAIRS { 0 } else { self.directional_cooldown_until_ns[slot_idx][Self::dir_idx(side)] }
+    }
+    #[inline] #[must_use] pub fn global_dir_debt_bps_x100_for(&self, side: Side) -> i64 {
+        self.global_dir_debt_bps_x100[Self::dir_idx(side)].load()
+    }
+    #[inline] #[must_use] pub fn global_dir_cooldown_until_ns_for(&self, side: Side) -> i64 {
+        self.global_dir_cooldown_until_ns[Self::dir_idx(side)].load()
+    }
+    #[inline] #[must_use]
+    pub fn qualifies_inside_spread_penny_jump_c1(
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        psi_health: f64,
+    ) -> bool {
+        let Some((_, _, spread_ticks)) = snap.bbo_and_spread_ticks() else {
+            return false;
+        };
+        if spread_ticks < 2 || !psi_health.is_finite() || psi_health <= crate::alpha_3factor::INV_PHI_SQ {
+            return false;
+        }
+        let dir_s = side.sign_f64();
+        let ofi_al = snap.factor_ofi.get() * dir_s;
+        let tfi_al = snap.factor_tfi.get() * dir_s;
+        let geom_al = snap.factor_geom.get() * dir_s;
+        let (m_skew, _) = OrthogonalFactorState::stoikov_microprice_and_skew(side, snap);
+        let prop_al = 0.50 * ofi_al + 0.38 * tfi_al + 0.12 * geom_al;
+        ofi_al >= crate::alpha_3factor::INV_PHI_CUBE
+            && tfi_al >= 0.0
+            && (prop_al >= crate::alpha_3factor::INV_PHI_CUBE
+                || m_skew >= crate::alpha_3factor::INV_PHI_FOURTH)
     }
     #[inline] pub fn set_slot_momentum_chain_context(&mut self, slot_idx: usize, signed_propulsion: f64, climax_active: bool, ws_rtt_us: u32) {
         if slot_idx < MAX_ACTIVE_PAIRS {
@@ -429,12 +500,14 @@ impl OnlineAdaptiveGovernor {
     #[inline]
     pub fn dispatch_ema_prewarm_async(&self, now_ns: TimestampNs, vault_tx: &SyncSender<VaultIoCommand>) {
         if self.ewma_fast_px_1e4.iter().all(|&v| v <= 0) { return; }
-        let _ = vault_tx.try_send(VaultIoCommand::SaveEmaPrewarm {
-            ts_ns: now_ns.0,
-            fast_px_1e4: self.ewma_fast_px_1e4,
-            slow_px_1e4: self.ewma_slow_px_1e4,
-            eq_vol_5m_bps: self.eq_vol_5m_bps,
-        });
+        let _ = vault_tx.try_send(VaultIoCommand::SaveEmaPrewarm(Box::new(
+            crate::vault_io::EmaPrewarmPayload {
+                ts_ns: now_ns.0,
+                fast_px_1e4: self.ewma_fast_px_1e4,
+                slow_px_1e4: self.ewma_slow_px_1e4,
+                eq_vol_5m_bps: self.eq_vol_5m_bps,
+            },
+        )));
     }
 
     #[must_use]
@@ -484,6 +557,9 @@ impl OnlineAdaptiveGovernor {
             snap.mark_price.0
         };
         if mid_ticks <= 0 { return; }
+        for d in 0..2 {
+            self.sync_global_debt_clock_and_decay(slot_idx, d, PriceTicks(mid_ticks), snap.ts_local_ns.0);
+        }
         let px_1e4 = mid_ticks.saturating_mul(10_000);
         let slot_tkr_pm = i64::midpoint(
             self.slot_taker_prob_permille(slot_idx, Side::Bid),
@@ -521,6 +597,89 @@ impl OnlineAdaptiveGovernor {
 }
 
 impl OnlineAdaptiveGovernor {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn compute_elastic_global_debt_cooldown_ns(
+        &self,
+        slot_idx: usize,
+        d: usize,
+        entry_px: PriceTicks,
+    ) -> i64 {
+        const PHI_CD: f64 = 1.618_033_988_749_895;
+        const PHI_CUBE_CD: f64 = 4.236_067_977_499_79;
+        const PHI_FIFTH_CD: f64 = 11.090_169_943_749_475;
+        let eff_slot = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+        let tau_mkt = (self.intrinsic_diffusion_clock_ns(eff_slot).max(1)) as f64;
+        let fee_rt = self.active_maker_rt_fee_bps().max(100);
+        let c_rt = if slot_idx < MAX_ACTIVE_PAIRS && entry_px.0 > 0 {
+            let side = if d == 0 { Side::Bid } else { Side::Ask };
+            let p_pm = self.slot_taker_prob_permille(slot_idx, side);
+            APPROVED_SPECS[slot_idx]
+                .expected_round_trip_cost_bps_dynamic(entry_px, p_pm, self.active_fee_schedule())
+                .raw()
+                .max(100) as f64
+        } else {
+            fee_rt as f64
+        };
+        let debt_abs = self.global_dir_debt_bps_x100[d].load().unsigned_abs() as f64;
+        let s_debt = crate::wave_elliott::hermite_smoothstep_c1(
+            debt_abs / c_rt.max(1.0),
+            PHI_CUBE_CD,
+            PHI_FIFTH_CD,
+        );
+        (PHI_CD * tau_mkt * (1.0 + s_debt)).round() as i64
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn sync_global_debt_clock_and_decay(
+        &self,
+        slot_idx: usize,
+        d: usize,
+        entry_px: PriceTicks,
+        now_ts_ns: i64,
+    ) {
+        const PHI_SQ_DEC: f64 = 2.618_033_988_749_895;
+        const INV_PHI_SQ_DEC: f64 = 0.381_966_011_250_105;
+        if now_ts_ns <= 0 || d >= 2 {
+            return;
+        }
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let contagion_floor = -(fee_rt * 25);
+        let mut debt = self.global_dir_debt_bps_x100[d].load();
+        let cd = self.global_dir_cooldown_until_ns[d].load();
+        let decay_ts = self.global_debt_decay_ts_ns[d].load();
+
+        if debt <= contagion_floor && cd <= 0 && decay_ts <= 0 {
+            let dt_cd = self.compute_elastic_global_debt_cooldown_ns(slot_idx, d, entry_px);
+            self.global_dir_cooldown_until_ns[d].store(now_ts_ns.saturating_add(dt_cd.max(1)));
+            self.global_debt_decay_ts_ns[d].store(0);
+            return;
+        }
+
+        if (cd > 0 && now_ts_ns >= cd) || (cd <= 0 && decay_ts > 0 && debt < 0) {
+            let anchor = if decay_ts > 0 { decay_ts } else { cd };
+            if now_ts_ns > anchor && debt < 0 {
+                let dt_ns = (now_ts_ns - anchor) as f64;
+                let eff_slot = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+                let tau_mkt = (self.intrinsic_diffusion_clock_ns(eff_slot).max(1)) as f64;
+                let psi_eff = self.psi_health().max(INV_PHI_SQ_DEC);
+                let tau_decay = (PHI_SQ_DEC * tau_mkt) / psi_eff;
+                debt = ((debt as f64) * (-dt_ns / tau_decay).exp()).trunc() as i64;
+                self.global_dir_debt_bps_x100[d].store(debt);
+            }
+            if debt >= 0 {
+                if cd > 0 && now_ts_ns >= cd {
+                    self.global_dir_cooldown_until_ns[d].store(0);
+                }
+                self.global_debt_decay_ts_ns[d].store(0);
+            } else if debt > contagion_floor {
+                self.global_dir_cooldown_until_ns[d].store(0);
+                self.global_debt_decay_ts_ns[d].store(now_ts_ns);
+            } else {
+                self.global_debt_decay_ts_ns[d].store(now_ts_ns);
+            }
+        }
+    }
+
     pub fn step_regime_shift_shadow_rehab(&mut self, slot_idx: usize, snap: &SymbolLobSnapshot) {
         if slot_idx >= MAX_ACTIVE_PAIRS || snap.ts_local_ns.0 <= 0 { return; }
         let mid_px = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
@@ -529,6 +688,9 @@ impl OnlineAdaptiveGovernor {
             snap.mark_price
         };
         if mid_px.0 <= 0 { return; }
+        for d in 0..2 {
+            self.sync_global_debt_clock_and_decay(slot_idx, d, mid_px, snap.ts_local_ns.0);
+        }
         let spec = APPROVED_SPECS[slot_idx];
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
         let eq_vol = self.eq_vol_5m_bps[slot_idx];
@@ -579,21 +741,33 @@ impl OnlineAdaptiveGovernor {
     }
 
     #[inline] #[must_use]
-    pub const fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
+    pub fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
         if slot_idx >= MAX_ACTIVE_PAIRS { return false; }
         let d = Self::dir_idx(side);
         self.is_in_local_slot_scar_debt(slot_idx, side)
-            || self.global_dir_debt_bps_x100[d] < -(self.active_maker_rt_fee_bps() * 15)
+            || self.global_dir_debt_bps_x100[d].load() < -(self.active_maker_rt_fee_bps() * 15)
     }
 
     #[inline] #[must_use]
-    pub const fn audit_historical_entry_veto(&self, slot_idx: usize, side: Side, entry_ticks: i64, check_ts_ns: i64) -> Option<&'static str> {
+    pub fn audit_historical_entry_veto(&self, slot_idx: usize, side: Side, entry_ticks: i64, check_ts_ns: i64) -> Option<&'static str> {
         if slot_idx >= MAX_ACTIVE_PAIRS { return Some("VETO_INVALID_SLOT"); }
         let d = Self::dir_idx(side);
-        if check_ts_ns > 0 && check_ts_ns < self.directional_cooldown_until_ns[slot_idx][d] { return Some("VETO_SLOT_COOLDOWN"); }
-        if check_ts_ns > 0 && check_ts_ns < self.global_dir_cooldown_until_ns[d] { return Some("VETO_GLOBAL_WAVE_OR_SL_BREATHER"); }
         let fee_rt = self.active_maker_rt_fee_bps();
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
+        if check_ts_ns > 0 {
+            self.sync_global_debt_clock_and_decay(slot_idx, d, PriceTicks(entry_ticks), check_ts_ns);
+        }
+        if check_ts_ns > 0 && check_ts_ns < self.directional_cooldown_until_ns[slot_idx][d] { return Some("VETO_SLOT_COOLDOWN"); }
+        let sym_net = self.cum_net_bps_x100[slot_idx][0].saturating_add(self.cum_net_bps_x100[slot_idx][1]);
+        let in_contagion = slot_idx > 0
+            && sym_net <= -(fee_rt * 6)
+            && self.global_dir_debt_bps_x100[d].load() <= -(fee_rt * 25)
+            && self.cum_net_bps_x100[slot_idx][d] <= 0;
+        let glob_cd_now = self.global_dir_cooldown_until_ns[d].load();
+        if in_contagion && (check_ts_ns <= 0 || check_ts_ns < glob_cd_now) {
+            return Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION");
+        }
+        if check_ts_ns > 0 && check_ts_ns < glob_cd_now { return Some("VETO_GLOBAL_WAVE_OR_SL_BREATHER"); }
         let (anchor_1e4, anchor_ts) = (self.wave_anchor_px_1e4[slot_idx][d], self.wave_anchor_ts_ns[slot_idx][d]);
         let wave_fresh = check_ts_ns <= 0 || anchor_ts <= 0 || check_ts_ns.saturating_sub(anchor_ts) <= self.elastic_wave_anchor_ttl_ns(slot_idx, d);
         let cur_1e4 = entry_ticks.saturating_mul(10_000);
@@ -621,18 +795,18 @@ impl OnlineAdaptiveGovernor {
             }
         }
         if slot_idx > 0 {
-            let glob_cd = self.global_dir_cooldown_until_ns[d];
+            let glob_cd = self.global_dir_cooldown_until_ns[d].load();
+            let decay_ts = self.global_debt_decay_ts_ns[d].load();
             if self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8) {
                 let dom_ns = tau_ns.saturating_mul(c_min_u32(self.global_dir_sl_streak[d], 4) as i64) * 2;
-                if check_ts_ns <= 0 || glob_cd <= 0 || check_ts_ns < glob_cd.saturating_add(dom_ns) {
+                if glob_cd <= 0 && decay_ts <= 0 {
+                    if check_ts_ns > 0 {
+                        self.global_dir_cooldown_until_ns[d].store(check_ts_ns.saturating_add(dom_ns));
+                    }
                     return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
                 }
-            }
-            let sym_net = self.cum_net_bps_x100[slot_idx][0].saturating_add(self.cum_net_bps_x100[slot_idx][1]);
-            if sym_net <= -(fee_rt * 6) && self.global_dir_debt_bps_x100[d] <= -(fee_rt * 25) && self.cum_net_bps_x100[slot_idx][d] <= 0 {
-                let glob_mult = c_clamp_i64(self.global_dir_debt_bps_x100[d].saturating_neg() / (fee_rt * 4), 4, 16);
-                if check_ts_ns <= 0 || glob_cd <= 0 || check_ts_ns < glob_cd.saturating_add(tau_ns.saturating_mul(glob_mult)) {
-                    return Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION");
+                if check_ts_ns <= 0 || (glob_cd > 0 && decay_ts <= 0 && check_ts_ns < glob_cd.saturating_add(dom_ns)) {
+                    return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
                 }
             }
         }
@@ -694,8 +868,15 @@ impl OnlineAdaptiveGovernor {
         self.ewma_net_bps_x100[slot_idx][d] = ((prev_mean * 75 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 25) / 100).clamp(-100_000, 100_000);
         self.portfolio_ewma_net_bps_x100 = ((self.portfolio_ewma_net_bps_x100.clamp(-100_000, 100_000) * 764 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 236) / 1_000).clamp(-100_000, 100_000);
         let _ = self.recompute_psi_health_in_place();
+        if ts_ns.0 > 0 {
+            self.sync_global_debt_clock_and_decay(slot_idx, d, entry_price, ts_ns.0);
+        }
         self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 60), fee_rt * 60);
-        self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d].saturating_add(net_scaled_bps.raw()).clamp(-(fee_rt * 75), fee_rt * 30);
+        let updated_glob_debt = self.global_dir_debt_bps_x100[d]
+            .load()
+            .saturating_add(net_scaled_bps.raw())
+            .clamp(-(fee_rt * 75), fee_rt * 30);
+        self.global_dir_debt_bps_x100[d].store(updated_glob_debt);
         let tau_ns = self.intrinsic_diffusion_clock_ns(slot_idx);
         let ir_x100 = self.slot_information_ratio_x100(slot_idx, side).clamp(-50, 100);
         if is_maker_exit && net_scaled_bps.raw() < 0 {
@@ -740,13 +921,17 @@ impl OnlineAdaptiveGovernor {
                 self.global_dir_sl_streak[d] = gs;
                 if ts_ns.0 > 0 {
                     let g_cd = (((((tau_ns * 3) / 5).saturating_mul(i64::from(gs))) as f64) * h_glob).round() as i64;
-                    self.global_dir_cooldown_until_ns[d] =
-                        self.global_dir_cooldown_until_ns[d].max(ts_ns.0.saturating_add(g_cd));
+                    let cur_gcd = self.global_dir_cooldown_until_ns[d].load();
+                    self.global_dir_cooldown_until_ns[d]
+                        .store(cur_gcd.max(ts_ns.0.saturating_add(g_cd)));
+                    self.global_debt_decay_ts_ns[d].store(0);
                 }
             } else if h_glob > 0.0 && ts_ns.0 > 0 {
                 let mild_cd = ((((tau_ns * 3) / 5) as f64) * h_glob).round() as i64;
-                self.global_dir_cooldown_until_ns[d] =
-                    self.global_dir_cooldown_until_ns[d].max(ts_ns.0.saturating_add(mild_cd));
+                let cur_gcd = self.global_dir_cooldown_until_ns[d].load();
+                self.global_dir_cooldown_until_ns[d]
+                    .store(cur_gcd.max(ts_ns.0.saturating_add(mild_cd)));
+                self.global_debt_decay_ts_ns[d].store(0);
             }
         } else if net_scaled_bps.raw() < fee_rt / 4 {
             if ts_ns.0 > 0 {
@@ -797,8 +982,19 @@ impl OnlineAdaptiveGovernor {
                 self.sl_streak[slot_idx][d] -= 1;
                 self.win_streak[slot_idx][d] = 0;
             }
-            if self.global_dir_sl_streak[d] > 0 && self.global_dir_debt_bps_x100[d] >= -(fee_rt * 15) {
+            if self.global_dir_sl_streak[d] > 0 && updated_glob_debt >= -(fee_rt * 15) {
                 self.global_dir_sl_streak[d] -= 1;
+            }
+            if updated_glob_debt >= 0 {
+                self.global_debt_decay_ts_ns[d].store(0);
+            }
+        }
+        if net_scaled_bps.raw() < 0 && ts_ns.0 > 0 && updated_glob_debt <= -(fee_rt * 25) {
+            let cur_gcd = self.global_dir_cooldown_until_ns[d].load();
+            if cur_gcd <= 0 || ts_ns.0 >= cur_gcd {
+                let dt_cd = self.compute_elastic_global_debt_cooldown_ns(slot_idx, d, entry_price);
+                self.global_dir_cooldown_until_ns[d].store(ts_ns.0.saturating_add(dt_cd.max(1)));
+                self.global_debt_decay_ts_ns[d].store(0);
             }
         }
     }
@@ -864,7 +1060,7 @@ impl OnlineAdaptiveGovernor {
             }
         }
         if slot_idx > 0 {
-            let glob_debt = (-self.global_dir_debt_bps_x100[d]).max(0) as f64;
+            let glob_debt = (-self.global_dir_debt_bps_x100[d].load()).max(0) as f64;
             let opp_macro = (-snap.wave_observables().macro_phase.get() * side.sign_f64()).max(0.0);
             if glob_debt >= 8_000.0 || self.global_dir_sl_streak[d] >= 1 || opp_macro > 0.05 {
                 let min_btc_snr = (-0.04 + 0.04 * (glob_debt / 10_000.0).tanh() + 0.85 * (opp_macro - 0.05).max(0.0)).clamp(-0.04, 0.28);
@@ -891,6 +1087,14 @@ impl OnlineAdaptiveGovernor {
 
     #[must_use]
     pub fn to_scar_snapshot_json(&self, ts_ns: TimestampNs) -> serde_json::Value {
+        let glob_debt = [
+            self.global_dir_debt_bps_x100[0].load(),
+            self.global_dir_debt_bps_x100[1].load(),
+        ];
+        let glob_cd = [
+            self.global_dir_cooldown_until_ns[0].load(),
+            self.global_dir_cooldown_until_ns[1].load(),
+        ];
         let mut val = serde_json::json!({
             "event": "GOV_SCAR_SNAPSHOT", "ts_ns": ts_ns.0,
             "ewma_net_bps_x100": self.ewma_net_bps_x100, "ewma_var_bps2": self.ewma_var_bps2,
@@ -898,9 +1102,9 @@ impl OnlineAdaptiveGovernor {
             "sl_streak": self.sl_streak, "win_streak": self.win_streak,
             "directional_cooldown_until_ns": self.directional_cooldown_until_ns,
             "wave_anchor_px_1e4": self.wave_anchor_px_1e4, "wave_anchor_ts_ns": self.wave_anchor_ts_ns,
-            "global_dir_debt_bps_x100": self.global_dir_debt_bps_x100,
+            "global_dir_debt_bps_x100": glob_debt,
             "global_dir_sl_streak": self.global_dir_sl_streak, "global_dir_win_streak": self.global_dir_win_streak,
-            "global_dir_cooldown_until_ns": self.global_dir_cooldown_until_ns, "last_global_win_dir": self.last_global_win_dir,
+            "global_dir_cooldown_until_ns": glob_cd, "last_global_win_dir": self.last_global_win_dir,
             "cross_chop_cooldown_until_ns": self.cross_chop_cooldown_until_ns,
             "abc_chop_last_sl_ts_ns": self.abc_chop_last_sl_ts_ns,
             "abc_chop_sl_score_pm": self.abc_chop_sl_score_pm,
@@ -947,7 +1151,11 @@ impl OnlineAdaptiveGovernor {
             }
         }
         if let Some(a) = val.get("global_dir_debt_bps_x100").and_then(serde_json::Value::as_array) {
-            for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_i64() { self.global_dir_debt_bps_x100[d] = n.clamp(-200_000, 200_000); } }
+            for (d, c) in a.iter().take(2).enumerate() {
+                if let Some(n) = c.as_i64() {
+                    self.global_dir_debt_bps_x100[d].store(n.clamp(-200_000, 200_000));
+                }
+            }
         }
         if let Some(a) = val.get("global_dir_sl_streak").and_then(serde_json::Value::as_array) {
             for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_u64() { self.global_dir_sl_streak[d] = n.min(4) as u32; } }
@@ -955,8 +1163,16 @@ impl OnlineAdaptiveGovernor {
         if let Some(a) = val.get("global_dir_win_streak").and_then(serde_json::Value::as_array) {
             for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_u64() { self.global_dir_win_streak[d] = n.min(6) as u32; } }
         }
+        self.global_dir_cooldown_until_ns[0].store(0);
+        self.global_dir_cooldown_until_ns[1].store(0);
+        self.global_debt_decay_ts_ns[0].store(0);
+        self.global_debt_decay_ts_ns[1].store(0);
         if let Some(a) = val.get("global_dir_cooldown_until_ns").and_then(serde_json::Value::as_array) {
-            for (d, c) in a.iter().take(2).enumerate() { if let Some(n) = c.as_i64() { self.global_dir_cooldown_until_ns[d] = n; } }
+            for (d, c) in a.iter().take(2).enumerate() {
+                if let Some(n) = c.as_i64() {
+                    self.global_dir_cooldown_until_ns[d].store(n.max(0));
+                }
+            }
         }
         if let Some(ld) = val.get("last_global_win_dir").and_then(serde_json::Value::as_u64) { self.last_global_win_dir = ld.min(255) as u8; }
         self.cross_chop_cooldown_until_ns = [0; MAX_ACTIVE_PAIRS];
@@ -1027,10 +1243,12 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => (candidate_snap.bids[0].qty, candidate_snap.asks[0].qty, candidate_snap.deep_bid_lots_l1_l5),
             Side::Ask => (candidate_snap.asks[0].qty, candidate_snap.bids[0].qty, candidate_snap.deep_ask_lots_l1_l5),
         };
-        if !spec.passes_l1_queue_depth_and_wall_guard_dynamic(
+        let is_penny_jump =
+            Self::qualifies_inside_spread_penny_jump_c1(side, candidate_snap, self.psi_health());
+        if !spec.passes_l1_queue_depth_and_wall_guard_penny_jump(
             entry_px, candidate_snap.realized_vol_5m, self.ewma_net_bps_x100[slot_idx][d],
             own_q, opp_q, own_deep, candidate_snap.factor_ofi.get().abs(), candidate_snap.factor_tfi.get().abs(),
-            self.slot_taker_prob_permille(slot_idx, side), fees,
+            self.slot_taker_prob_permille(slot_idx, side), fees, is_penny_jump,
         ) { return false; }
         let (self_drift_bps, self_ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, candidate_snap);
         let dir_s = side.sign_f64();
@@ -1054,10 +1272,11 @@ impl OnlineAdaptiveGovernor {
             candidate_snap.factor_tfi.get() * dir_s,
             btc_iceberg_al,
         );
-        let base_cand_comp = OrthogonalFactorState::adaptive_snr_from_snapshot(candidate_snap, spoof_density)
-            .get()
-            .abs()
-            * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg);
+        let base_cand_comp =
+            OrthogonalFactorState::adaptive_snr_from_snapshot_with_fees(candidate_snap, spoof_density, fees)
+                .get()
+                .abs()
+                * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg);
         let cand_comp = (base_cand_comp + bonus).min(1.0);
         let in_local_scar = self.is_in_local_slot_scar_debt(slot_idx, side);
         let in_scar = self.is_in_scar_debt(slot_idx, side);
@@ -1101,7 +1320,7 @@ impl OnlineAdaptiveGovernor {
         let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
         let debt_penalty = if debt_bps < 0.0 { ((-debt_bps) / 16_000.0).min(0.28) } else { 0.0 };
-        let global_debt_bps = self.global_dir_debt_bps_x100[d] as f64;
+        let global_debt_bps = self.global_dir_debt_bps_x100[d].load() as f64;
         let global_penalty = if global_debt_bps < -2_000.0 { ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14) } else { 0.0 };
         let staircase_penalty = if win_s >= 2.0 { 0.03 * (win_s - 1.0) } else { 0.0 };
         let ir_adj = (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
@@ -1197,7 +1416,16 @@ impl OnlineAdaptiveGovernor {
         if slot_idx >= MAX_ACTIVE_PAIRS { return Err("VETO_INVALID_SLOT"); }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else { return Err("VETO_PREFLIGHT_INVALID_BBO"); };
         let (ofi, tfi) = (snap.factor_ofi.get(), snap.factor_tfi.get());
-        if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08) || (ofi.abs() > 0.55 && tfi.abs() < 0.08) { return Err("VETO_PREFLIGHT_SPOOFING"); }
+        let fees = self.active_fee_schedule();
+        let eta_lat = crate::alpha_3factor::compute_tick_lattice_granularity_eta(snap, fees);
+        if crate::alpha_3factor::is_opposing_or_silent_spoof_veto_c1(
+            ofi,
+            tfi,
+            eta_lat,
+            crate::alpha_3factor::PHI,
+        ) {
+            return Err("VETO_PREFLIGHT_SPOOFING");
+        }
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         if let Some(veto) = self.audit_historical_entry_veto(slot_idx, side, entry_px.0, snap.ts_local_ns.0) { return Err(veto); }
         if !self.passes_cross_side_abc_chop_shield(slot_idx, side, snap) { return Err("VETO_CROSS_SIDE_ABC_CHOP_COOLDOWN"); }
@@ -1221,11 +1449,13 @@ impl OnlineAdaptiveGovernor {
             tfi * dir_s,
             btc_iceberg_al,
         );
-        let raw_signed_snr = OrthogonalFactorState::adaptive_snr_from_snapshot(snap, spoof_density).get() * dir_s;
+        let raw_signed_snr =
+            OrthogonalFactorState::adaptive_snr_from_snapshot_with_fees(snap, spoof_density, fees)
+                .get()
+                * dir_s;
         let signed_snr = (raw_signed_snr * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg) + bonus).min(1.0);
         if signed_snr < 0.30 { return Err("VETO_PREFLIGHT_SNR_COLLAPSE"); }
         let spec = APPROVED_SPECS[slot_idx];
-        let fees = self.active_fee_schedule();
         if opposing_ob_for_side(side, snap).vetoes_into_opposing_wall_dynamic(
             side, spec, entry_px, snap.realized_vol_5m, tfi * dir_s, self.slot_taker_prob_permille(slot_idx, side), fees,
         ) { return Err("VETO_PREFLIGHT_OPPOSING_OB_WALL"); }
@@ -1869,13 +2099,36 @@ impl OnlineAdaptiveGovernor {
             candidate_snap,
             daily_damper_permille,
         );
+        let d_entry = Self::dir_idx(side);
+        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v55(
+            spec,
+            candidate_snap,
+            btc_leader_snap,
+            learned_mfe_bps,
+            ScaledBps(self.ewma_net_bps_x100[slot_idx][d_entry]),
+            taker_pm,
+            fees,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            self.psi_health(),
+            lead_lag_ignition_bonus,
+        ) {
+            crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+                side: sig_side,
+                target_excursion_scaled_bps,
+            } if sig_side == side => target_excursion_scaled_bps,
+            _ => ScaledBps(0),
+        };
         if self
-            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_v553_sbps(
                 slot_idx,
                 side,
                 lots,
                 entry_px,
                 learned_mfe_bps,
+                target_excursion_sbps,
                 candidate_snap,
                 btc_leader_snap,
                 epps_signed_beta,
@@ -2093,13 +2346,36 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_elastic_preflight_l1_support(slot_idx, side, entry_px, snap) {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
+        let d_pf = Self::dir_idx(side);
+        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v55(
+            spec,
+            snap,
+            btc_leader_snap,
+            learned_mfe_bps,
+            ScaledBps(self.ewma_net_bps_x100[slot_idx][d_pf]),
+            taker_pm,
+            fees,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            self.psi_health(),
+            lead_lag_ignition_bonus,
+        ) {
+            crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+                side: sig_side,
+                target_excursion_scaled_bps,
+            } if sig_side == side => target_excursion_scaled_bps,
+            _ => ScaledBps(0),
+        };
         if self
-            .evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_v553_sbps(
                 slot_idx,
                 side,
                 allocated_lots,
                 entry_px,
                 learned_mfe_bps,
+                target_excursion_sbps,
                 snap,
                 btc_leader_snap,
                 epps_signed_beta,
@@ -2236,8 +2512,69 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
-    /// Evaluates V5.4.1 Pillar-2 ex-ante Expected Value coupling `1-lot` excursion to `OFI + BTC` propulsion `S_prop`
-    /// and universal `C1` passive Iceberg absorption attenuation across multi-lot and `1-lot` contracts.
+    /// Evaluates V5.4.1/V5.5.3 Pillar-2 ex-ante Expected Value coupling multi-lot `M_eff(V, q_struct)` to `cont_ratio_x1000`,
+    /// endogenous `target_excursion_scaled_bps` & aligned `fib_proj_bps`, and `1-lot` excursion to `OFI + BTC` propulsion `S_prop`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+    pub fn evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        learned_mfe_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_signed_beta: f64,
+    ) -> Option<i64> {
+        if slot_idx >= MAX_ACTIVE_PAIRS || entry_px.0 <= 0 {
+            return None;
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let d = Self::dir_idx(side);
+        let auto_target = match OrthogonalFactorState::evaluate_entry_signal_v542(
+            spec,
+            snap,
+            btc_leader_snap,
+            learned_mfe_bps,
+            ScaledBps(self.ewma_net_bps_x100[slot_idx][d]),
+            self.slot_taker_prob_permille(slot_idx, side),
+            self.active_fee_schedule(),
+            0.0,
+            epps_signed_beta,
+            if slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id {
+                let own_v = snap.realized_vol_5m.raw().max(100) as f64;
+                let btc_v = btc_leader_snap.realized_vol_5m.raw().max(100) as f64;
+                (epps_signed_beta * (btc_v / own_v)).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            },
+            None,
+            self.psi_health(),
+        ) {
+            crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+                side: sig_side,
+                target_excursion_scaled_bps,
+            } if sig_side == side => target_excursion_scaled_bps,
+            _ => ScaledBps(0),
+        };
+        self.evaluate_slot_pilar2_ex_ante_ev_with_leader_v553_sbps(
+            slot_idx,
+            side,
+            allocated_lots,
+            entry_px,
+            learned_mfe_bps,
+            auto_target,
+            snap,
+            btc_leader_snap,
+            epps_signed_beta,
+        )
+    }
+
+    /// Evaluates V5.5.3 `O(V)` homogeneous Pillar-2 ex-ante Expected Value (`ScaledBps`) explicitly connecting
+    /// `cont_ratio_x1000`, `target_excursion_scaled_bps`, and aligned `fib_proj_bps` for `allocated_lots >= 2`
+    /// while preserving `1-lot` (`BTC/ETH`) `compute_single_lot_flow_btc_propulsion_c1` selectivity 100% intact.
     #[inline]
     #[must_use]
     #[allow(
@@ -2246,13 +2583,14 @@ impl OnlineAdaptiveGovernor {
         clippy::suboptimal_flops,
         clippy::too_many_arguments
     )]
-    pub fn evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+    pub fn evaluate_slot_pilar2_ex_ante_ev_with_leader_v553_sbps(
         &self,
         slot_idx: usize,
         side: Side,
         allocated_lots: LotQty,
         entry_px: PriceTicks,
         learned_mfe_bps: ScaledBps,
+        target_excursion_scaled_bps: ScaledBps,
         snap: &SymbolLobSnapshot,
         btc_leader_snap: &SymbolLobSnapshot,
         epps_signed_beta: f64,
@@ -2284,7 +2622,15 @@ impl OnlineAdaptiveGovernor {
         let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
         let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
         let vacuum_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, snap);
-        let base_ev = spec.evaluate_pilar2_asymmetry_ev_with_multilot_flow_sbps(
+        let cont_ratio_x1000 = self.slot_cont_ratio_x1000(slot_idx, side);
+        let aligned_fib_proj_bps = ScaledBps(
+            snap.wave_observables()
+                .fib_proj_bps
+                .raw()
+                .saturating_mul(side.sign_i64())
+                .max(0),
+        );
+        let base_ev = spec.evaluate_pilar2_asymmetry_ev_v553_sbps(
             allocated_lots,
             entry_px,
             snap.realized_vol_5m,
@@ -2299,6 +2645,9 @@ impl OnlineAdaptiveGovernor {
             tfi_aligned,
             btc_aligned,
             vacuum_l2_l3,
+            cont_ratio_x1000,
+            target_excursion_scaled_bps,
+            aligned_fib_proj_bps,
         )?;
         let ev_damped = ((base_ev as f64) * (1.0 - crate::alpha_3factor::PHI * s_iceberg)).round() as i64;
         (ev_damped > 0).then_some(ev_damped)

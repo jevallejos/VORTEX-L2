@@ -4087,3 +4087,346 @@ fn test_v552_live_macro_ob_horizon_tick_hurst_intraday_reversal_and_multilot_qst
     drop(shm_reg);
     let _ = std::fs::remove_file(&shm_p);
 }
+
+#[test]
+fn test_v553_full_forensic_audit_seals_f01_to_f16() {
+    use std::net::{IpAddr, Ipv4Addr};
+    use vortex_rs::alpha_3factor::{
+        compute_tick_lattice_granularity_eta, is_opposing_impulse_wave3_entry_hazard_v552,
+        is_opposing_or_silent_spoof_veto_c1, OrthogonalFactorState, SignalVerdict,
+    };
+    use vortex_rs::execution_fsm::compute_stagnation_sl_compression_factor;
+    use vortex_rs::exit_quoter::ClosedPnlQueryOutcome;
+    use vortex_rs::fifo_sim::{FifoQueueSimulator, SimulatedOrderState};
+    use vortex_rs::forensic_parquet::ParitySyncLedger;
+    use vortex_rs::markout_tracker::SlotMarkoutRing;
+    use vortex_rs::types::slot_from_symbol_name;
+    use vortex_rs::web_server::{
+        is_valid_loopback_origin, VortexWebConfig, VortexWebContext, WebApiError, CSRF_HEADER_NAME,
+    };
+
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    let avax_idx = slot_from_symbol_name("AVAXUSDT").unwrap_or(3);
+    let avax_spec = APPROVED_SPECS[avax_idx];
+    let wif_idx = slot_from_symbol_name("WIFUSDT").unwrap_or(8);
+    let wif_spec = APPROVED_SPECS[wif_idx];
+
+    // (a) F-01: AVAXUSDT Ask with zeta_tox = 0.47 < 0.618, mfe_bps = 0.0, tfi_out = +0.87 at hold = 41.8s
+    // respects the diffusive floor without 82% contraction nor activating exhaustion_unwind_active.
+    let stag_factor = compute_stagnation_sl_compression_factor(
+        41_800_000_000,
+        180_000_000_000,
+        1.0,
+        0,
+        -0.87,
+        0.47,
+    );
+    assert!(stag_factor < 0.01);
+    let mut avax_snap = mk_vault_snap(avax_idx, 8_200, 3_600, -0.72, -0.68, -0.64, 10_000_000_000);
+    let mut avax_eng = SlotExecutionEngine::new(avax_idx);
+    avax_eng.intrinsic_tau_mkt_s = 180;
+    avax_eng.learned_mfe_bps = 680;
+    assert!(avax_eng
+        .try_arm_maker_entry(
+            &avax_snap,
+            SignalVerdict::AuthorizeMakerEntry {
+                side: Side::Ask,
+                target_excursion_scaled_bps: ScaledBps(680),
+            },
+            LotQty(4),
+        )
+        .is_ok());
+    assert!(avax_eng.on_maker_entry_filled(TimestampNs(10_000_000_000)).is_ok());
+    let init_sl_dist = avax_eng.last_eff_sl_ticks.0 - 8_201;
+    let mut avax_ring = SlotMarkoutRing::new();
+    avax_ring.arm_fill_probe(Side::Ask, PriceTicks(8_201), PriceTicks(8_201), TimestampNs(10_000_000_000));
+    avax_ring.step_clock(PriceTicks(8_202), TimestampNs(10_300_000_000), 200);
+    avax_ring.step_clock(PriceTicks(8_202), TimestampNs(11_200_000_000), 200);
+    avax_ring.step_clock(PriceTicks(8_202), TimestampNs(16_000_000_000), 200);
+    avax_ring.step_clock(PriceTicks(8_203), TimestampNs(25_500_000_000), 200);
+    avax_snap.ts_local_ns = TimestampNs(51_800_000_000);
+    avax_snap.bids[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(450) };
+    avax_snap.asks[0] = BookLevel { price: PriceTicks(8_203), qty: LotQty(220) };
+    avax_snap.mark_price = PriceTicks(8_202);
+    avax_snap.last_trade_price = PriceTicks(8_202);
+    avax_snap.factor_ofi = BoundedScore::new_clamped(0.18);
+    avax_snap.factor_tfi = BoundedScore::new_clamped(0.87);
+    let z_obs = avax_eng.observe_post_fill_toxicity_and_wald_v49(&avax_snap, &avax_snap, 0.25, &avax_ring, 1.0);
+    assert!(z_obs < 0.618);
+    assert!(!avax_eng.wald_sprt.exhaustion_unwind_active);
+    let _ = avax_eng.maybe_ratchet_sl_with_toxicity_v48(&avax_snap, &avax_snap, 0.25, 0.47);
+    assert!(!avax_eng.wald_sprt.exhaustion_unwind_active);
+    assert!(avax_eng.wald_sprt.contraction_pct < 82);
+    let cur_sl_dist = avax_eng.last_eff_sl_ticks.0 - 8_201;
+    assert!(cur_sl_dist * 100 > init_sl_dist * 50);
+
+    // (b.1) F-02: Divisible altcoin admission in high volatility (quantum_ev_net_drift_bps / evaluate_pilar2_asymmetry_ev_v553_sbps).
+    let hv_vol = ScaledBps(9_600);
+    let div_lots = avax_spec.compute_risk_parity_kelly_lots_with_fees(
+        6_800_000_000,
+        PriceTicks(8_200),
+        hv_vol,
+        fees.round_trip_maker_exit_bps().raw(),
+        45,
+        1_000,
+        false,
+        fees,
+    );
+    assert!(div_lots.0 >= 1);
+    assert!(avax_spec.quantum_ev_net_drift_bps(6_800_000_000, PriceTicks(8_200), hv_vol, ScaledBps(860), 48, fees) > 0.0);
+    let ev_hv = avax_spec.evaluate_pilar2_asymmetry_ev_v553_sbps(
+        LotQty(div_lots.0.max(2)),
+        PriceTicks(8_200),
+        hv_vol,
+        860,
+        48,
+        0.78,
+        640,
+        460,
+        Side::Bid,
+        fees,
+        0.82,
+        0.76,
+        0.68,
+        0.58,
+        640,
+        ScaledBps(980),
+        ScaledBps(1_450),
+    );
+    assert!(ev_hv.is_some_and(|ev| ev > 0));
+
+    // (b.2) F-08: Wide-tick WIF admission with OFI = +0.78, TFI = 0.00 without NeutralNoAction / SpoofingVeto.
+    let btc_bull = mk_vault_snap(0, 680_000, 3_200, 0.72, 0.68, 0.64, 60_000_000_000);
+    let mut wif_snap = mk_vault_snap(wif_idx, 1_470, 9_500, 0.78, 0.00, 0.74, 60_000_000_000);
+    wif_snap.ob_bull_efficacy_pm = 620;
+    wif_snap.ob_bear_efficacy_pm = 480;
+    wif_snap.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.64),
+        macro_phase: BoundedScore::new_clamped(0.62),
+        oi_impulse: BoundedScore::new_clamped(0.35),
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(3_800),
+    });
+    let eta_wif = compute_tick_lattice_granularity_eta(&wif_snap, fees);
+    assert!(eta_wif > 1.62);
+    assert!(!is_opposing_or_silent_spoof_veto_c1(0.78, 0.00, eta_wif, 0.90));
+    let wif_verdict = OrthogonalFactorState::evaluate_entry_signal_v553(
+        wif_spec,
+        &wif_snap,
+        &btc_bull,
+        ScaledBps(3_600),
+        ScaledBps(120),
+        48,
+        fees,
+        0.0,
+        0.85,
+        0.75,
+        Some(0.65),
+        1.0,
+        0.0,
+        0.90,
+    );
+    assert!(matches!(
+        wif_verdict,
+        SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+    ));
+
+    // (b.3) F-09: Penny-Jump admission (is_penny_jump = true, SPR >= 2) despite thick rear L1 wall (own_l1_1e8 > max_q_1e8).
+    let mut pj_snap = mk_vault_snap(avax_idx, 8_200, 4_200, 0.84, 0.79, 0.72, 62_000_000_000);
+    pj_snap.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(500_000) };
+    pj_snap.asks[0] = BookLevel { price: PriceTicks(8_202), qty: LotQty(80) };
+    pj_snap.refresh_deep_l1_l5_totals();
+    assert!(OnlineAdaptiveGovernor::qualifies_inside_spread_penny_jump_c1(Side::Bid, &pj_snap, 1.0));
+    assert!(!avax_spec.passes_l1_queue_depth_and_wall_guard_v553(
+        PriceTicks(8_200),
+        ScaledBps(4_200),
+        150,
+        LotQty(500_000),
+        LotQty(80),
+        pj_snap.deep_bid_lots_l1_l5,
+        0.84,
+        0.79,
+        48,
+        fees,
+        false,
+    ));
+    assert!(avax_spec.passes_l1_queue_depth_and_wall_guard_v553(
+        PriceTicks(8_201),
+        ScaledBps(4_200),
+        150,
+        LotQty(500_000),
+        LotQty(80),
+        pj_snap.deep_bid_lots_l1_l5,
+        0.84,
+        0.79,
+        48,
+        fees,
+        true,
+    ));
+
+    // (c) F-03: Zero 0 ms self-cancellation in RestingEntryQueue while OFI/TFI/BTC backing holds, immediate abort once lost.
+    let mut w3_rev = mk_vault_snap(avax_idx, 8_200, 3_800, 0.78, 0.74, 0.70, 70_000_000_000);
+    w3_rev.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.56),
+        macro_phase: BoundedScore::new_clamped(-0.62),
+        oi_impulse: BoundedScore::new_clamped(-0.10),
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(-3_200),
+    });
+    assert!(!is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid, &w3_rev, 0.64, 0.92, 3_800, 48, fees
+    ));
+    w3_rev.factor_ofi = BoundedScore::new_clamped(-0.18);
+    w3_rev.factor_tfi = BoundedScore::new_clamped(-0.22);
+    assert!(is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid, &w3_rev, -0.25, 0.92, 3_800, 48, fees
+    ));
+
+    // (d) F-05: Finite contagion cooldown + smooth decay toward 0 when global_dir_debt_bps_x100 crosses threshold with glob_cd == 0, preserving sl_streak.
+    let mut gov_f05 = OnlineAdaptiveGovernor::new();
+    let mut cum_mat = [[0_i64; 2]; 12];
+    cum_mat[1][0] = -3_200;
+    let mut sl_mat = [[0_u32; 2]; 12];
+    sl_mat[1][0] = 2;
+    let scar_f05 = serde_json::json!({
+        "event": "GOV_SCAR_SNAPSHOT",
+        "ts_ns": 1_700_000_000_000_000_000_i64,
+        "cum_net_bps_x100": cum_mat,
+        "sl_streak": sl_mat,
+        "global_dir_debt_bps_x100": [-12_500_i64, 0_i64],
+        "global_dir_cooldown_until_ns": [0_i64, 0_i64],
+    });
+    assert!(gov_f05.apply_scar_snapshot_json(&scar_f05).is_some());
+    assert_eq!(gov_f05.global_dir_cooldown_until_ns_for(Side::Bid), 0);
+    let t_f05 = 1_700_000_010_000_000_000_i64;
+    assert_eq!(
+        gov_f05.audit_historical_entry_veto(1, Side::Bid, 200_000, t_f05),
+        Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION")
+    );
+    let armed_cd = gov_f05.global_dir_cooldown_until_ns_for(Side::Bid);
+    assert!(armed_cd > t_f05);
+    let t_unlocked = armed_cd + 2_400_000_000_000_i64;
+    assert_eq!(gov_f05.audit_historical_entry_veto(1, Side::Bid, 200_000, t_unlocked), None);
+    assert!(gov_f05.global_dir_debt_bps_x100_for(Side::Bid) > -10_000);
+    let t_fully_damped = t_unlocked + 7_200_000_000_000_i64;
+    let _ = gov_f05.audit_historical_entry_veto(1, Side::Bid, 200_000, t_fully_damped);
+    assert_eq!(gov_f05.global_dir_debt_bps_x100_for(Side::Bid), 0);
+    let after_scar = gov_f05.to_scar_snapshot_json(TimestampNs(t_fully_damped));
+    assert_eq!(after_scar["sl_streak"][1][0].as_u64(), Some(2));
+
+    // (e) F-06: FifoQueueSimulator::on_lob_snapshot produces ZERO phantom fills when own L1 retreats with SPR > 1 without opposite cross or PublicTrade.
+    let mut fifo = FifoQueueSimulator::new();
+    fifo.submit_post_only(Side::Bid, PriceTicks(8_200), LotQty(8), TimestampNs(1_000_000_000));
+    let mut s_rest = mk_vault_snap(avax_idx, 8_200, 3_200, 0.40, 0.35, 0.30, 1_030_000_000);
+    s_rest.bids[0] = BookLevel { price: PriceTicks(8_200), qty: LotQty(400) };
+    s_rest.asks[0] = BookLevel { price: PriceTicks(8_203), qty: LotQty(400) };
+    fifo.on_lob_snapshot(&s_rest);
+    assert!(matches!(fifo.state, SimulatedOrderState::RestingInFifoQueue { .. }));
+    let mut s_retreat = s_rest;
+    s_retreat.ts_local_ns = TimestampNs(1_050_000_000);
+    s_retreat.bids[0] = BookLevel { price: PriceTicks(8_198), qty: LotQty(350) };
+    s_retreat.asks[0] = BookLevel { price: PriceTicks(8_203), qty: LotQty(400) };
+    fifo.on_lob_snapshot(&s_retreat);
+    assert_eq!(fifo.total_maker_fills, 0);
+    assert!(!matches!(fifo.state, SimulatedOrderState::FilledMaker { .. }));
+
+    // (f) F-10: Exact T1 Maker + T3 Taker fee attribution on mixed close (PARITY_SYNC Drift == 0).
+    let mut eng_f10 = SlotExecutionEngine::new(avax_idx);
+    let s_f10 = mk_vault_snap(avax_idx, 8_200, 3_600, 0.75, 0.72, 0.68, 10_000_000_000);
+    assert!(eng_f10
+        .try_arm_maker_entry(
+            &s_f10,
+            SignalVerdict::AuthorizeMakerEntry {
+                side: Side::Bid,
+                target_excursion_scaled_bps: ScaledBps(700),
+            },
+            LotQty(10),
+        )
+        .is_ok());
+    assert!(eng_f10.on_maker_entry_filled(TimestampNs(10_000_000_000)).is_ok());
+    let (net_t1, fee_t1_mkr, _, _) = avax_spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+        Side::Bid, LotQty(5), PriceTicks(8_200), PriceTicks(8_212), true, fees,
+    );
+    let (net_t3, fee_t3_tkr, _, _) = avax_spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+        Side::Bid, LotQty(5), PriceTicks(8_200), PriceTicks(8_175), false, fees,
+    );
+    let (_, fee_t1_if_all_tkr, _, _) = avax_spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+        Side::Bid, LotQty(5), PriceTicks(8_200), PriceTicks(8_212), false, fees,
+    );
+    let qty_half_str = avax_spec.format_lot_qty_str(LotQty(5));
+    let (en_w, en_f) = avax_spec.format_price_usdt_parts(PriceTicks(8_200));
+    let (t1_w, t1_f) = avax_spec.format_price_usdt_parts(PriceTicks(8_212));
+    let (t3_w, t3_f) = avax_spec.format_price_usdt_parts(PriceTicks(8_175));
+    let mixed_payload = serde_json::json!({
+        "retCode": 0,
+        "result": {
+            "list": [
+                {
+                    "symbol": avax_spec.symbol_id.name(),
+                    "orderType": "Market",
+                    "closedSize": qty_half_str,
+                    "avgEntryPrice": format!("{en_w}.{en_f:04}"),
+                    "avgExitPrice": format!("{t3_w}.{t3_f:04}"),
+                    "closedPnl": format!("{:.8}", (net_t3 as f64) / 100_000_000.0),
+                    "updatedTime": "20000"
+                },
+                {
+                    "symbol": avax_spec.symbol_id.name(),
+                    "orderType": "Limit",
+                    "closedSize": qty_half_str,
+                    "avgEntryPrice": format!("{en_w}.{en_f:04}"),
+                    "avgExitPrice": format!("{t1_w}.{t1_f:04}"),
+                    "closedPnl": format!("{:.8}", (net_t1 as f64) / 100_000_000.0),
+                    "updatedTime": "15000"
+                }
+            ]
+        }
+    });
+    let outcome_f10 = eng_f10.reconcile_closed_pnl_payload(&mixed_payload, 0, false);
+    assert!(matches!(outcome_f10, ClosedPnlQueryOutcome::Verified(_)));
+    if let ClosedPnlQueryOutcome::Verified(res_f10) = outcome_f10 {
+        assert_eq!(res_f10.maker_closed_lots, LotQty(5));
+        assert_eq!(res_f10.taker_closed_lots, LotQty(5));
+        assert_eq!(res_f10.exact_fee_1e8, Some(fee_t1_mkr + fee_t3_tkr));
+        assert!(fee_t1_mkr + fee_t3_tkr < fee_t1_if_all_tkr + fee_t3_tkr);
+        let init_eq_1e8 = 6_800_000_000_i64;
+        let mut ledger_f10 = ParitySyncLedger::new(init_eq_1e8);
+        let applied_opt = eng_f10.apply_verified_close_resolution(res_f10, TimestampNs(20_000_000_000), &mut ledger_f10);
+        assert!(applied_opt.is_some());
+        if let Some(sum_f10) = applied_opt {
+            assert_eq!(sum_f10.fee_1e8, fee_t1_mkr + fee_t3_tkr);
+            assert_eq!(sum_f10.net_pnl_1e8, net_t1 + net_t3);
+        }
+        let expected_exch_eq_1e8 = init_eq_1e8 + net_t1 + net_t3;
+        let parity_sync_drift_1e8 = ledger_f10.current_equity_1e8() - expected_exch_eq_1e8;
+        assert_eq!(parity_sync_drift_1e8, 0);
+    }
+
+    // (g) F-16: Strict authority CSRF rejects http://localhost.evil.tld and accepts http://localhost:8080.
+    assert!(!is_valid_loopback_origin("http://localhost.evil.tld"));
+    assert!(!is_valid_loopback_origin("http://127.0.0.1.evil.tld"));
+    assert!(!is_valid_loopback_origin("http://localhost:0"));
+    assert!(!is_valid_loopback_origin("http://localhost:65536"));
+    assert!(is_valid_loopback_origin("http://localhost:8080"));
+    assert!(is_valid_loopback_origin("http://127.0.0.1:8787/"));
+    assert!(is_valid_loopback_origin("http://[::1]:8787"));
+    let web_ctx = VortexWebContext::new(VortexWebConfig {
+        bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port: 0,
+        ..VortexWebConfig::default()
+    });
+    let evil_hdrs = vec![
+        ("Origin".to_string(), "http://localhost.evil.tld".to_string()),
+        (CSRF_HEADER_NAME.to_string(), web_ctx.csrf_token.clone()),
+    ];
+    assert_eq!(web_ctx.verify_csrf_header(&evil_hdrs), Err(WebApiError::CsrfRejected));
+    let good_hdrs = vec![
+        ("Origin".to_string(), "http://localhost:8080".to_string()),
+        (CSRF_HEADER_NAME.to_string(), web_ctx.csrf_token.clone()),
+    ];
+    assert_eq!(web_ctx.verify_csrf_header(&good_hdrs), Ok(()));
+}

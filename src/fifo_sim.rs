@@ -163,24 +163,28 @@ impl FifoQueueSimulator {
             SimulatedOrderState::RestingInFifoQueue {
                 side, limit_price, order_qty, mut queue_ahead_qty, last_observed_lvl_qty,
             } => {
-                let level_wiped = match side {
-                    Side::Bid => {
-                        (best_ask.price.0 > 0 && best_ask.price.0 <= limit_price.0)
-                            || (last_observed_lvl_qty.0 > 0
-                                && best_bid.price.0 > 0
-                                && best_bid.price.0 < limit_price.0)
-                    }
-                    Side::Ask => {
-                        best_bid.price.0 >= limit_price.0
-                            || (last_observed_lvl_qty.0 > 0
-                                && best_ask.price.0 > 0
-                                && best_ask.price.0 > limit_price.0)
-                    }
+                let opp_crossed = match side {
+                    Side::Bid => best_ask.price.0 > 0 && best_ask.price <= limit_price,
+                    Side::Ask => best_bid.price.0 > 0 && best_bid.price >= limit_price,
                 };
-                if level_wiped {
+                if opp_crossed {
                     self.total_maker_fills += 1;
                     self.state = SimulatedOrderState::FilledMaker {
                         side, fill_price: limit_price, filled_qty: order_qty, fill_ts_ns: ts_ns,
+                    };
+                    return;
+                }
+                let own_retreated = match side {
+                    Side::Bid => best_bid.price.0 > 0 && best_bid.price < limit_price,
+                    Side::Ask => best_ask.price.0 > 0 && best_ask.price > limit_price,
+                };
+                if own_retreated {
+                    self.state = SimulatedOrderState::RestingInFifoQueue {
+                        side,
+                        limit_price,
+                        order_qty,
+                        queue_ahead_qty: LotQty(0),
+                        last_observed_lvl_qty: LotQty(0),
                     };
                     return;
                 }
@@ -193,6 +197,8 @@ impl FifoQueueSimulator {
                         queue_ahead_qty = clamp_resting_queue_ahead_physical(
                             queue_ahead_qty, cur_q, LotQty(0), last_observed_lvl_qty,
                         );
+                    } else {
+                        queue_ahead_qty = LotQty(0);
                     }
                     cur_q
                 } else {
@@ -257,24 +263,28 @@ impl FifoQueueSimulator {
             SimulatedOrderState::RestingInFifoQueue {
                 side, limit_price, order_qty, mut queue_ahead_qty, last_observed_lvl_qty,
             } => {
-                let level_wiped = match side {
-                    Side::Bid => {
-                        (best_ask.price.0 > 0 && best_ask.price.0 <= limit_price.0)
-                            || (last_observed_lvl_qty.0 > 0
-                                && best_bid.price.0 > 0
-                                && best_bid.price.0 < limit_price.0)
-                    }
-                    Side::Ask => {
-                        best_bid.price.0 >= limit_price.0
-                            || (last_observed_lvl_qty.0 > 0
-                                && best_ask.price.0 > 0
-                                && best_ask.price.0 > limit_price.0)
-                    }
+                let opp_crossed = match side {
+                    Side::Bid => best_ask.price.0 > 0 && best_ask.price <= limit_price,
+                    Side::Ask => best_bid.price.0 > 0 && best_bid.price >= limit_price,
                 };
-                if level_wiped {
+                if opp_crossed {
                     self.total_maker_fills += 1;
                     self.state = SimulatedOrderState::FilledMaker {
                         side, fill_price: limit_price, filled_qty: order_qty, fill_ts_ns: ts_ns,
+                    };
+                    return;
+                }
+                let own_retreated = match side {
+                    Side::Bid => best_bid.price.0 > 0 && best_bid.price < limit_price,
+                    Side::Ask => best_ask.price.0 > 0 && best_ask.price > limit_price,
+                };
+                if own_retreated {
+                    self.state = SimulatedOrderState::RestingInFifoQueue {
+                        side,
+                        limit_price,
+                        order_qty,
+                        queue_ahead_qty: LotQty(0),
+                        last_observed_lvl_qty: LotQty(0),
                     };
                     return;
                 }
@@ -287,6 +297,8 @@ impl FifoQueueSimulator {
                         queue_ahead_qty = clamp_resting_queue_ahead_physical(
                             queue_ahead_qty, cur_q, LotQty(0), last_observed_lvl_qty,
                         );
+                    } else {
+                        queue_ahead_qty = LotQty(0);
                     }
                     cur_q
                 } else {

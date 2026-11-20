@@ -1,9 +1,9 @@
 [package]
 name = "vortex-rs"
-version = "5.5.2"
+version = "5.5.3"
 edition = "2021"
 rust-version = "1.88"
-description = "VORTEX-OMEGA V5.5.2 Autonomous 200Hz Maker-First HFT Engine (27 Modules, 4 Binaries, SHM v15, VKL1, PAR2Z & Observatory Web)"
+description = "VORTEX-OMEGA V5.5.3 Autonomous 200Hz Maker-First HFT Engine (27 Modules, 4 Binaries, SHM v15, VKL1, PAR2Z & Observatory Web)"
 license = "Proprietary"
 publish = false
 
