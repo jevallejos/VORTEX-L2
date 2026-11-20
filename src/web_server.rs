@@ -924,7 +924,7 @@ pub fn stream_sse_5hz_loop(
     let hdr = concat!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n",
         "Cache-Control: no-cache\r\nConnection: keep-alive\r\n",
-        "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'\r\n\r\n"
+        "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; img-src 'self' data: blob:\r\n\r\n"
     );
     stream.write_all(hdr.as_bytes())?;
     let mut sent = 0_usize;
@@ -994,7 +994,7 @@ fn handle_tcp_client(ctx: std::sync::Arc<VortexWebContext>, mut stream: std::net
         500 => "Internal Server Error", _ => "Not Found",
     };
     let head = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'\r\nX-Vortex-Csrf: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; img-src 'self' data: blob:\r\nX-Vortex-Csrf: {}\r\nConnection: close\r\n\r\n",
         resp_body.len(), ctx.csrf_token
     );
     let _ = stream.write_all(head.as_bytes());

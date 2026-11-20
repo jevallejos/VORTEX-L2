@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta id="vortex-csrf-meta" name="vortex-csrf" content="__VORTEX_CSRF__">
 <title>VORTEX-OMEGA V5.5 — Institutional Observatory (SHM v15 / VKL1)</title>
-<script src="https://unpkg.com/lightweight-charts@5.0.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.0/dist/lightweight-charts.standalone.production.js" onerror="this.onerror=null;this.src='https://unpkg.com/lightweight-charts@5.0.0/dist/lightweight-charts.standalone.production.js'"></script>
 <style>
 :root{--bg:#070b12;--panel:#0d1421;--panel2:#121b2d;--brd:#1e2d47;--txt:#e2e8f0;--muted:#8899b0;--cyan:#38bdf8;--green:#22c55e;--gold:#facc15;--orange:#fb923c;--red:#ef4444;--mono:'JetBrains Mono','Cascadia Code',Consolas,monospace;}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -294,9 +294,89 @@ function addCompatSeries(chart, kind, opts) {
   return null;
 }
 
+function drawFallbackCandles2D() {
+  const mBox = el("chart-main"), sBox = el("chart-sub");
+  if (!mBox || !sBox || VX.candleSeries) return;
+  let mCv = el("fb-main-cv");
+  if (!mCv) { mCv = document.createElement("canvas"); mCv.id = "fb-main-cv"; mCv.style.cssText = "width:100%;height:100%;display:block;"; mBox.innerHTML = ""; mBox.appendChild(mCv); }
+  let sCv = el("fb-sub-cv");
+  if (!sCv) { sCv = document.createElement("canvas"); sCv.id = "fb-sub-cv"; sCv.style.cssText = "width:100%;height:100%;display:block;"; sBox.innerHTML = ""; sBox.appendChild(sCv); }
+  const dpr = window.devicePixelRatio || 1;
+  const mw = Math.max(mBox.clientWidth || 720, 320), mh = Math.max(mBox.clientHeight || 315, 180);
+  if (mCv.width !== Math.floor(mw * dpr) || mCv.height !== Math.floor(mh * dpr)) { mCv.width = Math.floor(mw * dpr); mCv.height = Math.floor(mh * dpr); }
+  const sw = Math.max(sBox.clientWidth || 720, 320), sh = Math.max(sBox.clientHeight || 115, 80);
+  if (sCv.width !== Math.floor(sw * dpr) || sCv.height !== Math.floor(sh * dpr)) { sCv.width = Math.floor(sw * dpr); sCv.height = Math.floor(sh * dpr); }
+  const ctx = mCv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0d1421"; ctx.fillRect(0, 0, mw, mh);
+  const raw = Array.isArray(VX.candles) ? VX.candles : [];
+  const bars = raw.slice(Math.max(0, raw.length - 110));
+  const slot = (VX.state && Array.isArray(VX.state.slots)) ? VX.state.slots.find(function(s) { return s.symbol === VX.symbol; }) : null;
+  if (bars.length === 0 && slot && (slot.mark > 0 || slot.bid > 0)) {
+    const px = slot.mark || slot.bid;
+    bars.push({ time: Math.floor(Date.now() / 1000), open: px, high: Math.max(px, slot.ask || px), low: Math.min(px, slot.bid || px), close: px, ofi: slot.ofi || 0, tfi: slot.tfi || 0 });
+  }
+  if (bars.length === 0) { ctx.fillStyle = "#8899b0"; ctx.font = "12px Consolas, monospace"; ctx.fillText("Cargando velas VKL1 (" + VX.symbol + " " + VX.tf + ")...", 18, mh / 2); return; }
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < bars.length; i++) { if (bars[i].low < lo) lo = bars[i].low; if (bars[i].high > hi) hi = bars[i].high; }
+  if (slot && slot.state_code >= 1) {
+    if (slot.entry_px > 0) { lo = Math.min(lo, slot.entry_px); hi = Math.max(hi, slot.entry_px); }
+    if (slot.state_code >= 3 && slot.tp_px > 0) { lo = Math.min(lo, slot.tp_px); hi = Math.max(hi, slot.tp_px); }
+    if (slot.state_code >= 3 && slot.sl_px > 0) { lo = Math.min(lo, slot.sl_px); hi = Math.max(hi, slot.sl_px); }
+  }
+  const span = Math.max(hi - lo, (hi || 1) * 0.0004); lo -= span * 0.08; hi += span * 0.08;
+  const padL = 8, padR = 74, padT = 10, padB = 20;
+  const plotW = Math.max(mw - padL - padR, 60), plotH = Math.max(mh - padT - padB, 60);
+  const yOf = function(p) { return padT + (1 - (p - lo) / (hi - lo)) * plotH; };
+  const dec = hi >= 1000 ? 2 : (hi >= 10 ? 3 : 4);
+  ctx.strokeStyle = "#142033"; ctx.lineWidth = 1; ctx.fillStyle = "#8899b0"; ctx.font = "10px Consolas, monospace";
+  for (let g = 0; g <= 4; g++) {
+    const gy = padT + (plotH * g) / 4, gp = hi - ((hi - lo) * g) / 4;
+    ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(mw - padR, gy); ctx.stroke();
+    ctx.fillText(gp.toFixed(dec), mw - padR + 5, gy + 3);
+  }
+  const step = plotW / Math.max(bars.length, 1), bw = Math.max(Math.min(step * 0.72, 11), 2);
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i], cx = padL + (i + 0.5) * step, up = b.close >= b.open;
+    ctx.strokeStyle = up ? "#22c55e" : "#ef4444"; ctx.fillStyle = up ? "#22c55e" : "#ef4444";
+    ctx.beginPath(); ctx.moveTo(cx, yOf(b.high)); ctx.lineTo(cx, yOf(b.low)); ctx.stroke();
+    const yo = yOf(b.open), yc = yOf(b.close);
+    ctx.fillRect(cx - bw / 2, Math.min(yo, yc), bw, Math.max(Math.abs(yc - yo), 1.5));
+  }
+  const drawLvl = function(px, col, dash, lbl) {
+    if (!(px >= lo && px <= hi)) return;
+    const y = yOf(px); ctx.save(); ctx.strokeStyle = col; ctx.setLineDash(dash); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(mw - padR, y); ctx.stroke();
+    ctx.fillStyle = col; ctx.fillText(lbl, padL + 4, Math.max(y - 3, 10)); ctx.restore();
+  };
+  if (slot) {
+    drawLvl(slot.ob_bull_px, "#16a34a", [4, 3], "OB+"); drawLvl(slot.ob_bear_px, "#dc2626", [4, 3], "OB-");
+    if (slot.state_code >= 1 && slot.entry_px > 0) drawLvl(slot.entry_px, "#facc15", [], "ENTRY");
+    if (slot.state_code >= 3 && slot.tp_px > 0) drawLvl(slot.tp_px, "#38bdf8", [], "TP");
+    if (slot.state_code >= 3 && slot.sl_px > 0) drawLvl(slot.sl_px, "#ef4444", [2, 2], "SL");
+  }
+  const sctx = sCv.getContext("2d"); sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  sctx.fillStyle = "#0d1421"; sctx.fillRect(0, 0, sw, sh);
+  const sMid = sh / 2, sAmp = Math.max(sh / 2 - 10, 12);
+  sctx.strokeStyle = "#1e2d47"; sctx.beginPath(); sctx.moveTo(padL, sMid); sctx.lineTo(sw - padR, sMid); sctx.stroke();
+  for (let i = 0; i < bars.length; i++) {
+    const v = Math.max(-1, Math.min(1, Number(bars[i].ofi) || 0)), cx = padL + (i + 0.5) * step, yv = sMid - v * sAmp;
+    sctx.fillStyle = v >= 0 ? "rgba(34,197,94,0.60)" : "rgba(239,68,68,0.60)";
+    sctx.fillRect(cx - bw / 2, Math.min(sMid, yv), bw, Math.max(Math.abs(yv - sMid), 1));
+  }
+  sctx.strokeStyle = "#38bdf8"; sctx.lineWidth = 1.6; sctx.beginPath();
+  for (let i = 0; i < bars.length; i++) {
+    const tv = Math.max(-1, Math.min(1, Number(bars[i].tfi) || 0)), cx = padL + (i + 0.5) * step, yv = sMid - tv * sAmp;
+    if (i === 0) sctx.moveTo(cx, yv); else sctx.lineTo(cx, yv);
+  }
+  sctx.stroke();
+  sctx.fillStyle = "#8899b0"; sctx.font = "10px Consolas, monospace";
+  sctx.fillText("+1.0", sw - padR + 5, 14); sctx.fillText(" 0.0", sw - padR + 5, sMid + 3); sctx.fillText("-1.0", sw - padR + 5, sh - 6);
+}
+
 function initCharts() {
   const mBox = el("chart-main"), sBox = el("chart-sub"), LWC = window.LightweightCharts;
-  if (!LWC || !mBox || !sBox) return;
+  if (!mBox || !sBox) return;
+  if (!LWC) { window.addEventListener("resize", drawFallbackCandles2D); drawFallbackCandles2D(); return; }
   const baseCfg = {
     layout: { background: { color: "#0d1421" }, textColor: "#8899b0", fontSize: 11 },
     grid: { vertLines: { color: "#142033" }, horzLines: { color: "#142033" } },
@@ -361,6 +441,7 @@ function syncSlotOverlays() {
   el("l5-asks").innerHTML = asksHtml;
   el("l5-spread").textContent = "Mid/Mark: " + num(slot.mark || slot.bid, 4) + " | Spread: " + slot.spread_ticks + "t";
   el("l5-bids").innerHTML = bidsHtml;
+  if (!VX.candleSeries) { drawFallbackCandles2D(); }
 }
 
 async function loadCandles() {
@@ -370,6 +451,13 @@ async function loadCandles() {
     if (!r.ok) return;
     const j = await r.json();
     const arr = Array.isArray(j.candles) ? j.candles : [];
+    if (arr.length === 0 && VX.state && Array.isArray(VX.state.slots)) {
+      const sl = VX.state.slots.find(function(s) { return s.symbol === VX.symbol; });
+      if (sl && (sl.mark > 0 || sl.bid > 0)) {
+        const px = sl.mark || sl.bid;
+        arr.push({ time: Math.floor(Date.now() / 1000), open: px, high: Math.max(px, sl.ask || px), low: Math.min(px, sl.bid || px), close: px, ofi: sl.ofi || 0, tfi: sl.tfi || 0 });
+      }
+    }
     VX.candles = arr;
     if (VX.candleSeries && arr.length > 0) {
       const bars = [], ofiPts = [], tfiPts = [];
@@ -386,6 +474,7 @@ async function loadCandles() {
       if (VX.ofiSeries) VX.ofiSeries.setData(ofiPts);
       if (VX.tfiSeries) VX.tfiSeries.setData(tfiPts);
     }
+    if (!VX.candleSeries) { drawFallbackCandles2D(); }
     syncSlotOverlays();
   } catch (_) {}
 }
