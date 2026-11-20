@@ -1,4 +1,4 @@
-//! VORTEX-OMEGA V5.4.2 Institutional Zero-Jitter Execution Core (27-Submodule Clean-Room Architecture).
+//! VORTEX-OMEGA V5.5 Institutional Zero-Jitter Execution Core (27-Submodule Clean-Room Architecture).
 #![recursion_limit = "256"]
 
 pub mod alpha_3factor;

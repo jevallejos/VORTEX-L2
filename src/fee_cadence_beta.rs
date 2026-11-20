@@ -530,6 +530,7 @@ impl PairSpec {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MonetaryPortfolioBetaGuard {
     active: [bool; 12],
+    free_ride: [bool; 12],
     side: [Side; 12],
     risk_ppm: [i64; 12],
     beta_x1000: [i64; 12],
@@ -548,10 +549,17 @@ impl MonetaryPortfolioBetaGuard {
     pub const fn new() -> Self {
         Self {
             active: [false; 12],
+            free_ride: [false; 12],
             side: [Side::Bid; 12],
             risk_ppm: [0; 12],
             beta_x1000: [1_000; 12],
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_slot_free_ride(&self, slot_idx: usize) -> bool {
+        slot_idx < 12 && self.active[slot_idx] && self.free_ride[slot_idx]
     }
 
     #[inline]
@@ -568,6 +576,22 @@ impl MonetaryPortfolioBetaGuard {
             }
         }
         (bids, asks, bids + asks)
+    }
+
+    #[inline]
+    #[must_use]
+    fn risk_bearing_side_counts(&self) -> (usize, usize) {
+        let mut bids = 0_usize;
+        let mut asks = 0_usize;
+        for i in 0..12 {
+            if self.active[i] && !self.free_ride[i] {
+                match self.side[i] {
+                    Side::Bid => bids += 1,
+                    Side::Ask => asks += 1,
+                }
+            }
+        }
+        (bids, asks)
     }
 
     #[inline]
@@ -615,20 +639,21 @@ impl MonetaryPortfolioBetaGuard {
         if slot_idx >= 12 || self.active[slot_idx] {
             return false;
         }
-        let (bids, asks, tot) = self.open_counts();
+        let (_, _, tot) = self.open_counts();
         if tot >= MAX_TOTAL_OPEN_SLOTS {
             return false;
         }
+        let (risk_bids, risk_asks) = self.risk_bearing_side_counts();
         match side {
-            Side::Bid if bids >= MAX_SIDE_OPEN_SLOTS => return false,
-            Side::Ask if asks >= MAX_SIDE_OPEN_SLOTS => return false,
+            Side::Bid if risk_bids >= MAX_SIDE_OPEN_SLOTS => return false,
+            Side::Ask if risk_asks >= MAX_SIDE_OPEN_SLOTS => return false,
             _ => {}
         }
         let eff_risk = risk_ppm.clamp(1, MAX_PORTFOLIO_RISK_PPM);
         if self.total_open_risk_ppm().saturating_add(eff_risk) > MAX_PORTFOLIO_RISK_PPM {
             return false;
         }
-        if tot == 0 {
+        if tot == 0 || (risk_bids + risk_asks) == 0 {
             return true;
         }
         let eff_beta = beta_x1000.clamp(-1_618, 1_618);
@@ -649,8 +674,46 @@ impl MonetaryPortfolioBetaGuard {
     ) {
         if slot_idx < 12 {
             self.active[slot_idx] = true;
+            self.free_ride[slot_idx] = false;
             self.side[slot_idx] = side;
             self.risk_ppm[slot_idx] = risk_ppm.clamp(1, MAX_PORTFOLIO_RISK_PPM);
+            self.beta_x1000[slot_idx] = beta_x1000.clamp(-1_618, 1_618);
+        }
+    }
+
+    /// Registers an open position scaling `eff_risk_ppm` and directional beta load by
+    /// `S_3(residual_risk_ratio; 0.0, INV_PHI_SQ)` (V5.5 O4 House-Money Free-Ride).
+    /// When `residual_s3_scale <= 0.0` (`residual_risk_1e8 == 0`), marks the slot `free_ride`
+    /// (`eff_risk_ppm = 0`, freeing risk budget and same-side slot cap while enforcing `<= 6` total slots).
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn register_slot_open_house_money(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        base_risk_ppm: i64,
+        beta_x1000: i64,
+        residual_s3_scale: f64,
+    ) {
+        if slot_idx >= 12 {
+            return;
+        }
+        let scale = if residual_s3_scale.is_finite() {
+            residual_s3_scale.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.active[slot_idx] = true;
+        self.side[slot_idx] = side;
+        if scale <= 1e-9 {
+            self.free_ride[slot_idx] = true;
+            self.risk_ppm[slot_idx] = 0;
+            self.beta_x1000[slot_idx] = 0;
+        } else {
+            let base_c = base_risk_ppm.clamp(1, MAX_PORTFOLIO_RISK_PPM);
+            let scaled = ((base_c as f64) * scale).round() as i64;
+            self.free_ride[slot_idx] = false;
+            self.risk_ppm[slot_idx] = scaled.clamp(1, MAX_PORTFOLIO_RISK_PPM);
             self.beta_x1000[slot_idx] = beta_x1000.clamp(-1_618, 1_618);
         }
     }
@@ -659,6 +722,7 @@ impl MonetaryPortfolioBetaGuard {
     pub fn release_slot(&mut self, slot_idx: usize) {
         if slot_idx < 12 {
             self.active[slot_idx] = false;
+            self.free_ride[slot_idx] = false;
             self.risk_ppm[slot_idx] = 0;
             self.beta_x1000[slot_idx] = 1_000;
         }

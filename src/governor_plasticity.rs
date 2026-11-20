@@ -16,6 +16,9 @@ const INV_PHI2_PM: i64 = 382;
 const MIN_REHAB_SNR: f64 = 0.72;
 const SHADOW_CREDITS_REQUIRED: u8 = 3;
 pub const DEFAULT_FILL_PRIOR_X1000: i64 = 1_000;
+pub const DEFAULT_CONT_RATIO_X1000: i64 = 1_000;
+pub const MIN_CONT_RATIO_X1000: i64 = 618;
+pub const MAX_CONT_RATIO_X1000: i64 = 2_618;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GovernorPlasticityState {
@@ -28,6 +31,7 @@ pub struct GovernorPlasticityState {
     last_credit_ts_ns: [[i64; 2]; MAX_ACTIVE_PAIRS],
     pub fill_obs_alpha_x1000: [i64; MAX_ACTIVE_PAIRS],
     pub fill_obs_beta_x1000: [i64; MAX_ACTIVE_PAIRS],
+    pub cont_ratio_x1000: [[i64; 2]; MAX_ACTIVE_PAIRS],
 }
 
 impl Default for GovernorPlasticityState {
@@ -52,6 +56,7 @@ impl GovernorPlasticityState {
             last_credit_ts_ns: [[0; 2]; MAX_ACTIVE_PAIRS],
             fill_obs_alpha_x1000: [DEFAULT_FILL_PRIOR_X1000; MAX_ACTIVE_PAIRS],
             fill_obs_beta_x1000: [DEFAULT_FILL_PRIOR_X1000; MAX_ACTIVE_PAIRS],
+            cont_ratio_x1000: [[DEFAULT_CONT_RATIO_X1000; 2]; MAX_ACTIVE_PAIRS],
         }
     }
 
@@ -352,6 +357,10 @@ impl GovernorPlasticityState {
             "fill_obs_beta_x1000".to_string(),
             serde_json::json!(self.fill_obs_beta_x1000),
         );
+        map.insert(
+            "cont_ratio_x1000".to_string(),
+            serde_json::json!(self.cont_ratio_x1000),
+        );
     }
 
     pub fn apply_from_scar_json(&mut self, val: &serde_json::Value) {
@@ -418,6 +427,21 @@ impl GovernorPlasticityState {
                 if let Some(n) = c.as_i64() {
                     self.fill_obs_beta_x1000[s] = n.clamp(100, 500_000);
                 }
+            }
+        }
+        self.cont_ratio_x1000 = [[DEFAULT_CONT_RATIO_X1000; 2]; MAX_ACTIVE_PAIRS];
+        crate::kinematic_surface::extract_matrix_i64_12x2(
+            val,
+            "cont_ratio_x1000",
+            &mut self.cont_ratio_x1000,
+        );
+        for row in &mut self.cont_ratio_x1000 {
+            for cell in row.iter_mut() {
+                *cell = if *cell <= 0 {
+                    DEFAULT_CONT_RATIO_X1000
+                } else {
+                    (*cell).clamp(MIN_CONT_RATIO_X1000, MAX_CONT_RATIO_X1000)
+                };
             }
         }
     }
@@ -940,6 +964,51 @@ pub fn compute_fractional_maker_bailout_scar_weight_c1(
 
 impl GovernorPlasticityState {
     #[inline]
+    #[must_use]
+    pub const fn slot_cont_ratio_x1000(&self, slot_idx: usize, side: Side) -> i64 {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return DEFAULT_CONT_RATIO_X1000;
+        }
+        let raw = self.cont_ratio_x1000[slot_idx][Self::dir_idx(side)];
+        if raw < MIN_CONT_RATIO_X1000 {
+            MIN_CONT_RATIO_X1000
+        } else if raw > MAX_CONT_RATIO_X1000 {
+            MAX_CONT_RATIO_X1000
+        } else {
+            raw
+        }
+    }
+
+    /// EWMA (`eta = INV_PHI_CUBE`) continuation ratio observer updating `cont_ratio_x1000` in `[618, 2618]`
+    /// (`[INV_PHI, PHI^2]`) from `max(mfe_bps, markout_60s_favorable_bps) / t1_floor_bps` (V5.5 O3).
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn observe_continuation_sample(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        mfe_sbps: i64,
+        markout_60s_fav_sbps: i64,
+        t1_floor_sbps: i64,
+    ) -> i64 {
+        const ETA_INV_PHI3: f64 = 0.236_067_977_499_79;
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return DEFAULT_CONT_RATIO_X1000;
+        }
+        let d = Self::dir_idx(side);
+        let denom = (t1_floor_sbps.max(100)) as f64;
+        let peak_fav = (mfe_sbps.max(markout_60s_fav_sbps).max(0)) as f64;
+        let sample_x1000 = (((peak_fav / denom) * 1_000.0).round() as i64)
+            .clamp(MIN_CONT_RATIO_X1000, MAX_CONT_RATIO_X1000);
+        let prev = (self.slot_cont_ratio_x1000(slot_idx, side)) as f64;
+        let updated = ((1.0 - ETA_INV_PHI3) * prev + ETA_INV_PHI3 * (sample_x1000 as f64))
+            .round() as i64;
+        let clamped = updated.clamp(MIN_CONT_RATIO_X1000, MAX_CONT_RATIO_X1000);
+        self.cont_ratio_x1000[slot_idx][d] = clamped;
+        clamped
+    }
+
+    #[inline]
     pub fn observe_exit_outcome_with_mfe(
         &mut self,
         slot_idx: usize,
@@ -962,7 +1031,6 @@ impl GovernorPlasticityState {
     }
 
     #[inline]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
     pub fn observe_exit_outcome_with_net_and_mfe(
         &mut self,
         slot_idx: usize,
@@ -970,6 +1038,31 @@ impl GovernorPlasticityState {
         is_adverse_taker_sl: bool,
         net_bps: ScaledBps,
         mfe_bps: ScaledBps,
+        ts_ns: i64,
+        eq_vol_bps: i64,
+    ) {
+        self.observe_exit_outcome_core(
+            slot_idx,
+            side,
+            is_adverse_taker_sl,
+            net_bps,
+            mfe_bps,
+            true,
+            ts_ns,
+            eq_vol_bps,
+        );
+    }
+
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+    pub(crate) fn observe_exit_outcome_core(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        is_adverse_taker_sl: bool,
+        net_bps: ScaledBps,
+        mfe_bps: ScaledBps,
+        has_uncensored_mfe: bool,
         ts_ns: i64,
         eq_vol_bps: i64,
     ) {
@@ -999,6 +1092,20 @@ impl GovernorPlasticityState {
             self.shadow_credits[slot_idx][d] = 0;
             self.last_credit_ts_ns[slot_idx][d] = ts_ns;
             return;
+        }
+        if has_uncensored_mfe && !is_adverse_taker_sl && net_bps.raw() > 0 && mfe_bps.raw() > 0 {
+            let t1_floor_sbps = crate::exit_quoter::compute_elastic_offensive_win_floor_bps(
+                fee_rt_raw,
+                ScaledBps(eq_vol_bps.max(1_200)),
+            )
+            .raw();
+            let _ = self.observe_continuation_sample(
+                slot_idx,
+                side,
+                mfe_bps.raw(),
+                0,
+                t1_floor_sbps,
+            );
         }
         let is_stressed_scratch = !is_adverse_taker_sl
             && net_bps.raw() >= 0
@@ -1106,4 +1213,51 @@ pub fn compute_epoch_5u_loss_lot_damper_c1(epoch_loss_1e8: i64) -> f64 {
         / (crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8 as f64);
     (1.0 - INV_PHI_SQ_D * crate::wave_elliott::hermite_smoothstep_c1(ratio, INV_PHI_D, 1.0))
         .clamp(INV_PHI_D, 1.0)
+}
+
+/// Continuous `C1` Momentum Chain Re-Entry directional cooldown compressor (V5.5 O5).
+/// Compresses post-win cooldown by `1.0 - S_3(aligned_propulsion; INV_PHI_SQ, INV_PHI)` down to
+/// settlement floor `round(PHI^2 * ws_rtt_ns)` (`~185 ms` at `70 ms` RTT) strictly on clean
+/// offensive Maker wins (`is_maker_exit && net >= round(INV_PHI_SQ * active_fee_rt_mkr_sbps)`),
+/// `!climax_active`, and `psi_health > INV_PHI_SQ`. Preserves 100% of loss, scratch, and `F6` cooldowns.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn compute_momentum_chain_win_cooldown_ns_c1(
+    base_win_cd_ns: i64,
+    is_maker_exit: bool,
+    net_scaled_bps: ScaledBps,
+    active_fee_rt_mkr_sbps: i64,
+    climax_active: bool,
+    psi_health: f64,
+    aligned_propulsion: f64,
+    ws_rtt_us: u32,
+) -> i64 {
+    const PHI_SQ_M: f64 = 2.618_033_988_749_895;
+    const INV_PHI_M: f64 = 0.618_033_988_749_895;
+    const INV_PHI_SQ_M: f64 = 0.381_966_011_250_105;
+
+    let base_pos = base_win_cd_ns.max(0);
+    let min_clean_win_sbps =
+        (INV_PHI_SQ_M * (active_fee_rt_mkr_sbps.max(100) as f64)).round() as i64;
+    if !is_maker_exit
+        || net_scaled_bps.raw() < min_clean_win_sbps
+        || climax_active
+        || psi_health <= INV_PHI_SQ_M
+    {
+        return base_pos;
+    }
+    let rtt_us_eff = if ws_rtt_us > 0 { ws_rtt_us } else { 70_000 };
+    let ws_rtt_ns = i64::from(rtt_us_eff).saturating_mul(1_000);
+    let settle_floor_ns = ((PHI_SQ_M * (ws_rtt_ns as f64)).round() as i64).max(1_000_000);
+    if base_pos <= settle_floor_ns {
+        return base_pos;
+    }
+    let s_prop = crate::wave_elliott::hermite_smoothstep_c1(
+        aligned_propulsion,
+        INV_PHI_SQ_M,
+        INV_PHI_M,
+    );
+    let compressed = ((base_pos as f64) * (1.0 - s_prop)).round() as i64;
+    compressed.clamp(settle_floor_ns, base_pos)
 }

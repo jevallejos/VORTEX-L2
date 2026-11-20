@@ -1,4 +1,4 @@
-name: VORTEX-OMEGA V5.4.2 Constitutional /dev/shm & 4-Binary LTO Gate
+name: VORTEX-OMEGA V5.5 Constitutional /dev/shm & 4-Binary LTO Gate
 on:
   push:
     branches: [ main, "feat/**" ]
@@ -19,7 +19,7 @@ jobs:
           ! grep -rnU $'\r' src/ tests/ deploy/ README.md CONSTITUTION_VORTEX_OMEGA.md Cargo.toml
       - name: Gate 1 - Clippy Zero-Warnings
         run: cargo clippy --all-targets -- -D warnings
-      - name: Gate 2 - Deterministic /dev/shm Lib (86+) & Integration Suites (Red-Team, De-Legacy, V5.4.2 Forensic)
+      - name: Gate 2 - Deterministic /dev/shm Lib (86+) & Integration Suites (Red-Team, De-Legacy, V5.5 Forensic)
         run: |
           cargo test --lib -- --test-threads=1
           cargo test --tests -- --test-threads=1

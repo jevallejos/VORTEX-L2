@@ -1,4 +1,4 @@
-//! Live Gateway Event Handlers, Markout/Epps Runtime State, Chandelier ACK & OOS 520 Gate (V5.4.2).
+//! Live Gateway Event Handlers, Markout/Epps Runtime State, 3-Tranche Cascade & OOS 520 Gate (V5.5).
 #![allow(
     clippy::cast_precision_loss,
     clippy::manual_clamp,
@@ -203,7 +203,7 @@ pub fn maybe_latch_validation_epoch_5usdt_shield(
                 epoch_loss_1e8,
             });
             let _ = tg_tx.try_send(format!(
-                "\u{1f534} [VORTEX-OMEGA V5.4.2 TOTAL LOSS SHIELD -5.00 USDT]\n- Perdida Epoca : -{:.4} / -5.0000 USDT\n- Equity Ancla  : {:.4} -> {:.4} USDT\n- Estado        : HALTED IRREVERSIBLE (Custodia P0-B activa hasta 0 posiciones)",
+                "\u{1f534} [VORTEX-OMEGA V5.5 TOTAL LOSS SHIELD -5.00 USDT]\n- Perdida Epoca : -{:.4} / -5.0000 USDT\n- Equity Ancla  : {:.4} -> {:.4} USDT\n- Estado        : HALTED IRREVERSIBLE (Custodia P0-B activa hasta 0 posiciones)",
                 (epoch_loss_1e8 as f64) / 100_000_000.0,
                 (ledger.initial_equity_1e8 as f64) / 100_000_000.0,
                 (eff_eq_1e8 as f64) / 100_000_000.0
@@ -356,7 +356,22 @@ fn finalize_and_emit_live_close_core(
     let hold_s = (now_ns.0.saturating_sub(engines[s_idx].last_opened_ts.0)).max(0) / 1_000_000_000;
     let Some(summary) = engines[s_idx].apply_verified_close_resolution(resolution, now_ns, ledger) else { return; };
     let non_punitive_exit = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
-    gov.observe_closed_trade_with_regime_v51(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, ScaledBps(engines[s_idx].last_closed_mfe_bps), non_punitive_exit, cached_snaps[s_idx].wave_observables(), event_dilation, now_ns);
+    let close_snap = &cached_snaps[s_idx];
+    let w_close = close_snap.wave_observables();
+    let (ws_rtt_us, _) = crate::execution_fsm::read_live_ws_pulse();
+    let signed_prop =
+        0.50 * close_snap.factor_ofi.get() + 0.38 * close_snap.factor_tfi.get() + 0.12 * close_snap.factor_geom.get();
+    gov.set_slot_momentum_chain_context(s_idx, signed_prop, w_close.climax_active, ws_rtt_us);
+    gov.observe_closed_trade_with_regime_v51(s_idx, summary.side, summary.entry_price, summary.net_scaled_bps, ScaledBps(engines[s_idx].last_closed_mfe_bps), non_punitive_exit, w_close, event_dilation, now_ns);
+    engines[s_idx].apply_momentum_chain_post_close_cooldown(
+        now_ns,
+        non_punitive_exit,
+        summary.net_scaled_bps,
+        w_close.climax_active || matches!(w_close.regime, crate::wave_elliott::WaveRegime::ClimaxExhaustion),
+        gov.psi_health(),
+        signed_prop * summary.side.sign_f64(),
+        ws_rtt_us,
+    );
     arena.exec_closed_count.fetch_add(1, Ordering::Relaxed);
     dispatch_closed_trade_logs_v47(
         s_idx, &summary, &engines[s_idx], &entry_forensics[s_idx], &cached_snaps[s_idx],
@@ -629,7 +644,7 @@ pub fn handle_gateway_event(
         GatewayEvent::SlotStillOpenSynced { slot_idx, real_side, verified_avg, real_lots, active_resting_tp } => {
             rt.slot_rpc_inflight[slot_idx] = false;
             let OrderLifecycleState::PositionOpenMakerExit {
-                side, avg_price_ticks, initial_lots, tranche1_harvested, resting_exit_price: prev_rest_tp, opened_ts, ..
+                side, avg_price_ticks, initial_lots, open_lots: prev_open_lots, tranche1_harvested, resting_exit_price: prev_rest_tp, opened_ts, ..
             } = engines[slot_idx].state else { return; };
             if real_side == side {
                 if let Some(v_avg) = verified_avg { engines[slot_idx].sync_open_avg_price_ticks(v_avg); }
@@ -641,6 +656,7 @@ pub fn handle_gateway_event(
             } else {
                 defensive_zero_loss_maker_exit_price_with_fees(side, avg_price_ticks, engines[slot_idx].active_fees)
             };
+            let partial_delta = LotQty((prev_open_lots.0 - real_lots.0).max(0));
             let mut t1_done = tranche1_harvested;
             if let Some(min_w3_t1) = SlotExecutionEngine::compute_tranche1_split_lots(slot_idx, eff_init, ref_exit_px, 350) {
                 let max_rem = (eff_init.0 - min_w3_t1.0).max(1);
@@ -648,6 +664,9 @@ pub fn handle_gateway_event(
                     t1_done = true;
                     engines[slot_idx].tranche1_harvests_count = engines[slot_idx].tranche1_harvests_count.saturating_add(1);
                 }
+            }
+            if partial_delta.0 > 0 && real_lots.0 > 0 && hold_ms >= 50 {
+                engines[slot_idx].record_live_partial_harvest_synced(partial_delta, ref_exit_px);
             }
             if active_resting_tp.0 > 0 && active_resting_tp != prev_rest_tp {
                 engines[slot_idx].exit_peg_attempts = engines[slot_idx].exit_peg_attempts.saturating_add(1);
@@ -735,7 +754,7 @@ pub fn handle_gateway_event(
                         });
                         if new_phase != prev_phase && matches!(new_phase, DailyShieldPhase::ProfitLockArmed | DailyShieldPhase::HibernatingProfitLocked | DailyShieldPhase::HibernatingLossCap) {
                             let _ = tg_tx.try_send(format!(
-                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.4.2 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
+                                "\u{1f6e1}\u{fe0f} [VORTEX-OMEGA V5.5 DAILY SHIELD] Fase UTC -> {} | Hoy: {:+.4} USDT ({:+.2}%)",
                                 new_phase.label(),
                                 (rt.daily_gov.day_realized_pnl_1e8 as f64) / 100_000_000.0,
                                 (rt.daily_gov.day_pnl_ppm() as f64) / 10_000.0
@@ -925,7 +944,7 @@ pub fn bootstrap_live_adopt_if_enabled(
             };
             engines[s_idx].sync_to_shm_telemetry(arena);
             println!(
-                "{}\u{1f7e2} [VORTEX-OMEGA V5.4.2 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
+                "{}\u{1f7e2} [VORTEX-OMEGA V5.5 LIVE ADOPT] Slot {:2} {} {:?} qty={} @ {}t (SL={}t ok={} T1={}){}",
                 ANSI_GREEN, s_idx, sym_name, side_p, sz_s, bybit_avg_t.0, sl_t.0, sl_ok, t1_done, ANSI_RESET
             );
         }

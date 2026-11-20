@@ -77,7 +77,7 @@ sha256sum "$VORTEX_DIR/bin/vortex_tap" "$VORTEX_DIR/bin/vortex_replay" "$VORTEX_
 
 sudo tee /etc/systemd/system/vortex-tap.service > /dev/null <<UNIT_TAP
 [Unit]
-Description=VORTEX-OMEGA V5.4.2 Bybit UTA V5 12-Pair L2 + PAR2Z + VKL1 Daemon (SHM v15)
+Description=VORTEX-OMEGA V5.5 Bybit UTA V5 12-Pair L2 + PAR2Z + VKL1 Daemon (SHM v15)
 After=network-online.target
 Wants=network-online.target
 
@@ -99,7 +99,7 @@ UNIT_TAP
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<UNIT_EXEC
 [Unit]
-Description=VORTEX-OMEGA V5.4.2 200Hz Zero-Jitter 12-Slot Execution Daemon (SHM v15)
+Description=VORTEX-OMEGA V5.5 200Hz Zero-Jitter 12-Slot Execution Daemon (SHM v15)
 After=vortex-tap.service
 Requires=vortex-tap.service
 

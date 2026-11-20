@@ -563,6 +563,40 @@ impl OrthogonalFactorState {
         btc_lead_aligned_override: Option<f64>,
         psi_health: f64,
     ) -> SignalVerdict {
+        Self::evaluate_entry_signal_v55(
+            spec,
+            snap,
+            leader_btc_snap,
+            learned_mfe_bps,
+            learned_dir_edge_bps,
+            taker_prob_pm,
+            fees,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            psi_health,
+            0.0,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_entry_signal_v55(
+        spec: PairSpec,
+        snap: &SymbolLobSnapshot,
+        leader_btc_snap: &SymbolLobSnapshot,
+        learned_mfe_bps: ScaledBps,
+        learned_dir_edge_bps: ScaledBps,
+        taker_prob_pm: i64,
+        fees: FeeSchedule,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+        lead_lag_ignition_bonus: f64,
+    ) -> SignalVerdict {
         let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
@@ -594,19 +628,26 @@ impl OrthogonalFactorState {
         if (ofi.abs() > 0.32 && tfi.abs() > 0.32 && (ofi * tfi) < -0.08) || (ofi.abs() > 0.55 && tfi.abs() < 0.08) {
             return SignalVerdict::SpoofingVeto;
         }
+        let bonus = if lead_lag_ignition_bonus.is_finite() {
+            lead_lag_ignition_bonus.clamp(0.0, INV_PHI_CUBE)
+        } else {
+            0.0
+        };
         let eq_vol_anchor = (b3x_barrier.raw().saturating_mul(4)).max(1) as f64;
         let nu_sigma = ((snap.realized_vol_5m.raw().max(b3x_barrier.raw()) as f64) / eq_vol_anchor).sqrt().clamp(0.82, 1.25);
         let edge_relief = ((learned_dir_edge_bps.raw().clamp(0, 450) as f64) / 10_000.0).min(0.04);
         let elastic_snr_floor = (0.40 * nu_sigma - edge_relief).clamp(0.34, 0.48);
         let composite = Self::adaptive_snr_from_snapshot(snap, spoof_density).get();
-        if composite.abs() < elastic_snr_floor {
+        if composite.abs() + bonus < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
+        let min_ofi_dir = 0.15 * (1.0 - bonus);
+        let min_tfi_dir = 0.12 * (1.0 - bonus);
         let side = if composite > 0.0 {
-            if ofi <= 0.15 || tfi <= 0.12 || geom < 0.0 { return SignalVerdict::NeutralNoAction; }
+            if ofi <= min_ofi_dir || tfi <= min_tfi_dir || geom < 0.0 { return SignalVerdict::NeutralNoAction; }
             Side::Bid
         } else {
-            if ofi >= -0.15 || tfi >= -0.12 || geom > 0.0 { return SignalVerdict::NeutralNoAction; }
+            if ofi >= -min_ofi_dir || tfi >= -min_tfi_dir || geom > 0.0 { return SignalVerdict::NeutralNoAction; }
             Side::Ask
         };
         if is_opposing_impulse_wave3_hazard_dynamic(side, snap, 0, taker_prob_pm, fees) {
@@ -663,7 +704,7 @@ impl OrthogonalFactorState {
             tfi * dir_sign,
             inst_btc_aligned,
         );
-        let eff_composite_abs = composite.abs() * (1.0 - INV_PHI * s_iceberg);
+        let eff_composite_abs = (composite.abs() * (1.0 - INV_PHI * s_iceberg) + bonus).min(1.0);
         if eff_composite_abs < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
@@ -1520,12 +1561,19 @@ pub fn compute_corrective_abc_epps_sync_lift_c1(
     INV_PHI2_S * s_epps * s_btc * s_flow * opp_clear
 }
 
-/// Zero-allocation short exponential memory (`\tau = \varphi^4` s) capturing natural `BTC -> Altcoin` lead-lag (V5.4.2 M1).
+/// Zero-allocation unified-horizon lead-lag memory (`BtcLeadLagMemory`, V5.4.2 M1 + V5.5 O2):
+/// Tracks `BTC` SNR memory (`\tau = \varphi^4` s) AND short exponential price return `\Delta p_{\tau_{ll}}`
+/// across `BTCUSDT` (`slot 0`) and all slots `0..MAX_ACTIVE_PAIRS` using the exact same continuous
+/// semigroup decay `\alpha_{ll}` coupled to `\tau_{ll} = (\varphi^2 \cdot rtt_{eff}).clamp(\varphi^{-2}, \varphi)`.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct BtcLeadLagMemory {
     snr_ema: f64,
     last_ts_ns: i64,
     initialized: bool,
+    ema_mid_ticks: [f64; crate::lob_shm::MAX_ACTIVE_PAIRS],
+    dp_tau_bps: [f64; crate::lob_shm::MAX_ACTIVE_PAIRS],
+    slot_last_ts_ns: [i64; crate::lob_shm::MAX_ACTIVE_PAIRS],
+    slot_initialized: [bool; crate::lob_shm::MAX_ACTIVE_PAIRS],
 }
 
 impl BtcLeadLagMemory {
@@ -1536,11 +1584,211 @@ impl BtcLeadLagMemory {
             snr_ema: 0.0,
             last_ts_ns: 0,
             initialized: false,
+            ema_mid_ticks: [0.0; crate::lob_shm::MAX_ACTIVE_PAIRS],
+            dp_tau_bps: [0.0; crate::lob_shm::MAX_ACTIVE_PAIRS],
+            slot_last_ts_ns: [0; crate::lob_shm::MAX_ACTIVE_PAIRS],
+            slot_initialized: [false; crate::lob_shm::MAX_ACTIVE_PAIRS],
         }
     }
 
     #[inline]
+    #[must_use]
+    pub fn unified_horizon_tau_ll_s(ws_rtt_us: u32) -> f64 {
+        let rtt_eff_s = (f64::from(if ws_rtt_us > 0 { ws_rtt_us } else { 70_000 })) * 1e-6;
+        (PHI_SQ * rtt_eff_s).clamp(INV_PHI_SQ, PHI)
+    }
+
+    #[inline]
+    #[must_use]
+    fn snapshot_mid_f64(snap: &SymbolLobSnapshot) -> Option<f64> {
+        if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            Some(0.5 * ((snap.bids[0].price.0 + snap.asks[0].price.0) as f64))
+        } else if snap.mark_price.0 > 0 {
+            Some(snap.mark_price.0 as f64)
+        } else {
+            None
+        }
+    }
+
+    /// Updates short exponential return `\Delta p_{\tau_{ll}}` (in bps, `1.0 = 1 bp`) for `slot_idx`
+    /// using unified decay `\alpha_{ll} = 1 - \exp(-\Delta t / \tau_{ll})`.
+    #[inline]
+    pub fn observe_slot_snapshot(
+        &mut self,
+        slot_idx: usize,
+        snap: &SymbolLobSnapshot,
+        ws_rtt_us: u32,
+    ) -> f64 {
+        if slot_idx >= crate::lob_shm::MAX_ACTIVE_PAIRS {
+            return 0.0;
+        }
+        let Some(mid_px) = Self::snapshot_mid_f64(snap) else {
+            return self.dp_tau_bps[slot_idx];
+        };
+        if !mid_px.is_finite() || mid_px <= 0.0 {
+            return self.dp_tau_bps[slot_idx];
+        }
+        let ts = snap.ts_local_ns.0;
+        if !self.slot_initialized[slot_idx]
+            || ts <= 0
+            || self.slot_last_ts_ns[slot_idx] <= 0
+            || ts < self.slot_last_ts_ns[slot_idx]
+        {
+            self.ema_mid_ticks[slot_idx] = mid_px;
+            self.dp_tau_bps[slot_idx] = 0.0;
+            self.slot_last_ts_ns[slot_idx] = ts;
+            self.slot_initialized[slot_idx] = true;
+            return 0.0;
+        }
+        if ts == self.slot_last_ts_ns[slot_idx] {
+            let ema = self.ema_mid_ticks[slot_idx].max(1e-9);
+            self.dp_tau_bps[slot_idx] = 10_000.0 * (mid_px - ema) / ema;
+            return self.dp_tau_bps[slot_idx];
+        }
+        let dt_s = ((ts - self.slot_last_ts_ns[slot_idx]) as f64) * 1e-9;
+        let tau_ll = Self::unified_horizon_tau_ll_s(ws_rtt_us);
+        let alpha_ll = if dt_s >= 30.0 * tau_ll {
+            1.0
+        } else {
+            (1.0 - (-dt_s / tau_ll).exp()).clamp(0.0, 1.0)
+        };
+        let prev_ema = self.ema_mid_ticks[slot_idx];
+        let next_ema = (prev_ema + alpha_ll * (mid_px - prev_ema)).max(1e-9);
+        self.ema_mid_ticks[slot_idx] = next_ema;
+        self.dp_tau_bps[slot_idx] = 10_000.0 * (mid_px - next_ema) / next_ema;
+        self.slot_last_ts_ns[slot_idx] = ts;
+        self.dp_tau_bps[slot_idx]
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn slot_dp_tau_bps_at(
+        &self,
+        slot_idx: usize,
+        snap: &SymbolLobSnapshot,
+        eval_ts_ns: i64,
+        ws_rtt_us: u32,
+    ) -> f64 {
+        if slot_idx >= crate::lob_shm::MAX_ACTIVE_PAIRS || !self.slot_initialized[slot_idx] {
+            return 0.0;
+        }
+        let Some(cur_mid) = Self::snapshot_mid_f64(snap) else {
+            return self.dp_tau_bps[slot_idx];
+        };
+        let prev_ema = self.ema_mid_ticks[slot_idx].max(1e-9);
+        let last_ts = self.slot_last_ts_ns[slot_idx];
+        if eval_ts_ns <= last_ts || last_ts <= 0 {
+            return 10_000.0 * (cur_mid - prev_ema) / prev_ema;
+        }
+        let dt_s = ((eval_ts_ns - last_ts) as f64) * 1e-9;
+        let tau_ll = Self::unified_horizon_tau_ll_s(ws_rtt_us);
+        let alpha_ll = if dt_s >= 30.0 * tau_ll {
+            1.0
+        } else {
+            (1.0 - (-dt_s / tau_ll).exp()).clamp(0.0, 1.0)
+        };
+        let ema_eval = (prev_ema + alpha_ll * (cur_mid - prev_ema)).max(1e-9);
+        10_000.0 * (cur_mid - ema_eval) / ema_eval
+    }
+
+    /// Computes undiscounted directional lead-lag `lag_bps = dir_sign * (epps_beta * dp_btc_bps - dp_own_bps)`
+    /// on the exact unified EMA horizon `\tau_{ll}` (V5.5 O2).
+    #[inline]
+    #[must_use]
+    pub fn undiscounted_lead_lag_bps(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        btc_snap: &SymbolLobSnapshot,
+        ws_rtt_us: u32,
+        epps_beta: f64,
+    ) -> f64 {
+        if slot_idx == 0
+            || slot_idx >= crate::lob_shm::MAX_ACTIVE_PAIRS
+            || snap.symbol_id == btc_snap.symbol_id
+            || !self.slot_initialized[0]
+            || !self.slot_initialized[slot_idx]
+            || !epps_beta.is_finite()
+        {
+            return 0.0;
+        }
+        let eval_ts = snap.ts_local_ns.0.max(btc_snap.ts_local_ns.0);
+        let dp_btc_bps = self.slot_dp_tau_bps_at(0, btc_snap, eval_ts, ws_rtt_us);
+        let dp_own_bps = self.slot_dp_tau_bps_at(slot_idx, snap, eval_ts, ws_rtt_us);
+        let beta_c = epps_beta.clamp(-PHI, PHI);
+        side.sign_f64() * (beta_c * dp_btc_bps - dp_own_bps)
+    }
+
+    /// Bounded `C1` lead-lag ignition bonus `psi_health * INV_PHI_CUBE * S_3(lag_bps; INV_PHI * fee_rt_mkr_bps, PHI * fee_rt_mkr_bps)`
+    /// strictly when `btc_ofi_al >= INV_PHI_SQ && btc_tfi_al >= INV_PHI_SQ`, `|epps_corr| >= INV_PHI`,
+    /// `!iceberg_trap` and `lag_bps >= INV_PHI * fee_rt_mkr_bps` (V5.5 O2).
+    #[inline]
+    #[must_use]
+    pub fn compute_lead_lag_ignition_bonus_c1(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        btc_snap: &SymbolLobSnapshot,
+        ws_rtt_us: u32,
+        epps_beta: f64,
+        epps_corr: f64,
+        psi_health: f64,
+        fees: FeeSchedule,
+    ) -> f64 {
+        if slot_idx == 0
+            || slot_idx >= crate::lob_shm::MAX_ACTIVE_PAIRS
+            || snap.symbol_id == btc_snap.symbol_id
+            || !epps_corr.is_finite()
+            || epps_corr.abs() < INV_PHI
+            || !psi_health.is_finite()
+            || psi_health <= 0.0
+        {
+            return 0.0;
+        }
+        let dir_s = side.sign_f64();
+        let corr_sign = if epps_corr < 0.0 { -1.0 } else { 1.0 };
+        let btc_ofi_al = corr_sign * btc_snap.factor_ofi.get() * dir_s;
+        let btc_tfi_al = corr_sign * btc_snap.factor_tfi.get() * dir_s;
+        if btc_ofi_al < INV_PHI_SQ || btc_tfi_al < INV_PHI_SQ {
+            return 0.0;
+        }
+        let ofi_al = snap.factor_ofi.get() * dir_s;
+        let tfi_al = snap.factor_tfi.get() * dir_s;
+        let iceberg_trap = ofi_al < 0.0
+            || tfi_al < 0.0
+            || compute_passive_iceberg_absorption_penalty_c1(ofi_al, tfi_al, 0.0) > 0.0;
+        if iceberg_trap {
+            return 0.0;
+        }
+        let fee_rt_mkr_bps = ((fees.round_trip_maker_exit_bps().raw().max(100)) as f64) / 100.0;
+        let lo_lag = INV_PHI * fee_rt_mkr_bps;
+        let hi_lag = PHI * fee_rt_mkr_bps;
+        let lag_bps =
+            self.undiscounted_lead_lag_bps(slot_idx, side, snap, btc_snap, ws_rtt_us, epps_beta);
+        if lag_bps < lo_lag {
+            return 0.0;
+        }
+        let s_lag = crate::wave_elliott::hermite_smoothstep_c1(lag_bps, lo_lag, hi_lag);
+        (psi_health.clamp(0.0, 1.0) * INV_PHI_CUBE * s_lag).clamp(0.0, INV_PHI_CUBE)
+    }
+
+    #[inline]
     pub fn observe_btc_snapshot(&mut self, btc_snap: &SymbolLobSnapshot) -> f64 {
+        self.observe_btc_snapshot_with_rtt(
+            btc_snap,
+            crate::execution_fsm::read_live_ws_pulse().0,
+        )
+    }
+
+    #[inline]
+    pub fn observe_btc_snapshot_with_rtt(
+        &mut self,
+        btc_snap: &SymbolLobSnapshot,
+        ws_rtt_us: u32,
+    ) -> f64 {
+        let _ = self.observe_slot_snapshot(0, btc_snap, ws_rtt_us);
         if btc_snap.bids[0].price.0 <= 0 || btc_snap.asks[0].price.0 <= 0 {
             return self.snr_ema;
         }

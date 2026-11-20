@@ -2558,7 +2558,7 @@ fn test_v542_elastic_throughput_penny_jump_fill_rate_and_5usdt_hard_lock() {
 
     // Verify exact 1 single Telegram alert (zero duplicate spam on subsequent ticks):
     let tg_msg = tg_rx.try_recv().unwrap_or_default();
-    assert!(tg_msg.contains("\u{1f534} [VORTEX-OMEGA V5.4.2 TOTAL LOSS SHIELD -5.00 USDT]"));
+    assert!(tg_msg.contains("\u{1f534} [VORTEX-OMEGA V5.5 TOTAL LOSS SHIELD -5.00 USDT]"));
     assert!(tg_rx.try_recv().is_err());
 
     // 3) Advance across 00:00 UTC rollover: DailySessionGovernor wakes up, YET -5.00 USDT halt stays 100% latched!
@@ -2700,4 +2700,774 @@ fn test_v542_elastic_throughput_penny_jump_fill_rate_and_5usdt_hard_lock() {
     let _ = std::fs::remove_file(&shm_p);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     assert!(!std::path::Path::new("data/vault/HALTED_ON_LOSS.lock").exists());
+}
+
+#[test]
+fn test_v55_multilot_priority_3tranche_cascade_freeride_chain_and_antihostage() {
+    use std::sync::mpsc;
+    use vortex_rs::alpha_3factor::{
+        BtcLeadLagMemory, EppsBtcCorrelationTracker, OrthogonalFactorState, SignalVerdict,
+        INV_PHI, INV_PHI_CUBE, INV_PHI_SQ, PHI, PHI_CUBE, PHI_SQ,
+    };
+    use vortex_rs::bybit_client::InstrumentSpecVerification;
+    use vortex_rs::exec_daemon::{
+        build_monetary_beta_guard_with_epps, can_stage_same_direction_entry_v542,
+        compute_exit_sync_schedule, compute_exit_sync_schedule_elastic,
+        compute_offensive_entry_utility_score_x1000_v55, compute_vacuum_l2_l3_c1,
+        step_12_slot_daemon_tick,
+    };
+    use vortex_rs::exec_gateway_handlers::ExecRuntimeState;
+    use vortex_rs::execution_fsm::OrderLifecycleState;
+    use vortex_rs::exit_quoter::{
+        compute_anti_hostage_aging_c1, compute_anti_hostage_horizon_s,
+    };
+    use vortex_rs::forensic_parquet::{MarketEventKind, ParitySyncLedger};
+    use vortex_rs::lob_shm::{MappedShmRegion, MAX_ACTIVE_PAIRS};
+    use vortex_rs::markout_tracker::SlotMarkoutRing;
+    use vortex_rs::replay_walkforward::{OmegaDigitalTwinEngine, TwinReplayEvent};
+    use vortex_rs::telemetry_hud::{SlotForensicEntrySnapshot, VaultIoCommand};
+
+    let t0 = 1_802_000_000_000_000_000_i64;
+    record_live_ws_pulse(70_000, 100);
+    assert!(core::mem::size_of::<VaultIoCommand>() <= 512);
+
+    // =========================================================================
+    // (1) O1: Zero-Alloc Multi-Lot Priority Router at 200.0 Hz & Twin Parity
+    // =========================================================================
+    let u_1lot = compute_offensive_entry_utility_score_x1000_v55(260, LotQty(1), 1.0, 0.20, 0.55);
+    let u_8lot = compute_offensive_entry_utility_score_x1000_v55(260, LotQty(8), 1.0, 0.75, 0.75);
+    assert!(u_8lot > u_1lot);
+
+    let shm_p = MappedShmRegion::ephemeral_self_test_path("v55_o1_priority_router");
+    let shm_res = MappedShmRegion::open_or_create(&shm_p, true);
+    assert!(shm_res.is_ok());
+    let Ok(shm_reg) = shm_res else { return };
+    let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(32);
+    let (vault_tx, _vault_rx) = mpsc::sync_channel::<VaultIoCommand>(64);
+    let inst = InstrumentSpecVerification::baseline_from_specs(&APPROVED_SPECS);
+    let mut rt = ExecRuntimeState::new();
+    rt.wallet_1e8 = 10_000_000_000;
+    let _ = rt.daily_gov.sync_utc_day(TimestampNs(t0), rt.wallet_1e8);
+
+    let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    snaps[0] = mk_vault_snap(0, 652_000, 3_200, 0.12, 0.35, 0.25, t0);
+    // Slot 1 ETHUSDT (1-lot indivisible @ $22.37/lot) AND Slot 3 AVAXUSDT (divisible multi-lot @ $8.20)
+    // receive simultaneous valid bullish impulses on the same 200 Hz tick:
+    snaps[1] = mk_vault_snap(1, 223_700, 6_500, 0.82, 0.86, 0.62, t0);
+    snaps[3] = mk_vault_snap(3, 8_200, 6_500, 0.82, 0.86, 0.62, t0);
+    // Give AVAX L2/L3 thin ask vacuum so vacuum_l2_l3 > 0:
+    snaps[3].asks[1] = BookLevel { price: PriceTicks(8_202), qty: LotQty(120) };
+    snaps[3].asks[2] = BookLevel { price: PriceTicks(8_203), qty: LotQty(110) };
+    snaps[3].refresh_deep_l1_l5_totals();
+    assert!(compute_vacuum_l2_l3_c1(Side::Bid, &snaps[3]) > 0.5);
+
+    let mut entry_f = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+    let mut engines = SlotExecutionEngine::new_12_slot_array();
+    engines[1].learned_mfe_bps = 920;
+    engines[3].learned_mfe_bps = 920;
+    let mut gov_o1 = OnlineAdaptiveGovernor::new();
+    let mut led_o1 = ParitySyncLedger::new(10_000_000_000);
+    let mut last_rest_ns = 0_i64;
+
+    let _ = step_12_slot_daemon_tick(
+        TimestampNs(t0),
+        None,
+        inst,
+        None,
+        &mut rt,
+        &mut last_rest_ns,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_o1,
+        &mut led_o1,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    // O1: Divisible multi-lot AVAX (Slot 3) MUST win admission priority over Slot 1 ETH 1-lot!
+    assert!(matches!(
+        engines[3].state,
+        OrderLifecycleState::PlacingEntryMaker { side: Side::Bid, qty, .. } if qty.0 >= 4
+    ));
+    assert!(matches!(engines[1].state, OrderLifecycleState::Idle));
+
+    // When ETH is the sole valid candidate, O1 NEVER blocks ETH:
+    engines[3].state = OrderLifecycleState::Idle;
+    rt.slot_rpc_inflight[3] = false;
+    snaps[3].sequence_id = 0;
+    last_rest_ns = 0;
+    let _ = step_12_slot_daemon_tick(
+        TimestampNs(t0 + 50_000_000),
+        None,
+        inst,
+        None,
+        &mut rt,
+        &mut last_rest_ns,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_o1,
+        &mut led_o1,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert!(matches!(
+        engines[1].state,
+        OrderLifecycleState::PlacingEntryMaker { side: Side::Bid, .. }
+    ));
+
+    // 1:1 Digital Twin simultaneous slice priority parity:
+    let mut twin_o1 = OmegaDigitalTwinEngine::new();
+    twin_o1.engines[1].learned_mfe_bps = 920;
+    twin_o1.engines[3].learned_mfe_bps = 920;
+    let btc_ev = TwinReplayEvent {
+        slot_idx: 0,
+        kind: MarketEventKind::L2BookSnapshot,
+        aggressor_side: Side::Bid,
+        trade_price: PriceTicks(652_000),
+        trade_lots: LotQty(10),
+        snap: snaps[0],
+    };
+    twin_o1.ingest_event(&btc_ev);
+    snaps[3].sequence_id = 500;
+    for warm_dt in [10_000_000_i64, 45_000_000, 80_000_000] {
+        let mut s1 = snaps[1];
+        let mut s3 = snaps[3];
+        s1.ts_local_ns = TimestampNs(t0 + warm_dt);
+        s3.ts_local_ns = TimestampNs(t0 + warm_dt);
+        if warm_dt < 80_000_000 {
+            s1.factor_ofi = BoundedScore::new_clamped(0.10);
+            s3.factor_ofi = BoundedScore::new_clamped(0.10);
+            twin_o1.ingest_event(&TwinReplayEvent {
+                slot_idx: 1,
+                kind: MarketEventKind::L2BookSnapshot,
+                aggressor_side: Side::Bid,
+                trade_price: PriceTicks(223_700),
+                trade_lots: LotQty(1),
+                snap: s1,
+            });
+            twin_o1.ingest_event(&TwinReplayEvent {
+                slot_idx: 3,
+                kind: MarketEventKind::L2BookSnapshot,
+                aggressor_side: Side::Bid,
+                trade_price: PriceTicks(8_200),
+                trade_lots: LotQty(1),
+                snap: s3,
+            });
+        } else {
+            let winner_slot = twin_o1.ingest_simultaneous_tick_slice(&[
+                TwinReplayEvent {
+                    slot_idx: 1,
+                    kind: MarketEventKind::L2BookSnapshot,
+                    aggressor_side: Side::Bid,
+                    trade_price: PriceTicks(223_700),
+                    trade_lots: LotQty(1),
+                    snap: s1,
+                },
+                TwinReplayEvent {
+                    slot_idx: 3,
+                    kind: MarketEventKind::L2BookSnapshot,
+                    aggressor_side: Side::Bid,
+                    trade_price: PriceTicks(8_200),
+                    trade_lots: LotQty(1),
+                    snap: s3,
+                },
+            ]);
+            assert_eq!(winner_slot, Some(3));
+        }
+    }
+
+    // =========================================================================
+    // (2) O2: BTCUSDT Lead-Lag Ignition on Unified EMA Horizon
+    // =========================================================================
+    let tau_70ms = BtcLeadLagMemory::unified_horizon_tau_ll_s(70_000);
+    let tau_250ms = BtcLeadLagMemory::unified_horizon_tau_ll_s(250_000);
+    assert!((tau_70ms - INV_PHI_SQ).abs() < 1e-9);
+    assert!((tau_250ms - PHI_SQ * 0.250).abs() < 1e-9);
+
+    let mut ll_mem = BtcLeadLagMemory::new();
+    let btc_t0 = mk_vault_snap(0, 650_000, 3_400, 0.25, 0.25, 0.20, t0);
+    let sol_t0 = mk_vault_snap(2, 7_500, 4_200, 0.32, 0.34, 0.35, t0);
+    let _ = ll_mem.observe_btc_snapshot_with_rtt(&btc_t0, 70_000);
+    let _ = ll_mem.observe_slot_snapshot(2, &sol_t0, 70_000);
+
+    // BTC jumps +8.5 bps in 45ms while SOL has not repriced yet:
+    let mut btc_jump = mk_vault_snap(0, 650_553, 3_400, 0.72, 0.78, 0.52, t0 + 45_000_000);
+    btc_jump.mark_price = PriceTicks(650_553);
+    let mut sol_lag = sol_t0;
+    sol_lag.ts_local_ns = TimestampNs(t0 + 45_000_000);
+    let lag_bps = ll_mem.undiscounted_lead_lag_bps(2, Side::Bid, &sol_lag, &btc_jump, 70_000, 1.15);
+    assert!(lag_bps > PHI * 4.0);
+    let bonus_o2 = ll_mem.compute_lead_lag_ignition_bonus_c1(
+        2,
+        Side::Bid,
+        &sol_lag,
+        &btc_jump,
+        70_000,
+        1.15,
+        0.78,
+        1.0,
+        FeeSchedule::VIP0_DEFAULT,
+    );
+    assert!(bonus_o2 > 0.20 && bonus_o2 <= INV_PHI_CUBE + 1e-12);
+
+    // Marginal SOL snapshot fails without lead-lag ignition bonus and arms cleanly WITH bonus:
+    let verd_no_bonus = OrthogonalFactorState::evaluate_entry_signal_v55(
+        APPROVED_SPECS[2],
+        &sol_lag,
+        &btc_jump,
+        ScaledBps(780),
+        ScaledBps(120),
+        50,
+        FeeSchedule::VIP0_DEFAULT,
+        0.0,
+        1.15,
+        0.78,
+        Some(0.75),
+        1.0,
+        0.0,
+    );
+    let verd_with_bonus = OrthogonalFactorState::evaluate_entry_signal_v55(
+        APPROVED_SPECS[2],
+        &sol_lag,
+        &btc_jump,
+        ScaledBps(780),
+        ScaledBps(120),
+        50,
+        FeeSchedule::VIP0_DEFAULT,
+        0.0,
+        1.15,
+        0.78,
+        Some(0.75),
+        1.0,
+        bonus_o2,
+    );
+    assert_eq!(verd_no_bonus, SignalVerdict::NeutralNoAction);
+    assert!(matches!(
+        verd_with_bonus,
+        SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+    ));
+    let gov_o2 = OnlineAdaptiveGovernor::new();
+    let lots_o2 = gov_o2.authorizes_adaptive_entry_v55(
+        2,
+        Side::Bid,
+        6_500_000_000,
+        1_000,
+        ScaledBps(780),
+        &sol_lag,
+        &btc_jump,
+        0.0,
+        1.15,
+        0.78,
+        Some(0.75),
+        bonus_o2,
+    );
+    assert!(lots_o2.is_ok());
+
+    // Iceberg trap (high aggressive TFI absorbed by passive wall, weak OFI) OR already-discounted follower move yields strictly 0.0 bonus:
+    let mut sol_iceberg = sol_lag;
+    sol_iceberg.factor_ofi = BoundedScore::new_clamped(0.05);
+    sol_iceberg.factor_tfi = BoundedScore::new_clamped(0.85);
+    assert_eq!(
+        ll_mem.compute_lead_lag_ignition_bonus_c1(
+            2,
+            Side::Bid,
+            &sol_iceberg,
+            &btc_jump,
+            70_000,
+            1.15,
+            0.78,
+            1.0,
+            FeeSchedule::VIP0_DEFAULT,
+        ),
+        0.0
+    );
+    let sol_repriced = mk_vault_snap(2, 7_510, 3_600, 0.55, 0.55, 0.35, t0 + 45_000_000);
+    assert_eq!(
+        ll_mem.compute_lead_lag_ignition_bonus_c1(
+            2,
+            Side::Bid,
+            &sol_repriced,
+            &btc_jump,
+            70_000,
+            1.15,
+            0.78,
+            1.0,
+            FeeSchedule::VIP0_DEFAULT,
+        ),
+        0.0
+    );
+
+    // =========================================================================
+    // (3) O3: Golden 3-Tranche Cascade (T1 + T2 + T3) & cont_ratio_x1000 Learning
+    // =========================================================================
+    let mut gov_o3 = OnlineAdaptiveGovernor::new();
+    assert_eq!(gov_o3.slot_cont_ratio_x1000(3, Side::Bid), 1_000);
+
+    // Short pair (Slot 10 NEAR) converges toward ~618 permille T1 harvest:
+    let w_warm = WaveObservables {
+        regime: WaveRegime::NeutralWarmup,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.55),
+        macro_phase: BoundedScore::ZERO,
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(0),
+    };
+    for k in 0..8_i64 {
+        gov_o3.observe_closed_trade_with_regime_v51(
+            10,
+            Side::Bid,
+            PriceTicks(3_500),
+            ScaledBps(80),
+            ScaledBps(370),
+            true,
+            w_warm,
+            1.0,
+            TimestampNs(t0 + k * 60_000_000_000),
+        );
+    }
+    assert!(gov_o3.slot_cont_ratio_x1000(10, Side::Bid) < 800);
+    assert_eq!(gov_o3.learned_tranche1_fraction_permille(10, Side::Bid, 520), 618);
+
+    // Explosive pair (Slot 3 AVAX) updated via +60s SlotMarkoutRing resolution & positive closes -> ~382 permille T1:
+    let mut mk_ring = SlotMarkoutRing::new();
+    mk_ring.arm_fill_probe(Side::Bid, PriceTicks(8_200), PriceTicks(8_200), TimestampNs(t0));
+    for step_s in [1_i64, 2, 6, 16, 61] {
+        mk_ring.step_clock(PriceTicks(8_216), TimestampNs(t0 + step_s * 1_000_000_000), 200);
+    }
+    let resolved_60s = mk_ring.take_resolved_60s_fill_markout();
+    assert_eq!(resolved_60s.map(|x| x.0), Some(Side::Bid));
+    let fav_60s = resolved_60s.map_or(0, |x| x.1);
+    assert!(fav_60s > 1_500);
+    for _ in 0..8 {
+        let _ = gov_o3.observe_markout_60s_continuation(3, Side::Bid, 1_850, fav_60s, ScaledBps(3_600));
+    }
+    let cr_avax = gov_o3.slot_cont_ratio_x1000(3, Side::Bid);
+    assert!(cr_avax > 1_618 && cr_avax <= 2_618);
+    assert_eq!(gov_o3.learned_tranche1_fraction_permille(3, Side::Bid, 1_650), 382);
+
+    // Retrocompatible GOV_SCAR_SNAPSHOT persistence & legacy snapshot fallback:
+    let scar_json = gov_o3.to_scar_snapshot_json(TimestampNs(t0 + 600_000_000_000));
+    let mut gov_rehyd = OnlineAdaptiveGovernor::new();
+    assert!(gov_rehyd.apply_scar_snapshot_json(&scar_json).is_some());
+    assert_eq!(gov_rehyd.slot_cont_ratio_x1000(3, Side::Bid), cr_avax);
+    assert_eq!(
+        gov_rehyd.slot_cont_ratio_x1000(10, Side::Bid),
+        gov_o3.slot_cont_ratio_x1000(10, Side::Bid)
+    );
+    let mut legacy_scar = scar_json;
+    if let Some(obj) = legacy_scar.as_object_mut() {
+        let _ = obj.remove("cont_ratio_x1000");
+    }
+    let mut gov_legacy = OnlineAdaptiveGovernor::new();
+    assert!(gov_legacy.apply_scar_snapshot_json(&legacy_scar).is_some());
+    assert_eq!(gov_legacy.slot_cont_ratio_x1000(3, Side::Bid), 1_000);
+
+    // Full 3-Tranche Cascade (T1 -> T2 -> T3) in SlotExecutionEngine:
+    let mut eng_c3 = SlotExecutionEngine::new(3);
+    eng_c3.learned_mfe_bps = 1_750;
+    eng_c3.sync_governor_for_side(&gov_o3, Side::Bid);
+    let mut led_c3 = ParitySyncLedger::new(6_500_000_000);
+    let mut snap_c3 = mk_vault_snap(3, 8_200, 3_600, 0.62, 0.66, 0.45, t0);
+    snap_c3.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.64),
+        macro_phase: BoundedScore::new_clamped(0.75),
+        oi_impulse: BoundedScore::new_clamped(0.35),
+        liq_imbalance: BoundedScore::new_clamped(0.45),
+        fib_proj_bps: ScaledBps(2_200),
+    });
+    assert!(eng_c3
+        .try_arm_maker_entry(
+            &snap_c3,
+            SignalVerdict::AuthorizeMakerEntry {
+                side: Side::Bid,
+                target_excursion_scaled_bps: ScaledBps(1_750),
+            },
+            LotQty(10),
+        )
+        .is_ok());
+    assert!(eng_c3.on_maker_entry_filled(TimestampNs(t0)).is_ok());
+
+    // Step 1: T1 partial harvest (~38.2% of 10 -> 4 lots, rem_lots = 6):
+    let q_t1_opt = eng_c3.compute_canonical_exit_quote(&snap_c3);
+    assert!(q_t1_opt.is_some());
+    let Some(q_t1) = q_t1_opt else { return };
+    assert_eq!(q_t1.role, ExitOrderRole::Tranche1Harvest50);
+    assert!(q_t1.order_lots.0 >= 3 && q_t1.order_lots.0 <= 4);
+    snap_c3.ts_local_ns = TimestampNs(t0 + 2_000_000_000);
+    snap_c3.bids[0].price = PriceTicks(q_t1.target_price.0 - 1);
+    snap_c3.asks[0].price = q_t1.target_price;
+    snap_c3.mark_price = q_t1.target_price;
+    snap_c3.last_trade_price = q_t1.target_price;
+    assert!(eng_c3.step_open_position(&snap_c3, &snaps[0], &gov_o3, &mut led_c3).is_none());
+    assert_eq!(eng_c3.tranche1_harvests_count, 1);
+
+    // Step 2: T2 golden intermediate harvest (round(INV_PHI * rem_lots), leaving T3 Shadow-Runner):
+    let q_t2_opt = eng_c3.compute_canonical_exit_quote(&snap_c3);
+    assert!(q_t2_opt.is_some());
+    let Some(q_t2) = q_t2_opt else { return };
+    assert_eq!(q_t2.role, ExitOrderRole::Tranche2HarvestPhi);
+    assert_eq!(q_t2.sub_reason, ExitSubReason::Tranche2HarvestPhi);
+    let rem_before_t2 = match eng_c3.state {
+        OrderLifecycleState::PositionOpenMakerExit { open_lots, .. } => open_lots.0,
+        _ => 0,
+    };
+    let expected_t2_lots = ((INV_PHI * (rem_before_t2 as f64)).round() as i64).clamp(1, rem_before_t2 - 1);
+    assert_eq!(q_t2.order_lots, LotQty(expected_t2_lots));
+    snap_c3.ts_local_ns = TimestampNs(t0 + 5_000_000_000);
+    snap_c3.bids[0].price = PriceTicks(q_t2.target_price.0 - 1);
+    snap_c3.asks[0].price = q_t2.target_price;
+    snap_c3.mark_price = q_t2.target_price;
+    snap_c3.last_trade_price = q_t2.target_price;
+    snap_c3.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.64),
+        macro_phase: BoundedScore::new_clamped(0.78),
+        oi_impulse: BoundedScore::new_clamped(0.35),
+        liq_imbalance: BoundedScore::new_clamped(0.45),
+        fib_proj_bps: ScaledBps(850),
+    });
+    assert!(eng_c3.step_open_position(&snap_c3, &snaps[0], &gov_o3, &mut led_c3).is_none());
+    assert!(eng_c3.tranche2_harvested && eng_c3.tranche2_harvests_count == 1);
+    assert!(eng_c3.ratchet_locked_gross_bps >= 500);
+    assert!(eng_c3.lvdbs_deep_surfs_count >= 1);
+
+    // Step 3: T3 Uncapped Shadow-Runner closes remaining lots at impulse crest -> 3 consolidated legs:
+    let q_t3_opt = eng_c3.compute_canonical_exit_quote(&snap_c3);
+    assert!(q_t3_opt.is_some());
+    let Some(q_t3) = q_t3_opt else { return };
+    assert_eq!(q_t3.role, ExitOrderRole::LvdbsDeepSurf50);
+    let crest_px = PriceTicks(q_t3.target_price.0.max(8_224));
+    snap_c3.ts_local_ns = TimestampNs(t0 + 9_000_000_000);
+    snap_c3.bids[0].price = PriceTicks(crest_px.0 - 1);
+    snap_c3.asks[0].price = crest_px;
+    snap_c3.mark_price = crest_px;
+    snap_c3.last_trade_price = crest_px;
+    snap_c3.factor_ofi = BoundedScore::new_clamped(-0.15);
+    snap_c3.factor_tfi = BoundedScore::new_clamped(-0.15);
+    snap_c3.factor_geom = BoundedScore::ZERO;
+    snap_c3.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.64),
+        macro_phase: BoundedScore::new_clamped(0.82),
+        oi_impulse: BoundedScore::new_clamped(0.30),
+        liq_imbalance: BoundedScore::new_clamped(0.40),
+        fib_proj_bps: ScaledBps(10),
+    });
+    let sum_3leg_opt = eng_c3.step_open_position(&snap_c3, &snaps[0], &gov_o3, &mut led_c3);
+    assert!(sum_3leg_opt.is_some());
+    let Some(sum_3leg) = sum_3leg_opt else { return };
+    assert_eq!(sum_3leg.legs_consolidated, 3);
+    assert_eq!(sum_3leg.closed_lots, LotQty(10));
+    assert_eq!(eng_c3.last_closed_legs_fee_1e8, sum_3leg.fee_1e8);
+    assert!(sum_3leg.net_pnl_1e8 > 0 && led_c3.cumulative_net_pnl_1e8 == sum_3leg.net_pnl_1e8);
+
+    // Reversal after T1 before T2 closes cleanly in 2 legs (preserving V17 invariant):
+    let mut eng_2leg = SlotExecutionEngine::new(3);
+    eng_2leg.learned_mfe_bps = 1_750;
+    eng_2leg.sync_governor_for_side(&gov_o3, Side::Bid);
+    let mut snap_2l = mk_vault_snap(3, 8_200, 3_600, 0.62, 0.66, 0.45, t0 + 20_000_000_000);
+    assert!(eng_2leg
+        .try_arm_maker_entry(
+            &snap_2l,
+            SignalVerdict::AuthorizeMakerEntry {
+                side: Side::Bid,
+                target_excursion_scaled_bps: ScaledBps(1_750),
+            },
+            LotQty(10),
+        )
+        .is_ok());
+    assert!(eng_2leg.on_maker_entry_filled(TimestampNs(t0 + 20_000_000_000)).is_ok());
+    let qt1_rev_opt = eng_2leg.compute_canonical_exit_quote(&snap_2l);
+    assert!(qt1_rev_opt.is_some());
+    let Some(qt1_rev) = qt1_rev_opt else { return };
+    assert!(eng_2leg.record_tranche1_harvest(qt1_rev.target_price));
+    snap_2l.ts_local_ns = TimestampNs(t0 + 24_000_000_000);
+    snap_2l.factor_ofi = BoundedScore::new_clamped(-0.65);
+    snap_2l.factor_tfi = BoundedScore::new_clamped(-0.65);
+    let sum_2leg_opt = eng_2leg.finalize_open_position_close(
+        ClosedTradeKind::MakerPassiveUnwind,
+        qt1_rev.target_price,
+        snap_2l.ts_local_ns,
+        &mut led_c3,
+    );
+    assert!(sum_2leg_opt.is_some());
+    let Some(sum_2leg) = sum_2leg_opt else { return };
+    assert_eq!(sum_2leg.legs_consolidated, 2);
+
+    // =========================================================================
+    // (4) O4: House-Money Recycling (Free-Ride Risk & Same-Side Stagger Unlock)
+    // =========================================================================
+    let mut hm_engines = SlotExecutionEngine::new_12_slot_array();
+    let mut hm_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    let hm_epps = [EppsBtcCorrelationTracker::new(); MAX_ACTIVE_PAIRS];
+    for &s_i in &[2_usize, 3, 5] {
+        hm_snaps[s_i] = mk_vault_snap(s_i, 7_500, 3_200, 0.55, 0.60, 0.40, t0);
+        assert!(hm_engines[s_i]
+            .adopt_live_open_position(
+                Side::Bid,
+                PriceTicks(7_500),
+                LotQty(10),
+                LotQty(10),
+                false,
+                PriceTicks(7_500),
+                PriceTicks(7_500),
+                TimestampNs(t0),
+                &hm_snaps[s_i],
+            )
+            .is_ok());
+    }
+    let guard_full = build_monetary_beta_guard_with_epps(
+        6_500_000_000,
+        &hm_engines,
+        &hm_snaps,
+        &hm_epps,
+        FeeSchedule::VIP0_DEFAULT,
+    );
+    assert!(!guard_full.can_open_with_risk_ppm(9, Side::Bid, 8_000, 900));
+
+    // Harvest T1 + ratchet SL to breakeven on slots 2 & 3 -> residual_risk_1e8 == 0 (Free-Ride!):
+    for &s_i in &[2_usize, 3] {
+        assert!(hm_engines[s_i].record_tranche1_harvest(PriceTicks(7_510)));
+        hm_engines[s_i].last_eff_sl_ticks = PriceTicks(7_504);
+        assert!(hm_engines[s_i].is_house_money_free_ride());
+        assert_eq!(hm_engines[s_i].house_money_residual_risk_1e8_and_s3_scale(), (0, 0.0));
+    }
+    let guard_freeride = build_monetary_beta_guard_with_epps(
+        6_500_000_000,
+        &hm_engines,
+        &hm_snaps,
+        &hm_epps,
+        FeeSchedule::VIP0_DEFAULT,
+    );
+    assert!(guard_freeride.is_slot_free_ride(2) && guard_freeride.is_slot_free_ride(3));
+    assert!(!guard_freeride.is_slot_free_ride(5));
+    assert!(guard_freeride.total_open_risk_ppm() < guard_full.total_open_risk_ppm() / 2);
+    assert!(guard_freeride.can_open_with_risk_ppm(9, Side::Bid, 8_000, 900));
+
+    // Stagger unlock: even with 2 resting entries if converted to Free-Ride open slots, new divisible shot is unlocked;
+    // AND hard physical cap <= 6 open slots STILL blocks a 7th slot even when all 6 are Free-Ride:
+    for &s_i in &[4_usize, 6, 7] {
+        hm_snaps[s_i] = mk_vault_snap(s_i, 7_500, 3_200, 0.55, 0.60, 0.40, t0);
+        assert!(hm_engines[s_i]
+            .adopt_live_open_position(
+                Side::Bid,
+                PriceTicks(7_500),
+                LotQty(10),
+                LotQty(10),
+                false,
+                PriceTicks(7_500),
+                PriceTicks(7_500),
+                TimestampNs(t0),
+                &hm_snaps[s_i],
+            )
+            .is_ok());
+        assert!(hm_engines[s_i].record_tranche1_harvest(PriceTicks(7_510)));
+        hm_engines[s_i].last_eff_sl_ticks = PriceTicks(7_504);
+    }
+    assert!(hm_engines[5].record_tranche1_harvest(PriceTicks(7_510)));
+    hm_engines[5].last_eff_sl_ticks = PriceTicks(7_504);
+    let guard_six = build_monetary_beta_guard_with_epps(
+        6_500_000_000,
+        &hm_engines,
+        &hm_snaps,
+        &hm_epps,
+        FeeSchedule::VIP0_DEFAULT,
+    );
+    assert_eq!(guard_six.open_counts().2, 6);
+    assert_eq!(guard_six.total_open_risk_ppm(), 0);
+    assert!(!guard_six.can_open_with_risk_ppm(9, Side::Bid, 5_000, 800));
+    assert!(can_stage_same_direction_entry_v542(
+        9,
+        Side::Bid,
+        TimestampNs(t0 + 100_000_000),
+        &hm_engines,
+        &hm_snaps,
+        &hm_epps,
+        1.0,
+        50,
+    ));
+
+    // =========================================================================
+    // (5) O5: Momentum Chain Re-Entry Cooldown Compression on Clean Maker Win
+    // =========================================================================
+    let mut gov_o5 = OnlineAdaptiveGovernor::new();
+    let mut eng_o5 = SlotExecutionEngine::new(2);
+    let close_ts = TimestampNs(t0 + 100_000_000_000);
+    gov_o5.set_slot_momentum_chain_context(2, 0.78, false, 70_000);
+    gov_o5.observe_closed_trade_with_regime_v51(
+        2,
+        Side::Bid,
+        PriceTicks(7_500),
+        ScaledBps(680),
+        ScaledBps(1_200),
+        true,
+        w_warm,
+        1.0,
+        close_ts,
+    );
+    eng_o5.cooldown_until_ns = TimestampNs(close_ts.0 + 3_000_000_000);
+    eng_o5.apply_momentum_chain_post_close_cooldown(
+        close_ts,
+        true,
+        ScaledBps(680),
+        false,
+        gov_o5.psi_health(),
+        0.78,
+        70_000,
+    );
+    let expected_settle_ns = (PHI_SQ * 70_000_000.0).round() as i64;
+    assert_eq!(
+        gov_o5.directional_cooldown_until_ns_for(2, Side::Bid) - close_ts.0,
+        expected_settle_ns
+    );
+    assert_eq!(eng_o5.cooldown_until_ns.0 - close_ts.0, expected_settle_ns);
+
+    // Scratch, Climax, and SL Loss MUST preserve 100% uncompressed cooldowns:
+    let close_ts2 = TimestampNs(close_ts.0 + 50_000_000_000);
+    let w_climax = WaveObservables {
+        regime: WaveRegime::ClimaxExhaustion,
+        climax_active: true,
+        ..w_warm
+    };
+    gov_o5.set_slot_momentum_chain_context(5, 0.80, true, 70_000);
+    gov_o5.observe_closed_trade_with_regime_v51(
+        5,
+        Side::Bid,
+        PriceTicks(7_200),
+        ScaledBps(680),
+        ScaledBps(1_200),
+        true,
+        w_climax,
+        1.0,
+        close_ts2,
+    );
+    assert!(gov_o5.directional_cooldown_until_ns_for(5, Side::Bid) - close_ts2.0 > 10_000_000_000);
+    gov_o5.observe_closed_trade_at_entry(6, Side::Bid, PriceTicks(2_800), ScaledBps(40), true, close_ts2);
+    assert!(gov_o5.directional_cooldown_until_ns_for(6, Side::Bid) - close_ts2.0 > 30_000_000_000);
+    gov_o5.observe_closed_trade_at_entry(7, Side::Bid, PriceTicks(14_000), ScaledBps(-1_400), false, close_ts2);
+    assert!(gov_o5.directional_cooldown_until_ns_for(7, Side::Bid) - close_ts2.0 >= 250_000_000_000);
+
+    // =========================================================================
+    // (6) O6: Sub-Second Crest Snap-In Coupled to ws_rtt_us & ws_quota_rem
+    // =========================================================================
+    let crest_quote = vortex_rs::exit_quoter::CanonicalExitQuote {
+        role: ExitOrderRole::LvdbsDeepSurf50,
+        target_price: PriceTicks(7_520),
+        order_lots: LotQty(5),
+        sub_reason: ExitSubReason::ShadowRunnerCrestHarvest,
+        vac_level: 1,
+        defensive_lock_active: false,
+        urgent_close_repeg: false,
+        cur_gross_bps: 1_800,
+        wald_pct: 0,
+    };
+    let (preempt_hi, delay_hi) = compute_exit_sync_schedule_elastic(
+        &crest_quote,
+        PriceTicks(7_545),
+        PriceTicks(7_500),
+        70_000,
+        100,
+    );
+    let (_, delay_low_q) = compute_exit_sync_schedule_elastic(
+        &crest_quote,
+        PriceTicks(7_545),
+        PriceTicks(7_500),
+        70_000,
+        10,
+    );
+    assert!(preempt_hi);
+    assert!((delay_hi - (PHI * 70_000_000.0).round() as i64).abs() <= 2);
+    assert!(delay_low_q > delay_hi && delay_low_q < 350_000_000);
+
+    let float_quote = vortex_rs::exit_quoter::CanonicalExitQuote {
+        sub_reason: ExitSubReason::LvdbsDeepVacuumSurf,
+        urgent_close_repeg: false,
+        ..crest_quote
+    };
+    let (preempt_fl, delay_fl) = compute_exit_sync_schedule_elastic(
+        &float_quote,
+        PriceTicks(7_528),
+        PriceTicks(7_500),
+        70_000,
+        100,
+    );
+    let min_fl = (PHI_CUBE * 70_000_000.0).round() as i64;
+    let max_fl = ((PHI_CUBE * PHI_SQ) * 70_000_000.0).round() as i64;
+    assert!(!preempt_fl && delay_fl >= min_fl && delay_fl <= max_fl);
+    let _ = compute_exit_sync_schedule(&float_quote, PriceTicks(7_528), PriceTicks(7_500));
+
+    // =========================================================================
+    // (7) O7: Diffusive Anti-Hostage Expiration & 1:1 Digital Twin Non-Regression
+    // =========================================================================
+    let tau_h0 = compute_anti_hostage_horizon_s(120, 0);
+    let tau_h1 = compute_anti_hostage_horizon_s(180, 1);
+    assert!(tau_h0 > 390.0 && tau_h0 < 600.0);
+    assert!(tau_h1 > 1_100.0 && tau_h1 < 1_300.0);
+    assert_eq!(compute_anti_hostage_aging_c1(180.0, 180.0, tau_h0), 0.0);
+    assert_eq!(compute_anti_hostage_aging_c1(700.0, 30.0, tau_h0), 0.0);
+    assert!(compute_anti_hostage_aging_c1(900.0, 900.0, tau_h0) > 0.99);
+
+    let mut eng_ah = SlotExecutionEngine::new(3);
+    eng_ah.intrinsic_tau_mkt_s = 120;
+    let mut snap_ah = mk_vault_snap(3, 8_200, 3_600, 0.05, 0.05, 0.02, t0);
+    assert!(eng_ah
+        .adopt_live_open_position(
+            Side::Bid,
+            PriceTicks(8_200),
+            LotQty(6),
+            LotQty(6),
+            false,
+            PriceTicks(8_201),
+            PriceTicks(8_188),
+            TimestampNs(t0),
+            &snap_ah,
+        )
+        .is_ok());
+    let init_sl = eng_ah.last_eff_sl_ticks;
+    // Early life (+150s): zero aging, initial diffusive SL amplitude 100% untouched:
+    snap_ah.ts_local_ns = TimestampNs(t0 + 150_000_000_000);
+    assert_eq!(eng_ah.current_anti_hostage_aging_c1(snap_ah.ts_local_ns), 0.0);
+    assert!(eng_ah.maybe_ratchet_chandelier_or_wald_sl(&snap_ah, &snaps[0]).is_none());
+    assert_eq!(eng_ah.last_eff_sl_ticks, init_sl);
+
+    // Multi-minute stagnation (+950s < 8h funding, zero new peak):
+    // (1) opportunistic passive Maker exit in [-fee_rt_mkr, +zero_loss_floor], AND
+    // (2) monotonic Server MarkPrice SL contraction toward diffusive floor!
+    snap_ah.ts_local_ns = TimestampNs(t0 + 950_000_000_000);
+    snap_ah.bids[0].price = PriceTicks(8_198);
+    snap_ah.asks[0].price = PriceTicks(8_199);
+    snap_ah.mark_price = PriceTicks(8_198);
+    snap_ah.last_trade_price = PriceTicks(8_198);
+    assert!(eng_ah.current_anti_hostage_aging_c1(snap_ah.ts_local_ns) > 0.99);
+    let q_aged_opt = eng_ah.compute_canonical_exit_quote(&snap_ah);
+    assert!(q_aged_opt.is_some());
+    let Some(q_aged) = q_aged_opt else { return };
+    assert!(q_aged.urgent_close_repeg && q_aged.target_price == PriceTicks(8_199));
+    let aged_sl_opt = eng_ah.maybe_ratchet_chandelier_or_wald_sl(&snap_ah, &snaps[0]);
+    assert!(aged_sl_opt.is_some());
+    let Some(aged_sl) = aged_sl_opt else { return };
+    assert!(aged_sl.0 > init_sl.0 && aged_sl.0 < 8_198);
+
+    // Constitutional 1:1 Digital Twin & SCAR-LOCK 63/63 non-regression check:
+    assert_eq!(
+        OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold(),
+        (UNIFIED_LOSS_LAB_COUNT, 2_160)
+    );
+    let twin_rep = run_omega_digital_twin_walk_forward_lab();
+    assert_eq!(twin_rep.closed_trades, 3);
+    assert_eq!(twin_rep.cum_net_bps_x100, 9_873);
+    assert_eq!(twin_rep.hawkes_queue_aborts, 1);
+    assert_eq!(twin_rep.post_only_rejects, 0);
+    assert_eq!(twin_rep.parity_sync_drift_1e8, 0);
+
+    drop(shm_reg);
+    let _ = std::fs::remove_file(&shm_p);
 }

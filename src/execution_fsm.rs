@@ -222,7 +222,18 @@ pub struct SlotExecutionEngine {
     pub state: OrderLifecycleState,
     pub cooldown_until_ns: TimestampNs,
     pub tranche1_harvests_count: u64,
+    pub tranche2_harvests_count: u64,
     pub lvdbs_deep_surfs_count: u64,
+    pub tranche2_harvested: bool,
+    pub tranche2_lots: LotQty,
+    pub tranche2_exit_price: PriceTicks,
+    pub partial_harvest_legs: u32,
+    pub realized_partial_net_1e8: i64,
+    pub realized_legs_fee_1e8: i64,
+    pub last_closed_legs_fee_1e8: i64,
+    pub learned_psi_health: f64,
+    pub learned_cont_ratio_x1000: i64,
+    pub last_peak_favorable_ts_ns: i64,
     pub learned_mfe_bps: i64,
     pub learned_t1_permille: i64,
     pub learned_ir_x100: i64,
@@ -261,7 +272,11 @@ impl SlotExecutionEngine {
     pub const fn new(slot_idx: usize) -> Self {
         Self {
             slot_idx, state: OrderLifecycleState::Idle, cooldown_until_ns: TimestampNs(0),
-            tranche1_harvests_count: 0, lvdbs_deep_surfs_count: 0,
+            tranche1_harvests_count: 0, tranche2_harvests_count: 0, lvdbs_deep_surfs_count: 0,
+            tranche2_harvested: false, tranche2_lots: LotQty(0), tranche2_exit_price: PriceTicks(0),
+            partial_harvest_legs: 0, realized_partial_net_1e8: 0, realized_legs_fee_1e8: 0,
+            last_closed_legs_fee_1e8: 0, learned_psi_health: 1.0, learned_cont_ratio_x1000: 1_000,
+            last_peak_favorable_ts_ns: 0,
             learned_mfe_bps: (ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 17) / 5,
             learned_t1_permille: 500, learned_ir_x100: 33, learned_ret_std_bps: 200,
             intrinsic_tau_mkt_s: VOL_5M_HORIZON_NS / 1_000_000_000,
@@ -325,10 +340,13 @@ impl SlotExecutionEngine {
         self.learned_ret_std_bps = gov.slot_return_std_bps(self.slot_idx, side);
         self.intrinsic_tau_mkt_s = (gov.intrinsic_diffusion_clock_ns(self.slot_idx) / 1_000_000_000).max(90);
         self.in_slot_scar_debt = gov.is_in_local_slot_scar_debt(self.slot_idx, side);
+        self.learned_psi_health = gov.psi_health();
+        self.learned_cont_ratio_x1000 = gov.slot_cont_ratio_x1000(self.slot_idx, side);
     }
 
     #[inline]
     pub fn sync_governor_dynamics(&mut self, gov: &OnlineAdaptiveGovernor) {
+        self.learned_psi_health = gov.psi_health();
         if let Some(side) = self.active_side() { self.sync_governor_for_side(gov, side); }
         else { self.active_fees = gov.active_fee_schedule(); }
     }
@@ -719,20 +737,23 @@ impl SlotExecutionEngine {
         if self.chandelier_profit_sl_armed { return None; }
         let OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, sl_trigger_price: cur_sl, opened_ts, .. } = self.state else { return None; };
         if avg_price_ticks.0 <= 0 { return None; }
+        let chi_aging = self.current_anti_hostage_aging_c1(snap.ts_local_ns);
         let fee_rt = self.active_maker_rt_fee_bps();
         let ref_m_px = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { avg_price_ticks.0 };
         let cur_g_sbps = ((ref_m_px - avg_price_ticks.0).saturating_mul(side.sign_i64()).saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
-        let tau_t_sbps = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)].tick_to_price_scaled_bps(avg_price_ticks).unwrap_or(ScaledBps(50)).raw();
+        let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+        let tau_t_sbps = spec.tick_to_price_scaled_bps(avg_price_ticks).unwrap_or(ScaledBps(50)).raw();
         let retained_mfe = compute_c1_retained_mfe_bps(self.last_closed_mfe_bps, cur_g_sbps, fee_rt, self.learned_taker_prob_pm, tau_t_sbps, self.chandelier_profit_sl_armed);
-        if retained_mfe >= (fee_rt * 13) / 10 { return None; }
+        if retained_mfe >= (fee_rt * 13) / 10 && chi_aging <= 0.0 { return None; }
         let hold_s = snap.ts_local_ns.0.saturating_sub(opened_ts.0).max(0) / 1_000_000_000;
         let sl_ref_vol = if self.open_vol_5m_bps.0 > 0 && self.open_vol_5m_bps.0 < snap.realized_vol_5m.0 { self.open_vol_5m_bps } else { snap.realized_vol_5m };
-        let contracted_bps = if hold_s >= 3 && self.wald_sprt.exhaustion_unwind_active {
+        let wald_contracted_opt = if retained_mfe >= (fee_rt * 13) / 10 {
+            None
+        } else if hold_s >= 3 && self.wald_sprt.exhaustion_unwind_active {
             let (comp_bps, eff_gamma) = compute_wald_v2_contracted_sl_bps_with_fees(sl_ref_vol, &self.wald_sprt, self.active_fees);
             self.last_closed_wald_pct = self.last_closed_wald_pct.max(eff_gamma);
-            comp_bps
-        } else {
-            if self.last_closed_wald_pct < 12 || hold_s < (self.intrinsic_tau_mkt_s.max(90) / 5).max(45) { return None; }
+            Some(comp_bps)
+        } else if self.last_closed_wald_pct >= 12 && hold_s >= (self.intrinsic_tau_mkt_s.max(90) / 5).max(45) {
             let dir_s = side.sign_f64();
             let own_flow = self.signed_intrinsic_flow_slow(side, snap).get();
             let beta_c = if self.slot_idx == 0 { 0.0 } else { epps_signed_beta.clamp(-EPPS_PHI_CAP, EPPS_PHI_CAP) };
@@ -741,11 +762,33 @@ impl SlotExecutionEngine {
             } else {
                 beta_c * (OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s)
             };
-            if own_flow >= -0.05 && btc_snr >= -0.20 { return None; }
+            if own_flow < -0.05 || btc_snr < -0.20 {
+                let base_sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(sl_ref_vol, self.active_fees).raw();
+                let btc_headwind = if self.slot_idx > 0 && btc_snr < -0.25 { ((-btc_snr - 0.25) * 20.0).round() as i64 } else { 0 };
+                let eff_wald_pct = (self.last_closed_wald_pct + btc_headwind).clamp(12, 42);
+                Some(((base_sl_bps * (100 - eff_wald_pct)) / 100).max(fee_rt * 9))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let aging_contracted_opt = if chi_aging > 0.0 {
+            let c_rt = spec.expected_round_trip_cost_bps_dynamic(avg_price_ticks, self.learned_taker_prob_pm, self.active_fees).raw();
             let base_sl_bps = PairSpec::elastic_server_sl_distance_bps_with_fees(sl_ref_vol, self.active_fees).raw();
-            let btc_headwind = if self.slot_idx > 0 && btc_snr < -0.25 { ((-btc_snr - 0.25) * 20.0).round() as i64 } else { 0 };
-            let eff_wald_pct = (self.last_closed_wald_pct + btc_headwind).clamp(12, 42);
-            ((base_sl_bps * (100 - eff_wald_pct)) / 100).max(fee_rt * 9)
+            let min_diff_floor_bps = ((2.618_033_988_749_895 * (c_rt.max(150) as f64)).round() as i64)
+                .max(tau_t_sbps.max(10).saturating_mul(4));
+            let aged_bps = base_sl_bps
+                - (((base_sl_bps - min_diff_floor_bps).max(0) as f64 * chi_aging).round() as i64);
+            Some(aged_bps.max(min_diff_floor_bps))
+        } else {
+            None
+        };
+        let contracted_bps = match (wald_contracted_opt, aging_contracted_opt) {
+            (Some(w), Some(a)) => w.min(a),
+            (Some(w), None) => w,
+            (None, Some(a)) => a,
+            (None, None) => return None,
         };
         let sl_delta = ((avg_price_ticks.0.saturating_mul(contracted_bps)) / 1_000_000).max(4);
         let ref_mark = if snap.mark_price.0 > 0 { snap.mark_price } else { avg_price_ticks };
@@ -756,9 +799,10 @@ impl SlotExecutionEngine {
         };
         let valid_sl = PairSpec::validate_stop_loss_geometry(side, cand_sl, ref_last, ref_mark).ok()?;
         let prev_sl = if self.last_eff_sl_ticks.0 > 0 { self.last_eff_sl_ticks } else { cur_sl };
+        let min_step = if chi_aging > 0.0 { 1_i64 } else { 3_i64 };
         let tighter = match side {
-            Side::Bid => valid_sl.0 >= prev_sl.0.saturating_add(3) && valid_sl.0 < avg_price_ticks.0,
-            Side::Ask => valid_sl.0 <= prev_sl.0.saturating_sub(3) && valid_sl.0 > avg_price_ticks.0,
+            Side::Bid => valid_sl.0 >= prev_sl.0.saturating_add(min_step) && valid_sl.0 < avg_price_ticks.0,
+            Side::Ask => valid_sl.0 <= prev_sl.0.saturating_sub(min_step) && valid_sl.0 > avg_price_ticks.0,
         };
         if !tighter { return None; }
         self.last_eff_sl_ticks = valid_sl;
@@ -1087,10 +1131,17 @@ impl SlotExecutionEngine {
             None => (ExitOrderRole::StandardMakerExit100, structural_tp_price, eff_lots),
         };
         self.last_opened_ts = fill_ts;
+        self.last_peak_favorable_ts_ns = fill_ts.0;
         self.last_eff_sl_ticks = eff_sl_px;
         self.ratchet_locked_gross_bps = 0;
         self.tranche1_harvests_count = 0;
         self.lvdbs_deep_surfs_count = 0;
+        self.tranche2_harvested = false;
+        self.tranche2_lots = LotQty(0);
+        self.tranche2_exit_price = PriceTicks(0);
+        self.partial_harvest_legs = 0;
+        self.realized_partial_net_1e8 = 0;
+        self.realized_legs_fee_1e8 = 0;
         self.last_closed_mfe_bps = 0;
         self.last_closed_mae_bps = 0;
         self.last_closed_peak_ticks = eff_entry_px;
@@ -1151,6 +1202,7 @@ impl SlotExecutionEngine {
         let wr_init = if worst_price.0 > 0 { worst_price } else { verified_avg_price };
         let avg_d = verified_avg_price.0.max(1);
         self.last_opened_ts = opened_ts;
+        self.last_peak_favorable_ts_ns = opened_ts.0;
         self.last_eff_sl_ticks = sl_t;
         self.open_vol_5m_bps = snap.realized_vol_5m;
         self.ratchet_locked_gross_bps = 0;
@@ -1161,6 +1213,12 @@ impl SlotExecutionEngine {
         self.last_closed_wald_pct = 0;
         self.tranche1_harvests_count = u64::from(t1_done);
         self.lvdbs_deep_surfs_count = 0;
+        self.tranche2_harvested = false;
+        self.tranche2_lots = LotQty(0);
+        self.tranche2_exit_price = PriceTicks(0);
+        self.partial_harvest_legs = u32::from(t1_done);
+        self.realized_partial_net_1e8 = 0;
+        self.realized_legs_fee_1e8 = 0;
         self.exit_peg_attempts = 0;
         self.close_reconcile_retries = 0;
         self.next_peg_allowed_ts_ns = opened_ts.0;
@@ -1233,6 +1291,7 @@ impl SlotExecutionEngine {
         let (s_idx, phi) = (self.slot_idx, self.learned_t1_permille);
         let spec = APPROVED_SPECS[s_idx.min(MAX_ACTIVE_PAIRS - 1)];
         let OrderLifecycleState::PositionOpenMakerExit {
+            side, avg_price_ticks, ref mut peak_favorable_price,
             ref mut open_lots, ref mut tranche1_harvested, ref mut tranche1_lots,
             ref mut tranche1_exit_price, ref mut active_exit_role, ref mut active_exit_lots, ..
         } = self.state else { return false; };
@@ -1249,8 +1308,285 @@ impl SlotExecutionEngine {
         *tranche1_exit_price = fill_price;
         *active_exit_role = ExitOrderRole::LvdbsDeepSurf50;
         *active_exit_lots = *open_lots;
+        if (side == Side::Bid && fill_price.0 > peak_favorable_price.0)
+            || (side == Side::Ask && fill_price.0 > 0 && fill_price.0 < peak_favorable_price.0)
+        {
+            *peak_favorable_price = fill_price;
+        }
+        let (pnl1, fee1, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+            side,
+            harvested,
+            avg_price_ticks,
+            fill_price,
+            true,
+            self.active_fees,
+        );
+        self.realized_partial_net_1e8 = self.realized_partial_net_1e8.saturating_add(pnl1);
+        self.realized_legs_fee_1e8 = self.realized_legs_fee_1e8.saturating_add(fee1);
+        self.partial_harvest_legs = self.partial_harvest_legs.saturating_add(1);
         self.tranche1_harvests_count = self.tranche1_harvests_count.saturating_add(1);
+        self.fold_price_into_excursions(side, avg_price_ticks, fill_price);
         true
+    }
+
+    /// Records intermediate `reduceOnly` `Tranche 2` (`~ PHI * T1_gross`, `round(INV_PHI * rem_lots).clamp(1, rem_lots - 1)`)
+    /// leaving `T3` as *Uncapped Shadow-Runner*, elevating guaranteed floor, and accumulating exact
+    /// `realized_partial_net_1e8`, `realized_legs_fee_1e8`, and `lvdbs_deep_surfs_count` (V5.5 O3/O4).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn record_tranche2_harvest(&mut self, fill_price: PriceTicks) -> bool {
+        let s_idx = self.slot_idx;
+        let spec = APPROVED_SPECS[s_idx.min(MAX_ACTIVE_PAIRS - 1)];
+        let OrderLifecycleState::PositionOpenMakerExit {
+            side,
+            avg_price_ticks,
+            ref mut peak_favorable_price,
+            ref mut open_lots,
+            tranche1_harvested,
+            tranche1_exit_price,
+            ref mut active_exit_role,
+            ref mut active_exit_lots,
+            ..
+        } = self.state
+        else {
+            return false;
+        };
+        if !tranche1_harvested || self.tranche2_harvested || open_lots.0 < 2 || fill_price.0 <= 0 {
+            return false;
+        }
+        let harvested = if matches!(*active_exit_role, ExitOrderRole::Tranche2HarvestPhi)
+            && active_exit_lots.0 >= 1
+            && active_exit_lots.0 < open_lots.0
+        {
+            *active_exit_lots
+        } else {
+            LotQty(
+                ((crate::alpha_3factor::INV_PHI * (open_lots.0 as f64)).round() as i64)
+                    .clamp(1, open_lots.0 - 1),
+            )
+        };
+        *open_lots = LotQty(open_lots.0 - harvested.0);
+        *active_exit_role = ExitOrderRole::LvdbsDeepSurf50;
+        *active_exit_lots = *open_lots;
+        if (side == Side::Bid && fill_price.0 > peak_favorable_price.0)
+            || (side == Side::Ask && fill_price.0 > 0 && fill_price.0 < peak_favorable_price.0)
+        {
+            *peak_favorable_price = fill_price;
+        }
+        let t1_px = tranche1_exit_price;
+        let (pnl2, fee2, g2, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+            side,
+            harvested,
+            avg_price_ticks,
+            fill_price,
+            true,
+            self.active_fees,
+        );
+        self.tranche2_harvested = true;
+        self.tranche2_lots = harvested;
+        self.tranche2_exit_price = fill_price;
+        self.realized_partial_net_1e8 = self.realized_partial_net_1e8.saturating_add(pnl2);
+        self.realized_legs_fee_1e8 = self.realized_legs_fee_1e8.saturating_add(fee2);
+        self.partial_harvest_legs = self.partial_harvest_legs.saturating_add(1);
+        self.tranche2_harvests_count = self.tranche2_harvests_count.saturating_add(1);
+        self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
+        let avg_d = avg_price_ticks.0.max(1);
+        let t1_gross = if t1_px.0 > 0 {
+            ((t1_px.0 - avg_price_ticks.0)
+                .saturating_mul(side.sign_i64())
+                .saturating_mul(1_000_000))
+                / avg_d
+        } else {
+            self.active_maker_rt_fee_bps()
+        };
+        let post_t2_floor = t1_gross
+            .max(((g2.raw() as f64) * crate::alpha_3factor::INV_PHI).round() as i64)
+            .max(self.active_maker_rt_fee_bps());
+        self.ratchet_locked_gross_bps = self.ratchet_locked_gross_bps.max(post_t2_floor);
+        self.fold_price_into_excursions(side, avg_price_ticks, fill_price);
+        true
+    }
+
+    /// Synchronizes a live partial `reduceOnly` execution (`T1` or `T2`) observed via Bybit WS `position`/`order` stream.
+    pub fn record_live_partial_harvest_synced(&mut self, delta_harvested: LotQty, fill_price_hint: PriceTicks) {
+        if delta_harvested.0 <= 0 {
+            return;
+        }
+        let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+        let Some((side, avg_px, t1_already, t1_px)) = (match self.state {
+            OrderLifecycleState::PositionOpenMakerExit {
+                side,
+                avg_price_ticks,
+                tranche1_harvested,
+                tranche1_exit_price,
+                ..
+            } => Some((side, avg_price_ticks, tranche1_harvested, tranche1_exit_price)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let eff_px = if fill_price_hint.0 > 0 { fill_price_hint } else { avg_px };
+        let (pnl_leg, fee_leg, g_leg, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+            side,
+            delta_harvested,
+            avg_px,
+            eff_px,
+            true,
+            self.active_fees,
+        );
+        self.realized_partial_net_1e8 = self.realized_partial_net_1e8.saturating_add(pnl_leg);
+        self.realized_legs_fee_1e8 = self.realized_legs_fee_1e8.saturating_add(fee_leg);
+        self.partial_harvest_legs = self.partial_harvest_legs.saturating_add(1);
+        if !t1_already || self.tranche1_harvests_count == 0 {
+            self.tranche1_harvests_count = self.tranche1_harvests_count.max(1);
+        } else if !self.tranche2_harvested {
+            self.tranche2_harvested = true;
+            self.tranche2_lots = delta_harvested;
+            self.tranche2_exit_price = eff_px;
+            self.tranche2_harvests_count = self.tranche2_harvests_count.saturating_add(1);
+            self.lvdbs_deep_surfs_count = self.lvdbs_deep_surfs_count.saturating_add(1);
+            let t1_g = if t1_px.0 > 0 {
+                ((t1_px.0 - avg_px.0)
+                    .saturating_mul(side.sign_i64())
+                    .saturating_mul(1_000_000))
+                    / avg_px.0.max(1)
+            } else {
+                self.active_maker_rt_fee_bps()
+            };
+            let post_t2 = t1_g
+                .max(((g_leg.raw() as f64) * crate::alpha_3factor::INV_PHI).round() as i64)
+                .max(self.active_maker_rt_fee_bps());
+            self.ratchet_locked_gross_bps = self.ratchet_locked_gross_bps.max(post_t2);
+        }
+        self.fold_price_into_excursions(side, avg_px, eff_px);
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn cascade_and_aging_context_v55(&self) -> crate::exit_quoter::CascadeAndAgingContextV55 {
+        crate::exit_quoter::CascadeAndAgingContextV55 {
+            tranche1_harvests_count: self.tranche1_harvests_count,
+            tranche2_harvested: self.tranche2_harvested,
+            harvested_legs: self.partial_harvest_legs,
+            psi_health: self.learned_psi_health,
+            cont_ratio_x1000: self.learned_cont_ratio_x1000,
+            last_peak_favorable_ts_ns: self.last_peak_favorable_ts_ns,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn current_anti_hostage_aging_c1(&self, now_ts: TimestampNs) -> f64 {
+        let OrderLifecycleState::PositionOpenMakerExit { opened_ts, .. } = self.state else {
+            return 0.0;
+        };
+        let hold_s = (now_ts.0.saturating_sub(opened_ts.0).max(0) as f64) * 1e-9;
+        let peak_ts = if self.last_peak_favorable_ts_ns > 0 {
+            self.last_peak_favorable_ts_ns
+        } else {
+            opened_ts.0
+        };
+        let stag_s = (now_ts.0.saturating_sub(peak_ts).max(0) as f64) * 1e-9;
+        let tau_h = crate::exit_quoter::compute_anti_hostage_horizon_s(
+            self.intrinsic_tau_mkt_s,
+            self.partial_harvest_legs,
+        );
+        crate::exit_quoter::compute_anti_hostage_aging_c1(hold_s, stag_s, tau_h)
+    }
+
+    #[inline]
+    pub fn update_peak_favorable_timestamp_if_improved(
+        &mut self,
+        prev_peak: PriceTicks,
+        new_peak: PriceTicks,
+        side: Side,
+        now_ts: TimestampNs,
+    ) {
+        if now_ts.0 <= 0 {
+            return;
+        }
+        let improved = match side {
+            Side::Bid => new_peak.0 > prev_peak.0,
+            Side::Ask => new_peak.0 > 0 && new_peak.0 < prev_peak.0,
+        };
+        if improved {
+            self.last_peak_favorable_ts_ns = now_ts.0;
+        }
+    }
+
+    /// Computes live net residual risk `residual_risk_1e8 = (rem_lots_loss_to_eff_sl_1e8 - realized_partial_net_1e8.max(0)).max(0)`
+    /// and its `C1` Hermite risk/stagger scale `S_3(residual_risk_ratio; 0.0, INV_PHI_SQ)` (V5.5 O4 House-Money).
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn house_money_residual_risk_1e8_and_s3_scale(&self) -> (i64, f64) {
+        let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+        match self.state {
+            OrderLifecycleState::Idle => (0, 0.0),
+            OrderLifecycleState::PlacingEntryMaker { side, entry_price, qty, sl_trigger_price, .. }
+            | OrderLifecycleState::RestingEntryQueue { side, entry_price, qty, sl_trigger_price, .. } => {
+                let (pnl_sl, _, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+                    side,
+                    qty,
+                    entry_price,
+                    sl_trigger_price,
+                    false,
+                    self.active_fees,
+                );
+                ((-pnl_sl).max(1), 1.0)
+            }
+            OrderLifecycleState::PositionOpenMakerExit {
+                side,
+                avg_price_ticks,
+                initial_lots,
+                open_lots,
+                sl_trigger_price,
+                ..
+            } => {
+                let eff_sl = if self.last_eff_sl_ticks.0 > 0 {
+                    self.last_eff_sl_ticks
+                } else {
+                    sl_trigger_price
+                };
+                let (init_pnl_sl, _, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+                    side,
+                    LotQty(initial_lots.0.max(open_lots.0).max(1)),
+                    avg_price_ticks,
+                    sl_trigger_price,
+                    false,
+                    self.active_fees,
+                );
+                let init_loss_1e8 = (-init_pnl_sl).max(1);
+                let (rem_pnl_sl, _, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+                    side,
+                    LotQty(open_lots.0.max(1)),
+                    avg_price_ticks,
+                    eff_sl,
+                    false,
+                    self.active_fees,
+                );
+                let rem_lots_loss_to_eff_sl_1e8 = (-rem_pnl_sl).max(0);
+                let residual_risk_1e8 =
+                    (rem_lots_loss_to_eff_sl_1e8 - self.realized_partial_net_1e8.max(0)).max(0);
+                if residual_risk_1e8 <= 0 {
+                    return (0, 0.0);
+                }
+                let ratio = (residual_risk_1e8 as f64) / (init_loss_1e8 as f64);
+                let s3 = crate::wave_elliott::hermite_smoothstep_c1(
+                    ratio,
+                    0.0,
+                    crate::alpha_3factor::INV_PHI_SQ,
+                );
+                (residual_risk_1e8, s3.clamp(0.0, 1.0))
+            }
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_house_money_free_ride(&self) -> bool {
+        matches!(self.state, OrderLifecycleState::PositionOpenMakerExit { .. })
+            && self.house_money_residual_risk_1e8_and_s3_scale().0 == 0
     }
 
     #[inline]
@@ -1340,14 +1676,43 @@ impl SlotExecutionEngine {
         }
     }
 
+    #[inline]
+    pub fn apply_momentum_chain_post_close_cooldown(
+        &mut self,
+        closed_ts: TimestampNs,
+        is_maker_exit: bool,
+        net_scaled_bps: ScaledBps,
+        climax_active: bool,
+        psi_health: f64,
+        aligned_propulsion: f64,
+        ws_rtt_us: u32,
+    ) {
+        if !is_maker_exit || net_scaled_bps.raw() <= 0 || closed_ts.0 <= 0 {
+            return;
+        }
+        let base_cd_ns = self.cooldown_until_ns.0.saturating_sub(closed_ts.0).max(0);
+        let eff_cd_ns = crate::governor_plasticity::compute_momentum_chain_win_cooldown_ns_c1(
+            base_cd_ns,
+            is_maker_exit,
+            net_scaled_bps,
+            self.active_maker_rt_fee_bps(),
+            climax_active,
+            psi_health,
+            aligned_propulsion,
+            ws_rtt_us,
+        );
+        self.cooldown_until_ns = TimestampNs(closed_ts.0.saturating_add(eff_cd_ns));
+    }
+
     #[must_use]
     pub fn compute_canonical_exit_quote(&self, snap: &SymbolLobSnapshot) -> Option<CanonicalExitQuote> {
         let ctx = self.open_exit_context()?;
         let adv_f_sbps = self.accrued_open_adverse_funding_sbps(snap);
         let (ws_rtt_us, _) = read_live_ws_pulse();
-        let mut quote = crate::exit_quoter::compute_canonical_exit_quote_omega_v54(
+        let mut quote = crate::exit_quoter::compute_canonical_exit_quote_omega_v55(
             &ctx,
             self.shadow_runner_kinematics(),
+            self.cascade_and_aging_context_v55(),
             snap,
             self.open_vol_5m_bps,
             Some(self.wald_sprt.log_likelihood),
@@ -1395,11 +1760,19 @@ impl SlotExecutionEngine {
             (calc_gross_bps, calc_net_bps)
         };
         self.fold_price_into_excursions(side, entry_price, exit_price);
+        self.last_closed_legs_fee_1e8 = self.realized_legs_fee_1e8.max(fee_1e8);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, net_scaled_bps);
         self.observe_censored_close_mfe_plasticity(side, gross_scaled_bps.raw(), is_maker_exit);
         self.cooldown_until_ns = self.compute_post_close_cooldown_until_ns(closed_ts, is_maker_exit, net_scaled_bps);
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
+        self.tranche2_harvested = false;
+        self.tranche2_lots = LotQty(0);
+        self.tranche2_exit_price = PriceTicks(0);
+        self.partial_harvest_legs = 0;
+        self.realized_partial_net_1e8 = 0;
+        self.realized_legs_fee_1e8 = 0;
+        self.last_peak_favorable_ts_ns = 0;
         self.last_flow_sample_ts_ns = 0;
         self.hawkes_tracker.reset();
         self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
@@ -1417,40 +1790,62 @@ impl SlotExecutionEngine {
         let OrderLifecycleState::PositionOpenMakerExit {
             side, avg_price_ticks, open_lots, tranche1_harvested, tranche1_lots, tranche1_exit_price, ..
         } = self.state else { return None; };
-        let q2 = LotQty(open_lots.0.max(1));
+        let q_rem = LotQty(open_lots.0.max(1));
         if !tranche1_harvested || tranche1_lots.0 <= 0 || tranche1_exit_price.0 <= 0 {
-            return Some(self.finalize_close_with_lots(leg2_kind, side, avg_price_ticks, leg2_exit_price, q2, 1, None, closed_ts, ledger));
+            return Some(self.finalize_close_with_lots(leg2_kind, side, avg_price_ticks, leg2_exit_price, q_rem, 1, None, closed_ts, ledger));
         }
         let spec = APPROVED_SPECS[self.slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
         let q1 = tranche1_lots;
         let is_maker_exit = !matches!(leg2_kind, ClosedTradeKind::ServerMarkPriceStopLoss);
-        let fee1_bps = self.active_fees.round_trip_maker_exit_bps();
-        let fee2_bps = if is_maker_exit { fee1_bps } else { self.active_fees.round_trip_taker_exit_bps() };
+        let fee_mkr_bps = self.active_fees.round_trip_maker_exit_bps();
+        let fee_rem_bps = if is_maker_exit { fee_mkr_bps } else { self.active_fees.round_trip_taker_exit_bps() };
         let (pnl1, fee1, g1, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(side, q1, avg_price_ticks, tranche1_exit_price, true, self.active_fees);
-        let (pnl2, fee2, g2, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(side, q2, avg_price_ticks, leg2_exit_price, is_maker_exit, self.active_fees);
-        let tot_q = (q1.0 + q2.0).max(1);
+        let has_t2 = self.tranche2_harvested && self.tranche2_lots.0 > 0 && self.tranche2_exit_price.0 > 0;
+        let (q2_mid, t2_px, pnl2_mid, fee2_mid, g2_mid, legs_total) = if has_t2 {
+            let q_m = self.tranche2_lots;
+            let px_m = self.tranche2_exit_price;
+            let (p_m, f_m, g_m, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(side, q_m, avg_price_ticks, px_m, true, self.active_fees);
+            (q_m, px_m, p_m, f_m, g_m.raw(), 3_u32)
+        } else {
+            (LotQty(0), PriceTicks(0), 0_i64, 0_i64, 0_i64, 2_u32)
+        };
+        let (pnl_rem, fee_rem, g_rem, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(side, q_rem, avg_price_ticks, leg2_exit_price, is_maker_exit, self.active_fees);
+        let tot_q = (q1.0 + q2_mid.0 + q_rem.0).max(1);
         let tot_q_128 = tot_q as i128;
-        let w_exit = (q1.0 as i128) * (tranche1_exit_price.0 as i128) + (q2.0 as i128) * (leg2_exit_price.0 as i128);
+        let w_exit = (q1.0 as i128) * (tranche1_exit_price.0 as i128)
+            + (q2_mid.0 as i128) * (t2_px.0 as i128)
+            + (q_rem.0 as i128) * (leg2_exit_price.0 as i128);
         let avg_exit_ticks = match side { Side::Bid => (w_exit / tot_q_128).max(1) as i64, Side::Ask => ((w_exit + tot_q_128 - 1) / tot_q_128) as i64 };
-        let gross_bps = (q1.0 * g1.raw() + q2.0 * g2.raw()) / tot_q;
-        let fee_bps = (q1.0 * fee1_bps.raw() + q2.0 * fee2_bps.raw()) / tot_q;
+        let gross_bps = (q1.0 * g1.raw() + q2_mid.0 * g2_mid + q_rem.0 * g_rem.raw()) / tot_q;
+        let fee_bps = (q1.0 * fee_mkr_bps.raw() + q2_mid.0 * fee_mkr_bps.raw() + q_rem.0 * fee_rem_bps.raw()) / tot_q;
         let net_bps = gross_bps - fee_bps;
-        let net_pnl_1e8 = pnl1.saturating_add(pnl2);
-        let fee_1e8 = fee1.saturating_add(fee2);
+        let net_pnl_1e8 = pnl1.saturating_add(pnl2_mid).saturating_add(pnl_rem);
+        let fee_1e8 = fee1.saturating_add(fee2_mid).saturating_add(fee_rem);
+        self.last_closed_legs_fee_1e8 = fee_1e8;
         self.fold_price_into_excursions(side, avg_price_ticks, tranche1_exit_price);
+        if has_t2 {
+            self.fold_price_into_excursions(side, avg_price_ticks, t2_px);
+        }
         self.fold_price_into_excursions(side, avg_price_ticks, leg2_exit_price);
         ledger.record_closed_trade_with_sinking_split(net_pnl_1e8, fee_1e8, ScaledBps(net_bps));
         self.observe_censored_close_mfe_plasticity(side, gross_bps, is_maker_exit);
         self.cooldown_until_ns = self.compute_post_close_cooldown_until_ns(closed_ts, is_maker_exit, ScaledBps(net_bps));
         self.close_reconcile_retries = 0;
         self.chandelier_profit_sl_armed = false;
+        self.tranche2_harvested = false;
+        self.tranche2_lots = LotQty(0);
+        self.tranche2_exit_price = PriceTicks(0);
+        self.partial_harvest_legs = 0;
+        self.realized_partial_net_1e8 = 0;
+        self.realized_legs_fee_1e8 = 0;
+        self.last_peak_favorable_ts_ns = 0;
         self.last_flow_sample_ts_ns = 0;
         self.hawkes_tracker.reset();
         self.last_obs_funding_cut_id = 0; self.pre_cut_funding_rate_sbps = 0; self.accrued_adverse_funding_sbps = 0; self.wald_sprt.reset();
         self.state = OrderLifecycleState::Idle;
         Some(ClosedTradeSummary {
             kind: leg2_kind, side, entry_price: avg_price_ticks, exit_price: PriceTicks(avg_exit_ticks),
-            closed_lots: LotQty(tot_q), legs_consolidated: 2, gross_scaled_bps: ScaledBps(gross_bps),
+            closed_lots: LotQty(tot_q), legs_consolidated: legs_total, gross_scaled_bps: ScaledBps(gross_bps),
             fee_scaled_bps: ScaledBps(fee_bps), net_scaled_bps: ScaledBps(net_bps), net_pnl_1e8, fee_1e8, is_maker_exit,
         })
     }
@@ -1471,6 +1866,7 @@ impl SlotExecutionEngine {
         } = self.state else { return None; };
         let cur_bbo_ref = match side { Side::Bid => snap.asks[0].price, Side::Ask => snap.bids[0].price };
         let ref_trade = if snap.last_trade_price.0 > 0 { snap.last_trade_price } else { cur_bbo_ref };
+        let prev_peak = peak_favorable_price;
         match side {
             Side::Bid => {
                 if ref_trade.0 > peak_favorable_price.0 { peak_favorable_price = ref_trade; }
@@ -1481,6 +1877,7 @@ impl SlotExecutionEngine {
                 if ref_trade.0 > worst_adverse_price.0 { worst_adverse_price = ref_trade; }
             }
         }
+        self.update_peak_favorable_timestamp_if_improved(prev_peak, peak_favorable_price, side, snap.ts_local_ns);
         if let OrderLifecycleState::PositionOpenMakerExit { peak_favorable_price: ref mut pk, worst_adverse_price: ref mut wr, .. } = self.state {
             *pk = peak_favorable_price;
             *wr = worst_adverse_price;
@@ -1518,6 +1915,10 @@ impl SlotExecutionEngine {
         if !reached_target { return None; }
         if matches!(quote.role, ExitOrderRole::Tranche1Harvest50) {
             let _ = self.record_tranche1_harvest(quote.target_price);
+            return None;
+        }
+        if matches!(quote.role, ExitOrderRole::Tranche2HarvestPhi) {
+            let _ = self.record_tranche2_harvest(quote.target_price);
             return None;
         }
         self.exit_peg_attempts = self.exit_peg_attempts.saturating_add(1);

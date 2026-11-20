@@ -42,6 +42,7 @@ pub enum ExitOrderRole {
     #[default]
     None,
     Tranche1Harvest50,
+    Tranche2HarvestPhi,
     LvdbsDeepSurf50,
     StandardMakerExit100,
 }
@@ -51,6 +52,7 @@ pub enum ExitSubReason {
     #[default]
     AdverseScratchEscape,
     Tranche1Harvest50,
+    Tranche2HarvestPhi,
     StandardStructuralTp,
     LvdbsDeepVacuumSurf,
     FibonacciImpulseSurf,
@@ -299,9 +301,9 @@ pub fn compute_wave_dynamic_t1_permille(base_learned_permille: i64, side: Side, 
     } else {
         -(40.0 * (hurst - 0.50) / 0.20).round() as i64
     };
-    let eff_base = if delta < 0 {
+    let eff_base = if delta <= -60 {
         base_learned_permille.min(500)
-    } else if delta > 0 {
+    } else if delta >= 60 {
         base_learned_permille.max(500)
     } else {
         base_learned_permille
@@ -754,11 +756,89 @@ pub fn compute_canonical_exit_quote_omega_v52(
     )
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct CascadeAndAgingContextV55 {
+    pub tranche1_harvests_count: u64,
+    pub tranche2_harvested: bool,
+    pub harvested_legs: u32,
+    pub psi_health: f64,
+    pub cont_ratio_x1000: i64,
+    pub last_peak_favorable_ts_ns: i64,
+}
+
+impl CascadeAndAgingContextV55 {
+    #[inline]
+    #[must_use]
+    pub const fn default_from_ctx(ctx: &OpenExitContext) -> Self {
+        Self {
+            tranche1_harvests_count: ctx.tranche1_harvested as u64,
+            tranche2_harvested: false,
+            harvested_legs: ctx.tranche1_harvested as u32,
+            psi_health: 1.0,
+            cont_ratio_x1000: 1_000,
+            last_peak_favorable_ts_ns: ctx.opened_ts.0,
+        }
+    }
+}
+
+/// Intrinsic diffusive signal lifetime `\tau_{horizon} = \varphi^3 \cdot \tau_{mkt,i} \cdot (1 + \varphi^{-1} S_3(harvested\_legs; 0, 1))` (`~6.5..20 min`, V5.5 O7).
+#[inline]
+#[must_use]
+pub fn compute_anti_hostage_horizon_s(intrinsic_tau_mkt_s: i64, harvested_legs: u32) -> f64 {
+    const PHI_CUBE_AH: f64 = 4.236_067_977_499_79;
+    let tau_mkt = (intrinsic_tau_mkt_s.max(90)) as f64;
+    let s_harv = hermite_s3_unit(f64::from(harvested_legs), 0.0, 1.0);
+    PHI_CUBE_AH * tau_mkt * (1.0 + INV_PHI * s_harv)
+}
+
+/// Continuous `C1` diffusive anti-hostage aging ramp `chi_aging = S_3(hold_s / tau_horizon; INV_PHI, PHI)`
+/// strictly `0.0` during initial minutes (`hold_s <= INV_PHI * tau_horizon`) and while new `peak_favorable_price`
+/// highs are being marked (V5.5 O7).
+#[inline]
+#[must_use]
+pub fn compute_anti_hostage_aging_c1(
+    hold_s: f64,
+    stagnant_since_peak_s: f64,
+    tau_horizon_s: f64,
+) -> f64 {
+    let tau_h = tau_horizon_s.max(90.0);
+    if hold_s <= INV_PHI * tau_h {
+        return 0.0;
+    }
+    let s_hold = hermite_s3_unit(hold_s / tau_h, INV_PHI, PHI);
+    let s_stag = hermite_s3_unit(stagnant_since_peak_s / tau_h, INV_PHI_SQ, INV_PHI);
+    (s_hold * s_stag).clamp(0.0, 1.0)
+}
+
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn compute_canonical_exit_quote_omega_v54(
     ctx: &OpenExitContext,
     kin: ShadowRunnerKinematics,
+    snap: &SymbolLobSnapshot,
+    open_vol_5m_bps: ScaledBps,
+    wald_log_likelihood: Option<f64>,
+    funding_adv_sbps: i64,
+    ws_rtt_us: u32,
+) -> Option<CanonicalExitQuote> {
+    compute_canonical_exit_quote_omega_v55(
+        ctx,
+        kin,
+        CascadeAndAgingContextV55::default_from_ctx(ctx),
+        snap,
+        open_vol_5m_bps,
+        wald_log_likelihood,
+        funding_adv_sbps,
+        ws_rtt_us,
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_canonical_exit_quote_omega_v55(
+    ctx: &OpenExitContext,
+    kin: ShadowRunnerKinematics,
+    v55: CascadeAndAgingContextV55,
     snap: &SymbolLobSnapshot,
     open_vol_5m_bps: ScaledBps,
     wald_log_likelihood: Option<f64>,
@@ -891,7 +971,26 @@ pub fn compute_canonical_exit_quote_omega_v54(
         }
     }
     let role = if ctx.tranche1_harvested { ExitOrderRole::LvdbsDeepSurf50 } else { ExitOrderRole::StandardMakerExit100 };
-    if defensive_lock_active || ratchet_pullback || shadow_crest_snap {
+    let tau_horizon_s = compute_anti_hostage_horizon_s(tau_s, v55.harvested_legs);
+    let peak_ts = if v55.last_peak_favorable_ts_ns > 0 {
+        v55.last_peak_favorable_ts_ns
+    } else {
+        ctx.opened_ts.0
+    };
+    let stagnant_s = ((snap.ts_local_ns.0.saturating_sub(peak_ts).max(0)) as f64) * 1e-9;
+    let chi_aging = compute_anti_hostage_aging_c1(hold_s_f, stagnant_s, tau_horizon_s);
+    let aging_min_gross_sbps =
+        zero_loss_bps - (((zero_loss_bps + fee_rt) as f64 * chi_aging).round() as i64);
+    let aging_opportunistic_maker = chi_aging > 0.0
+        && !climax_harvest
+        && !shadow_crest_snap
+        && !ratchet_pullback
+        && eff_ratchet_bps < win_floor_bps
+        && ref_px.0 > 0
+        && cur_gross_bps >= aging_min_gross_sbps
+        && (cur_gross_bps <= zero_loss_bps
+            || (chi_aging >= INV_PHI_SQ && cur_gross_bps < win_floor_bps));
+    if defensive_lock_active || ratchet_pullback || shadow_crest_snap || aging_opportunistic_maker {
         let p_taker = (ctx.learned_taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
         let s_adv_flow = hermite_s3_unit(-eff_flow_slow, INV_PHI_FOURTH, INV_PHI);
         let p_eff_cont = (p_cont * (1.0 - p_taker) * (1.0 - INV_PHI * s_adv_flow)).clamp(0.0, 1.0);
@@ -990,13 +1089,21 @@ pub fn compute_canonical_exit_quote_omega_v54(
             * base_bailout_band)
             .max(s_w3_pause_evac);
         let trapped_or_underwater = cur_gross_bps < 0 || worst_mae_bps < 0;
-        let maker_bailout_active = trapped_or_underwater
-            && cur_gross_bps < zero_loss_bps
-            && eff_ratchet_bps < win_floor_bps
-            && ref_px.0 > 0
-            && chi_stress >= INV_PHI
-            && v_bailout_maker > e_hold + INV_PHI_CUBE * c_mkr_scale;
-        let target_price = if maker_bailout_active {
+        let maker_bailout_active = aging_opportunistic_maker
+            || (trapped_or_underwater
+                && cur_gross_bps < zero_loss_bps
+                && eff_ratchet_bps < win_floor_bps
+                && ref_px.0 > 0
+                && chi_stress >= INV_PHI
+                && v_bailout_maker > e_hold + INV_PHI_CUBE * c_mkr_scale);
+        let target_price = if aging_opportunistic_maker {
+            let aging_px = if cur_gross_bps > zero_loss_bps {
+                pick_more_ambitious_tp(ctx.side, zero_loss_px, ref_px)
+            } else {
+                ref_px
+            };
+            enforce_maker_bbo_bound(ctx.side, aging_px, snap)
+        } else if maker_bailout_active {
             enforce_maker_bbo_bound(ctx.side, ref_px, snap)
         } else {
             let floor_bps = if climax_harvest || shadow_crest_snap || opposing_wave3_escape {
@@ -1015,11 +1122,13 @@ pub fn compute_canonical_exit_quote_omega_v54(
             else { ExitSubReason::AdverseScratchEscape };
         return Some(CanonicalExitQuote {
             role, target_price, order_lots: ctx.open_lots, sub_reason, vac_level: 1,
-            defensive_lock_active, urgent_close_repeg: true, cur_gross_bps, wald_pct,
+            defensive_lock_active: defensive_lock_active || aging_opportunistic_maker,
+            urgent_close_repeg: true, cur_gross_bps, wald_pct,
         });
     }
     let min_win_px = dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(eff_ratchet_bps.max(win_floor_bps)));
-    let eff_struct_tp = if snap.realized_vol_5m.raw() > 0
+    let eff_struct_tp = if !v55.tranche2_harvested
+        && snap.realized_vol_5m.raw() > 0
         && snap.realized_vol_5m.raw() < eq_vol_mfe.raw()
         && !matches!(w_obs.regime, WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5)
     {
@@ -1068,7 +1177,9 @@ pub fn compute_canonical_exit_quote_omega_v54(
     let runner2_px = if lvdbs_vac_level < 2 && s_run > 1e-6 {
         let sigma_1m = vol_f / SQRT_5;
         let base_r = (projected_mfe_bps as f64).min(PHI * sigma_1m).max(win_floor_bps as f64);
-        let opt_coeff = if ctx.tranche1_harvested {
+        let opt_coeff = if v55.tranche2_harvested {
+            1.0 + INV_PHI * s_run
+        } else if ctx.tranche1_harvested {
             INV_PHI + INV_PHI_SQ * s_run
         } else {
             1.0 + INV_PHI_SQ * s_run
@@ -1111,6 +1222,86 @@ pub fn compute_canonical_exit_quote_omega_v54(
         ctx.side, spec, ctx.avg_price_ticks, combined_best, ctx.active_fees,
     );
     let target_price = enforce_maker_bbo_bound(ctx.side, pick_more_ambitious_tp(ctx.side, min_win_px, ob_tp), snap);
+    if v55.psi_health > INV_PHI_SQ
+        && !kin.in_scar_debt
+        && v55.tranche1_harvests_count == 1
+        && ctx.tranche1_harvested
+        && !v55.tranche2_harvested
+        && ctx.open_lots.0 >= 3
+    {
+        let raw_t1_gross = if ctx.tranche1_exit_price.0 > 0 {
+            ((ctx.tranche1_exit_price.0 - ctx.avg_price_ticks.0)
+                .saturating_mul(d_sign)
+                .saturating_mul(1_000_000))
+                / avg_denom
+        } else {
+            win_floor_bps
+        };
+        let t1_was_offensive = ctx.tranche1_exit_price.0 <= 0
+            || raw_t1_gross.saturating_add(25) >= win_floor_bps;
+        let t1_gross_sbps = raw_t1_gross.max(win_floor_bps);
+        let base_phi_t2_sbps = ((PHI * (t1_gross_sbps as f64)).round() as i64)
+            .max(t1_gross_sbps + 40)
+            .max(eff_ratchet_bps);
+        let min_ext_sbps = ((INV_PHI * (fee_rt as f64)).round() as i64).max(1);
+        let learned_struct_sbps = ctx.learned_mfe_bps.max(projected_mfe_bps);
+        let learned_mfe_tp = dynamic_maker_floor_price(
+            ctx.side,
+            ctx.avg_price_ticks,
+            ScaledBps(learned_struct_sbps),
+        );
+        let ext_struct_px = enforce_maker_bbo_bound(
+            ctx.side,
+            pick_more_ambitious_tp(ctx.side, learned_mfe_tp, fib_px),
+            snap,
+        );
+        let base_t2_px = enforce_maker_bbo_bound(
+            ctx.side,
+            dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(base_phi_t2_sbps)),
+            snap,
+        );
+        let struct_tick_gap = (ext_struct_px.0 - base_t2_px.0).saturating_mul(d_sign);
+        let struct_sbps_gap = (struct_tick_gap.saturating_mul(1_000_000)) / avg_denom;
+        let cont_ready = v55.cont_ratio_x1000 > 1_000
+            || ctx.learned_mfe_bps >= base_phi_t2_sbps.saturating_add(min_ext_sbps);
+        if t1_was_offensive && cont_ready && struct_tick_gap >= 2 && struct_sbps_gap >= min_ext_sbps {
+            let full_ext_px = pick_more_ambitious_tp(ctx.side, ext_struct_px, target_price);
+            let full_ext_sbps = ((full_ext_px.0 - ctx.avg_price_ticks.0)
+                .saturating_mul(d_sign)
+                .saturating_mul(1_000_000))
+                / avg_denom;
+            let span_above_t1 = (full_ext_sbps - t1_gross_sbps).max(0) as f64;
+            let golden_sec_t2_sbps = t1_gross_sbps.saturating_add(
+                (INV_PHI_SQ * span_above_t1 * (1.0 + INV_PHI * s_run.clamp(0.0, 1.0))).round()
+                    as i64,
+            );
+            let t2_gross_sbps = base_phi_t2_sbps.max(golden_sec_t2_sbps);
+            let t2_px = enforce_maker_bbo_bound(
+                ctx.side,
+                dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(t2_gross_sbps)),
+                snap,
+            );
+            let final_tick_gap = (target_price.0 - t2_px.0).saturating_mul(d_sign);
+            let final_sbps_gap = (final_tick_gap.saturating_mul(1_000_000)) / avg_denom;
+            if final_tick_gap >= 2 && final_sbps_gap >= min_ext_sbps {
+                let t2_lots = LotQty(
+                    ((INV_PHI * (ctx.open_lots.0 as f64)).round() as i64)
+                        .clamp(1, ctx.open_lots.0 - 1),
+                );
+                return Some(CanonicalExitQuote {
+                    role: ExitOrderRole::Tranche2HarvestPhi,
+                    target_price: t2_px,
+                    order_lots: t2_lots,
+                    sub_reason: ExitSubReason::Tranche2HarvestPhi,
+                    vac_level: 2,
+                    defensive_lock_active: false,
+                    urgent_close_repeg: false,
+                    cur_gross_bps,
+                    wald_pct,
+                });
+            }
+        }
+    }
     let (vac_level, sub_reason) = if fib_or_shadow_ext { (lvdbs_vac_level.max(3), ExitSubReason::FibonacciImpulseSurf) }
         else if lvdbs_vac_level >= 2 || runner2_ext { (lvdbs_vac_level.max(2), ExitSubReason::LvdbsDeepVacuumSurf) }
         else { (1, ExitSubReason::StandardStructuralTp) };

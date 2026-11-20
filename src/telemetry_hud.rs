@@ -1,4 +1,4 @@
-//! Tear-Free SHM v15 Live HUD, Full 360 Executive Dashboard, Daily Shield & Zero-Alloc Vault Dispatch (V5.4.2).
+//! Tear-Free SHM v15 Live HUD, Full 360 Executive Dashboard, Daily Shield & Zero-Alloc Vault Dispatch (V5.5).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -228,7 +228,7 @@ pub fn record_and_notify_entry_fill(
     );
     let _ = tg_tx.try_send(format!(
         concat!(
-            "\u{1f7e1} [VORTEX-OMEGA V5.4.2 {}]\n",
+            "\u{1f7e1} [VORTEX-OMEGA V5.5 {}]\n",
             "\u{2022} Par y Lado : {} ({:?}) | Lote: {}\n",
             "\u{2022} Entrada L1 : {}.{:04} USDT ({}t) | Cola: {} ms\n",
             "\u{2022} Techos/SL  : WIN Floor: {}.{:04} USDT | SL: {}.{:04} USDT\n",
@@ -290,7 +290,7 @@ pub fn format_telegram_close_message(
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
-            "{} [VORTEX-OMEGA V5.4.2 {} #{} \u{2014} {:?}]\n",
+            "{} [VORTEX-OMEGA V5.5 {} #{} \u{2014} {:?}]\n",
             "- Ganancia : {:+.2}% @10x | {:+.4} USDT\n",
             "- Par y Lado : {} ({:?}) qty={} ({}L) | Maker: {}\n",
             "- Precios    : {}.{:04} -> {}.{:04} USDT ({}t -> {}t)\n",
@@ -496,7 +496,7 @@ pub fn rehydrate_shadow_ledger_from_paths(
     let should_halt = ledger.cumulative_net_pnl_1e8 <= -crate::vault_io::MAX_VALIDATION_EPOCH_LOSS_1E8
         || halt_lock_path.exists();
     println!(
-        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.4.2] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns} | Halt5U: {should_halt}){ANSI_RESET}",
+        "{ANSI_GREEN}\u{1f7e2} [JSONL REHYDRATE V5.5] Session: {l3_vault_count} trades (+{funding_rows} funding) | Scars: {scar_rows_ingested} unique (Reserva 30%: {:+.2} bps | Blindado 70%: {:+.2} bps | ScarTs: {scar_max_ts_ns} | Halt5U: {should_halt}){ANSI_RESET}",
         (ledger.sinking_fund_reserve_bps_x100 as f64) / 100.0,
         (ledger.vault_locked_profit_bps_x100 as f64) / 100.0,
     );
@@ -607,7 +607,7 @@ fn build_closed_trade_vault_json_v48_core(
         (markout_curve.samples_bps[2] as f64) / 100.0, (markout_curve.samples_bps[3] as f64) / 100.0,
     ];
     let mut base_val = serde_json::json!({
-        "event": "TRADE_CLOSE", "schema": "V5.4.2", "trade_id": ledger.closed_trades_count,
+        "event": "TRADE_CLOSE", "schema": "V5.5", "trade_id": ledger.closed_trades_count,
         "armed_ts_ns": entry_f.armed_ts_ns, "opened_ts_ns": eng.last_opened_ts.0, "ts_ns": ts_ns.0,
         "queue_wait_ms": q_wait_ms, "hold_ms": hold_ms, "symbol": sym, "slot_idx": slot_idx, "side": side_str,
         "closed_lots": summary.closed_lots.0, "legs_consolidated": summary.legs_consolidated,
@@ -797,7 +797,7 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
         DailyShieldPhase::HibernatingLossCap => ANSI_ORANGE,
     };
     let sec_title = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.4.2 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
+        "{ANSI_SKY_BLUE}\u{1f4e1} [VORTEX-OMEGA V5.5 LIVE HUD] SHM v{}: /dev/shm/vortex_lob.mmap \u{2502} HB Age: {hb_age_ms} ms \u{2502} Resyncs: {resyncs}{ANSI_RESET}",
         arena.version()
     )];
     let sec_hdr = vec![concat!(
@@ -1002,7 +1002,7 @@ pub fn evaluate_capital_scaling_semaphore(
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
             let is_v48 = matches!(
                 v.get("schema").and_then(serde_json::Value::as_str),
-                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2")
+                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5")
             );
             match v.get("event").and_then(serde_json::Value::as_str) {
                 Some("EPOCH_RESET") => {
@@ -1108,7 +1108,7 @@ pub fn render_capital_scaling_semaphore(
         rep.v48_trades,
         g1_pct
     );
-    let g1_c3 = format!("Dias UTC V5.4.2: {:>2}/12 dias", rep.v48_days);
+    let g1_c3 = format!("Dias UTC V5.5: {:>2}/12 dias", rep.v48_days);
 
     let w_pct = ((rep.wallet_usdt / 67.0) * 100.0).clamp(0.0, 100.0);
     let g2_c2 = format!(
@@ -1125,7 +1125,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.2}", rep.pf_v48)
     };
     let v70_txt = if rep.vault_70_ok { "Vault>12.5b OK" } else { "Vault<=12.5b" };
-    let g2_c3 = format!("PF V5.4.2: {pf_txt:<10} | {v70_txt}");
+    let g2_c3 = format!("PF V5.5: {pf_txt:<10} | {v70_txt}");
 
     let mkr_ref = if rep.v48_trades >= 10 { rep.v48_mkr_pct } else { rep.global_mkr_pct };
     let g3_pct = ((mkr_ref / 82.0) * 100.0).clamp(0.0, 100.0);
@@ -1137,7 +1137,7 @@ pub fn render_capital_scaling_semaphore(
         format!("{:.1}% ({}/{}t)", rep.v48_mkr_pct, rep.v48_maker_closes, rep.v48_trades)
     };
     let g3_c3 = format!(
-        "V5.4.2 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
+        "V5.5 Mkr: {mkr_v48_txt} | Drift:{} Halt:{}",
         rep.parity_drift_1e8,
         usize::from(rep.halt_active)
     );
@@ -1172,10 +1172,10 @@ pub fn render_capital_scaling_semaphore(
         )
     };
     let sec_hdr = vec![format!(
-        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.4.2 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
+        "{ANSI_SKY_BLUE}\u{1f6a6} [VORTEX-OMEGA V5.5 CAPITAL SCALING SEMAPHORE \u{2014} HITO DE INYECCION (\x24155-\x24165 USDT)]{ANSI_RESET}"
     )];
     let sec_gates = vec![
-        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.4.2", g1_c2, g1_c3),
+        fmt_gate(1, rep.gate1_ok, "EN PROGRESO", "Muestra Pura V5.5", g1_c2, g1_c3),
         fmt_gate(2, rep.gate2_ok, "EN PROGRESO", "Expectativa & Cap.", g2_c2, g2_c3),
         fmt_gate(3, rep.gate3_ok, g3_tag, "Ejecucion Maker", g3_c2, g3_c3),
         fmt_gate(4, rep.gate4_ok, "EN PROGRESO", "Resiliencia Escudo", g4_c2, g4_c3),
@@ -1275,7 +1275,7 @@ pub fn render_trades_and_executive_dashboard() {
         }
     }
     if rows_out.is_empty() {
-        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.4.2...{ANSI_RESET}"));
+        rows_out.push(format!("  {ANSI_GRAY}\u{26aa} [LEDGER EMPTY] Waiting for first closed trade in VORTEX-OMEGA V5.5...{ANSI_RESET}"));
     }
     let mut live_client = BybitV5LiveClient::from_env_if_enabled(true);
     let fb_w = (DEFAULT_WALLET_EQUITY_1E8 as f64) / 100_000_000.0;
@@ -1329,7 +1329,7 @@ pub fn render_trades_and_executive_dashboard() {
         format_total_loss_shield_5u_plain(epoch_loss_1e8, halt_active)
     );
 
-    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.4.2 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
+    let sec_hdr = vec![format!("{ANSI_SKY_BLUE}[VORTEX-OMEGA V5.5 EXECUTIVE LEDGER, PROGRESS BARS & ELASTIC DAILY SHIELD]{ANSI_RESET}")];
     let sec_kpi = vec![
         fmt_3col(
             format!("Wallet: {w_usdt:.4} USDT (Eq: {eq_usdt:.4} | Avail: {av_usdt:.4})"),
@@ -1505,7 +1505,7 @@ pub fn build_closed_trade_vault_json(
     let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
     if let Some(obj) = val.as_object_mut() {
         let _ = obj.remove("fnv1a64_hex");
-        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.4.2"));
+        obj.insert("telemetry_rev".to_string(), serde_json::json!("V5.5"));
         obj.insert(
             "markout_resolved_mask".to_string(),
             serde_json::json!(markout_curve.resolved_mask),
@@ -1639,7 +1639,7 @@ mod v49_hud_telemetry_tests {
             140,
             TimestampNs(1_794_920_000_000_000_000),
         );
-        assert!(line.contains("\"telemetry_rev\":\"V5.4.2\""));
+        assert!(line.contains("\"telemetry_rev\":\"V5.5\""));
         assert!(line.contains("\"markout_resolved_mask\":31"));
         assert!(line.contains("\"markout_5h_bps\":[-0.35,-0.8,1.4,4.2,9.1]"));
         assert!(line.contains("\"ws_rtt_us\":1310") && line.contains("\"fnv1a64_hex\":\"0x"));

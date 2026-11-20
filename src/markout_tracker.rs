@@ -183,6 +183,7 @@ pub struct SlotMarkoutRing {
     ewma_markout_15s_bps: i64,
     ewma_markout_60s_bps: i64,
     pending_uncensored_peak_sbps: i64,
+    pending_resolved_60s_fill: Option<(Side, i64)>,
     tp_abort_count: u64,
     resolved_abort_count: u64,
     veto_tp_counts: [u32; VETO_CODE_CARDINALITY],
@@ -218,6 +219,7 @@ impl SlotMarkoutRing {
             ewma_markout_15s_bps: 0,
             ewma_markout_60s_bps: 0,
             pending_uncensored_peak_sbps: 0,
+            pending_resolved_60s_fill: None,
             tp_abort_count: 0,
             resolved_abort_count: 0,
             veto_tp_counts: [0; VETO_CODE_CARDINALITY],
@@ -374,6 +376,7 @@ impl SlotMarkoutRing {
                             self.ewma_markout_15s_bps = ((1_000 - LVR_EWMA_ETA_PM) * self.ewma_markout_15s_bps + LVR_EWMA_ETA_PM * slot.curve.samples_bps[3]) / 1_000;
                         } else if h_idx == 4 {
                             self.ewma_markout_60s_bps = ((1_000 - LVR_EWMA_ETA_PM) * self.ewma_markout_60s_bps + LVR_EWMA_ETA_PM * slot.curve.samples_bps[4]) / 1_000;
+                            self.pending_resolved_60s_fill = Some((slot.side, slot.curve.samples_bps[4].max(0)));
                         }
                         if slot.t0_ns >= self.last_fill_t0_ns {
                             self.last_fill_curve = slot.curve;
@@ -478,6 +481,11 @@ impl SlotMarkoutRing {
         let pk = self.pending_uncensored_peak_sbps;
         self.pending_uncensored_peak_sbps = 0;
         (pk > 0).then_some(pk)
+    }
+
+    #[inline]
+    pub fn take_resolved_60s_fill_markout(&mut self) -> Option<(Side, i64)> {
+        self.pending_resolved_60s_fill.take()
     }
 
     #[inline]
