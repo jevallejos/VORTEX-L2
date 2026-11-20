@@ -245,6 +245,61 @@ pub enum VaultIoCommand {
 
 const _: () = assert!(core::mem::size_of::<VaultIoCommand>() <= 512);
 
+/// Pure resolver returning `Some(root)` ONLY when `cwd` contains neither `data/vault` nor `Cargo.toml`,
+/// `exe_path` resides directly inside a `bin/` directory, and the parent of `bin/` (`root`) contains
+/// `data/vault` or `Cargo.toml`.
+#[must_use]
+pub fn resolve_project_root_from_exe_if_detached(
+    cwd: &Path,
+    exe_path: &Path,
+) -> Option<std::path::PathBuf> {
+    if cwd.join("data/vault").exists() || cwd.join("Cargo.toml").exists() {
+        return None;
+    }
+    let bin_dir = exe_path.parent()?;
+    if !bin_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
+    {
+        return None;
+    }
+    let root = bin_dir.parent()?;
+    if root.join("data/vault").exists() || root.join("Cargo.toml").exists() {
+        Some(root.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Auto-anchors the process working directory to the project root ONLY when neither `data/vault`
+/// nor `Cargo.toml` exists in the current directory and `std::env::current_exe()` resides inside
+/// `<root>/bin/` where `<root>` contains `data/vault` or `Cargo.toml`.
+pub fn ensure_project_root_cwd_from_exe() {
+    if Path::new("data/vault").exists() || Path::new("Cargo.toml").exists() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(bin_dir) = exe.parent() else {
+        return;
+    };
+    if !bin_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
+    {
+        return;
+    }
+    let Some(root) = bin_dir.parent() else {
+        return;
+    };
+    if root.join("data/vault").exists() || root.join("Cargo.toml").exists() {
+        let _ = std::env::set_current_dir(root);
+    }
+}
+
 pub fn atomic_write_bytes_sync(target: &Path, payload: &[u8]) -> Result<(), VortexError> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
     if let Some(parent) = target.parent() {
@@ -487,7 +542,7 @@ pub fn persist_total_loss_halt_to_path_atomic(
     }
     let payload = serde_json::json!({
         "event": "TOTAL_LOSS_SHIELD_5USDT_HALT",
-        "version": "5.5.0",
+        "version": "5.5.1",
         "ts_ns": ts_ns,
         "anchor_equity_1e8": anchor_equity_1e8,
         "current_equity_1e8": current_equity_1e8,
@@ -652,5 +707,37 @@ mod tests {
             ob_bull_pm: [520; 12], ob_bear_pm: [540; 12], epps_corr_pm: [610; 12], ws_rtt_us: 1_850, ws_quota_rem: 98,
         });
         assert!(pa_j.contains("\"event\":\"PLASTICITY_AUDIT_V49\"") && pa_j.contains("\"fnv1a64_hex\":\"0x"));
+    }
+
+    #[test]
+    fn test_v551_ensure_project_root_cwd_from_exe_anchors_detached_bin_only() {
+        ensure_project_root_cwd_from_exe();
+        let tmp = std::env::temp_dir().join(format!("vortex_cwd_anchor_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let detached_home = tmp.join("home_ubuntu");
+        let deploy_root = detached_home.join("vortex-rs");
+        let bin_dir = deploy_root.join("bin");
+        let vault_dir = deploy_root.join("data/vault");
+        let target_rel_dir = deploy_root.join("target/release");
+        assert!(fs::create_dir_all(&bin_dir).is_ok());
+        assert!(fs::create_dir_all(&vault_dir).is_ok());
+        assert!(fs::create_dir_all(&target_rel_dir).is_ok());
+
+        // 1. Detached CWD (/home/ubuntu) + deployed binary under <root>/bin/ -> anchors to <root>
+        assert_eq!(
+            resolve_project_root_from_exe_if_detached(&detached_home, &bin_dir.join("vortex_exec")),
+            Some(deploy_root.clone())
+        );
+        // 2. CWD already at <root> (data/vault exists) -> no-op (None)
+        assert_eq!(
+            resolve_project_root_from_exe_if_detached(&deploy_root, &bin_dir.join("vortex_exec")),
+            None
+        );
+        // 3. Binary inside target/release (not bin/) -> never touches CWD during cargo test / CI
+        assert_eq!(
+            resolve_project_root_from_exe_if_detached(&detached_home, &target_rel_dir.join("vortex_replay")),
+            None
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -81,6 +81,29 @@ pub fn load_hud_fee_schedule() -> FeeSchedule {
 
 #[inline]
 #[must_use]
+pub fn is_partial_harvest_sub_reason_str(sub_reason: &str) -> bool {
+    sub_reason.contains("Tranche1Harvest50")
+        || sub_reason.contains("Tranche2HarvestPhi")
+        || sub_reason.contains("Partial")
+}
+
+#[inline]
+#[must_use]
+pub fn format_trade_reason_with_legs(sub_reason: &str, legs_consolidated: u64) -> String {
+    if legs_consolidated >= 2 {
+        let tag = format!("({legs_consolidated}L)");
+        if sub_reason.contains(&tag) {
+            sub_reason.to_string()
+        } else {
+            format!("{sub_reason} {tag}")
+        }
+    } else {
+        sub_reason.to_string()
+    }
+}
+
+#[inline]
+#[must_use]
 pub const fn format_veto_badge(code: LastVetoCode) -> &'static str {
     match code {
         LastVetoCode::None => "NONE_CLEAR",
@@ -148,7 +171,10 @@ pub fn serialize_open_positions_state(
                 "peak_ticks": peak_favorable_price.0, "worst_ticks": worst_adverse_price.0,
                 "initial_lots": initial_lots.0, "open_lots": open_lots.0,
                 "tranche1_harvested": tranche1_harvested, "tranche1_lots": tranche1_lots.0,
-                "tranche1_exit_ticks": tranche1_exit_price.0, "defensive_floor_locked": defensive_floor_locked,
+                "tranche1_exit_ticks": tranche1_exit_price.0,
+                "tranche2_harvested": eng.tranche2_harvested, "tranche2_lots": eng.tranche2_lots.0,
+                "tranche2_exit_ticks": eng.tranche2_exit_price.0, "partial_harvest_legs": eng.partial_harvest_legs,
+                "defensive_floor_locked": defensive_floor_locked,
                 "structural_tp_ticks": structural_tp_price.0, "tp_ticks": resting_exit_price.0,
                 "sl_ticks": sl_trigger_price.0, "opened_ts_ns": opened_ts.0,
                 "armed_ts_ns": ef.armed_ts_ns, "init_q_lots": ef.init_q_lots,
@@ -286,7 +312,10 @@ pub fn format_telegram_close_message(
     let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
     let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
     let qty_s = spec.format_lot_qty_str(summary.closed_lots);
-    let is_partial = matches!(sub_reason, ExitSubReason::Tranche1Harvest50) && net_bps_f < 1.00;
+    let is_partial = matches!(
+        sub_reason,
+        ExitSubReason::Tranche1Harvest50 | ExitSubReason::Tranche2HarvestPhi
+    ) && net_bps_f < 1.00;
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
@@ -1002,7 +1031,7 @@ pub fn evaluate_capital_scaling_semaphore(
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
             let is_v48 = matches!(
                 v.get("schema").and_then(serde_json::Value::as_str),
-                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5")
+                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5" | "V5.5.1")
             );
             match v.get("event").and_then(serde_json::Value::as_str) {
                 Some("EPOCH_RESET") => {
@@ -1253,9 +1282,14 @@ pub fn render_trades_and_executive_dashboard() {
                     let mae = v.get("mae_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                     let hold_ms = v.get("hold_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let sub_r = v.get("exit_sub_reason").and_then(serde_json::Value::as_str).unwrap_or("MakerExit");
+                    let legs = v
+                        .get("legs_consolidated")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1)
+                        .max(1);
                     let mkr = v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
                     if mkr { maker_closes += 1; }
-                    let is_partial = (sub_r.contains("Tranche1Harvest50") || sub_r.contains("Partial")) && n_bps < 1.00;
+                    let is_partial = is_partial_harvest_sub_reason_str(sub_r) && n_bps < 1.00;
                     if is_partial { partials += 1; } else if n_bps >= 1.00 { wins += 1; } else if n_bps >= -0.50 { scratches += 1; } else { losses += 1; }
                     cum_gross += g_bps; cum_fee += f_bps; cum_net += n_bps;
                     sum_mfe += mfe; sum_mae += mae; sum_hold_s += (hold_ms as f64) / 1_000.0;
@@ -1264,9 +1298,10 @@ pub fn render_trades_and_executive_dashboard() {
                     let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(&v, slot_from_symbol_name(sym), side_from_str(side_s), net_sc, fee_sc, fees);
                     dash_ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
                     sum_cashflow_1e8 = sum_cashflow_1e8.saturating_add(pnl_1e8);
+                    let reason_col = format_trade_reason_with_legs(sub_r, legs);
                     let (col, icon, lbl) = classify_trade_badge(n_bps, is_partial);
                     rows_out.push(format!(
-                        "{col}{icon} [TRADE #{total:<3} {lbl}] {sym:<10} {side_s:<3} \u{2502} {en_t:>7}t->{ex_t:<7}t \u{2502} G:{g_bps:>+6.2} F:{f_bps:>5.2} N:{n_bps:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{mfe:>+6.2} MAE:{mae:>+6.2} \u{2502} {:>4}s \u{2502} {sub_r:<21} (Mkr={mkr}){ANSI_RESET}",
+                        "{col}{icon} [TRADE #{total:<3} {lbl}] {sym:<10} {side_s:<3} \u{2502} {en_t:>7}t->{ex_t:<7}t \u{2502} G:{g_bps:>+6.2} F:{f_bps:>5.2} N:{n_bps:>+6.2}bp ({:>+5.2}%@10x) \u{2502} MFE:{mfe:>+6.2} MAE:{mae:>+6.2} \u{2502} {:>4}s \u{2502} {reason_col:<25} (Mkr={mkr}){ANSI_RESET}",
                         n_bps / 10.0, hold_ms / 1_000
                     ));
                 }
@@ -1688,5 +1723,41 @@ mod v49_hud_telemetry_tests {
         assert_eq!(engines[6].learned_mfe_bps, SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);     // DOGE: capped at elastic 12 * active_fee_rt_mkr (4800)
         assert_eq!(engines[10].learned_mfe_bps, DEFAULT_LEARNED_MFE_SCALED_BPS);       // NEAR: floored at 613
         assert_eq!(engines[11].learned_mfe_bps, DEFAULT_LEARNED_MFE_SCALED_BPS);       // LTC: 0 samples -> 613
+    }
+
+    #[test]
+    fn test_v551_multileg_reason_badge_tranche2_partial_and_v551_semaphore() {
+        assert!(is_partial_harvest_sub_reason_str("Tranche1Harvest50"));
+        assert!(is_partial_harvest_sub_reason_str("Tranche2HarvestPhi"));
+        assert!(!is_partial_harvest_sub_reason_str("LvdbsDeepVacuumSurf"));
+
+        assert_eq!(format_trade_reason_with_legs("StandardStructuralTp", 1), "StandardStructuralTp");
+        assert_eq!(format_trade_reason_with_legs("Tranche2HarvestPhi", 2), "Tranche2HarvestPhi (2L)");
+        assert_eq!(format_trade_reason_with_legs("LvdbsDeepVacuumSurf", 3), "LvdbsDeepVacuumSurf (3L)");
+        assert_eq!(format_trade_reason_with_legs("LvdbsDeepVacuumSurf (3L)", 3), "LvdbsDeepVacuumSurf (3L)");
+
+        let part_sum = ClosedTradeSummary {
+            kind: ClosedTradeKind::MakerPassiveUnwind,
+            side: Side::Bid,
+            entry_price: PriceTicks(8_200),
+            exit_price: PriceTicks(8_204),
+            closed_lots: LotQty(6),
+            legs_consolidated: 2,
+            gross_scaled_bps: ScaledBps(488),
+            fee_scaled_bps: ScaledBps(400),
+            net_scaled_bps: ScaledBps(88),
+            net_pnl_1e8: 430_000,
+            fee_1e8: 1_968_000,
+            is_maker_exit: true,
+        };
+        let led = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let tg = format_telegram_close_message(
+            APPROVED_SPECS[3],
+            &part_sum,
+            ExitSubReason::Tranche2HarvestPhi,
+            9,
+            &led,
+        );
+        assert!(tg.contains("PARTIAL #9") && tg.contains("(2L)"));
     }
 }

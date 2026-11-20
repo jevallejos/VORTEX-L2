@@ -12,13 +12,6 @@
 use crate::lob_shm::LastVetoCode;
 use crate::types::{LotQty, PriceTicks, ScaledBps, Side, TimestampNs};
 
-pub const MARKOUT_HORIZONS_NS: [i64; 4] = [
-    250_000_000,
-    1_000_000_000,
-    5_000_000_000,
-    15_000_000_000,
-];
-
 pub const MARKOUT_HORIZONS_V49: usize = 5;
 pub const MARKOUT_HORIZONS_V49_NS: [i64; MARKOUT_HORIZONS_V49] = [
     250_000_000,

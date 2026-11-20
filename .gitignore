@@ -7,7 +7,13 @@
 *.vkl1
 *.par2z
 *.tmp
+*.log
+output.txt
 .env
+.env.*
+/backups/
+/data/archive/
+/data/candles/
 data/*.jsonl
 data/candles/*.vkl1
 data/archive/*.par2z
@@ -15,5 +21,4 @@ data/vault/*.jsonl
 data/vault/*.json
 data/vault/*.lock
 *.csv
-.env.*
 .vscode/

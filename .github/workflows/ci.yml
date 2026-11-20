@@ -1,7 +1,7 @@
-name: VORTEX-OMEGA V5.5 Constitutional /dev/shm & 4-Binary LTO Gate
+name: VORTEX-OMEGA V5.5.1 Constitutional /dev/shm & 4-Binary LTO Gate
 on:
   push:
-    branches: [ main, "feat/**" ]
+    branches: [ main, "feat/**", "chore/**" ]
   pull_request:
     branches: [ main ]
 jobs:
@@ -9,9 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install Rust Stable Toolchain & Clippy
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
       - name: Gate 0 - UTF-8 LF Hygiene & Forbidden Artifact Scan
         run: |
           bad=$(find . -maxdepth 3 \( -name "*.mmap" -o -name "*.parquet" -o -name "*.jsonl" -o -name "*.vkl1" -o -name "*.par2z" -o -name ".env" -o \( -name "*.lock" ! -name "Cargo.lock" \) \) | wc -l)

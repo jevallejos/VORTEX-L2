@@ -115,6 +115,7 @@ fn spawn_housekeeping_worker(cfg: VortexWebConfig, shutdown: Arc<AtomicBool>) {
 }
 
 fn main() -> ExitCode {
+    vortex_rs::vault_io::ensure_project_root_cwd_from_exe();
     let args: Vec<String> = std::env::args().collect();
     let daemon_mode = args.iter().any(|a| a == "--daemon" || a == "--serve");
     if !daemon_mode {

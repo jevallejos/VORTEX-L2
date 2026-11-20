@@ -658,6 +658,7 @@ fn run_live_bybit_ws_daemon(arena: &VortexShmArena, writer: AsyncParquetRingWrit
 }
 
 fn main() -> ExitCode {
+    vortex_rs::vault_io::ensure_project_root_cwd_from_exe();
     let args: Vec<String> = std::env::args().collect();
     let is_daemon = args.iter().any(|a| a == "--daemon");
     let shm_path = MappedShmRegion::default_shm_path();

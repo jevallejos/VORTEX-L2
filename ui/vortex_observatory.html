@@ -646,14 +646,18 @@ async function loadTradesAndAborts() {
       el("trades-body").innerHTML = VX.trades.map(function(t) {
         const tid = Number(t.trade_id) || 0;
         const nb = Number(t.net_bps) || 0;
-        const cls = nb >= 1.0 ? "band-GREEN_WIN" : (nb >= -0.5 ? "band-CYAN_SCRATCH" : "band-RED_HEAT");
+        const legs = Math.max(1, Number(t.legs_consolidated) || 1);
+        const subRaw = String(t.exit_reason_display || t.exit_sub_reason || "MakerExit");
+        const subLbl = (legs >= 2 && subRaw.indexOf("(" + legs + "L)") < 0) ? (subRaw + " (" + legs + "L)") : subRaw;
+        const isPart = !!(t.is_partial_harvest || ((subRaw.indexOf("Tranche1Harvest50") >= 0 || subRaw.indexOf("Tranche2HarvestPhi") >= 0 || subRaw.indexOf("Partial") >= 0) && nb < 1.0));
+        const cls = (nb >= 1.0 || isPart) ? "band-GREEN_WIN" : (nb >= -0.5 ? "band-CYAN_SCRATCH" : "band-RED_HEAT");
         const sel = tid === VX.selectedTradeId ? " selected-row" : "";
         return "<tr class='trade-row" + sel + "' data-tid='" + tid + "'>" +
           "<td>#" + tid + "</td><td class='l'>" + esc(t.symbol || "") + "</td><td>" + esc(t.side || "") + "</td>" +
           "<td class='" + cls + "'>" + sgn(nb, 2) + "</td>" +
           "<td>" + sgn(t.mfe_bps, 1) + "/" + sgn(t.mae_bps, 1) + "</td>" +
           "<td>" + Math.round((Number(t.hold_ms) || 0) / 1000) + "s</td>" +
-          "<td class='l'>" + esc(t.exit_sub_reason || "MakerExit") + "</td></tr>";
+          "<td class='l'>" + esc(subLbl) + "</td></tr>";
       }).join("");
     }
     const ra = await fetch("/api/aborts?limit=80");

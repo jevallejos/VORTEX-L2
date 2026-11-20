@@ -32,8 +32,9 @@ use crate::lob_shm::{
     MAX_ACTIVE_PAIRS, VORTEX_SHM_VERSION,
 };
 use crate::telemetry_hud::{
-    extract_vault_row_pnl_and_fee_1e8, format_veto_badge, load_hud_fee_schedule,
-    DEFAULT_WALLET_EQUITY_1E8, FALLBACK_NOTIONAL_1E8,
+    extract_vault_row_pnl_and_fee_1e8, format_trade_reason_with_legs, format_veto_badge,
+    is_partial_harvest_sub_reason_str, load_hud_fee_schedule, DEFAULT_WALLET_EQUITY_1E8,
+    FALLBACK_NOTIONAL_1E8,
 };
 use crate::types::{
     now_epoch_ns, side_from_str, slot_from_symbol_name, PairSpec, ScaledBps, Side, VortexError,
@@ -56,6 +57,7 @@ struct CachedForensicSummary {
     ledger: Option<ParitySyncLedger>,
     total: usize,
     wins: usize,
+    partials: usize,
     scratches: usize,
     losses: usize,
     mkr_cnt: usize,
@@ -237,7 +239,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
 
     let vault_path = ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl");
     let (f_len, f_mt) = file_len_and_mtime_ns(&vault_path).unwrap_or((0, 0));
-    let (ledger, total, wins, scratches, losses, mkr_cnt, ws_rtt_us) = if let Ok(mut vc) = ctx.vault_cache.lock() {
+    let (ledger, total, wins, partials, scratches, losses, mkr_cnt, ws_rtt_us) = if let Ok(mut vc) = ctx.vault_cache.lock() {
         let hit = vc.ledger.is_some()
             && vc.file_len == f_len
             && vc.mtime_ns == f_mt
@@ -246,7 +248,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
         if !hit {
             let mut led = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
             led.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
-            let (mut tot, mut wn, mut sc, mut ls, mut mk, mut rtt) = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_u64);
+            let (mut tot, mut wn, mut pt, mut sc, mut ls, mut mk, mut rtt) = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_u64);
             if f_len > 0 {
                 for v in read_jsonl_rows(&vault_path) {
                     match v.get("event").and_then(serde_json::Value::as_str) {
@@ -254,7 +256,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
                             let eq_a = v.get("anchor_equity_1e8").and_then(serde_json::Value::as_i64).unwrap_or(DEFAULT_WALLET_EQUITY_1E8);
                             led = ParitySyncLedger::new(eq_a);
                             led.set_live_vip_fee_rates(fees.maker_fee_bps, fees.taker_fee_bps);
-                            tot = 0; wn = 0; sc = 0; ls = 0; mk = 0; rtt = 0;
+                            tot = 0; wn = 0; pt = 0; sc = 0; ls = 0; mk = 0; rtt = 0;
                         }
                         Some("FUNDING_SETTLEMENT") => {
                             let f = v.get("funding_1e8").and_then(serde_json::Value::as_i64).unwrap_or(0);
@@ -267,9 +269,18 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
                             let side_s = v.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
                             let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                             let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(4.0);
+                            let sub_r = v.get("exit_sub_reason").and_then(serde_json::Value::as_str).unwrap_or("");
                             if v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true) { mk += 1; }
                             if let Some(r) = v.get("ws_rtt_us").and_then(serde_json::Value::as_u64) { rtt = r; }
-                            if n_bps >= 1.00 { wn += 1; } else if n_bps >= -0.50 { sc += 1; } else { ls += 1; }
+                            if is_partial_harvest_sub_reason_str(sub_r) && n_bps < 1.00 {
+                                pt += 1;
+                            } else if n_bps >= 1.00 {
+                                wn += 1;
+                            } else if n_bps >= -0.50 {
+                                sc += 1;
+                            } else {
+                                ls += 1;
+                            }
                             let (pnl_1e8, fee_1e8, _) = extract_vault_row_pnl_and_fee_1e8(
                                 &v, slot_from_symbol_name(sym), side_from_str(side_s),
                                 ScaledBps((n_bps * 100.0).round() as i64), ScaledBps((f_bps * 100.0).round() as i64), fees,
@@ -282,13 +293,13 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             }
             *vc = CachedForensicSummary {
                 file_len: f_len, mtime_ns: f_mt, maker_fee_bps: fees.maker_fee_bps.0, taker_fee_bps: fees.taker_fee_bps.0,
-                ledger: Some(led), total: tot, wins: wn, scratches: sc, losses: ls, mkr_cnt: mk, ws_rtt_us: rtt,
+                ledger: Some(led), total: tot, wins: wn, partials: pt, scratches: sc, losses: ls, mkr_cnt: mk, ws_rtt_us: rtt,
             };
         }
         let led_out = vc.ledger.unwrap_or_else(|| ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8));
-        (led_out, vc.total, vc.wins, vc.scratches, vc.losses, vc.mkr_cnt, vc.ws_rtt_us)
+        (led_out, vc.total, vc.wins, vc.partials, vc.scratches, vc.losses, vc.mkr_cnt, vc.ws_rtt_us)
     } else {
-        (ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8), 0, 0, 0, 0, 0, 0)
+        (ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8), 0, 0, 0, 0, 0, 0, 0)
     };
 
     let mut eq_1e8 = ledger.current_equity_1e8();
@@ -408,7 +419,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             "equity_usdt": (eq_1e8 as f64) / 100_000_000.0,
             "net_pnl_usdt": (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0,
             "vault_70_bps": v70_bps, "reserve_30_bps": r30_bps,
-            "trades_total": total, "wins": wins, "scratches": scratches, "losses": losses,
+            "trades_total": total, "wins": wins, "partials": partials, "scratches": scratches, "losses": losses,
             "maker_ratio_pct": mkr_pct, "sample_target": 25,
         },
         "daily_shield": {
@@ -472,7 +483,24 @@ pub fn query_recent_trades_json(ctx: &VortexWebContext, limit: usize) -> serde_j
         if v.get("event").and_then(serde_json::Value::as_str) == Some("EPOCH_RESET") { closes.clear(); seq_id = 0; continue; }
         if v.get("event").and_then(serde_json::Value::as_str) == Some("TRADE_CLOSE") {
             seq_id += 1;
-            if let Some(obj) = v.as_object_mut() { obj.entry("trade_id").or_insert_with(|| serde_json::json!(seq_id)); }
+            if let Some(obj) = v.as_object_mut() {
+                obj.entry("trade_id").or_insert_with(|| serde_json::json!(seq_id));
+                let legs = obj
+                    .get("legs_consolidated")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1)
+                    .max(1);
+                let sub_r = obj
+                    .get("exit_sub_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("MakerExit")
+                    .to_string();
+                let n_bps = obj.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let is_part = is_partial_harvest_sub_reason_str(&sub_r) && n_bps < 1.00;
+                let reason_display = format_trade_reason_with_legs(&sub_r, legs);
+                obj.insert("is_partial_harvest".to_string(), serde_json::json!(is_part));
+                obj.insert("exit_reason_display".to_string(), serde_json::json!(reason_display));
+            }
             closes.push(v);
         }
     }
@@ -585,11 +613,12 @@ pub fn build_markdown_360_clip(ctx: &VortexWebContext, trade_id: Option<u64>) ->
     );
     let _ = writeln!(
         out,
-        "- **Ledger & Boveda**: Equity={:.4} USDT | Net={:+.4} USDT | Vault70={:+.2} bps | Res30={:+.2} bps | Maker={:.2}% | Tiros={}/25 (W:{} S:{} L:{})",
+        "- **Ledger & Boveda**: Equity={:.4} USDT | Net={:+.4} USDT | Vault70={:+.2} bps | Res30={:+.2} bps | Maker={:.2}% | Tiros={}/25 (W:{} P:{} S:{} L:{})",
         lg["equity_usdt"].as_f64().unwrap_or(0.0), lg["net_pnl_usdt"].as_f64().unwrap_or(0.0),
         lg["vault_70_bps"].as_f64().unwrap_or(0.0), lg["reserve_30_bps"].as_f64().unwrap_or(0.0),
         lg["maker_ratio_pct"].as_f64().unwrap_or(100.0), lg["trades_total"].as_u64().unwrap_or(0),
-        lg["wins"].as_u64().unwrap_or(0), lg["scratches"].as_u64().unwrap_or(0), lg["losses"].as_u64().unwrap_or(0)
+        lg["wins"].as_u64().unwrap_or(0), lg["partials"].as_u64().unwrap_or(0),
+        lg["scratches"].as_u64().unwrap_or(0), lg["losses"].as_u64().unwrap_or(0)
     );
     let _ = writeln!(
         out,
@@ -935,6 +964,20 @@ mod tests {
         let (c_clip, _, clip_s) = dispatch_http_request(&ctx, "GET", "/api/clip/360", &[], "");
         assert_eq!(c_clip, 200);
         assert!(!clip_s.contains("\u{1b}["));
+
+        let _ = fs::write(
+            ctx.cfg.vault_dir.join("vortex_ai_forensic_vault.jsonl"),
+            concat!(
+                "{\"event\":\"TRADE_CLOSE\",\"schema\":\"V5.5\",\"symbol\":\"AVAXUSDT\",\"side\":\"Bid\",\"entry_ticks\":8200,\"exit_ticks\":8204,\"net_bps\":0.85,\"fee_bps\":4.0,\"legs_consolidated\":2,\"exit_sub_reason\":\"Tranche2HarvestPhi\",\"maker_exit\":true}\n",
+                "{\"event\":\"TRADE_CLOSE\",\"schema\":\"V5.5\",\"symbol\":\"AVAXUSDT\",\"side\":\"Bid\",\"entry_ticks\":8200,\"exit_ticks\":8232,\"net_bps\":21.40,\"fee_bps\":4.0,\"legs_consolidated\":3,\"exit_sub_reason\":\"LvdbsDeepVacuumSurf\",\"maker_exit\":true}\n"
+            ),
+        );
+        let (c_tr, _, tr_body) = dispatch_http_request(&ctx, "GET", "/api/trades?limit=10", &[], "");
+        assert_eq!(c_tr, 200);
+        assert!(tr_body.contains("Tranche2HarvestPhi (2L)") && tr_body.contains("LvdbsDeepVacuumSurf (3L)"));
+        assert!(tr_body.contains("\"is_partial_harvest\":true"));
+        let (_, _, st_with_tr) = dispatch_http_request(&ctx, "GET", "/api/state", &[], "");
+        assert!(st_with_tr.contains("\"partials\":1") && st_with_tr.contains("\"wins\":1"));
         let _ = fs::remove_dir_all(&base);
     }
 }

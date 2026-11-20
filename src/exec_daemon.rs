@@ -2003,34 +2003,6 @@ pub const fn step_drain_standby_latch(
 
 #[inline]
 #[must_use]
-pub fn compute_exit_sync_schedule_adaptive_v51(
-    quote: &CanonicalExitQuote,
-    prev_resting_exit_px: PriceTicks,
-    avg_price_ticks: PriceTicks,
-    fees: FeeSchedule,
-    ws_rtt_us: u32,
-    ws_quota_rem: u16,
-) -> (bool, i64) {
-    if ws_rtt_us == 0 {
-        return compute_exit_sync_schedule_with_fees(quote, prev_resting_exit_px, avg_price_ticks, fees);
-    }
-    let prio_cd = crate::execution_fsm::compute_adaptive_repeg_cooldown_ns(u64::from(ws_rtt_us), u32::from(ws_quota_rem));
-    if quote.urgent_close_repeg && prev_resting_exit_px.0 > 0 && prev_resting_exit_px.0 != quote.target_price.0 {
-        return (true, prio_cd);
-    }
-    let calm_cd = ((prio_cd as f64) * 4.236_067_977_499_79).round() as i64;
-    if !quote.urgent_close_repeg && matches!(quote.sub_reason, ExitSubReason::FibonacciImpulseSurf) && prev_resting_exit_px.0 > 0 {
-        let diff = (quote.target_price.0 - prev_resting_exit_px.0).abs();
-        let drift_bps = (diff.saturating_mul(1_000_000)) / avg_price_ticks.0.max(1);
-        if drift_bps < (fees.maker_fee_bps.0.max(100).saturating_mul(3)) / 5 {
-            return (false, ((calm_cd as f64) * 1.618_033_988_749_895).round() as i64);
-        }
-    }
-    (false, calm_cd.clamp(650_000_000, 1_800_000_000))
-}
-
-#[inline]
-#[must_use]
 #[allow(clippy::suboptimal_flops)]
 pub fn compute_resting_l1_hawkes_lambda_v531(
     event_dilation: f64,

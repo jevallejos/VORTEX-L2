@@ -92,6 +92,11 @@ pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
                 let _ = fs::remove_file(&cand);
             }
         }
+    } else if parquet_seq == 0 {
+        let _ = crate::par2_archiver::prune_cold_par2z_archive(
+            &data_dir.join("archive"),
+            crate::par2_archiver::MAX_COLD_PAR2Z_HOURLY_FILES,
+        );
     }
     let legacy_lake = data_dir.join("lakehouse_par1");
     if legacy_lake.exists() {
