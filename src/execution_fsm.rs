@@ -2847,9 +2847,7 @@ impl SlotIntraTradeRing {
             };
         }
         let empty = crate::vault_io::IntraTradeSample::default();
-        for k in HALF..CAP {
-            self.samples[k] = empty;
-        }
+        self.samples[HALF..CAP].fill(empty);
         self.sample_count = HALF as u16;
         self.sample_stride_sec = self.sample_stride_sec.saturating_mul(2).max(2);
     }
