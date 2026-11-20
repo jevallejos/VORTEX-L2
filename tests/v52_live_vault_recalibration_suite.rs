@@ -937,57 +937,98 @@ fn test_v532_warmup_latch_no_4356ms_truncation_intact_wall_and_mfe_order() {
         LotQty(8_400),
     ));
 
-    // (c) Boot MFE order: rehydrate_cold_mfe_seeds_from_scar_vault executed AFTER hydrate_12_slot_mfe_from_path
-    // preserves rehydrated > 613 values instead of overwriting them back to 613.
-    let mut engines = SlotExecutionEngine::new_12_slot_array();
-    let mfe_vault = std::path::Path::new(vortex_rs::vault_io::MFE_PLASTICITY_VAULT_PATH);
-    SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut engines, mfe_vault);
-    engines[2].learned_mfe_bps = vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS;
-    engines[7].learned_mfe_bps = vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS;
-    engines[1].learned_mfe_bps = 647;
-    let scar_fixture = concat!(
-        "{\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":8.40}\n",
-        "{\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":9.10}\n",
-        "{\"symbol\":\"PENDLEUSDT\",\"maker_exit\":true,\"mfe_bps\":7.85}\n",
-        "{\"symbol\":\"ETHUSDT\",\"maker_exit\":true,\"mfe_bps\":12.00}\n"
-    );
-    vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_reader(
-        &mut engines,
-        std::io::Cursor::new(scar_fixture.as_bytes()),
-    );
-    assert!(engines[2].learned_mfe_bps > vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS);
-    assert!(engines[7].learned_mfe_bps > vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS);
-    assert!(engines[2].learned_mfe_bps <= vortex_rs::telemetry_hud::SCAR_MFE_REHYDRATE_CAP_SCALED_BPS);
-    assert_eq!(engines[1].learned_mfe_bps, 647);
+    // (c) Boot MFE order (100% hermetic temp-dir fixtures, independent of live data/vault/* state):
+    //     1) rehydrate_cold_mfe_seeds_from_scar_vault executed AFTER hydrate_12_slot_mfe_from_path
+    //        rescues cold (613) and scratch-sunk (< PHI * fee_rt_mkr, e.g. TAO=594, AVAX=628, SOL=640)
+    //        seeds upward while leaving already-healed slots (>= 647) untouched.
+    //     2) When all 12 slots in vortex_mfe_plasticity.json are already healed (>= 712), the boot
+    //        sequence preserves all 12 slots 1:1 with zero mutations.
+    let tmp_v532_dir = std::env::temp_dir().join(format!(
+        "vortex_v532_mfe_hermetic_{}_{}",
+        std::process::id(),
+        t0
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_v532_dir);
+    assert!(std::fs::create_dir_all(&tmp_v532_dir).is_ok());
 
-    // Also verify live vault read-only order if vault files exist on disk (zero temp files created).
-    let scar_vault = std::path::Path::new(vortex_rs::telemetry_hud::SCAR_MEMORY_VAULT_PATH);
-    if mfe_vault.exists() && scar_vault.exists() {
-        let mut live_eng = SlotExecutionEngine::new_12_slot_array();
-        SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut live_eng, mfe_vault);
-        let before = SlotExecutionEngine::extract_12_slot_mfe_array(&live_eng);
-        vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_scar_vault(&mut live_eng, scar_vault);
-        let after = SlotExecutionEngine::extract_12_slot_mfe_array(&live_eng);
-        let mut rescued_sunk = 0_usize;
-        for s_idx in 0..vortex_rs::lob_shm::MAX_ACTIVE_PAIRS {
-            let active_fee_rt_mkr = live_eng[s_idx].active_maker_rt_fee_bps().max(100);
-            let sunk_floor = (vortex_rs::alpha_3factor::PHI * (active_fee_rt_mkr as f64)).round() as i64;
-            if before[s_idx] != vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS
-                && before[s_idx] >= sunk_floor
-            {
-                assert_eq!(after[s_idx], before[s_idx]);
-            } else {
-                assert!(
-                    after[s_idx] >= before[s_idx]
-                        && after[s_idx] <= vortex_rs::telemetry_hud::SCAR_MFE_REHYDRATE_CAP_SCALED_BPS
-                );
-                if after[s_idx] > before[s_idx] {
-                    rescued_sunk += 1;
-                }
+    let tmp_mfe_sunk = tmp_v532_dir.join("vortex_mfe_plasticity_sunk.json");
+    let tmp_scar_jsonl = tmp_v532_dir.join("vortex_governor_scar_memory.jsonl");
+    let sunk_and_cold_src: [i64; 12] = [
+        vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS, // 0 BTC  = 613 (cold)
+        647,                                                      // 1 ETH  = 647 (warm boundary)
+        640,                                                      // 2 SOL  = 640 (sunk < 647)
+        628,                                                      // 3 AVAX = 628 (sunk < 647)
+        594,                                                      // 4 TAO  = 594 (sunk < 647)
+        890,                                                      // 5 SUI  = 890 (healed)
+        760,                                                      // 6 ORDI = 760 (healed)
+        vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS, // 7 PENDLE = 613 (cold)
+        820,                                                      // 8 WIF  = 820 (healed)
+        745,                                                      // 9 LINK = 745 (healed)
+        720,                                                      // 10 NEAR = 720 (healed)
+        712,                                                      // 11 LTC  = 712 (healed)
+    ];
+    assert!(vortex_rs::vault_io::save_mfe_plasticity_to_path_atomic(
+        &tmp_mfe_sunk,
+        t0,
+        &sunk_and_cold_src
+    )
+    .is_ok());
+    let scar_fixture = concat!(
+        "{\"event\":\"GOV_SCAR_SNAPSHOT\",\"symbol\":\"TAOUSDT\",\"maker_exit\":true,\"mfe_bps\":12.80,\"net_bps\":8.40}\n",
+        "{\"event\":\"TRADE_CLOSE\",\"symbol\":\"TAOUSDT\",\"maker_exit\":true,\"mfe_bps\":13.50,\"net_bps\":9.10}\n",
+        "{\"event\":\"TRADE_CLOSE\",\"symbol\":\"AVAXUSDT\",\"maker_exit\":true,\"mfe_bps\":11.40,\"net_bps\":7.20}\n",
+        "{\"event\":\"GOV_SCAR_SNAPSHOT\",\"symbol\":\"SOLUSDT\",\"maker_exit\":true,\"mfe_bps\":9.60,\"net_bps\":5.30}\n",
+        "{\"event\":\"TRADE_CLOSE\",\"symbol\":\"PENDLEUSDT\",\"maker_exit\":true,\"mfe_bps\":8.45,\"net_bps\":4.25}\n",
+        "{\"event\":\"TRADE_CLOSE\",\"symbol\":\"ETHUSDT\",\"maker_exit\":true,\"mfe_bps\":14.00,\"net_bps\":9.80}\n"
+    );
+    assert!(std::fs::write(&tmp_scar_jsonl, scar_fixture).is_ok());
+
+    let mut sim_eng = SlotExecutionEngine::new_12_slot_array();
+    SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut sim_eng, &tmp_mfe_sunk);
+    let before = SlotExecutionEngine::extract_12_slot_mfe_array(&sim_eng);
+    assert_eq!(before, sunk_and_cold_src);
+    vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_scar_vault(&mut sim_eng, &tmp_scar_jsonl);
+    let after = SlotExecutionEngine::extract_12_slot_mfe_array(&sim_eng);
+    let mut rescued_sunk = 0_usize;
+    for s_idx in 0..vortex_rs::lob_shm::MAX_ACTIVE_PAIRS {
+        let active_fee_rt_mkr = sim_eng[s_idx].active_maker_rt_fee_bps().max(100);
+        let sunk_floor = (vortex_rs::alpha_3factor::PHI * (active_fee_rt_mkr as f64)).round() as i64;
+        if before[s_idx] != vortex_rs::telemetry_hud::DEFAULT_LEARNED_MFE_SCALED_BPS
+            && before[s_idx] >= sunk_floor
+        {
+            assert_eq!(after[s_idx], before[s_idx]);
+        } else {
+            assert!(
+                after[s_idx] >= before[s_idx]
+                    && after[s_idx] <= vortex_rs::telemetry_hud::SCAR_MFE_REHYDRATE_CAP_SCALED_BPS
+            );
+            if after[s_idx] > before[s_idx] {
+                rescued_sunk += 1;
             }
         }
-        assert!(rescued_sunk >= 1);
     }
+    assert!(rescued_sunk >= 4);
+    assert!(after[4] > 594 && after[3] > 628 && after[2] > 640 && after[7] > 613);
+    assert_eq!(after[1], 647);
+
+    // Production healed-vault invariance: all 12 slots >= 712 remain 100% untouched.
+    let tmp_mfe_healed = tmp_v532_dir.join("vortex_mfe_plasticity_healed_712.json");
+    let healed_712_src: [i64; 12] = [740, 780, 712, 835, 910, 890, 760, 725, 845, 795, 730, 715];
+    assert!(vortex_rs::vault_io::save_mfe_plasticity_to_path_atomic(
+        &tmp_mfe_healed,
+        t0,
+        &healed_712_src
+    )
+    .is_ok());
+    let mut healed_eng = SlotExecutionEngine::new_12_slot_array();
+    SlotExecutionEngine::hydrate_12_slot_mfe_from_path(&mut healed_eng, &tmp_mfe_healed);
+    vortex_rs::telemetry_hud::rehydrate_cold_mfe_seeds_from_scar_vault(&mut healed_eng, &tmp_scar_jsonl);
+    assert_eq!(
+        SlotExecutionEngine::extract_12_slot_mfe_array(&healed_eng),
+        healed_712_src
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_v532_dir);
 }
 
 #[test]
@@ -2338,6 +2379,7 @@ fn test_v542_elastic_throughput_penny_jump_fill_rate_and_5usdt_hard_lock() {
     ));
 
     // Temp dir for isolated persistence checks (never touches data/vault/*):
+    let pre_live_halt_lock_exists = std::path::Path::new("data/vault/HALTED_ON_LOSS.lock").exists();
     let tmp_dir = std::env::temp_dir().join(format!(
         "vortex_v542_cert_{}_{}",
         std::process::id(),
@@ -2699,7 +2741,10 @@ fn test_v542_elastic_throughput_penny_jump_fill_rate_and_5usdt_hard_lock() {
     drop(shm_reg);
     let _ = std::fs::remove_file(&shm_p);
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    assert!(!std::path::Path::new("data/vault/HALTED_ON_LOSS.lock").exists());
+    assert_eq!(
+        std::path::Path::new("data/vault/HALTED_ON_LOSS.lock").exists(),
+        pre_live_halt_lock_exists
+    );
 }
 
 #[test]
