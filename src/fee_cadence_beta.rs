@@ -22,12 +22,34 @@ pub const MAX_DIRECTIONAL_BETA_RISK_PPM: i64 = 10_800;
 pub const MAX_SIDE_OPEN_SLOTS: usize = 3;
 pub const MAX_TOTAL_OPEN_SLOTS: usize = 6;
 
+const PHI_F64: f64 = 1.618_033_988_749_895;
 const INV_PHI_F64: f64 = 0.618_033_988_749_894_9;
 const INV_PHI2_F64: f64 = 0.381_966_011_250_105_1;
 const INV_PHI_PM: i64 = 618;
 const INV_PHI2_PM: i64 = 382;
 const INV_PHI3_PM: i64 = 236;
 const REAL_UTC_MIN_EPOCH_SECS: i64 = 1_577_836_800; // 2020-01-01T00:00:00Z
+
+/// Self-learned `C1` friction barrier multiplier in `[PHI, 3.0]` (`V5.5.4`):
+/// `m_fric = PHI + (3.0 - PHI) * (1.0 - INV_PHI * psi_health * S_3(1.0 - p_T; 0.84, 0.95) * (INV_PHI + INV_PHI_SQ * iota))`
+#[inline]
+#[must_use]
+pub fn compute_learned_friction_multiplier_c1(
+    taker_prob_pm: i64,
+    learned_ir_x100: i64,
+    psi_health: f64,
+) -> f64 {
+    let psi_c = if psi_health.is_finite() {
+        psi_health.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let p_t = ((taker_prob_pm as f64) * 1e-3).clamp(0.0, 1.0);
+    let iota = ((learned_ir_x100 as f64) * 1e-2).clamp(0.0, 1.0);
+    let s_maker = crate::wave_elliott::hermite_smoothstep_c1(1.0 - p_t, 0.84, 0.95);
+    let relief = INV_PHI_F64 * psi_c * s_maker * (INV_PHI_F64 + INV_PHI2_F64 * iota);
+    (PHI_F64 + (3.0 - PHI_F64) * (1.0 - relief)).clamp(PHI_F64, 3.0)
+}
 
 /// Live exchange fee schedule in ScaledBps (1 bp = 100), updated via /v5/account/fee-rate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -409,6 +431,46 @@ impl PairSpec {
         )
     }
 
+    /// Self-learned `C1` friction barrier in `ScaledBps` (`1 bp = 100`, `V5.5.4`),
+    /// continuously modulating `m_fric` in `[PHI, 3.0]` via `taker_prob_pm`, `learned_ir_x100`, and `psi_health`.
+    #[inline]
+    #[must_use]
+    pub fn learned_friction_barrier_bps_c1(
+        self,
+        mid: PriceTicks,
+        taker_prob_pm: i64,
+        learned_ir_x100: i64,
+        psi_health: f64,
+        fees: FeeSchedule,
+    ) -> ScaledBps {
+        let rt = self
+            .expected_round_trip_cost_bps_dynamic(mid, taker_prob_pm, fees)
+            .0 as f64;
+        let m_fric =
+            compute_learned_friction_multiplier_c1(taker_prob_pm, learned_ir_x100, psi_health);
+        ScaledBps((rt * m_fric).round().max(50.0) as i64)
+    }
+
+    /// Intrinsic diffusive reachability & `C1` friction eligibility (`V5.5.4`).
+    #[inline]
+    #[must_use]
+    pub fn validate_pair_eligibility_c1(
+        self,
+        realized_vol_5m: ScaledBps,
+        tau_mkt_s: f64,
+        fees: FeeSchedule,
+    ) -> bool {
+        let sigma_5m = realized_vol_5m.0.max(0) as f64;
+        let tau_s = if tau_mkt_s.is_finite() && tau_mkt_s > 0.0 {
+            tau_mkt_s
+        } else {
+            300.0
+        };
+        let tau_scale = (tau_s / 300.0).clamp(INV_PHI2_F64, PHI_F64).sqrt();
+        let c_rt_mkr = (fees.round_trip_maker_exit_bps().0.max(50)) as f64;
+        sigma_5m * tau_scale >= PHI_F64 * c_rt_mkr
+    }
+
     #[inline]
     #[must_use]
     pub const fn validate_pair_eligibility_dynamic(
@@ -771,6 +833,16 @@ mod tests {
         let b3x_vip3 = sol.three_x_friction_barrier_bps_dynamic(mid, pm_clean, vip3);
         assert!(b3x_toxic.0 > b3x_clean.0);
         assert!(b3x_vip3.0 < b3x_clean.0);
+
+        let m_clean = compute_learned_friction_multiplier_c1(pm_clean, 80, 1.0);
+        let m_mid = compute_learned_friction_multiplier_c1(90, 40, 0.85);
+        let m_toxic = compute_learned_friction_multiplier_c1(pm_toxic, 0, 1.0);
+        let m_sick = compute_learned_friction_multiplier_c1(pm_clean, 100, 0.0);
+        assert!((PHI_F64..=3.0).contains(&m_clean));
+        assert!(m_clean < m_mid && m_mid < m_toxic);
+        assert!((m_toxic - 3.0).abs() < 1e-12 && (m_sick - 3.0).abs() < 1e-12);
+        let b_c1_clean = sol.learned_friction_barrier_bps_c1(mid, pm_clean, 80, 1.0, vip0);
+        assert!(b_c1_clean.0 < b3x_clean.0 && b_c1_clean.0 > vip0.round_trip_maker_exit_bps().0);
     }
 
     #[test]

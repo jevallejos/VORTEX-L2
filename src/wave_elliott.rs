@@ -18,6 +18,7 @@ const INV_PHI: f64 = 0.618_033_988_749_895;
 const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
 const INV_PHI_CUBE: f64 = 0.236_067_977_499_790;
 const INV_PHI_FOURTH: f64 = 0.145_898_033_750_315;
+pub const STALE_IMPULSE_WAVE3_PHASE_FLOOR: f64 = INV_PHI + INV_PHI_FOURTH * INV_PHI_FOURTH;
 const GP_STRICT_HI: f64 = 0.650;
 const GP_CENTER: f64 = f64::midpoint(INV_PHI, GP_STRICT_HI);
 const GP_HALF_WIDTH: f64 = 0.5 * (GP_STRICT_HI - INV_PHI);
@@ -326,6 +327,8 @@ pub struct CausalElliottWaveState {
     ewma_liq_abs_fast_usdt: f64,
     ewma_liq_abs_slow_usdt: f64,
     last_liq_ts_ns: i64,
+    last_tick_ts_ns: i64,
+    last_vol_5m: ScaledBps,
     cached_obs: WaveObservables,
 }
 
@@ -363,6 +366,8 @@ impl CausalElliottWaveState {
             ewma_liq_abs_fast_usdt: 0.0,
             ewma_liq_abs_slow_usdt: 50.0 * PHI_SQ,
             last_liq_ts_ns: 0,
+            last_tick_ts_ns: 0,
+            last_vol_5m: ScaledBps(0),
             cached_obs: WaveObservables {
                 regime: WaveRegime::NeutralWarmup,
                 climax_active: false,
@@ -386,6 +391,43 @@ impl CausalElliottWaveState {
     #[inline]
     #[must_use]
     pub fn active_liquidation_floor_usdt(&self) -> f64 { self.liq_floor.floor_usdt() }
+
+    #[inline]
+    #[must_use]
+    pub const fn last_extreme_pivot_ts_ns(&self) -> TimestampNs {
+        let len = self.pivot_len as usize;
+        if len == 0 {
+            self.anchor_ts
+        } else {
+            self.pivots[len - 1].ts_ns
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn last_extreme_pivot_age_secs(&self, now_ts_ns: i64) -> f64 {
+        let ext_ts = self.last_extreme_pivot_ts_ns().0;
+        if ext_ts > 0 && now_ts_ns > ext_ts {
+            ((now_ts_ns - ext_ts) as f64) * 1e-9
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn endogenous_tau_mkt_secs(realized_vol_5m: ScaledBps) -> f64 {
+        let min_v = ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw();
+        let ref_v = (min_v.saturating_mul(4)) as f64;
+        let eq_v = (realized_vol_5m.raw().max(min_v)) as f64;
+        (FLOW_TAU_SECS * (ref_v / eq_v.max(1.0))).clamp(FLOW_TAU_SECS / 3.0, FLOW_TAU_SECS * 3.0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn aged_impulse_wave3_decay_c1(&self, now_ts_ns: i64, tau_mkt_s: f64) -> f64 {
+        compute_impulse_wave3_age_decay_c1(self.last_extreme_pivot_age_secs(now_ts_ns), tau_mkt_s)
+    }
 
     #[inline]
     fn ensure_floor_seeded(&mut self, spec: PairSpec, ref_px: PriceTicks) {
@@ -628,7 +670,14 @@ impl CausalElliottWaveState {
                     if (p_fib3 - px) * s > 0 {
                         fib_proj_bps = ((p_fib3 - px).saturating_mul(1_000_000)) / px.max(1);
                     }
-                    phase = (0.68 + 0.27 * gp_res) * sf;
+                    let pivot_age_s = self.last_extreme_pivot_age_secs(self.last_tick_ts_ns);
+                    let tau_mkt_s = Self::endogenous_tau_mkt_secs(self.last_vol_5m);
+                    let s_age = compute_impulse_wave3_age_decay_c1(pivot_age_s, tau_mkt_s);
+                    let raw_phase_mag = 0.68 + 0.27 * gp_res;
+                    let eff_phase_mag = raw_phase_mag * (1.0 - s_age)
+                        + STALE_IMPULSE_WAVE3_PHASE_FLOOR * s_age;
+                    fib_proj_bps = ((fib_proj_bps as f64) * (1.0 - INV_PHI * s_age)).round() as i64;
+                    phase = eff_phase_mag * sf;
                 }
             } else {
                 phase = 0.30 * f64::from(self.zig_dir);
@@ -647,6 +696,12 @@ impl CausalElliottWaveState {
         if mid_px.0 <= 0 { return self.cached_obs; }
         self.ensure_floor_seeded(spec, mid_px);
         self.last_mid_px = mid_px;
+        if ts_ns > self.last_tick_ts_ns {
+            self.last_tick_ts_ns = ts_ns;
+        }
+        if realized_vol_5m.0 > 0 {
+            self.last_vol_5m = realized_vol_5m;
+        }
         self.decay_liquidation_state(ts_ns);
         let h_val = self.update_hurst_vr(spec, mid_px, ts_ns);
         self.step_zigzag(spec, mid_px, ts_ns, realized_vol_5m);
@@ -802,7 +857,15 @@ impl CausalElliottWaveState {
                         fib_target_bps: ScaledBps(aligned_fib),
                     })
                 } else if signed_phase < -0.15 && btc_signed_snr < 0.20 {
-                    Ok(WaveEntryModulation { snr_threshold_delta: 0.045, def_horizon_permille_mult: 820, tranche1_permille_delta: 90, fib_target_bps: ScaledBps(0) })
+                    let s_fresh =
+                        hermite_smoothstep_c1(-signed_phase, STALE_IMPULSE_WAVE3_PHASE_FLOOR, 0.68);
+                    let eff_mult = INV_PHI + INV_PHI_SQ * s_fresh;
+                    Ok(WaveEntryModulation {
+                        snr_threshold_delta: 0.045 * eff_mult,
+                        def_horizon_permille_mult: 1_000 - ((180.0 * eff_mult).round() as i64),
+                        tranche1_permille_delta: (90.0 * eff_mult).round() as i64,
+                        fib_target_bps: ScaledBps(0),
+                    })
                 } else {
                     Ok(WaveEntryModulation { snr_threshold_delta: 0.010, def_horizon_permille_mult: 1_000, tranche1_permille_delta: 0, fib_target_bps: ScaledBps(aligned_fib) })
                 }
@@ -840,6 +903,22 @@ impl CausalElliottWaveState {
             }
         }
     }
+}
+
+/// Continuous `C1` age decay weight in `[0.0, 1.0]` for an aging `ImpulseWave3`
+/// normalized by `tau_mkt` (`pivot_age_s / tau_mkt_s`, `V5.5.4`).
+#[inline]
+#[must_use]
+pub fn compute_impulse_wave3_age_decay_c1(pivot_age_s: f64, tau_mkt_s: f64) -> f64 {
+    if !pivot_age_s.is_finite()
+        || pivot_age_s <= 0.0
+        || !tau_mkt_s.is_finite()
+        || tau_mkt_s <= 0.0
+    {
+        return 0.0;
+    }
+    let age_ratio = pivot_age_s / tau_mkt_s.max(1.0);
+    hermite_smoothstep_c1(age_ratio, INV_PHI_CUBE, PHI)
 }
 
 /// Cubic Hermite C1 smoothstep `S_3(u) = u^2 * (3 - 2u)` with zero slope at both boundaries.
@@ -956,5 +1035,16 @@ mod tests {
         assert!(passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.495, 0.70, 0.12)));
         assert!(!passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.560, 0.70, 0.05)));
         assert!(!passes_elliott_hurst_coherence_c1(Side::Ask, mk_wave(0.674, 0.30, 0.13)));
+
+        let mut w3_st = CausalElliottWaveState::new();
+        for &(px, st) in &[(10_000_i64, 1_i64), (10_100, 2), (10_038, 3), (10_120, 4)] {
+            let _ = w3_st.observe_price_tick(APPROVED_SPECS[3], PriceTicks(px), st * 2_000_000_000, vol);
+        }
+        let fresh_obs = w3_st.observables();
+        assert_eq!(fresh_obs.regime, WaveRegime::ImpulseWave3);
+        let aged_obs = w3_st.observe_price_tick(APPROVED_SPECS[3], PriceTicks(10_090), 600_000_000_000, vol);
+        assert_eq!(aged_obs.regime, WaveRegime::ImpulseWave3);
+        assert!(aged_obs.macro_phase.get() < fresh_obs.macro_phase.get());
+        assert!(aged_obs.macro_phase.get() >= STALE_IMPULSE_WAVE3_PHASE_FLOOR - 1e-6);
     }
 }

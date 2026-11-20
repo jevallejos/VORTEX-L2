@@ -694,6 +694,53 @@ impl OrthogonalFactorState {
         lead_lag_ignition_bonus: f64,
         kappa_evt: f64,
     ) -> SignalVerdict {
+        let sigma_est = (learned_mfe_bps.raw().max(200) / 2)
+            .max(200)
+            .saturating_add(fees.round_trip_maker_exit_bps().raw().max(0))
+            .max(1);
+        let implied_ir_x100 = (learned_dir_edge_bps.raw().saturating_mul(100)) / sigma_est;
+        let tau_mkt_s =
+            crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(snap.realized_vol_5m);
+        Self::evaluate_entry_signal_v554(
+            spec,
+            snap,
+            leader_btc_snap,
+            learned_mfe_bps,
+            learned_dir_edge_bps,
+            taker_prob_pm,
+            implied_ir_x100.clamp(-60, 120),
+            tau_mkt_s,
+            fees,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            psi_health,
+            lead_lag_ignition_bonus,
+            kappa_evt,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_entry_signal_v554(
+        spec: PairSpec,
+        snap: &SymbolLobSnapshot,
+        leader_btc_snap: &SymbolLobSnapshot,
+        learned_mfe_bps: ScaledBps,
+        learned_dir_edge_bps: ScaledBps,
+        taker_prob_pm: i64,
+        learned_ir_x100: i64,
+        tau_mkt_s: f64,
+        fees: FeeSchedule,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        psi_health: f64,
+        lead_lag_ignition_bonus: f64,
+        kappa_evt: f64,
+    ) -> SignalVerdict {
         let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() else {
             return SignalVerdict::NeutralNoAction;
         };
@@ -701,24 +748,25 @@ impl OrthogonalFactorState {
         let Ok(raw_tick_bps) = spec.tick_to_price_scaled_bps(mid_ticks) else {
             return SignalVerdict::NeutralNoAction;
         };
-        let b3x_barrier = spec.three_x_friction_barrier_bps_dynamic(mid_ticks, taker_prob_pm, fees);
+        let fric_barrier = spec.learned_friction_barrier_bps_c1(
+            mid_ticks,
+            taker_prob_pm,
+            learned_ir_x100,
+            psi_health,
+            fees,
+        );
         if spread_ticks > 1 {
             let spread_scaled_bps = (spread_ticks.saturating_mul(1_000_000)) / mid_ticks.0.max(1);
-            let rt_cost = (b3x_barrier.raw() / 3).max(50);
+            let rt_cost = spec
+                .expected_round_trip_cost_bps_dynamic(mid_ticks, taker_prob_pm, fees)
+                .raw()
+                .max(50);
             let max_elastic_spread_bps = (snap.realized_vol_5m.raw() / 24).clamp(rt_cost / 2, rt_cost);
             if spread_scaled_bps > max_elastic_spread_bps {
                 return SignalVerdict::NeutralNoAction;
             }
         }
-        if snap.realized_vol_5m.raw() < b3x_barrier.raw() {
-            return SignalVerdict::NeutralNoAction;
-        }
-        let p_hat = (taker_prob_pm.clamp(20, 450) as f64) * 1e-3;
-        let p_t_mult =
-            1.0 + INV_PHI * crate::wave_elliott::hermite_smoothstep_c1(p_hat, 0.05, INV_PHI_SQ);
-        let elastic_max_tick =
-            ((snap.realized_vol_5m.raw().max(0) as f64) / (10.0 * p_t_mult)).floor() as i64;
-        if raw_tick_bps.raw() > elastic_max_tick {
+        if !passes_intrinsic_diffusive_reachability_c1(snap.realized_vol_5m, tau_mkt_s, fees) {
             return SignalVerdict::NeutralNoAction;
         }
         let c_mkr_rt_sbps = fees.round_trip_maker_exit_bps().raw().max(1) as f64;
@@ -726,7 +774,40 @@ impl OrthogonalFactorState {
         let ofi = snap.factor_ofi.get();
         let tfi = snap.factor_tfi.get();
         let geom = snap.factor_geom.get();
-        if is_opposing_or_silent_spoof_veto_c1(ofi, tfi, eta_lat, kappa_evt) {
+        let composite = Self::adaptive_snr_from_snapshot_with_fees(snap, spoof_density, fees).get();
+        let cand_side = if composite > 0.0 {
+            Side::Bid
+        } else if composite < 0.0 {
+            Side::Ask
+        } else if ofi >= 0.0 {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let s_cand = cand_side.sign_f64();
+        let ofi_al = ofi * s_cand;
+        let tfi_al = tfi * s_cand;
+        let geom_al = geom * s_cand;
+        let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
+        let eff_epps_corr = if is_follower { epps_corr } else { 0.0 };
+        let btc_w3_aligned = compute_btc_leader_aligned_score(
+            cand_side,
+            snap,
+            leader_btc_snap,
+            eff_epps_corr,
+            btc_lead_aligned_override,
+        );
+        let s_preprint =
+            compute_preprint_alignment_bridge_c1(ofi_al, geom_al, btc_w3_aligned, spoof_density);
+        if (ofi * tfi) < 0.0 {
+            if is_opposing_or_silent_spoof_veto_c1(ofi, tfi, eta_lat, kappa_evt) {
+                return SignalVerdict::SpoofingVeto;
+            }
+        } else if ofi.abs() > 0.55
+            && tfi.abs() < 0.08
+            && (1.0 - s_preprint) * evaluate_silent_tape_spoof_weight_c1(eta_lat, kappa_evt)
+                >= INV_PHI
+        {
             return SignalVerdict::SpoofingVeto;
         }
         let bonus = if lead_lag_ignition_bonus.is_finite() {
@@ -734,35 +815,50 @@ impl OrthogonalFactorState {
         } else {
             0.0
         };
-        let eq_vol_anchor = (b3x_barrier.raw().saturating_mul(4)).max(1) as f64;
-        let nu_sigma = ((snap.realized_vol_5m.raw().max(b3x_barrier.raw()) as f64) / eq_vol_anchor).sqrt().clamp(0.82, 1.25);
+        let eq_vol_anchor = (fric_barrier.raw().saturating_mul(4)).max(1) as f64;
+        let nu_sigma = ((snap.realized_vol_5m.raw().max(fric_barrier.raw()) as f64) / eq_vol_anchor)
+            .sqrt()
+            .clamp(0.82, 1.25);
         let edge_relief = ((learned_dir_edge_bps.raw().clamp(0, 450) as f64) / 10_000.0).min(0.04);
         let elastic_snr_floor = (0.40 * nu_sigma - edge_relief).clamp(0.34, 0.48);
-        let composite = Self::adaptive_snr_from_snapshot_with_fees(snap, spoof_density, fees).get();
-        if composite.abs() + bonus < elastic_snr_floor {
+        let sp_c = if spoof_density.is_finite() {
+            spoof_density.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let preprint_min = -0.02 * (1.0 - sp_c);
+        let s_tfi_pause =
+            1.0 - crate::wave_elliott::hermite_smoothstep_c1(tfi_al.max(0.0), 0.0, INV_PHI_CUBE);
+        let preprint_snr_lift = if s_preprint > 0.0 && tfi_al >= preprint_min {
+            INV_PHI_CUBE * s_preprint * s_tfi_pause * (ofi_al - tfi_al).max(0.0)
+        } else {
+            0.0
+        };
+        let bridged_composite_abs = (composite.abs() + preprint_snr_lift).min(1.0);
+        if bridged_composite_abs + bonus < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
         let min_ofi_dir = 0.15 * (1.0 - bonus);
         let min_tfi_dir = 0.12 * (1.0 - bonus);
-        let cand_side = if composite > 0.0 { Side::Bid } else { Side::Ask };
-        let s_cand = cand_side.sign_f64();
-        let ofi_al = ofi * s_cand;
-        let tfi_al = tfi * s_cand;
-        let geom_al = geom * s_cand;
         let s_lat = crate::wave_elliott::hermite_smoothstep_c1(eta_lat, INV_PHI_SQ, PHI);
         let s_ofi_lat =
             crate::wave_elliott::hermite_smoothstep_c1(ofi_al, INV_PHI, 1.0 - INV_PHI_CUBE);
         let relaxed_tfi_floor = min_tfi_dir * (1.0 - s_lat * s_ofi_lat);
-        let tfi_ok = if s_lat * s_ofi_lat > 0.0 {
+        let bridged_tfi_floor =
+            relaxed_tfi_floor * (1.0 - s_preprint) + preprint_min * s_preprint;
+        let tfi_ok = if s_preprint > 0.0 {
+            tfi_al >= preprint_min && tfi_al >= bridged_tfi_floor
+        } else if s_lat * s_ofi_lat > 0.0 {
             tfi_al >= 0.0 && tfi_al >= relaxed_tfi_floor
         } else {
             tfi_al > min_tfi_dir
         };
+        let s_geom_relax = s_lat.max(s_preprint);
         let min_geom_al = if ofi_al >= INV_PHI {
-            -INV_PHI_FOURTH * s_lat
+            -INV_PHI_FOURTH * s_geom_relax
         } else {
             -INV_PHI_FOURTH
-                * s_lat
+                * s_geom_relax
                 * crate::wave_elliott::hermite_smoothstep_c1(ofi_al, INV_PHI_SQ, INV_PHI)
         };
         if ofi_al <= min_ofi_dir || !tfi_ok || geom_al < min_geom_al {
@@ -770,8 +866,6 @@ impl OrthogonalFactorState {
         }
         let side = cand_side;
         let dir_sign = side.sign_f64();
-        let is_follower = snap.symbol_id != leader_btc_snap.symbol_id;
-        let eff_epps_corr = if is_follower { epps_corr } else { 0.0 };
         let corr_sign = if eff_epps_corr < 0.0 { -1.0 } else { 1.0 };
         let inst_btc_aligned = if is_follower {
             corr_sign * Self::snr_composite_score(leader_btc_snap) * dir_sign
@@ -779,28 +873,17 @@ impl OrthogonalFactorState {
             0.0
         };
         let btc_sync_aligned = if is_follower {
-            compute_btc_leader_aligned_score(
-                side,
-                snap,
-                leader_btc_snap,
-                eff_epps_corr,
-                btc_lead_aligned_override,
-            )
+            btc_w3_aligned
         } else {
             0.0
         };
-        let btc_w3_aligned = compute_btc_leader_aligned_score(
-            side,
-            snap,
-            leader_btc_snap,
-            eff_epps_corr,
-            btc_lead_aligned_override,
-        );
-        if is_opposing_impulse_wave3_entry_hazard_v552(
+        if is_opposing_impulse_wave3_entry_hazard_v554(
             side,
             snap,
             btc_w3_aligned,
             psi_health,
+            0.0,
+            tau_mkt_s,
             0,
             taker_prob_pm,
             fees,
@@ -817,10 +900,10 @@ impl OrthogonalFactorState {
         let lead_lag_adj_bps = if !is_follower || beta_c.abs() < 1e-6 {
             0
         } else if aligned_leader >= 0.55 && leader_tfi_al >= 0.55 {
-            let bonus_cap = b3x_barrier.raw() / 9;
+            let bonus_cap = fric_barrier.raw() / 9;
             ((aligned_leader * (bonus_cap as f64)).round() as i64).clamp(0, bonus_cap)
         } else if aligned_leader <= -0.35 {
-            let drag_cap = b3x_barrier.raw() / 6;
+            let drag_cap = fric_barrier.raw() / 6;
             -((((-aligned_leader) - 0.35) * (drag_cap as f64)).round() as i64).clamp(0, drag_cap)
         } else {
             0
@@ -844,13 +927,13 @@ impl OrthogonalFactorState {
             tfi * dir_sign,
             inst_btc_aligned,
         );
-        let eff_composite_abs = (composite.abs() * (1.0 - INV_PHI * s_iceberg) + bonus).min(1.0);
+        let eff_composite_abs = (bridged_composite_abs * (1.0 - INV_PHI * s_iceberg) + bonus).min(1.0);
         if eff_composite_abs < elastic_snr_floor {
             return SignalVerdict::NeutralNoAction;
         }
         let raw_vol = snap.realized_vol_5m.raw() as f64;
         let learned_span = learned_mfe_bps.raw().max(0).saturating_add(learned_dir_edge_bps.raw().max(0));
-        let eq_horizon = b3x_barrier.raw().saturating_mul(3).saturating_add(learned_span.saturating_mul(2)) as f64;
+        let eq_horizon = fric_barrier.raw().saturating_mul(3).saturating_add(learned_span.saturating_mul(2)) as f64;
         let eff_vol = if matches!(w_entry.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc) && raw_vol < eq_horizon {
             let ob_tot = (al_ob_pm.max(382) + op_ob_pm.max(382)) as f64;
             let rho_ob_v = if al_ob_pm > 0 || op_ob_pm > 0 { (al_ob_pm.max(382) as f64) / ob_tot } else { 0.50 };
@@ -903,7 +986,7 @@ impl OrthogonalFactorState {
         };
         let flow_boost = (0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs()) * (1.0 - INV_PHI_SQ * s_iceberg);
         let expected_excursion = ScaledBps(((eff_composite_abs * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
-        if expected_excursion.raw() >= b3x_barrier.raw() {
+        if expected_excursion.raw() >= fric_barrier.raw() {
             SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps: expected_excursion }
         } else {
             SignalVerdict::NeutralNoAction
@@ -2235,9 +2318,10 @@ pub fn compute_s_opp_ob_wall_c1(
     compute_s_opp_ob_wall_with_target_c1(side, snap, 0, taker_prob_pm, fees)
 }
 
-/// Tick-level L2 (`200 Hz`) `CorrectiveAbc` Hurst persistence lift `delta_h_tick_l2` in `[0.0, INV_PHI_SQ]` (`V5.5.2`).
-/// Strictly active only when `chi_threat < INV_PHI`, `min(ofi_al, tfi_al) >= INV_PHI_SQ`,
-/// `btc_al >= INV_PHI_CUBE`, `|epps_corr| >= INV_PHI`, and without passive iceberg absorption.
+/// Tick-level L2 (`200 Hz`) `CorrectiveAbc` Hurst persistence lift `delta_h_tick_l2` in `[0.0, INV_PHI_SQ]` (`V5.5.4`).
+/// Eliminates the `|epps_corr| >= INV_PHI` step via continuous convex synergy:
+/// `|epps_corr| * S_3(btc_al; INV_PHI_CUBE, INV_PHI_SQ) + (1 - |epps_corr|) * S_3(min(ofi_al, tfi_al); INV_PHI_SQ, INV_PHI)`
+/// strictly gated by `chi_threat < INV_PHI` (preserving `0.0` whenever `s_opp_ob_wall == 1.0`) and passive iceberg absence.
 #[inline]
 #[must_use]
 #[allow(clippy::suboptimal_flops, clippy::too_many_arguments)]
@@ -2263,33 +2347,31 @@ pub fn compute_corrective_abc_tick_hurst_lift_c1(
         return 0.0;
     }
     let flow_min = ofi_aligned.min(tfi_aligned);
-    if flow_min < INV_PHI_SQ || btc_aligned < INV_PHI_CUBE || epps_corr.abs() < INV_PHI {
+    if flow_min < INV_PHI_SQ {
         return 0.0;
     }
     let s_threat_ok =
         crate::wave_elliott::hermite_smoothstep_c1(INV_PHI - chi_threat, 0.0, INV_PHI_FOURTH);
-    let s_flow = crate::wave_elliott::hermite_smoothstep_c1(
+    let s_flow_gate = crate::wave_elliott::hermite_smoothstep_c1(
         flow_min,
         INV_PHI_SQ,
         INV_PHI_SQ + INV_PHI_FIFTH,
     );
+    let s_flow_own =
+        crate::wave_elliott::hermite_smoothstep_c1(flow_min, INV_PHI_SQ, INV_PHI);
     let s_btc = crate::wave_elliott::hermite_smoothstep_c1(
         btc_aligned,
         INV_PHI_CUBE,
-        INV_PHI_CUBE + INV_PHI_FIFTH,
+        INV_PHI_SQ,
     );
-    let s_epps = crate::wave_elliott::hermite_smoothstep_c1(
-        epps_corr.abs(),
-        INV_PHI,
-        INV_PHI + INV_PHI_FIFTH,
-    );
+    let abs_corr = epps_corr.abs().clamp(0.0, 1.0);
+    let s_synergy = abs_corr * s_btc + (1.0 - abs_corr) * s_flow_own;
     let s_no_ice = (1.0 - s_iceberg_pen.clamp(0.0, 1.0)).clamp(0.0, 1.0);
     (psi_health.clamp(0.0, 1.0)
         * INV_PHI_SQ
         * s_threat_ok
-        * s_flow
-        * s_btc
-        * s_epps
+        * s_flow_gate
+        * s_synergy
         * s_no_ice)
         .clamp(0.0, INV_PHI_SQ)
 }
@@ -2368,7 +2450,7 @@ pub fn passes_corrective_abc_fractal_guard_with_health_c1(
         - INV_PHI3_C * s_adv_macro
         + delta_h_sync
         + delta_h_clear;
-    let h_crit = base_h_crit.max((base_h_crit + delta_h_tick).min(0.80));
+    let h_crit = (base_h_crit + delta_h_tick).min(0.80);
     wave.hurst_exponent() <= h_crit
 }
 
@@ -2513,7 +2595,153 @@ pub fn is_opposing_impulse_wave3_hazard(
     is_opposing_impulse_wave3_hazard_dynamic(side, snap, 0, 50, FeeSchedule::VIP0_DEFAULT)
 }
 
-/// Clean intraday reversal predicate against stale opposing `ImpulseWave3`, strictly for NEW entry admission (`psi_health > INV_PHI_SQ`, `V5.5.2`).
+/// Intrinsic diffusive reachability (`V5.5.4`):
+/// `sigma_5m * sqrt(clamp(tau_mkt / 300.0, INV_PHI_SQ, PHI)) >= PHI * c_rt_mkr` (all in `ScaledBps`, `1 bp = 100`).
+#[inline]
+#[must_use]
+pub fn passes_intrinsic_diffusive_reachability_c1(
+    realized_vol_5m: ScaledBps,
+    tau_mkt_s: f64,
+    fees: FeeSchedule,
+) -> bool {
+    let sigma_5m_sbps = realized_vol_5m.raw().max(0) as f64;
+    let tau_s = if tau_mkt_s.is_finite() && tau_mkt_s > 0.0 {
+        tau_mkt_s
+    } else {
+        300.0
+    };
+    let tau_scale = (tau_s / 300.0).clamp(INV_PHI_SQ, PHI).sqrt();
+    let c_rt_mkr_sbps = (fees.round_trip_maker_exit_bps().raw().max(50)) as f64;
+    sigma_5m_sbps * tau_scale >= PHI * c_rt_mkr_sbps
+}
+
+/// Continuous `C1` pre-print alignment bridge in `[0.0, 1.0]` (`V5.5.4`):
+/// Active strictly when `spoof_density < INV_PHI_SQ` and `OFI_al`, `GEOM_al`, and `BTC_al` are strongly aligned.
+#[inline]
+#[must_use]
+pub fn compute_preprint_alignment_bridge_c1(
+    ofi_aligned: f64,
+    geom_aligned: f64,
+    btc_aligned: f64,
+    spoof_density: f64,
+) -> f64 {
+    let sp_c = if spoof_density.is_finite() {
+        spoof_density.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if sp_c >= INV_PHI_SQ
+        || !ofi_aligned.is_finite()
+        || !geom_aligned.is_finite()
+        || !btc_aligned.is_finite()
+    {
+        return 0.0;
+    }
+    let s_sp = 1.0 - crate::wave_elliott::hermite_smoothstep_c1(sp_c, INV_PHI_FOURTH, INV_PHI_SQ);
+    let s_ofi = crate::wave_elliott::hermite_smoothstep_c1(ofi_aligned, INV_PHI_CUBE, INV_PHI);
+    let s_geom =
+        crate::wave_elliott::hermite_smoothstep_c1(geom_aligned, INV_PHI_FOURTH, INV_PHI_SQ);
+    let s_btc = crate::wave_elliott::hermite_smoothstep_c1(btc_aligned, INV_PHI_CUBE, INV_PHI_SQ);
+    (s_sp * s_ofi * s_geom * s_btc).clamp(0.0, 1.0)
+}
+
+/// Continuous `C1` own `[OB+, OB-]` support weight in `[0.0, 1.0]` (`V5.5.4`).
+/// Strictly `0.0` when neither an active own Order-Block wall (`own_sc >= INV_PHI_FOURTH`)
+/// nor net positive directional `[OB+, OB-]` efficacy (`own_pm > 500 && own_pm > opp_pm`) is present.
+#[inline]
+#[must_use]
+pub fn compute_own_ob_support_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> f64 {
+    let (own_pm, opp_pm, own_sc, own_dist) = match side {
+        crate::types::Side::Bid => (
+            snap.ob_bull_efficacy_pm,
+            snap.ob_bear_efficacy_pm,
+            snap.ob_bull_score.get(),
+            snap.ob_dist_bull_bps.raw(),
+        ),
+        crate::types::Side::Ask => (
+            snap.ob_bear_efficacy_pm,
+            snap.ob_bull_efficacy_pm,
+            snap.ob_bear_score.get(),
+            snap.ob_dist_bear_bps.raw(),
+        ),
+    };
+    let has_own_wall = own_dist > 0 && own_sc >= INV_PHI_FOURTH;
+    let has_own_efficacy = own_pm > 500 && own_pm > opp_pm;
+    if !has_own_wall && !has_own_efficacy {
+        return 0.0;
+    }
+    let rho_ob = compute_ob_alignment_ratio_c1(side, snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let (_, s_own_wall) =
+        compute_corrective_abc_ob_wall_pair_c1(side, snap, 0, taker_prob_pm, fees);
+    crate::wave_elliott::hermite_smoothstep_c1(rho_ob, 0.50, INV_PHI)
+        .max(s_own_wall)
+        .clamp(0.0, 1.0)
+}
+
+/// Continuous `C1` entry block attenuation in `[0.0, 1.0]` for an aged opposing `ImpulseWave3` (`V5.5.4`),
+/// modulated by `pivot_age_s / tau_mkt_s` (and `WaveObservables` aged phase), own `[OB+, OB-]` support,
+/// and `min(ofi_al, tfi_al) >= INV_PHI_SQ`.
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_aged_impulse_wave3_entry_relief_c1(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    _btc_aligned: f64,
+    psi_health: f64,
+    pivot_age_s: f64,
+    tau_mkt_s: f64,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> f64 {
+    if !psi_health.is_finite() || psi_health <= 0.0 {
+        return 0.0;
+    }
+    let w = snap.wave_observables();
+    if w.climax_active
+        || !matches!(w.regime, crate::wave_elliott::WaveRegime::ImpulseWave3)
+    {
+        return 0.0;
+    }
+    let dir_s = side.sign_f64();
+    let ofi_al = snap.factor_ofi.get() * dir_s;
+    let tfi_al = snap.factor_tfi.get() * dir_s;
+    if !ofi_al.is_finite() || !tfi_al.is_finite() {
+        return 0.0;
+    }
+    let flow_min = ofi_al.min(tfi_al);
+    if flow_min < INV_PHI_SQ {
+        return 0.0;
+    }
+    let s_own_ob = compute_own_ob_support_c1(side, snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    if s_own_ob <= 0.0 {
+        return 0.0;
+    }
+    let macro_aligned = w.macro_phase.get() * dir_s;
+    let s_age_direct =
+        crate::wave_elliott::compute_impulse_wave3_age_decay_c1(pivot_age_s, tau_mkt_s);
+    let s_age_obs = crate::wave_elliott::hermite_smoothstep_c1(
+        0.68 - (-macro_aligned),
+        0.0,
+        0.68 - crate::wave_elliott::STALE_IMPULSE_WAVE3_PHASE_FLOOR,
+    );
+    let s_age = s_age_direct.max(s_age_obs);
+    if s_age <= 0.0 {
+        return 0.0;
+    }
+    let s_flow = crate::wave_elliott::hermite_smoothstep_c1(flow_min, INV_PHI_SQ, INV_PHI);
+    let s_psi = crate::wave_elliott::hermite_smoothstep_c1(psi_health, INV_PHI_CUBE, INV_PHI);
+    (s_psi * s_age * s_own_ob * s_flow).clamp(0.0, 1.0)
+}
+
+/// Clean intraday reversal predicate against stale opposing `ImpulseWave3`, strictly for NEW entry admission (`psi_health > INV_PHI_SQ`, `V5.5.4`).
 #[inline]
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -2523,6 +2751,20 @@ pub fn qualifies_clean_intraday_wave3_reversal_v552(
     btc_aligned: f64,
     psi_health: f64,
 ) -> bool {
+    let aged_relief = compute_aged_impulse_wave3_entry_relief_c1(
+        side,
+        snap,
+        btc_aligned,
+        psi_health,
+        0.0,
+        300.0,
+        0,
+        50,
+        FeeSchedule::VIP0_DEFAULT,
+    );
+    if aged_relief >= INV_PHI_SQ {
+        return true;
+    }
     if !psi_health.is_finite() || psi_health <= INV_PHI_SQ || !btc_aligned.is_finite() {
         return false;
     }
@@ -2544,7 +2786,7 @@ pub fn qualifies_clean_intraday_wave3_reversal_v552(
         && fib_aligned_bps > -45.0
 }
 
-/// Continuous `C1` intraday reversal relief in `[0.0, 1.0]` attenuating stale `ImpulseWave3` headwind strictly on NEW entry (`V5.5.2`).
+/// Continuous `C1` intraday reversal relief in `[0.0, 1.0]` attenuating stale `ImpulseWave3` headwind strictly on NEW entry (`V5.5.4`).
 #[inline]
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -2554,8 +2796,19 @@ pub fn compute_intraday_wave3_reversal_relief_c1(
     btc_aligned: f64,
     psi_health: f64,
 ) -> f64 {
+    let aged_relief = compute_aged_impulse_wave3_entry_relief_c1(
+        side,
+        snap,
+        btc_aligned,
+        psi_health,
+        0.0,
+        300.0,
+        0,
+        50,
+        FeeSchedule::VIP0_DEFAULT,
+    );
     if !qualifies_clean_intraday_wave3_reversal_v552(side, snap, btc_aligned, psi_health) {
-        return 0.0;
+        return aged_relief;
     }
     let w = snap.wave_observables();
     let dir_s = side.sign_f64();
@@ -2567,16 +2820,65 @@ pub fn compute_intraday_wave3_reversal_relief_c1(
         crate::wave_elliott::hermite_smoothstep_c1(psi_health, INV_PHI_SQ, INV_PHI_SQ + 0.02);
     let s_ofi = crate::wave_elliott::hermite_smoothstep_c1(ofi_al, INV_PHI, INV_PHI + 0.005);
     let s_tfi = crate::wave_elliott::hermite_smoothstep_c1(tfi_al, INV_PHI, INV_PHI + 0.005);
-    let s_btc =
-        crate::wave_elliott::hermite_smoothstep_c1(btc_aligned, INV_PHI_SQ, INV_PHI_SQ + 0.005);
+    let s_btc = if btc_aligned.is_finite() {
+        crate::wave_elliott::hermite_smoothstep_c1(btc_aligned, INV_PHI_SQ, INV_PHI_SQ + 0.005)
+    } else {
+        0.0
+    };
     let s_macro = crate::wave_elliott::hermite_smoothstep_c1(macro_aligned, -0.75, -0.73);
     let s_fib = crate::wave_elliott::hermite_smoothstep_c1(fib_aligned_bps, -45.0, -43.0);
-    (s_psi * s_ofi * s_tfi * s_btc * s_macro * s_fib).clamp(0.0, 1.0)
+    (s_psi * s_ofi * s_tfi * s_btc * s_macro * s_fib)
+        .max(aged_relief)
+        .clamp(0.0, 1.0)
 }
 
-/// Opposing `ImpulseWave3` hazard strictly for NEW entry admission (`V5.5.2`):
-/// Preserves 100% veto when `psi_health <= INV_PHI_SQ`, `macro_aligned <= -0.75`, `fib_aligned_bps <= -45.0`, or `climax_active`,
-/// while permitting clean intraday reversals (`ofi_al >= INV_PHI && tfi_al >= INV_PHI && btc_al >= INV_PHI_SQ`).
+/// Opposing `ImpulseWave3` hazard for NEW entry admission with `C1` pivot-age / `tau_mkt` attenuation (`V5.5.4`).
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn is_opposing_impulse_wave3_entry_hazard_v554(
+    side: crate::types::Side,
+    snap: &crate::lob_shm::SymbolLobSnapshot,
+    btc_aligned: f64,
+    psi_health: f64,
+    pivot_age_s: f64,
+    tau_mkt_s: f64,
+    eq_vol_5m_sbps: i64,
+    taker_prob_pm: i64,
+    fees: FeeSchedule,
+) -> bool {
+    let w = snap.wave_observables();
+    if !matches!(w.regime, crate::wave_elliott::WaveRegime::ImpulseWave3) {
+        return false;
+    }
+    if qualifies_clean_intraday_wave3_reversal_v552(side, snap, btc_aligned, psi_health) {
+        return false;
+    }
+    let s_aged = compute_aged_impulse_wave3_entry_relief_c1(
+        side,
+        snap,
+        btc_aligned,
+        psi_health,
+        pivot_age_s,
+        tau_mkt_s,
+        eq_vol_5m_sbps,
+        taker_prob_pm,
+        fees,
+    );
+    let (b3x_sbps, eq_vol_sbps) =
+        endogenous_b3x_and_eq_vol_sbps(snap, eq_vol_5m_sbps, taker_prob_pm, fees);
+    let fib_cut_sbps = (PHI * (b3x_sbps as f64))
+        .max(INV_PHI * (eq_vol_sbps as f64))
+        * (1.0 + PHI_SQ * s_aged);
+    let dir_s = side.sign_f64();
+    let macro_aligned = w.macro_phase.get() * dir_s;
+    let fib_aligned_sbps = (w.fib_proj_bps.raw() as f64) * dir_s;
+    let macro_cut = -INV_PHI - (1.0 - INV_PHI) * s_aged;
+    let fib_phase_cut = -INV_PHI_SQ - (1.0 - INV_PHI_SQ) * s_aged;
+    macro_aligned < macro_cut || (macro_aligned < fib_phase_cut && fib_aligned_sbps <= -fib_cut_sbps)
+}
+
+/// Opposing `ImpulseWave3` hazard strictly for NEW entry admission (`V5.5.2` / `V5.5.4`).
 #[inline]
 #[must_use]
 pub fn is_opposing_impulse_wave3_entry_hazard_v552(
@@ -2588,8 +2890,19 @@ pub fn is_opposing_impulse_wave3_entry_hazard_v552(
     taker_prob_pm: i64,
     fees: FeeSchedule,
 ) -> bool {
-    is_opposing_impulse_wave3_hazard_dynamic(side, snap, eq_vol_5m_sbps, taker_prob_pm, fees)
-        && !qualifies_clean_intraday_wave3_reversal_v552(side, snap, btc_aligned, psi_health)
+    let tau_mkt_s =
+        crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(snap.realized_vol_5m);
+    is_opposing_impulse_wave3_entry_hazard_v554(
+        side,
+        snap,
+        btc_aligned,
+        psi_health,
+        0.0,
+        tau_mkt_s,
+        eq_vol_5m_sbps,
+        taker_prob_pm,
+        fees,
+    )
 }
 
 /// Continuous `C1` Order-Block alignment ratio `[0.0, 1.0]` combining Bayesian efficacy & physical `reach_bps` proximity.
@@ -2783,7 +3096,7 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
         - INV_PHI_FOURTH * s_opp_wall
         + delta_h_sync
         + delta_h_clear;
-    let h_crit = base_h_crit.max((base_h_crit + delta_h_tick).min(0.80));
+    let h_crit = (base_h_crit + delta_h_tick).min(0.80);
     let s_btc_backing = crate::wave_elliott::hermite_smoothstep_c1(
         btc_aligned,
         INV_PHI_CUBE,
@@ -3157,5 +3470,75 @@ mod v51_f4_l1_depletion_vs_cancel_tests {
             st_deep.on_trade_print(Side::Bid, LotQty(80), &mut s_deep);
         }
         assert!(s_deep.factor_tfi.get() > 0.20);
+    }
+
+    #[test]
+    fn test_v554_c1_friction_diffusive_preprint_aged_w3_and_abc_synergy() {
+        let fees = FeeSchedule::VIP0_DEFAULT;
+        assert!(passes_intrinsic_diffusive_reachability_c1(ScaledBps(600), 485.0, fees));
+        assert!(!passes_intrinsic_diffusive_reachability_c1(ScaledBps(450), 300.0, fees));
+
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.realized_vol_5m = ScaledBps(2_200);
+        btc.bids[0] = BookLevel { price: PriceTicks(680_000), qty: LotQty(500) };
+        btc.asks[0] = BookLevel { price: PriceTicks(680_001), qty: LotQty(500) };
+        btc.factor_ofi = BoundedScore::new_clamped(0.72);
+        btc.factor_tfi = BoundedScore::new_clamped(0.65);
+        btc.factor_geom = BoundedScore::new_clamped(0.55);
+
+        let mut eth = SymbolLobSnapshot::new_empty();
+        eth.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth.realized_vol_5m = ScaledBps(1_800);
+        eth.bids[0] = BookLevel { price: PriceTicks(180_000), qty: LotQty(800) };
+        eth.asks[0] = BookLevel { price: PriceTicks(180_001), qty: LotQty(800) };
+        eth.factor_ofi = BoundedScore::new_clamped(0.68);
+        eth.factor_tfi = BoundedScore::new_clamped(0.02);
+        eth.factor_geom = BoundedScore::new_clamped(0.48);
+        assert!(matches!(
+            OrthogonalFactorState::evaluate_entry_signal_v554(
+                APPROVED_SPECS[1], &eth, &btc, ScaledBps(850), ScaledBps(220),
+                45, 75, 360.0, fees, 0.05, 1.0, 0.80, None, 1.0, 0.0, PHI,
+            ),
+            SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+        ));
+        eth.factor_tfi = BoundedScore::new_clamped(-0.04);
+        assert_eq!(
+            OrthogonalFactorState::evaluate_entry_signal_v554(
+                APPROVED_SPECS[1], &eth, &btc, ScaledBps(850), ScaledBps(220),
+                45, 75, 360.0, fees, 0.05, 1.0, 0.80, None, 1.0, 0.0, PHI,
+            ),
+            SignalVerdict::SpoofingVeto
+        );
+
+        // Continuous CorrectiveAbc synergy without |epps_corr| >= INV_PHI step + s_opp_ob_wall == 1.0 when ob_own == 0
+        let lift_low_corr =
+            compute_corrective_abc_tick_hurst_lift_c1(1.0, 0.72, 0.70, 0.10, 0.15, 0.10, 0.0);
+        assert!(lift_low_corr > 0.10);
+        let mut s_ob_opp = eth;
+        s_ob_opp.ob_bull_score = BoundedScore::ZERO;
+        s_ob_opp.ob_dist_bull_bps = ScaledBps(0);
+        s_ob_opp.ob_bear_score = BoundedScore::new_clamped(0.85);
+        s_ob_opp.ob_dist_bear_bps = ScaledBps(800);
+        assert!((compute_s_opp_ob_wall_c1(Side::Bid, &s_ob_opp, 0, 50, fees) - 1.0).abs() < 1e-12);
+
+        // Aged ImpulseWave3 C1 relief with own [OB+, OB-] support and min(ofi_al, tfi_al) >= INV_PHI_SQ
+        let mut s_w3 = eth;
+        s_w3.factor_ofi = BoundedScore::new_clamped(0.55);
+        s_w3.factor_tfi = BoundedScore::new_clamped(0.52);
+        s_w3.ob_bull_efficacy_pm = 720;
+        s_w3.ob_bear_efficacy_pm = 430;
+        s_w3.set_wave_observables(crate::wave_elliott::WaveObservables {
+            regime: crate::wave_elliott::WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: crate::wave_elliott::WaveObservables::encode_hurst(0.56),
+            macro_phase: BoundedScore::new_clamped(-0.65),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(-1_800),
+        });
+        assert!(!is_opposing_impulse_wave3_entry_hazard_v554(
+            Side::Bid, &s_w3, 0.30, 1.0, 500.0, 300.0, 1_800, 50, fees,
+        ));
     }
 }

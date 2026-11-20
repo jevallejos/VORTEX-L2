@@ -404,13 +404,40 @@ fn finalize_and_emit_live_close_core(
     tg_tx: &SyncSender<String>,
     vault_tx: &SyncSender<VaultIoCommand>,
     halt_locked: &mut bool,
-) {
+) -> Option<crate::execution_fsm::ClosedTradeSummary> {
     let spec = APPROVED_SPECS[s_idx];
     let sym_name = spec.symbol_id.name();
     let hold_s = (now_ns.0.saturating_sub(engines[s_idx].last_opened_ts.0)).max(0) / 1_000_000_000;
-    let Some(summary) = engines[s_idx].apply_verified_close_resolution(resolution, now_ns, ledger) else { return; };
-    let non_punitive_exit = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
     let close_snap = &cached_snaps[s_idx];
+    if !matches!(resolution.kind, crate::exit_quoter::ClosedTradeKind::ServerMarkPriceStopLoss) {
+        if let OrderLifecycleState::PositionOpenMakerExit { side, avg_price_ticks, .. } = engines[s_idx].state {
+            let en_px = if resolution.verified_entry_price.0 > 0 {
+                resolution.verified_entry_price
+            } else {
+                avg_price_ticks
+            };
+            let snap_ext = SlotExecutionEngine::compute_post_exit_extension_sbps(
+                side,
+                en_px,
+                resolution.verified_exit_price,
+                close_snap,
+            );
+            let gross_close_est = ((resolution.verified_exit_price.0 - en_px.0)
+                .saturating_mul(side.sign_i64())
+                .saturating_mul(1_000_000))
+                / en_px.0.max(1);
+            let mut max_mk = 0_i64;
+            for h in 0..4 {
+                if (markout_curve.resolved_mask & (1_u8 << h)) != 0 {
+                    max_mk = max_mk.max(markout_curve.samples_bps[h]);
+                }
+            }
+            let mk_ext = (max_mk - gross_close_est).max(0);
+            engines[s_idx].stage_post_exit_extension_sbps(snap_ext.max(mk_ext));
+        }
+    }
+    let summary = engines[s_idx].apply_verified_close_resolution(resolution, now_ns, ledger)?;
+    let non_punitive_exit = summary.is_maker_exit || summary.net_scaled_bps.raw() >= 100;
     let w_close = close_snap.wave_observables();
     let (ws_rtt_us, _) = crate::execution_fsm::read_live_ws_pulse();
     let signed_prop =
@@ -452,6 +479,7 @@ fn finalize_and_emit_live_close_core(
     let _ = tg_tx.try_send(format_telegram_close_message(
         spec, &summary, engines[s_idx].last_exit_sub_reason, ledger.closed_trades_count, ledger,
     ));
+    Some(summary)
 }
 
 pub fn finalize_and_emit_live_close_with_markout(
@@ -470,7 +498,7 @@ pub fn finalize_and_emit_live_close_with_markout(
     vault_tx: &SyncSender<VaultIoCommand>,
     halt_locked: &mut bool,
 ) {
-    finalize_and_emit_live_close_core(
+    let _ = finalize_and_emit_live_close_core(
         s_idx, resolution, now_ns, markout_curve, lvr_5s_scaled_bps, 1.0,
         cached_snaps, entry_forensics, engines, gov, ledger, arena, tg_tx, vault_tx, halt_locked,
     );
@@ -659,7 +687,13 @@ pub fn handle_gateway_event(
                 let prev_sl = engines[slot_idx].last_eff_sl_ticks;
                 if let Some((eff_s, eff_px, eff_q)) = promote_verified_fill_state(&mut engines[slot_idx], now_ns, Some(real_side), verified_avg, Some(real_lots)) {
                     let mid_t0 = mid_or_fallback(&cached_snaps[slot_idx], eff_px);
-                    rt.markout_rings[slot_idx].arm_fill_probe(eff_s, eff_px, mid_t0, now_ns);
+                    let vol_fill = if engines[slot_idx].open_vol_5m_bps.0 > 0 {
+                        engines[slot_idx].open_vol_5m_bps
+                    } else {
+                        cached_snaps[slot_idx].realized_vol_5m
+                    };
+                    let c_rt_mkr = ScaledBps(engines[slot_idx].active_maker_rt_fee_bps());
+                    rt.markout_rings[slot_idx].arm_fill_probe_with_vol(eff_s, eff_px, mid_t0, now_ns, vol_fill, c_rt_mkr);
                     apply_post_fill_sl_or_breach(slot_idx, eff_s, eff_px, sl_verified, prev_sl, &cached_snaps[slot_idx], &mut engines[slot_idx], rt);
                     record_and_notify_entry_fill(slot_idx, APPROVED_SPECS[slot_idx], engines, entry_forensics, arena, tg_tx, vault_tx, now_ns, eff_s, eff_px, eff_q, tag);
                 }
@@ -688,11 +722,19 @@ pub fn handle_gateway_event(
                         )
                         .is_ok()
                     {
-                        rt.markout_rings[slot_idx].arm_fill_probe(
+                        let vol_fill = if engines[slot_idx].open_vol_5m_bps.0 > 0 {
+                            engines[slot_idx].open_vol_5m_bps
+                        } else {
+                            cached_snaps[slot_idx].realized_vol_5m
+                        };
+                        let c_rt_mkr = ScaledBps(engines[slot_idx].active_maker_rt_fee_bps());
+                        rt.markout_rings[slot_idx].arm_fill_probe_with_vol(
                             real_side,
                             eff_px,
                             mid_or_fallback(&cached_snaps[slot_idx], eff_px),
                             now_ns,
+                            vol_fill,
+                            c_rt_mkr,
                         );
                         apply_post_fill_sl_or_breach(
                             slot_idx,
@@ -814,7 +856,11 @@ pub fn handle_gateway_event(
                 }
             }
             if partial_delta.0 > 0 && real_lots.0 > 0 {
+                let prev_hm = engines[slot_idx].house_money_runner_unlocked;
                 engines[slot_idx].record_live_partial_harvest_synced(partial_delta, ref_exit_px);
+                if !prev_hm && engines[slot_idx].house_money_runner_unlocked {
+                    rt.sl_needs_sync[slot_idx] = true;
+                }
             }
             if active_resting_tp.0 > 0 && active_resting_tp != prev_rest_tp {
                 engines[slot_idx].exit_peg_attempts = engines[slot_idx].exit_peg_attempts.saturating_add(1);
@@ -877,17 +923,28 @@ pub fn handle_gateway_event(
                     let prev_pnl_1e8 = ledger.cumulative_net_pnl_1e8;
                     let prev_phase = rt.daily_gov.phase;
                     let evt_dil = rt.spoof_clocks[slot_idx].event_clock_dilation();
-                    finalize_and_emit_live_close_core(
+                    let closed_sum_opt = finalize_and_emit_live_close_core(
                         slot_idx, res, now_ns, mk_curve, lvr_5s, evt_dil, cached_snaps, entry_forensics,
                         engines, gov, ledger, arena, tg_tx, vault_tx, &mut rt.halt_locked,
                     );
                     if ledger.closed_trades_count > prev_closed {
                         let delta_1e8 = ledger.cumulative_net_pnl_1e8.saturating_sub(prev_pnl_1e8);
                         if let Some((p_side, p_entry, p_lots, p_open_ts)) = pre_open {
-                            rt.emit_live_position_path_from_delta_v49(
-                                ledger.closed_trades_count, slot_idx, p_side, p_entry, p_lots,
-                                delta_1e8, p_open_ts, now_ns, &cached_snaps[slot_idx], vault_tx,
-                            );
+                            if let Some(ref closed_sum) = closed_sum_opt {
+                                rt.emit_live_position_path_from_summary(
+                                    ledger.closed_trades_count,
+                                    slot_idx,
+                                    closed_sum,
+                                    p_open_ts,
+                                    now_ns,
+                                    vault_tx,
+                                );
+                            } else {
+                                rt.emit_live_position_path_from_delta_v49(
+                                    ledger.closed_trades_count, slot_idx, p_side, p_entry, p_lots,
+                                    delta_1e8, p_open_ts, now_ns, &cached_snaps[slot_idx], vault_tx,
+                                );
+                            }
                         }
                         let live_eq = rt.wallet_1e8.max(ledger.current_equity_1e8());
                         let new_phase = rt.daily_gov.observe_realized_cashflow(
@@ -954,7 +1011,13 @@ pub fn handle_gateway_event(
                     let prev_sl = engines[slot_idx].last_eff_sl_ticks;
                     if let Some((eff_s, eff_px, eff_q)) = promote_verified_fill_state(&mut engines[slot_idx], now_ns, Some(real_side), verified_avg, Some(real_lots)) {
                         let mid_t0 = mid_or_fallback(&cached_snaps[slot_idx], eff_px);
-                        rt.markout_rings[slot_idx].arm_fill_probe(eff_s, eff_px, mid_t0, now_ns);
+                        let vol_fill = if engines[slot_idx].open_vol_5m_bps.0 > 0 {
+                            engines[slot_idx].open_vol_5m_bps
+                        } else {
+                            cached_snaps[slot_idx].realized_vol_5m
+                        };
+                        let c_rt_mkr = ScaledBps(engines[slot_idx].active_maker_rt_fee_bps());
+                        rt.markout_rings[slot_idx].arm_fill_probe_with_vol(eff_s, eff_px, mid_t0, now_ns, vol_fill, c_rt_mkr);
                         apply_post_fill_sl_or_breach(slot_idx, eff_s, eff_px, false, prev_sl, &cached_snaps[slot_idx], &mut engines[slot_idx], rt);
                         record_and_notify_entry_fill(slot_idx, APPROVED_SPECS[slot_idx], engines, entry_forensics, arena, tg_tx, vault_tx, now_ns, eff_s, eff_px, eff_q, "MAKER FILL WS");
                     }
@@ -985,11 +1048,19 @@ pub fn handle_gateway_event(
                             )
                             .is_ok()
                         {
-                            rt.markout_rings[slot_idx].arm_fill_probe(
+                            let vol_fill = if engines[slot_idx].open_vol_5m_bps.0 > 0 {
+                                engines[slot_idx].open_vol_5m_bps
+                            } else {
+                                cached_snaps[slot_idx].realized_vol_5m
+                            };
+                            let c_rt_mkr = ScaledBps(engines[slot_idx].active_maker_rt_fee_bps());
+                            rt.markout_rings[slot_idx].arm_fill_probe_with_vol(
                                 real_side,
                                 eff_px,
                                 mid_or_fallback(&cached_snaps[slot_idx], eff_px),
                                 now_ns,
+                                vol_fill,
+                                c_rt_mkr,
                             );
                             apply_post_fill_sl_or_breach(
                                 slot_idx,
@@ -1606,7 +1677,7 @@ impl ExecRuntimeState {
                 }
             }
             let z_tox = if let OrderLifecycleState::PositionOpenMakerExit {
-                side, avg_price_ticks, sl_trigger_price, opened_ts, ..
+                side, sl_trigger_price, opened_ts, ..
             } = engines[s_idx].state
             {
                 let eff_sl = if engines[s_idx].last_eff_sl_ticks.0 > 0 {
@@ -1622,12 +1693,15 @@ impl ExecRuntimeState {
                     now_ns,
                     &mut self.sl_adverse_breach_since_ns[s_idx],
                 );
-                let c_rt = APPROVED_SPECS[s_idx].expected_round_trip_cost_bps_dynamic(
-                    avg_price_ticks.max(PriceTicks(1)),
-                    engines[s_idx].learned_taker_prob_pm,
-                    engines[s_idx].active_fees,
-                );
-                self.markout_rings[s_idx].active_fill_toxicity_zeta(opened_ts, c_rt).max(self.last_zeta_tox[s_idx])
+                let c_rt_mkr = ScaledBps(engines[s_idx].active_maker_rt_fee_bps());
+                let vol_fill = if engines[s_idx].open_vol_5m_bps.0 > 0 {
+                    engines[s_idx].open_vol_5m_bps
+                } else {
+                    cached_snaps[s_idx].realized_vol_5m
+                };
+                self.markout_rings[s_idx]
+                    .active_fill_toxicity_zeta_with_vol(opened_ts, c_rt_mkr, vol_fill)
+                    .max(self.last_zeta_tox[s_idx])
             } else {
                 self.sl_adverse_breach_since_ns[s_idx] = 0;
                 self.last_zeta_tox[s_idx] = 0.0;
@@ -1682,6 +1756,29 @@ impl ExecRuntimeState {
         }
     }
 
+    pub fn emit_live_position_path_from_summary(
+        &mut self,
+        trade_id: u64,
+        slot_idx: usize,
+        summary: &crate::execution_fsm::ClosedTradeSummary,
+        opened_ts_ns: TimestampNs,
+        closed_ts_ns: TimestampNs,
+        vault_tx: &SyncSender<VaultIoCommand>,
+    ) {
+        let s_idx = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
+        let m5 = self.markout_rings[s_idx].last_fill_curve_5h();
+        let path_sum = self.intra_rings[s_idx].build_position_path_summary(
+            trade_id,
+            s_idx,
+            summary,
+            opened_ts_ns,
+            closed_ts_ns,
+            m5,
+        );
+        self.intra_rings[s_idx].reset_on_open(TimestampNs(0));
+        let _ = vault_tx.try_send(VaultIoCommand::RecordPositionPath(Box::new(path_sum)));
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     pub fn emit_live_position_path_from_delta_v49(
         &mut self,
@@ -1693,25 +1790,33 @@ impl ExecRuntimeState {
         delta_net_1e8: i64,
         opened_ts_ns: TimestampNs,
         closed_ts_ns: TimestampNs,
-        exit_snap: &SymbolLobSnapshot,
+        _exit_snap: &SymbolLobSnapshot,
         vault_tx: &SyncSender<VaultIoCommand>,
     ) {
         let s_idx = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
-        let notional = APPROVED_SPECS[s_idx].lot_notional_1e8(open_lots.max(LotQty(1)), entry_px.max(PriceTicks(1))).max(1);
+        let safe_entry = entry_px.max(PriceTicks(1));
+        let notional = APPROVED_SPECS[s_idx].lot_notional_1e8(open_lots.max(LotQty(1)), safe_entry).max(1);
         let net_sbps = ScaledBps((((i128::from(delta_net_1e8)) * 1_000_000) / (i128::from(notional))) as i64);
-        let exit_px = if exit_snap.last_trade_price.0 > 0 { exit_snap.last_trade_price } else { entry_px };
+        let fee_rt_sbps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw().saturating_mul(2);
+        let gross_sbps = net_sbps.raw().saturating_add(fee_rt_sbps);
+        let delta_ticks = (((i128::from(safe_entry.0)) * (i128::from(gross_sbps))) / 1_000_000) as i64;
+        let implied_exit = PriceTicks(
+            (safe_entry.0.saturating_add(side.sign_i64().saturating_mul(delta_ticks))).max(1),
+        );
         let synth = crate::execution_fsm::ClosedTradeSummary {
-            side, closed_lots: open_lots, entry_price: entry_px, exit_price: exit_px,
-            gross_scaled_bps: net_sbps, fee_scaled_bps: ScaledBps(0), net_scaled_bps: net_sbps,
+            side, closed_lots: open_lots, entry_price: safe_entry, exit_price: implied_exit,
+            gross_scaled_bps: ScaledBps(gross_sbps), fee_scaled_bps: ScaledBps(fee_rt_sbps), net_scaled_bps: net_sbps,
             net_pnl_1e8: delta_net_1e8, fee_1e8: 0, legs_consolidated: 1, is_maker_exit: true,
             kind: crate::execution_fsm::ClosedTradeKind::MakerPassiveUnwind,
         };
-        let m5 = self.markout_rings[s_idx].last_fill_curve_5h();
-        let path_sum = self.intra_rings[s_idx].build_position_path_summary(
-            trade_id, s_idx, &synth, opened_ts_ns, closed_ts_ns, m5,
+        self.emit_live_position_path_from_summary(
+            trade_id,
+            s_idx,
+            &synth,
+            opened_ts_ns,
+            closed_ts_ns,
+            vault_tx,
         );
-        self.intra_rings[s_idx].reset_on_open(TimestampNs(0));
-        let _ = vault_tx.try_send(VaultIoCommand::RecordPositionPath(Box::new(path_sum)));
     }
 }
 

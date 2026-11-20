@@ -411,6 +411,104 @@ pub fn compute_tranche1_split_lots_core(slot_idx: usize, open_lots: LotQty, exit
     }
 }
 
+#[inline]
+#[must_use]
+pub fn can_split_runner_legs(
+    slot_idx: usize,
+    open_lots: LotQty,
+    exit_price: PriceTicks,
+    t1_permille: i64,
+) -> bool {
+    if open_lots.0 < 2 || exit_price.0 <= 0 {
+        return false;
+    }
+    let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let one_lot_1e8 = spec.lot_notional_1e8(LotQty(1), exit_price);
+    if one_lot_1e8 <= 0 {
+        return false;
+    }
+    let full_leg_lots = ((SPLIT_LEG_MIN_NOTIONAL_1E8 + one_lot_1e8 - 1) / one_lot_1e8).max(1);
+    open_lots.0 >= full_leg_lots.saturating_mul(3)
+        && compute_tranche1_split_lots_core(slot_idx, open_lots, exit_price, t1_permille).is_some()
+}
+
+/// Exact consolidated House-Money Stop-Loss floor `PriceTicks` where residual net risk across
+/// remaining `T2 + T3` (`rem_lots`) against realized `T1` net profit (`realized_partial_net_1e8`) is `<= 0`.
+#[inline]
+#[must_use]
+pub fn compute_house_money_sl_floor_ticks(
+    slot_idx: usize,
+    side: Side,
+    avg_price_ticks: PriceTicks,
+    rem_lots: LotQty,
+    realized_partial_net_1e8: i64,
+    fees: FeeSchedule,
+) -> PriceTicks {
+    let avg = avg_price_ticks.0.max(1);
+    let rem_q = LotQty(rem_lots.0.max(1));
+    let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let realized_gain = realized_partial_net_1e8.max(0);
+    let target_rem_pnl = -realized_gain;
+    let one_tick_1e8 = spec.lot_notional_1e8(rem_q, PriceTicks(1)).max(1) as i128;
+    let (pnl_at_avg, _, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+        side,
+        rem_q,
+        PriceTicks(avg),
+        PriceTicks(avg),
+        false,
+        fees,
+    );
+    let needed_1e8 = (target_rem_pnl as i128) - (pnl_at_avg as i128);
+    let approx_ticks = (needed_1e8 / one_tick_1e8) as i64;
+    let mut cand = match side {
+        Side::Bid => avg.saturating_add(approx_ticks).max(1),
+        Side::Ask => (avg - approx_ticks).max(1),
+    };
+    for _ in 0..32 {
+        let (pnl_c, _, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+            side,
+            rem_q,
+            PriceTicks(avg),
+            PriceTicks(cand),
+            false,
+            fees,
+        );
+        if pnl_c >= target_rem_pnl {
+            let looser = match side {
+                Side::Bid => (cand - 1).max(1),
+                Side::Ask => cand.saturating_add(1),
+            };
+            if looser == cand {
+                break;
+            }
+            let (pnl_l, _, _, _) = spec.compute_leg_pnl_and_fee_1e8_with_schedule(
+                side,
+                rem_q,
+                PriceTicks(avg),
+                PriceTicks(looser),
+                false,
+                fees,
+            );
+            if pnl_l >= target_rem_pnl {
+                cand = looser;
+            } else {
+                break;
+            }
+        } else {
+            match side {
+                Side::Bid => cand = cand.saturating_add(1),
+                Side::Ask => {
+                    if cand <= 1 {
+                        break;
+                    }
+                    cand -= 1;
+                }
+            }
+        }
+    }
+    PriceTicks(cand.max(1))
+}
+
 /// Validates `SPLIT_LEG_MIN_NOTIONAL_1E8` on `T2` and `T3 = open_lots - t2_lots` without creating `1-lot` sub-notional dust orphans (`[F-10]`).
 #[inline]
 #[must_use]
@@ -891,6 +989,8 @@ pub struct CascadeAndAgingContextV55 {
     pub psi_health: f64,
     pub cont_ratio_x1000: i64,
     pub last_peak_favorable_ts_ns: i64,
+    pub zeta_tox: f64,
+    pub house_money_runner_unlocked: bool,
 }
 
 impl CascadeAndAgingContextV55 {
@@ -904,8 +1004,29 @@ impl CascadeAndAgingContextV55 {
             psi_health: 1.0,
             cont_ratio_x1000: 1_000,
             last_peak_favorable_ts_ns: ctx.opened_ts.0,
+            zeta_tox: 0.0,
+            house_money_runner_unlocked: false,
         }
     }
+}
+
+/// Rebound continuation probability `pi_reb` under golden `C1` Hermite modulation (V5.5.4):
+/// `S_3(INV_PHI*ofi_al + INV_PHI_SQ*tfi_al + INV_PHI_CUBE*geom_al; INV_PHI_CUBE, INV_PHI) * (1 - S_3(zeta_tox; INV_PHI, PHI))`.
+#[inline]
+#[must_use]
+pub fn compute_rebound_probability_pi_c1(
+    side: Side,
+    snap: &SymbolLobSnapshot,
+    zeta_tox: f64,
+) -> f64 {
+    let dir_s = side.sign_f64();
+    let ofi_al = snap.factor_ofi.get() * dir_s;
+    let tfi_al = snap.factor_tfi.get() * dir_s;
+    let geom_al = snap.factor_geom.get() * dir_s;
+    let composite_al = INV_PHI * ofi_al + INV_PHI_SQ * tfi_al + INV_PHI_CUBE * geom_al;
+    let z_clean = if zeta_tox.is_finite() { zeta_tox.max(0.0) } else { 0.0 };
+    crate::wave_elliott::hermite_smoothstep_c1(composite_al, INV_PHI_CUBE, INV_PHI)
+        * (1.0 - crate::wave_elliott::hermite_smoothstep_c1(z_clean, INV_PHI, PHI))
 }
 
 /// Intrinsic diffusive signal lifetime `\tau_{horizon} = \varphi^3 \cdot \tau_{mkt,i} \cdot (1 + \varphi^{-1} S_3(harvested\_legs; 0, 1))` (`~6.5..20 min`, V5.5 O7).
@@ -1052,15 +1173,35 @@ pub fn compute_canonical_exit_quote_omega_v55(
     let ir_norm = (ctx.learned_ir_x100.clamp(0, 100) as f64) * 1e-2;
     let stag_flow_ceil = INV_PHI_CUBE * (1.0 - INV_PHI_SQ * ir_norm);
     let live_deep_underwater = cur_gross_bps <= mae_trig_bps && eff_flow_slow < 0.0;
-    let time_stagnation = hold_s_f >= def_horizon_s && cur_gross_bps < win_floor_bps && eff_flow_slow < stag_flow_ceil;
-    let defensive_lock_active = still_locked || opposing_wave3_escape || live_deep_underwater || time_stagnation || climax_harvest;
+    let time_stagnation = !v55.house_money_runner_unlocked
+        && hold_s_f >= def_horizon_s
+        && cur_gross_bps < win_floor_bps
+        && eff_flow_slow < stag_flow_ceil;
+    let mut defensive_lock_active = still_locked || opposing_wave3_escape || live_deep_underwater || time_stagnation || climax_harvest;
     let eff_ratchet_bps = if best_mfe_bps >= (fee_rt * 139) / 100 {
         ctx.ratchet_locked_gross_bps.max(fee_rt + ((best_mfe_bps - fee_rt) * 72) / 100).max(win_floor_bps)
     } else { ctx.ratchet_locked_gross_bps };
     let ratchet_pullback = eff_ratchet_bps >= win_floor_bps
         && ((own_flow <= -0.5 * INV_PHI_CUBE) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < INV_PHI_CUBE));
     let shadow_crest_snap = best_mfe_bps >= fee_rt * 2 && cur_gross_bps >= zero_loss_bps && s_prop < 0.18 && flow_accel < -0.005;
-    if !ctx.tranche1_harvested && !ratchet_pullback && !shadow_crest_snap && !opposing_wave3_escape && !climax_harvest
+    let q_floor_px = enforce_maker_bbo_bound(ctx.side, zero_loss_px, snap);
+    let eff_t1_pm_def = compute_wave_dynamic_t1_permille(ctx.learned_t1_permille, ctx.side, snap, kin.in_scar_debt);
+    let def_runner_split_t1 = if !ctx.tranche1_harvested
+        && ctx.defensive_floor_locked
+        && eff_flow_slow >= 0.0
+        && can_split_runner_legs(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def)
+    {
+        defensive_lock_active = true;
+        compute_tranche1_split_lots_core(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def)
+    } else {
+        None
+    };
+    if def_runner_split_t1.is_none()
+        && !ctx.tranche1_harvested
+        && !ratchet_pullback
+        && !shadow_crest_snap
+        && !opposing_wave3_escape
+        && !climax_harvest
         && (!defensive_lock_active || (!still_locked && signed_flow_slow.get() >= INV_PHI_FIFTH))
     {
         let sigma_1m_cur = (snap.realized_vol_5m.raw().max(0) as f64) / SQRT_5;
@@ -1232,6 +1373,23 @@ pub fn compute_canonical_exit_quote_omega_v55(
             enforce_maker_bbo_bound(ctx.side, aging_px, snap)
         } else if maker_bailout_active {
             enforce_maker_bbo_bound(ctx.side, ref_px, snap)
+        } else if let Some(t1_lots) = def_runner_split_t1 {
+            let opp_w3 = opposing_wave3_escape || opp_w3_confirmed;
+            let pi_reb = compute_rebound_probability_pi_c1(ctx.side, snap, v55.zeta_tox);
+            if pi_reb >= INV_PHI_SQ && !opp_w3 && !climax_harvest {
+                return Some(CanonicalExitQuote {
+                    role: ExitOrderRole::Tranche1Harvest50,
+                    target_price: q_floor_px,
+                    order_lots: t1_lots,
+                    sub_reason: ExitSubReason::Tranche1Harvest50,
+                    vac_level: 1,
+                    defensive_lock_active: true,
+                    urgent_close_repeg: true,
+                    cur_gross_bps,
+                    wald_pct,
+                });
+            }
+            q_floor_px
         } else {
             let floor_bps = if climax_harvest || shadow_crest_snap || opposing_wave3_escape {
                 cur_gross_bps.max(eff_ratchet_bps).max(zero_loss_bps)
@@ -1365,6 +1523,7 @@ pub fn compute_canonical_exit_quote_omega_v55(
             win_floor_bps
         };
         let t1_was_offensive = ctx.tranche1_exit_price.0 <= 0
+            || v55.house_money_runner_unlocked
             || raw_t1_gross.saturating_add(25) >= win_floor_bps;
         let t1_gross_sbps = raw_t1_gross.max(win_floor_bps);
         let base_phi_t2_sbps = ((PHI * (t1_gross_sbps as f64)).round() as i64)

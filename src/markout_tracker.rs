@@ -28,6 +28,14 @@ const PROBE_RING_CAP: usize = 12;
 const DRAIN_ABORT_CAP: usize = 8;
 const LVR_EWMA_ETA_PM: i64 = 125;
 
+const PHI_MK: f64 = 1.618_033_988_749_895;
+const INV_PHI_MK: f64 = 0.618_033_988_749_895;
+const INV_PHI_SQ_MK: f64 = 0.381_966_011_250_105;
+const INV_PHI_CUBE_MK: f64 = 0.236_067_977_499_79;
+const DIFFUSIVE_REF_WINDOW_SEC: f64 = 300.0;
+const MARKOUT_HORIZONS_SEC: [f64; MARKOUT_HORIZONS_V49] = [0.25, 1.0, 5.0, 15.0, 60.0];
+const HORIZON_WEIGHTS_4H: [f64; 4] = [INV_PHI_CUBE_MK, INV_PHI_SQ_MK, INV_PHI_MK, 1.0];
+
 /// Legacy 4-horizon markout curve preserved 1:1 for backwards compatibility (`+250ms..+15s`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarkoutCurveBps {
@@ -77,35 +85,120 @@ pub struct ResolvedAbortSample {
     pub is_true_positive: bool,
 }
 
-/// Glosten-Milgrom multi-horizon post-fill adverse selection functional `zeta_tox >= 0.0` (4-horizon).
+/// Brownian diffusive Z-score Glosten-Milgrom toxicity functional (`+250ms..+15s`, V5.5.4)
+/// with `sigma_h = max(INV_PHI * c_rt_mkr, vol5m_at_fill * sqrt(dt_h / 300.0))` and `C1` `+15s` equilibrium-reversion attenuation.
 #[inline]
 #[must_use]
-pub fn glosten_milgrom_toxicity_zeta(curve: MarkoutCurveBps, expected_rt_cost: ScaledBps) -> f64 {
-    const WEIGHTS: [f64; 4] = [0.10, 0.20, 0.35, 0.35];
+pub fn glosten_milgrom_toxicity_zeta_diffusive(
+    curve: MarkoutCurveBps,
+    c_rt_mkr: ScaledBps,
+    vol5m_at_fill: ScaledBps,
+) -> f64 {
     let mask = curve.resolved_mask & MARKOUT_MASK_15S;
     if mask == 0 {
         return 0.0;
     }
-    let cost_denom = (expected_rt_cost.raw().max(100)) as f64;
-    let mut weighted_adv = 0.0_f64;
+    let c_rt_f = (c_rt_mkr.raw().max(100)) as f64;
+    if vol5m_at_fill.raw() <= 0 {
+        let mut weighted_adv = 0.0_f64;
+        let mut weight_sum = 0.0_f64;
+        let mut worst_adv = 0.0_f64;
+        for h_idx in 0..4 {
+            if (mask & (1_u8 << h_idx)) != 0 {
+                let adv = (-curve.samples_bps[h_idx]).max(0) as f64;
+                weighted_adv += HORIZON_WEIGHTS_4H[h_idx] * adv;
+                weight_sum += HORIZON_WEIGHTS_4H[h_idx];
+                if h_idx >= 1 && adv > worst_adv {
+                    worst_adv = adv;
+                }
+            }
+        }
+        if weight_sum <= 1e-9 {
+            return 0.0;
+        }
+        let mean_adv = weighted_adv / weight_sum;
+        let eff_worst = if (mask & 0x0E) != 0 { worst_adv } else { mean_adv };
+        let eff_adv = INV_PHI_MK * mean_adv + INV_PHI_SQ_MK * eff_worst;
+        return (eff_adv / c_rt_f).clamp(0.0, 6.0);
+    }
+    let vol_f = vol5m_at_fill.raw() as f64;
+    let fee_floor_sigma = INV_PHI_MK * c_rt_f;
+    let mut weighted_z = 0.0_f64;
     let mut weight_sum = 0.0_f64;
-    let mut worst_adv = 0.0_f64;
+    let mut worst_z = 0.0_f64;
+    let mut peak_early_adv = 0.0_f64;
+    let mut adv_15s = 0.0_f64;
+    let mut z_15s = 0.0_f64;
     for h_idx in 0..4 {
         if (mask & (1_u8 << h_idx)) != 0 {
+            let sigma_h = fee_floor_sigma
+                .max(vol_f * (MARKOUT_HORIZONS_SEC[h_idx] / DIFFUSIVE_REF_WINDOW_SEC).sqrt())
+                .max(1.0);
             let adv = (-curve.samples_bps[h_idx]).max(0) as f64;
-            weighted_adv += WEIGHTS[h_idx] * adv;
-            weight_sum += WEIGHTS[h_idx];
-            if h_idx >= 1 && adv > worst_adv {
-                worst_adv = adv;
+            let z_h = adv / sigma_h;
+            weighted_z += HORIZON_WEIGHTS_4H[h_idx] * z_h;
+            weight_sum += HORIZON_WEIGHTS_4H[h_idx];
+            if h_idx >= 1 && z_h > worst_z {
+                worst_z = z_h;
+            }
+            if h_idx < 3 {
+                if adv > peak_early_adv {
+                    peak_early_adv = adv;
+                }
+            } else {
+                adv_15s = adv;
+                z_15s = z_h;
             }
         }
     }
     if weight_sum <= 1e-9 {
         return 0.0;
     }
-    let mean_adv = weighted_adv / weight_sum;
-    let eff_adv = 0.65 * mean_adv + 0.35 * worst_adv;
-    (eff_adv / cost_denom).clamp(0.0, 6.0)
+    let mean_z = weighted_z / weight_sum;
+    let eff_worst_z = if (mask & 0x0E) != 0 { worst_z } else { mean_z };
+    let raw_zeta = PHI_MK * (INV_PHI_MK * mean_z + INV_PHI_SQ_MK * eff_worst_z);
+    let zeta = if (mask & (1_u8 << 3)) != 0 && peak_early_adv > 0.0 {
+        let rev_frac = (1.0 - adv_15s / peak_early_adv).clamp(0.0, 1.0);
+        let s_rev = crate::wave_elliott::hermite_smoothstep_c1(rev_frac, INV_PHI_CUBE_MK, INV_PHI_MK);
+        let s_eq15 = 1.0 - crate::wave_elliott::hermite_smoothstep_c1(z_15s, INV_PHI_CUBE_MK, INV_PHI_MK);
+        let psi_rev = (s_rev * s_eq15).clamp(0.0, 1.0);
+        (1.0 - psi_rev) * raw_zeta + psi_rev * (PHI_MK * z_15s)
+    } else {
+        raw_zeta
+    };
+    zeta.clamp(0.0, 6.0)
+}
+
+/// Extended 5-horizon diffusive Glosten-Milgrom post-fill toxicity functional (`+250ms..+60s`, V5.5.4).
+#[inline]
+#[must_use]
+pub fn glosten_milgrom_toxicity_zeta_5h_diffusive(
+    curve: MarkoutCurve5hBps,
+    c_rt_mkr: ScaledBps,
+    vol5m_at_fill: ScaledBps,
+) -> f64 {
+    let base_zeta = glosten_milgrom_toxicity_zeta_diffusive(curve.to_legacy_4h(), c_rt_mkr, vol5m_at_fill);
+    if (curve.resolved_mask & 0x10) == 0 {
+        return base_zeta;
+    }
+    let c_rt_f = (c_rt_mkr.raw().max(100)) as f64;
+    if vol5m_at_fill.raw() <= 0 {
+        let adv_60s = ((-curve.samples_bps[4]).max(0) as f64) / c_rt_f;
+        return (INV_PHI_MK * base_zeta + INV_PHI_SQ_MK * adv_60s).clamp(0.0, 6.0);
+    }
+    let vol_f = vol5m_at_fill.raw() as f64;
+    let sigma_60s = (INV_PHI_MK * c_rt_f)
+        .max(vol_f * (MARKOUT_HORIZONS_SEC[4] / DIFFUSIVE_REF_WINDOW_SEC).sqrt())
+        .max(1.0);
+    let z_60s = ((-curve.samples_bps[4]).max(0) as f64) / sigma_60s;
+    (INV_PHI_MK * base_zeta + INV_PHI_SQ_MK * (PHI_MK * z_60s)).clamp(0.0, 6.0)
+}
+
+/// Glosten-Milgrom multi-horizon post-fill adverse selection functional `zeta_tox >= 0.0` (4-horizon).
+#[inline]
+#[must_use]
+pub fn glosten_milgrom_toxicity_zeta(curve: MarkoutCurveBps, expected_rt_cost: ScaledBps) -> f64 {
+    glosten_milgrom_toxicity_zeta_diffusive(curve, expected_rt_cost, ScaledBps(0))
 }
 
 /// Extended 5-horizon Glosten-Milgrom post-fill toxicity functional (`+250ms..+60s`).
@@ -115,13 +208,7 @@ pub fn glosten_milgrom_toxicity_zeta_5h(
     curve: MarkoutCurve5hBps,
     expected_rt_cost: ScaledBps,
 ) -> f64 {
-    let base_zeta = glosten_milgrom_toxicity_zeta(curve.to_legacy_4h(), expected_rt_cost);
-    if (curve.resolved_mask & 0x10) == 0 {
-        return base_zeta;
-    }
-    let cost_denom = (expected_rt_cost.raw().max(100)) as f64;
-    let adv_60s = ((-curve.samples_bps[4]).max(0) as f64) / cost_denom;
-    (0.80 * base_zeta + 0.20 * adv_60s).clamp(0.0, 6.0)
+    glosten_milgrom_toxicity_zeta_5h_diffusive(curve, expected_rt_cost, ScaledBps(0))
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -137,6 +224,8 @@ struct PendingMarkoutProbe {
     t0_ns: i64,
     init_q_lots: LotQty,
     rem_q_lots: LotQty,
+    vol5m_at_fill: ScaledBps,
+    c_rt_mkr: ScaledBps,
     curve: MarkoutCurve5hBps,
 }
 
@@ -155,6 +244,8 @@ impl PendingMarkoutProbe {
             t0_ns: 0,
             init_q_lots: LotQty(0),
             rem_q_lots: LotQty(0),
+            vol5m_at_fill: ScaledBps(0),
+            c_rt_mkr: ScaledBps(400),
             curve: MarkoutCurve5hBps {
                 samples_bps: [0; MARKOUT_HORIZONS_V49],
                 resolved_mask: 0,
@@ -171,6 +262,8 @@ pub struct SlotMarkoutRing {
     write_idx: usize,
     last_fill_curve: MarkoutCurve5hBps,
     last_fill_t0_ns: i64,
+    last_fill_vol5m: ScaledBps,
+    last_c_rt_mkr: ScaledBps,
     last_maker_fee_bps: i64,
     ewma_lvr_5s_bps: i64,
     ewma_markout_15s_bps: i64,
@@ -207,6 +300,8 @@ impl SlotMarkoutRing {
                 peak_zeta_tox_pm: 0,
             },
             last_fill_t0_ns: 0,
+            last_fill_vol5m: ScaledBps(0),
+            last_c_rt_mkr: ScaledBps(400),
             last_maker_fee_bps: 200,
             ewma_lvr_5s_bps: 0,
             ewma_markout_15s_bps: 0,
@@ -265,11 +360,26 @@ impl SlotMarkoutRing {
 
     #[inline]
     pub fn arm_fill_probe(&mut self, side: Side, fill_px: PriceTicks, mid_t0: PriceTicks, ts_ns: TimestampNs) {
+        let c_rt = ScaledBps((self.last_maker_fee_bps.max(0).saturating_mul(2)).max(100));
+        self.arm_fill_probe_with_vol(side, fill_px, mid_t0, ts_ns, self.last_fill_vol5m, c_rt);
+    }
+
+    #[inline]
+    pub fn arm_fill_probe_with_vol(
+        &mut self,
+        side: Side,
+        fill_px: PriceTicks,
+        mid_t0: PriceTicks,
+        ts_ns: TimestampNs,
+        vol5m_at_fill: ScaledBps,
+        c_rt_mkr: ScaledBps,
+    ) {
         if fill_px.0 <= 0 {
             return;
         }
         let eff_mid = if mid_t0.0 > 0 { mid_t0 } else { fill_px };
         let init_edge = ((eff_mid.0 - fill_px.0) * side.sign_i64()).saturating_mul(1_000_000) / fill_px.0.max(1);
+        let eff_c_rt = ScaledBps(c_rt_mkr.raw().max(100));
         let idx = self.write_idx % PROBE_RING_CAP;
         self.write_idx = self.write_idx.wrapping_add(1);
         let curve = MarkoutCurve5hBps {
@@ -280,6 +390,10 @@ impl SlotMarkoutRing {
         };
         self.last_fill_curve = curve;
         self.last_fill_t0_ns = ts_ns.0;
+        if vol5m_at_fill.raw() > 0 {
+            self.last_fill_vol5m = vol5m_at_fill;
+        }
+        self.last_c_rt_mkr = eff_c_rt;
         self.probes[idx] = PendingMarkoutProbe {
             active: true,
             is_abort_probe: false,
@@ -292,8 +406,20 @@ impl SlotMarkoutRing {
             t0_ns: ts_ns.0,
             init_q_lots: LotQty(0),
             rem_q_lots: LotQty(0),
+            vol5m_at_fill,
+            c_rt_mkr: eff_c_rt,
             curve,
         };
+    }
+
+    #[inline]
+    pub fn set_vol5m_at_fill(&mut self, vol5m_at_fill: ScaledBps) {
+        self.last_fill_vol5m = vol5m_at_fill;
+        for slot in &mut self.probes {
+            if slot.active && !slot.is_abort_probe && slot.vol5m_at_fill.raw() <= 0 {
+                slot.vol5m_at_fill = vol5m_at_fill;
+            }
+        }
     }
 
     #[inline]
@@ -332,6 +458,8 @@ impl SlotMarkoutRing {
             t0_ns: aborted_ts_ns.0,
             init_q_lots,
             rem_q_lots,
+            vol5m_at_fill: ScaledBps(0),
+            c_rt_mkr: ScaledBps((self.last_maker_fee_bps.max(0).saturating_mul(2)).max(100)),
             curve: MarkoutCurve5hBps::default(),
         };
     }
@@ -343,12 +471,21 @@ impl SlotMarkoutRing {
         let fee_bar = maker_fee_bps.max(0);
         self.last_maker_fee_bps = fee_bar;
         let rt_cost_est = ScaledBps((fee_bar.saturating_mul(2)).max(100));
+        self.last_c_rt_mkr = rt_cost_est;
         for slot in &mut self.probes {
             if !slot.active {
                 continue;
             }
             let dt = now_ns.0.saturating_sub(slot.t0_ns);
             let denom = slot.ref_price.0.max(1);
+            if !slot.is_abort_probe && dt >= 0 && dt <= MARKOUT_HORIZONS_V49_NS[MARKOUT_HORIZONS_V49 - 1] {
+                let live_fav = ((mid_now.0 - slot.ref_price.0) * slot.side.sign_i64())
+                    .saturating_mul(1_000_000)
+                    / denom;
+                if live_fav > self.pending_uncensored_peak_sbps {
+                    self.pending_uncensored_peak_sbps = live_fav;
+                }
+            }
             for h_idx in 0..MARKOUT_HORIZONS_V49 {
                 let bit = 1_u8 << h_idx;
                 if (slot.curve.resolved_mask & bit) == 0 && dt >= MARKOUT_HORIZONS_V49_NS[h_idx] {
@@ -360,7 +497,18 @@ impl SlotMarkoutRing {
                     slot.curve.samples_bps[h_idx] = signed_diff.saturating_mul(1_000_000) / denom;
                     slot.curve.resolved_mask |= bit;
                     if !slot.is_abort_probe {
-                        let z_pm = (glosten_milgrom_toxicity_zeta_5h(slot.curve, rt_cost_est) * 1_000.0).round() as u16;
+                        slot.c_rt_mkr = rt_cost_est;
+                        let eff_vol = if slot.vol5m_at_fill.raw() > 0 {
+                            slot.vol5m_at_fill
+                        } else {
+                            self.last_fill_vol5m
+                        };
+                        let z_pm = (glosten_milgrom_toxicity_zeta_5h_diffusive(
+                            slot.curve,
+                            rt_cost_est,
+                            eff_vol,
+                        ) * 1_000.0)
+                            .round() as u16;
                         slot.curve.peak_zeta_tox_pm = slot.curve.peak_zeta_tox_pm.max(z_pm);
                         if h_idx == 2 {
                             let lvr_5s = ((slot.mid_t0.0 - mid_now.0) * slot.side.sign_i64()).saturating_mul(1_000_000) / denom;
@@ -374,6 +522,9 @@ impl SlotMarkoutRing {
                         if slot.t0_ns >= self.last_fill_t0_ns {
                             self.last_fill_curve = slot.curve;
                             self.last_fill_t0_ns = slot.t0_ns;
+                            if slot.vol5m_at_fill.raw() > 0 {
+                                self.last_fill_vol5m = slot.vol5m_at_fill;
+                            }
                         }
                         if slot.curve.samples_bps[h_idx] > self.pending_uncensored_peak_sbps {
                             self.pending_uncensored_peak_sbps = slot.curve.samples_bps[h_idx];
@@ -402,31 +553,89 @@ impl SlotMarkoutRing {
     }
 
     #[inline]
+    pub fn step_clock_with_vol(
+        &mut self,
+        mid_now: PriceTicks,
+        now_ns: TimestampNs,
+        maker_fee_bps: i64,
+        vol5m_now: ScaledBps,
+    ) {
+        if vol5m_now.raw() > 0 && self.last_fill_vol5m.raw() <= 0 {
+            self.set_vol5m_at_fill(vol5m_now);
+        }
+        self.step_clock(mid_now, now_ns, maker_fee_bps);
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn has_armed_vol5m(&self, opened_ts: TimestampNs) -> bool {
+        for slot in &self.probes {
+            if slot.active && !slot.is_abort_probe && slot.ref_price.0 > 0 {
+                let diff = slot.t0_ns.saturating_sub(opened_ts.0).saturating_abs();
+                if diff <= 2_000_000_000 && slot.vol5m_at_fill.raw() > 0 {
+                    return true;
+                }
+            }
+        }
+        self.last_fill_vol5m.raw() > 0
+            && self.last_fill_t0_ns > 0
+            && self.last_fill_t0_ns.saturating_sub(opened_ts.0).saturating_abs() <= 2_000_000_000
+    }
+
+    #[inline]
     #[must_use]
     pub fn active_fill_toxicity_zeta(&self, opened_ts: TimestampNs, expected_rt_cost: ScaledBps) -> f64 {
-        let mut best_curve: Option<MarkoutCurve5hBps> = None;
+        self.active_fill_toxicity_zeta_with_vol(opened_ts, expected_rt_cost, ScaledBps(0))
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn active_fill_toxicity_zeta_with_vol(
+        &self,
+        opened_ts: TimestampNs,
+        c_rt_mkr: ScaledBps,
+        vol5m_at_fill: ScaledBps,
+    ) -> f64 {
+        let mut best_probe: Option<(MarkoutCurve5hBps, ScaledBps, ScaledBps)> = None;
         let mut best_diff = i64::MAX;
         for slot in &self.probes {
             if slot.active && !slot.is_abort_probe && slot.ref_price.0 > 0 {
                 let diff = slot.t0_ns.saturating_sub(opened_ts.0).saturating_abs();
                 if diff <= 2_000_000_000 && diff < best_diff {
                     best_diff = diff;
-                    best_curve = Some(slot.curve);
+                    best_probe = Some((slot.curve, slot.vol5m_at_fill, slot.c_rt_mkr));
                 }
             }
         }
-        if let Some(c5) = best_curve {
-            return if (c5.resolved_mask & (1_u8 << 4)) != 0 {
-                glosten_milgrom_toxicity_zeta_5h(c5, expected_rt_cost)
+        let eff_c_rt = ScaledBps(c_rt_mkr.raw().max(100));
+        if let Some((c5, slot_vol, _slot_crt)) = best_probe {
+            let eff_vol = if slot_vol.raw() > 0 {
+                slot_vol
+            } else if vol5m_at_fill.raw() > 0 {
+                vol5m_at_fill
             } else {
-                glosten_milgrom_toxicity_zeta(c5.to_legacy_4h(), expected_rt_cost)
+                self.last_fill_vol5m
+            };
+            return if (c5.resolved_mask & (1_u8 << 4)) != 0 {
+                glosten_milgrom_toxicity_zeta_5h_diffusive(c5, eff_c_rt, eff_vol)
+            } else {
+                glosten_milgrom_toxicity_zeta_diffusive(c5.to_legacy_4h(), eff_c_rt, eff_vol)
             };
         }
         if self.last_fill_t0_ns > 0 && self.last_fill_t0_ns.saturating_sub(opened_ts.0).saturating_abs() <= 2_000_000_000 {
-            return if (self.last_fill_curve.resolved_mask & (1_u8 << 4)) != 0 {
-                glosten_milgrom_toxicity_zeta_5h(self.last_fill_curve, expected_rt_cost)
+            let eff_vol = if self.last_fill_vol5m.raw() > 0 {
+                self.last_fill_vol5m
             } else {
-                glosten_milgrom_toxicity_zeta(self.last_fill_curve.to_legacy_4h(), expected_rt_cost)
+                vol5m_at_fill
+            };
+            return if (self.last_fill_curve.resolved_mask & (1_u8 << 4)) != 0 {
+                glosten_milgrom_toxicity_zeta_5h_diffusive(self.last_fill_curve, eff_c_rt, eff_vol)
+            } else {
+                glosten_milgrom_toxicity_zeta_diffusive(
+                    self.last_fill_curve.to_legacy_4h(),
+                    eff_c_rt,
+                    eff_vol,
+                )
             };
         }
         0.0
@@ -576,5 +785,24 @@ mod tests {
         assert!(drained.is_true_positive && drained.resolved_mask == MARKOUT_MASK_60S);
         assert_eq!(drained.veto_code, LastVetoCode::HawkesStoikovQueueAbort);
         assert!(ring.pop_resolved_abort().is_none());
+    }
+
+    #[test]
+    fn test_v554_diffusive_brownian_zeta_tao4_reversion_vs_avax1_toxic_sweep() {
+        let tao4 = MarkoutCurveBps {
+            samples_bps: [-113, -339, -396, -56],
+            resolved_mask: MARKOUT_MASK_15S,
+            initial_edge_bps: 0,
+        };
+        let z_tao4 = glosten_milgrom_toxicity_zeta_diffusive(tao4, ScaledBps(400), ScaledBps(4_539));
+        assert!(z_tao4 < INV_PHI_MK);
+
+        let avax1 = MarkoutCurveBps {
+            samples_bps: [-153, -153, -306, -1_226],
+            resolved_mask: MARKOUT_MASK_15S,
+            initial_edge_bps: 0,
+        };
+        let z_avax1 = glosten_milgrom_toxicity_zeta_diffusive(avax1, ScaledBps(400), ScaledBps(3_490));
+        assert!(z_avax1 > 1.2);
     }
 }

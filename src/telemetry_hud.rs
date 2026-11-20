@@ -357,6 +357,36 @@ pub fn format_telegram_close_message(
     )
 }
 
+#[inline]
+fn extract_maker_post_exit_ext_bps(v: &serde_json::Value, gross_bps: f64) -> f64 {
+    let mut ext_bps = v
+        .get("post_exit_ext_bps")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|x| x.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0);
+    if v.get("armed_ts_ns").is_none() {
+        if let Some(raw_ext) = v.get("ext_bps").and_then(serde_json::Value::as_f64) {
+            if raw_ext.is_finite() && raw_ext > ext_bps {
+                ext_bps = raw_ext;
+            }
+        }
+    }
+    if let Some(mk_arr) = v.get("markout_fill_bps").and_then(serde_json::Value::as_array) {
+        for item in mk_arr {
+            if let Some(mk_bps) = item.as_f64() {
+                if mk_bps.is_finite() {
+                    let cand = (mk_bps - gross_bps).max(0.0);
+                    if cand > ext_bps {
+                        ext_bps = cand;
+                    }
+                }
+            }
+        }
+    }
+    ext_bps.max(0.0)
+}
+
 pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
     engines: &mut [SlotExecutionEngine; MAX_ACTIVE_PAIRS],
     reader: R,
@@ -397,12 +427,10 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
         if !is_maker_exit {
             continue;
         }
-        if matches!(
+        let is_scratch_row = matches!(
             v.get("exit_sub_reason").and_then(serde_json::Value::as_str),
             Some("AdverseScratchEscape")
-        ) {
-            continue;
-        }
+        );
         let Some(s_idx) = v
             .get("symbol")
             .and_then(serde_json::Value::as_str)
@@ -414,6 +442,7 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
             continue;
         }
         let active_fee_rt_mkr = engines[s_idx].active_maker_rt_fee_bps().max(100);
+        let cap_sbps_f = (SCAR_MFE_REHYDRATE_CAP_MULTIPLIER.saturating_mul(active_fee_rt_mkr)) as f64;
         let fee_rt_bps = (active_fee_rt_mkr as f64) / BPS_TO_SCALED_BPS_F64;
         let floor_bps = ((active_fee_rt_mkr + active_fee_rt_mkr / 8) as f64)
             / BPS_TO_SCALED_BPS_F64;
@@ -421,11 +450,21 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
             .get("mfe_bps")
             .and_then(serde_json::Value::as_f64)
             .filter(|&m| m > 0.0);
-        let mfe_bps_opt = explicit_mfe_opt.or_else(|| {
-            v.get("net_bps")
-                .and_then(serde_json::Value::as_f64)
-                .map(|n| n + fee_rt_bps.max(LEGACY_SCAR_MAKER_FEE_RT_BPS))
+        let gross_opt = v.get("gross_bps").and_then(serde_json::Value::as_f64);
+        let net_opt = v.get("net_bps").and_then(serde_json::Value::as_f64);
+        let gross_est_opt = gross_opt.or_else(|| {
+            net_opt.map(|n| n + fee_rt_bps.max(LEGACY_SCAR_MAKER_FEE_RT_BPS))
         });
+        let uncensored_close_opt = gross_est_opt.map(|g| {
+            let ext = extract_maker_post_exit_ext_bps(&v, g);
+            (g + ext).min(cap_sbps_f / BPS_TO_SCALED_BPS_F64)
+        });
+        let mfe_bps_opt = match (explicit_mfe_opt, uncensored_close_opt) {
+            (Some(m), Some(u)) => Some(m.max(u)),
+            (Some(m), None) => Some(m),
+            (None, Some(u)) => Some(u),
+            (None, None) => None,
+        };
         let Some(obs_mfe_bps) = mfe_bps_opt else {
             continue;
         };
@@ -433,8 +472,10 @@ pub fn rehydrate_cold_mfe_seeds_from_reader<R: BufRead>(
             continue;
         }
         let obs_sbps = obs_mfe_bps * BPS_TO_SCALED_BPS_F64;
+        if is_scratch_row && obs_sbps < (PHI_REHYD * (active_fee_rt_mkr as f64)).max(ewma_sbps[s_idx]) {
+            continue;
+        }
         let cap_pct_opt = v.get("mfe_capture_pct").and_then(serde_json::Value::as_f64);
-        let gross_opt = v.get("gross_bps").and_then(serde_json::Value::as_f64);
         let right_censored = explicit_mfe_opt.is_none()
             || cap_pct_opt.is_some_and(|pct| pct >= 100.0 * INV_PHI_REHYD)
             || gross_opt.is_some_and(|g| g > fee_rt_bps && g >= INV_PHI_REHYD * obs_mfe_bps);
@@ -522,9 +563,14 @@ pub fn rehydrate_shadow_ledger_from_paths(
                     ledger.record_closed_trade_with_sinking_split(pnl_1e8, fee_1e8, net_sc);
                     if let Some(s_idx) = s_opt {
                         let mfe_sc = (mfe_f * 100.0).round() as i64;
-                        if mfe_sc > 0 {
-                            engines[s_idx].observe_mfe_sample_uncensored(
-                                gross_sc, mfe_sc, is_mkr, is_scratch, fee_rt,
+                        let ext_sc = if is_mkr {
+                            (extract_maker_post_exit_ext_bps(&v, gross_f) * 100.0).round() as i64
+                        } else {
+                            0
+                        };
+                        if mfe_sc > 0 || (is_mkr && gross_sc.saturating_add(ext_sc) > 0) {
+                            engines[s_idx].observe_mfe_sample_uncensored_with_ext(
+                                gross_sc, mfe_sc, ext_sc, is_mkr, is_scratch, fee_rt,
                             );
                         }
                     }
