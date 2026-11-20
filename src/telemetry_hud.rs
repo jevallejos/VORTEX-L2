@@ -1031,7 +1031,7 @@ pub fn evaluate_capital_scaling_semaphore(
             let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
             let is_v48 = matches!(
                 v.get("schema").and_then(serde_json::Value::as_str),
-                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5" | "V5.5.1")
+                Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5" | "V5.5.1" | "V5.5.2")
             );
             match v.get("event").and_then(serde_json::Value::as_str) {
                 Some("EPOCH_RESET") => {

@@ -1,4 +1,4 @@
-# VORTEX-OMEGA V5.5.1 (`vortex-rs`) — Autonomous 200Hz Zero-Alloc Rust HFT Engine (Bybit UTA V5)
+# VORTEX-OMEGA V5.5.2 (`vortex-rs`) — Autonomous 200Hz Zero-Alloc Rust HFT Engine (Bybit UTA V5)
 
 ## Architecture & 4 Official LTO-Fat Binaries (`SHM v15` — 25 KB SeqLock)
 1. **`vortex_tap` (`Nice=-10`)**: 12-pair Bybit V5 public L2/Trade/Ticker/Liquidation ingestor, `PAR2` lossless ring (256 B/row + FNV-1a), rolling 12h `.par2z` (`VPZ1`) cold archiver, and `VKL1` (96 B/candle) perpetual multi-TF store (`1s..1d`).
@@ -9,4 +9,4 @@
 ## Constitutional Verification Gates
 - `cargo clippy --all-targets -- -D warnings` (`0` warnings)
 - `cargo test --lib -- --test-threads=1` (`90/90` unit tests)
-- `cargo test --tests -- --test-threads=1` (`28/28` Red-Team + `500` MC + `D1..D5` De-Legacy + `V5.1..V5.5.1` Forensic Counterfactual Suites + `SCAR-LOCK 63/63` + `OOS 520`)
+- `cargo test --tests -- --test-threads=1` (`28/28` Red-Team + `500` MC + `D1..D5` De-Legacy + `V5.1..V5.5.2` Forensic Counterfactual Suites + `SCAR-LOCK 63/63` + `OOS 520`)

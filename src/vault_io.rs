@@ -542,7 +542,7 @@ pub fn persist_total_loss_halt_to_path_atomic(
     }
     let payload = serde_json::json!({
         "event": "TOTAL_LOSS_SHIELD_5USDT_HALT",
-        "version": "5.5.1",
+        "version": "5.5.2",
         "ts_ns": ts_ns,
         "anchor_equity_1e8": anchor_equity_1e8,
         "current_equity_1e8": current_equity_1e8,

@@ -101,7 +101,14 @@ pub fn evaluate_macro_coherence_surface_with_health_c1(
     btc_aligned: f64,
     psi_health: f64,
 ) -> f64 {
-    if crate::alpha_3factor::is_opposing_impulse_wave3_hazard(side, snap) {
+    if crate::alpha_3factor::is_opposing_impulse_wave3_hazard(side, snap)
+        && !crate::alpha_3factor::qualifies_clean_intraday_wave3_reversal_v552(
+            side,
+            snap,
+            btc_aligned,
+            psi_health,
+        )
+    {
         return 1.0;
     }
     let w = snap.wave_observables();
@@ -116,12 +123,22 @@ pub fn evaluate_macro_coherence_surface_with_health_c1(
         .max(crate::alpha_3factor::INV_PHI * (eq_vol_sbps as f64));
     let oi_inv = crate::wave_elliott::hermite_smoothstep_c1(h_t, 0.494, 0.506)
         * crate::wave_elliott::hermite_smoothstep_c1(-0.20 - macro_aligned, 0.0, 0.08);
+    let s_w3_rev = if matches!(w.regime, WaveRegime::ImpulseWave3) {
+        crate::alpha_3factor::compute_intraday_wave3_reversal_relief_c1(
+            side,
+            snap,
+            btc_aligned,
+            psi_health,
+        )
+    } else {
+        0.0
+    };
     let fib_br = if matches!(w.regime, WaveRegime::ImpulseWave3 | WaveRegime::ImpulseWave5) {
         crate::wave_elliott::hermite_smoothstep_c1(
             -fib_cut_sbps - fib_aligned_sbps,
             0.0,
             (crate::alpha_3factor::INV_PHI * fib_cut_sbps).max(100.0),
-        )
+        ) * (1.0 - s_w3_rev)
     } else {
         0.0
     };
@@ -139,7 +156,7 @@ pub fn evaluate_macro_coherence_surface_with_health_c1(
         btc_aligned,
         psi_health,
     );
-    let slow_zigzag_pen = base_c1.max(oi_inv) * (1.0 - s_abc_sync);
+    let slow_zigzag_pen = base_c1.max(oi_inv) * (1.0 - s_abc_sync.max(s_w3_rev));
     slow_zigzag_pen.max(fib_br).max(abc_pen).clamp(0.0, 1.0)
 }
 
@@ -172,14 +189,14 @@ pub fn passes_elliott_macro_coherence_guard_with_health(
 ) -> bool {
     let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
     let eff_corr = if is_follower { epps_corr } else { 0.0 };
-    let corr_sign = if eff_corr < 0.0 { -1.0 } else { 1.0 };
-    let inst_btc_aligned = if is_follower {
-        corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * side.sign_f64()
-    } else {
-        0.0
-    };
     let btc_aligned = if is_follower {
-        btc_lead_aligned_override.map_or(inst_btc_aligned, |m| inst_btc_aligned.max(m))
+        crate::alpha_3factor::compute_btc_leader_aligned_score(
+            side,
+            snap,
+            btc_leader_snap,
+            eff_corr,
+            btc_lead_aligned_override,
+        )
     } else {
         0.0
     };
@@ -891,9 +908,30 @@ impl SlotExecutionEngine {
         if !matches!(self.state, OrderLifecycleState::Idle) || snap.ts_local_ns.0 < self.cooldown_until_ns.0 { return Ok(self.state); }
         let SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps } = verdict else { return Ok(self.state); };
         let eff_psi = if btc_lead_aligned_override.is_some() || psi_health > 0.0 { psi_health } else { 1.0 };
-        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+        let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
+        let btc_al = if is_follower {
+            crate::alpha_3factor::compute_btc_leader_aligned_score(
+                side,
+                snap,
+                btc_leader_snap,
+                epps_corr,
+                btc_lead_aligned_override,
+            )
+        } else {
+            0.0
+        };
+        let btc_w3_al = crate::alpha_3factor::compute_btc_leader_aligned_score(
             side,
             snap,
+            btc_leader_snap,
+            if is_follower { epps_corr } else { 0.0 },
+            btc_lead_aligned_override,
+        );
+        if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
+            side,
+            snap,
+            btc_w3_al,
+            psi_health,
             snap.realized_vol_5m.raw(),
             self.learned_taker_prob_pm,
             self.active_fees,
@@ -928,14 +966,6 @@ impl SlotExecutionEngine {
         }
         let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else { return Ok(self.state); };
         let base_l1_price = side.select_entry_bbo_price(best_bid.price, best_ask.price);
-        let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
-        let corr_sign = if is_follower && epps_corr < 0.0 { -1.0 } else { 1.0 };
-        let btc_al = if is_follower {
-            let inst = corr_sign * OrthogonalFactorState::snr_composite_score(btc_leader_snap) * side.sign_f64();
-            btc_lead_aligned_override.map_or(inst, |m| inst.max(m))
-        } else {
-            0.0
-        };
         let prop = compute_aligned_entry_propulsion_c1(side, snap, btc_al);
         let cand_px = select_elastic_entry_maker_price_v542(side, snap, psi_health, prop);
         let entry_price = if cand_px != base_l1_price
@@ -989,9 +1019,19 @@ impl SlotExecutionEngine {
     ) -> Result<(PriceTicks, PriceTicks), VortexError> {
         let OrderLifecycleState::PlacingEntryMaker { side, entry_price: armed_px, target_excursion, .. } = self.state else { return Err(VortexError::InvalidPriceOrTickSpec); };
         let eff_psi = if btc_lead_aligned_override.is_some() || psi_health > 0.0 { psi_health } else { 1.0 };
-        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+        let is_follower = snap.symbol_id != btc_leader_snap.symbol_id;
+        let btc_w3_al = crate::alpha_3factor::compute_btc_leader_aligned_score(
             side,
             snap,
+            btc_leader_snap,
+            if is_follower { epps_corr } else { 0.0 },
+            btc_lead_aligned_override,
+        );
+        if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
+            side,
+            snap,
+            btc_w3_al,
+            psi_health,
             self.open_vol_5m_bps.raw(),
             self.learned_taker_prob_pm,
             self.active_fees,

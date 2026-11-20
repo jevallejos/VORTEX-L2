@@ -3516,3 +3516,574 @@ fn test_v55_multilot_priority_3tranche_cascade_freeride_chain_and_antihostage() 
     drop(shm_reg);
     let _ = std::fs::remove_file(&shm_p);
 }
+
+#[test]
+fn test_v552_live_macro_ob_horizon_tick_hurst_intraday_reversal_and_multilot_qstruct() {
+    use core::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use vortex_rs::alpha_3factor::{
+        compute_corrective_abc_ob_reach_sbps, compute_corrective_abc_structural_threat_c1,
+        compute_passive_iceberg_absorption_penalty_c1, compute_s_opp_ob_wall_c1,
+        is_opposing_impulse_wave3_entry_hazard_v552, is_opposing_impulse_wave3_hazard_dynamic,
+        passes_corrective_abc_snapshot_guard_with_health_c1, OrthogonalFactorState, SignalVerdict,
+        INV_PHI, INV_PHI_CUBE, INV_PHI_SQ,
+    };
+    use vortex_rs::bybit_client::InstrumentSpecVerification;
+    use vortex_rs::exec_daemon::{compute_vacuum_l2_l3_c1, step_12_slot_daemon_tick};
+    use vortex_rs::exec_gateway_handlers::ExecRuntimeState;
+    use vortex_rs::execution_fsm::{
+        evaluate_macro_coherence_surface_with_health_c1,
+        passes_elliott_macro_coherence_guard_with_health, OrderLifecycleState,
+    };
+    use vortex_rs::forensic_parquet::ParitySyncLedger;
+    use vortex_rs::lob_shm::{MappedShmRegion, MAX_ACTIVE_PAIRS};
+    use vortex_rs::telemetry_hud::{SlotForensicEntrySnapshot, VaultIoCommand};
+    use vortex_rs::types::{compute_multilot_q_struct_c1, coupled_c1_effective_mfe_raw};
+
+    let t0 = 1_805_000_000_000_000_000_i64;
+    let fees = FeeSchedule::VIP0_DEFAULT;
+    record_live_ws_pulse(70_000, 100);
+
+    // =========================================================================
+    // 1. Physical Bounding of Universal Iceberg Guard (ofi_al < INV_PHI_CUBE vs >= INV_PHI_SQ)
+    // =========================================================================
+    assert!(
+        compute_passive_iceberg_absorption_penalty_c1(0.20, 0.72, -0.10) > 0.90,
+        "Genuine passive iceberg absorption (ofi_al < INV_PHI_CUBE) must remain > 0.90"
+    );
+    assert!(
+        compute_passive_iceberg_absorption_penalty_c1(INV_PHI_CUBE, 0.88, -0.20).abs()
+            <= f64::EPSILON
+    );
+    assert!(
+        compute_passive_iceberg_absorption_penalty_c1(0.43, 0.93, -0.15).abs() <= f64::EPSILON,
+        "SUI live OFI +0.43 / TFI +0.93 (>= INV_PHI_SQ) must have 0.0 iceberg penalty"
+    );
+    assert!(
+        compute_passive_iceberg_absorption_penalty_c1(0.48, 0.86, 0.45).abs() <= f64::EPSILON
+    );
+    // C1 continuity scan across ofi_al in [0.15, 0.45]:
+    let mut prev_ice = compute_passive_iceberg_absorption_penalty_c1(0.15, 0.86, -0.10);
+    for step in 1..=300 {
+        let x = 0.15 + 0.001 * f64::from(step);
+        let cur_ice = compute_passive_iceberg_absorption_penalty_c1(x, 0.86, -0.10);
+        assert!((cur_ice - prev_ice).abs() < 0.15);
+        prev_ice = cur_ice;
+    }
+
+    // =========================================================================
+    // 2. Multi-Lot (lots >= 2) q_struct Unlock vs Intact 1-Lot BTC/ETH Selectivity
+    // =========================================================================
+    let q_1lot = compute_multilot_q_struct_c1(LotQty(1), 0.0, 0.48, 0.86, 0.70);
+    assert!(q_1lot.abs() <= f64::EPSILON);
+    let q_multilot = compute_multilot_q_struct_c1(LotQty(12), 0.0, 0.48, 0.86, 0.70);
+    assert!(q_multilot > INV_PHI_SQ);
+    let unlocked_mfe = coupled_c1_effective_mfe_raw(
+        ScaledBps(680),
+        ScaledBps(1_520),
+        BoundedScore::new_clamped(q_multilot),
+    );
+    assert!(unlocked_mfe > 680);
+    // 1-lot ETH with weak geom=0.14 and learned_mfe=680 stays strictly vetoed in Pillar 2:
+    assert!(APPROVED_SPECS[1]
+        .evaluate_pilar2_asymmetry_ev_with_multilot_flow_sbps(
+            LotQty(1),
+            PriceTicks(182_000),
+            ScaledBps(4_200),
+            680,
+            50,
+            0.14,
+            520,
+            520,
+            Side::Bid,
+            fees,
+            0.48,
+            0.86,
+            0.45,
+            0.70,
+        )
+        .is_none());
+
+    // =========================================================================
+    // 3. Live Production Snapshot (SUIUSDT slot 5 & SOLUSDT slot 2):
+    //    wave_hurst = 0.72, ob_opp @ 95 bps (score = 0.72) + hydrated aligned OB,
+    //    geom = 0.14, OFI = +0.48, TFI = +0.86, BTC OFI/TFI = +0.45,
+    //    epps_corr = 0.75, learned_mfe = 680 -> MUST ARM ENTRY (Arm > 0)!
+    // =========================================================================
+    let mut btc_live = mk_vault_snap(0, 652_000, 4_200, 0.45, 0.45, 0.14, t0);
+    btc_live.bids[0].qty = LotQty(1_600);
+    btc_live.asks[0].qty = LotQty(1_400);
+    btc_live.refresh_deep_l1_l5_totals();
+
+    let w_live_abc = WaveObservables {
+        regime: WaveRegime::CorrectiveAbc,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.72),
+        macro_phase: BoundedScore::new_clamped(-0.18),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(0),
+    };
+
+    for &(slot_idx, px_ticks) in &[(5_usize, 7_350_i64), (2_usize, 7_520_i64)] {
+        let mut alt_live = mk_vault_snap(slot_idx, px_ticks, 4_500, 0.48, 0.86, 0.14, t0);
+        // Realistic L2/L3 ask vacuum on Bid breakout:
+        alt_live.bids[0].qty = LotQty(1_200);
+        alt_live.asks[0].qty = LotQty(950);
+        alt_live.asks[1] = BookLevel { price: PriceTicks(px_ticks + 2), qty: LotQty(110) };
+        alt_live.asks[2] = BookLevel { price: PriceTicks(px_ticks + 3), qty: LotQty(120) };
+        alt_live.refresh_deep_l1_l5_totals();
+        // Hydrated vortex_tap 25h 5m + 4h 1m OBs: own bull OB @ 28 bps + distant bear OB @ 95 bps (score = 0.72):
+        alt_live.ob_bull_score = BoundedScore::new_clamped(0.54);
+        alt_live.ob_dist_bull_bps = ScaledBps(2_800);
+        alt_live.ob_bear_score = BoundedScore::new_clamped(0.72);
+        alt_live.ob_dist_bear_bps = ScaledBps(9_500);
+        alt_live.set_wave_observables(w_live_abc);
+
+        let reach_sbps = compute_corrective_abc_ob_reach_sbps(&alt_live, 680, 50, fees);
+        assert!((1_800.0..=6_200.0).contains(&reach_sbps));
+        let s_opp_live = compute_s_opp_ob_wall_c1(Side::Bid, &alt_live, 0, 50, fees);
+        assert!(
+            s_opp_live < 0.05,
+            "Distant 95 bps opposing OB wall with aligned flow + own OB support must decay to ~0.0"
+        );
+        let chi_live = compute_corrective_abc_structural_threat_c1(s_opp_live, -0.18);
+        assert!(chi_live < INV_PHI);
+        let vac_live = compute_vacuum_l2_l3_c1(Side::Bid, &alt_live);
+        assert!(vac_live > 0.50);
+
+        assert!(passes_corrective_abc_snapshot_guard_with_health_c1(
+            Side::Bid,
+            &alt_live,
+            0.75,
+            0.45,
+            1.0,
+        ));
+        assert!(passes_elliott_macro_coherence_guard_with_health(
+            Side::Bid,
+            &alt_live,
+            &btc_live,
+            0.75,
+            None,
+            1.0,
+        ));
+
+        let verdict = OrthogonalFactorState::evaluate_entry_signal_v55(
+            APPROVED_SPECS[slot_idx],
+            &alt_live,
+            &btc_live,
+            ScaledBps(680),
+            ScaledBps(150),
+            65,
+            fees,
+            0.0,
+            0.95,
+            0.75,
+            None,
+            1.0,
+            0.0,
+        );
+        assert!(
+            matches!(verdict, SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }),
+            "Slot {slot_idx} must authorize Maker Bid entry on live production snapshot"
+        );
+
+        let gov_live = OnlineAdaptiveGovernor::new();
+        let lots_res = gov_live.authorizes_adaptive_entry_v55(
+            slot_idx,
+            Side::Bid,
+            6_800_000_000,
+            1_000,
+            ScaledBps(680),
+            &alt_live,
+            &btc_live,
+            0.0,
+            0.95,
+            0.75,
+            None,
+            0.0,
+        );
+        assert!(lots_res.is_ok(), "Governor V5.5 must authorize multi-lot slot {slot_idx}");
+        let Ok(alloc_lots) = lots_res else { return };
+        assert!(alloc_lots.0 >= 2);
+
+        let ev_opt = gov_live.evaluate_slot_pilar2_ex_ante_ev_with_leader_sbps(
+            slot_idx,
+            Side::Bid,
+            alloc_lots,
+            PriceTicks(px_ticks),
+            ScaledBps(680),
+            &alt_live,
+            &btc_live,
+            0.95,
+        );
+        assert!(ev_opt.is_some_and(|ev| ev > 0));
+
+        let mut eng_live = SlotExecutionEngine::new(slot_idx);
+        eng_live.learned_mfe_bps = 680;
+        let armed_state = eng_live.try_arm_maker_entry_v542(
+            &alt_live,
+            &btc_live,
+            verdict,
+            alloc_lots,
+            0.75,
+            None,
+            1.0,
+        );
+        assert!(matches!(
+            armed_state,
+            Ok(OrderLifecycleState::PlacingEntryMaker { side: Side::Bid, .. })
+        ));
+    }
+
+    // End-to-end 200 Hz daemon loop verification (Arm > 0 on SUIUSDT slot 5):
+    let shm_p = MappedShmRegion::ephemeral_self_test_path("v552_live_sui_arm");
+    let shm_res = MappedShmRegion::open_or_create(&shm_p, true);
+    assert!(shm_res.is_ok());
+    let Ok(shm_reg) = shm_res else { return };
+    let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(32);
+    let (vault_tx, _vault_rx) = mpsc::sync_channel::<VaultIoCommand>(64);
+    let inst = InstrumentSpecVerification::baseline_from_specs(&APPROVED_SPECS);
+    let mut rt = ExecRuntimeState::new();
+    rt.wallet_1e8 = 6_800_000_000;
+    let _ = rt.daily_gov.sync_utc_day(TimestampNs(t0), rt.wallet_1e8);
+    // Warm Epps tracker on slot 5 across 5s buckets to >= 0.72 correlation:
+    let mut own_p = 7_350_i64;
+    let mut btc_p = 652_000_i64;
+    for k in 0..48_i64 {
+        let dir = if k % 2 == 0 { 1_i64 } else { -1_i64 };
+        own_p += dir * 22;
+        btc_p += dir * 1_950;
+        let ts_k = TimestampNs(t0 - (48 - k) * 5_500_000_000);
+        rt.epps_trackers[5].observe_5s_pair(
+            ts_k,
+            false,
+            PriceTicks(own_p),
+            PriceTicks(btc_p),
+        );
+    }
+    assert!(rt.epps_trackers[5].correlation(false) >= 0.70);
+
+    let mut snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+    snaps[0] = btc_live;
+    snaps[5] = mk_vault_snap(5, 7_350, 4_500, 0.48, 0.86, 0.14, t0);
+    snaps[5].bids[0].qty = LotQty(1_200);
+    snaps[5].asks[0].qty = LotQty(950);
+    snaps[5].asks[1] = BookLevel { price: PriceTicks(7_352), qty: LotQty(110) };
+    snaps[5].asks[2] = BookLevel { price: PriceTicks(7_353), qty: LotQty(120) };
+    snaps[5].refresh_deep_l1_l5_totals();
+    snaps[5].ob_bull_score = BoundedScore::new_clamped(0.54);
+    snaps[5].ob_dist_bull_bps = ScaledBps(2_800);
+    snaps[5].ob_bear_score = BoundedScore::new_clamped(0.72);
+    snaps[5].ob_dist_bear_bps = ScaledBps(9_500);
+    snaps[5].set_wave_observables(w_live_abc);
+
+    let mut entry_f = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+    let mut engines = SlotExecutionEngine::new_12_slot_array();
+    engines[5].learned_mfe_bps = 680;
+    let mut gov_d = OnlineAdaptiveGovernor::new();
+    let mut led_d = ParitySyncLedger::new(6_800_000_000);
+    let mut last_rest_ns = 0_i64;
+
+    let _ = step_12_slot_daemon_tick(
+        TimestampNs(t0),
+        None,
+        inst,
+        None,
+        &mut rt,
+        &mut last_rest_ns,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut led_d,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert!(matches!(
+        engines[5].state,
+        OrderLifecycleState::PlacingEntryMaker { side: Side::Bid, .. }
+    ));
+    snaps[0].ts_local_ns = TimestampNs(t0 + 250_000_000);
+    snaps[5].ts_local_ns = TimestampNs(t0 + 250_000_000);
+    let _ = step_12_slot_daemon_tick(
+        TimestampNs(t0 + 250_000_000),
+        None,
+        inst,
+        None,
+        &mut rt,
+        &mut last_rest_ns,
+        &snaps,
+        &mut entry_f,
+        &mut engines,
+        &mut gov_d,
+        &mut led_d,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert!(matches!(
+        engines[5].state,
+        OrderLifecycleState::RestingEntryQueue { side: Side::Bid, .. }
+    ));
+    assert!(shm_reg.arena().exec_armed_count.load(Ordering::Relaxed) >= 1);
+
+    // =========================================================================
+    // 4. Clean Intraday Reversal vs Stale Opposing ImpulseWave3 (NEW Entry Only,
+    //    0ms Resting Queue Abort Intact, Deep Macro/Fib Veto Intact)
+    // =========================================================================
+    let mut sol_rev = mk_vault_snap(2, 7_520, 4_200, 0.68, 0.82, 0.28, t0);
+    sol_rev.asks[1] = BookLevel { price: PriceTicks(7_522), qty: LotQty(110) };
+    sol_rev.asks[2] = BookLevel { price: PriceTicks(7_523), qty: LotQty(110) };
+    sol_rev.refresh_deep_l1_l5_totals();
+    sol_rev.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.71),
+        macro_phase: BoundedScore::new_clamped(-0.68),
+        oi_impulse: BoundedScore::ZERO,
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(-3_200),
+    });
+    // 0ms resting-queue hazard detector MUST remain 100% intact (true):
+    assert!(is_opposing_impulse_wave3_hazard_dynamic(
+        Side::Bid, &sol_rev, 0, 50, fees
+    ));
+    // Static / contracted-health guard (psi_health <= INV_PHI_SQ) MUST veto:
+    assert!(is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid,
+        &sol_rev,
+        0.45,
+        INV_PHI_SQ,
+        0,
+        50,
+        fees,
+    ));
+    assert!(!passes_elliott_macro_coherence_guard(Side::Bid, &sol_rev));
+    // Healthy new entry (psi_health = 1.0, OFI >= INV_PHI, TFI >= INV_PHI, BTC >= INV_PHI_SQ) unlocks:
+    assert!(!is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid, &sol_rev, 0.45, 1.0, 0, 50, fees
+    ));
+    assert!(
+        evaluate_macro_coherence_surface_with_health_c1(Side::Bid, &sol_rev, 0.75, 0.45, 1.0)
+            < INV_PHI
+    );
+    assert!(matches!(
+        OrthogonalFactorState::evaluate_entry_signal_v55(
+            APPROVED_SPECS[2],
+            &sol_rev,
+            &btc_live,
+            ScaledBps(680),
+            ScaledBps(150),
+            50,
+            fees,
+            0.0,
+            0.95,
+            0.75,
+            None,
+            1.0,
+            0.0,
+        ),
+        SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }
+    ));
+    assert!(gov_d
+        .authorizes_adaptive_entry_v55(
+            2,
+            Side::Bid,
+            6_800_000_000,
+            1_000,
+            ScaledBps(680),
+            &sol_rev,
+            &btc_live,
+            0.0,
+            0.95,
+            0.75,
+            None,
+            0.0,
+        )
+        .is_ok());
+
+    // Deep opposing ImpulseWave3 (macro_aligned <= -0.75 OR fib_aligned_bps <= -45.0) MUST veto:
+    let mut sol_deep_macro = sol_rev;
+    sol_deep_macro.set_wave_observables(WaveObservables {
+        macro_phase: BoundedScore::new_clamped(-0.76),
+        ..sol_rev.wave_observables()
+    });
+    assert!(is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid,
+        &sol_deep_macro,
+        0.45,
+        1.0,
+        0,
+        50,
+        fees,
+    ));
+    let mut sol_deep_fib = sol_rev;
+    sol_deep_fib.set_wave_observables(WaveObservables {
+        fib_proj_bps: ScaledBps(-4_600),
+        ..sol_rev.wave_observables()
+    });
+    assert!(is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid,
+        &sol_deep_fib,
+        0.45,
+        1.0,
+        0,
+        50,
+        fees,
+    ));
+
+    // =========================================================================
+    // 5. Explicit Non-Regression on All 6 CorrectiveAbc Losses (#18, #19, #22,
+    //    #23, #27, #30), ETH #2, and ETH #5 (Trade #32 V5.2.1)
+    // =========================================================================
+    #[derive(Copy, Clone)]
+    struct V552AbcLossCase {
+        slot: usize,
+        px: i64,
+        vol: i64,
+        ofi: f64,
+        tfi: f64,
+        geom: f64,
+        btc_c: f64,
+        side: Side,
+        h_val: f64,
+        m_ph: f64,
+        bull_pm: u16,
+        bear_pm: u16,
+        opp_sc: f64,
+        opp_dist: i64,
+    }
+    let six_abc_losses = [
+        V552AbcLossCase { slot: 1, px: 179_267, vol: 1_725, ofi: 0.57, tfi: 0.93, geom: 0.09, btc_c: 0.10, side: Side::Bid, h_val: 0.696, m_ph: 0.45, bull_pm: 438, bear_pm: 415, opp_sc: 0.50, opp_dist: 5_572 },
+        V552AbcLossCase { slot: 5, px: 7_316, vol: 1_582, ofi: -0.75, tfi: -0.84, geom: -0.17, btc_c: -0.55, side: Side::Ask, h_val: 0.748, m_ph: -0.45, bull_pm: 522, bear_pm: 478, opp_sc: 0.57, opp_dist: 9_670 },
+        V552AbcLossCase { slot: 3, px: 7_156, vol: 1_873, ofi: -0.49, tfi: -0.95, geom: -0.20, btc_c: -0.21, side: Side::Ask, h_val: 0.637, m_ph: -0.45, bull_pm: 465, bear_pm: 471, opp_sc: 0.60, opp_dist: 3_908 },
+        V552AbcLossCase { slot: 4, px: 19_691, vol: 2_428, ofi: 0.65, tfi: 0.86, geom: 0.36, btc_c: 0.36, side: Side::Bid, h_val: 0.729, m_ph: -0.30, bull_pm: 564, bear_pm: 516, opp_sc: 0.44, opp_dist: 4_984 },
+        V552AbcLossCase { slot: 1, px: 179_552, vol: 1_890, ofi: 0.48, tfi: 0.84, geom: 0.93, btc_c: 0.43, side: Side::Bid, h_val: 0.715, m_ph: 0.45, bull_pm: 443, bear_pm: 441, opp_sc: 0.39, opp_dist: 6_337 },
+        V552AbcLossCase { slot: 4, px: 19_038, vol: 3_023, ofi: -0.72, tfi: -0.67, geom: -0.27, btc_c: -0.32, side: Side::Ask, h_val: 0.744, m_ph: -0.45, bull_pm: 476, bear_pm: 548, opp_sc: 0.64, opp_dist: 8_861 },
+        V552AbcLossCase { slot: 1, px: 177_485, vol: 5_800, ofi: -0.22, tfi: -0.62, geom: -0.92, btc_c: -0.14, side: Side::Ask, h_val: 0.700, m_ph: -0.35, bull_pm: 509, bear_pm: 532, opp_sc: 0.67, opp_dist: 3_115 },
+    ];
+    for c in six_abc_losses {
+        let mut s_l = mk_vault_snap(c.slot, c.px, c.vol, c.ofi, c.tfi, c.geom, t0);
+        s_l.ob_bull_efficacy_pm = i64::from(c.bull_pm);
+        s_l.ob_bear_efficacy_pm = i64::from(c.bear_pm);
+        match c.side {
+            Side::Bid => {
+                s_l.ob_bear_score = BoundedScore::new_clamped(c.opp_sc);
+                s_l.ob_dist_bear_bps = ScaledBps(c.opp_dist);
+            }
+            Side::Ask => {
+                s_l.ob_bull_score = BoundedScore::new_clamped(c.opp_sc);
+                s_l.ob_dist_bull_bps = ScaledBps(c.opp_dist);
+            }
+        }
+        s_l.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(c.h_val),
+            macro_phase: BoundedScore::new_clamped(c.m_ph),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        let btc_l = mk_vault_snap(0, 652_000, 3_200, c.btc_c, c.btc_c, c.btc_c, t0);
+        let btc_al = c.btc_c * c.side.sign_f64();
+        assert!(
+            !passes_corrective_abc_snapshot_guard_with_health_c1(c.side, &s_l, 0.82, btc_al, 1.0),
+            "Historical CorrectiveAbc loss on slot {} @ {} sbps must remain 100% blocked",
+            c.slot,
+            c.opp_dist
+        );
+        assert!(!matches!(
+            OrthogonalFactorState::evaluate_entry_signal_v55(
+                APPROVED_SPECS[c.slot],
+                &s_l,
+                &btc_l,
+                ScaledBps(680),
+                ScaledBps(150),
+                50,
+                fees,
+                0.0,
+                0.95,
+                0.82,
+                None,
+                1.0,
+                0.0,
+            ),
+            SignalVerdict::AuthorizeMakerEntry { .. }
+        ));
+        assert!(gov_d
+            .authorizes_adaptive_entry_v55(
+                c.slot,
+                c.side,
+                6_800_000_000,
+                1_000,
+                ScaledBps(680),
+                &s_l,
+                &btc_l,
+                0.0,
+                0.95,
+                0.82,
+                None,
+                0.0,
+            )
+            .is_err());
+    }
+
+    // ETH #5 (Trade #32 V5.2.1: Bid into low-Hurst bearish ImpulseWave3 -0.90, fib -157.90 bps) stays 100% vetoed:
+    let mut eth32 = mk_vault_snap(1, 206_119, 2_822, 0.22, 0.72, 0.91, t0);
+    eth32.set_wave_observables(WaveObservables {
+        regime: WaveRegime::ImpulseWave3,
+        climax_active: false,
+        hurst: WaveObservables::encode_hurst(0.320),
+        macro_phase: BoundedScore::new_clamped(-0.90),
+        oi_impulse: BoundedScore::new_clamped(0.05),
+        liq_imbalance: BoundedScore::ZERO,
+        fib_proj_bps: ScaledBps(-15_790),
+    });
+    assert!(is_opposing_impulse_wave3_hazard(Side::Bid, &eth32));
+    assert!(is_opposing_impulse_wave3_entry_hazard_v552(
+        Side::Bid, &eth32, 0.45, 1.0, 0, 50, fees
+    ));
+    assert!(!passes_elliott_macro_coherence_guard_with_health(
+        Side::Bid, &eth32, &btc_live, 0.85, None, 1.0
+    ));
+    assert_eq!(
+        OrthogonalFactorState::evaluate_entry_signal_v55(
+            APPROVED_SPECS[1],
+            &eth32,
+            &btc_live,
+            ScaledBps(715),
+            ScaledBps(120),
+            48,
+            fees,
+            0.0,
+            0.95,
+            0.85,
+            None,
+            1.0,
+            0.0,
+        ),
+        SignalVerdict::NeutralNoAction
+    );
+    assert!(gov_d
+        .authorizes_adaptive_entry_v55(
+            1,
+            Side::Bid,
+            6_800_000_000,
+            1_000,
+            ScaledBps(715),
+            &eth32,
+            &btc_live,
+            0.0,
+            0.95,
+            0.85,
+            None,
+            0.0,
+        )
+        .is_err());
+
+    drop(shm_reg);
+    let _ = std::fs::remove_file(&shm_p);
+}

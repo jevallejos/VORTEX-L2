@@ -1357,9 +1357,18 @@ pub fn step_12_slot_daemon_tick(
                 SignalVerdict::SpoofingVeto => publish_slot_veto_code(arena, s_idx, LastVetoCode::SpoofingVeto),
                 SignalVerdict::NeutralNoAction => {
                     if rt.last_abort_veto[s_idx] == LastVetoCode::None {
-                        let veto_c = if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+                        let probe_btc_w3 = crate::alpha_3factor::compute_btc_leader_aligned_score(
                             probe_side,
                             &snap,
+                            &btc_snap,
+                            if s_idx > 0 { epps_corr } else { 0.0 },
+                            probe_btc_lead,
+                        );
+                        let veto_c = if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
+                            probe_side,
+                            &snap,
+                            probe_btc_w3,
+                            psi_health,
                             gov.slot_eq_vol_5m_bps(s_idx),
                             taker_pm,
                             fees,

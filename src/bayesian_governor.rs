@@ -1067,7 +1067,33 @@ impl OnlineAdaptiveGovernor {
         let Ok((raw_e_kin, base_e_min)) = self.evaluate_kinematic_energy_surface(slot_idx, side, self_drift_bps, self_ext_bps, signed_geom, cand_comp) else { return false; };
         let cadence = self.slot_temporal_cadence_for_side(slot_idx, Some(side), candidate_snap);
         let fee_rt = self.active_maker_rt_fee_bps();
-        let kin_bonus = ((bonus * (fee_rt as f64) * crate::alpha_3factor::PHI).round() as i64).max(0);
+        let is_multilot = self
+            .compute_slot_entry_lots_v48(slot_idx, side, wallet_usdt_1e8, candidate_snap, 1_000)
+            .0
+            >= 2;
+        let qstruct_kin_bonus = if is_multilot && s_iceberg <= 0.0 {
+            let vac_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, candidate_snap);
+            let q_ml = crate::types::compute_multilot_q_struct_c1(
+                LotQty(2),
+                0.0,
+                candidate_snap.factor_ofi.get() * dir_s,
+                candidate_snap.factor_tfi.get() * dir_s,
+                vac_l2_l3,
+            );
+            let s_qml = crate::wave_elliott::hermite_smoothstep_c1(
+                q_ml,
+                crate::alpha_3factor::INV_PHI_SQ,
+                crate::alpha_3factor::INV_PHI,
+            );
+            ((self.psi_health() * s_qml * (fee_rt as f64) * crate::alpha_3factor::INV_PHI_CUBE)
+                .round() as i64)
+                .max(0)
+        } else {
+            0
+        };
+        let kin_bonus = ((bonus * (fee_rt as f64) * crate::alpha_3factor::PHI).round() as i64)
+            .max(0)
+            .saturating_add(qstruct_kin_bonus);
         let e_kin = raw_e_kin.saturating_add(kin_bonus);
         let scar_rt = fee_rt.max(400);
         if e_kin < (base_e_min + cadence.kin_energy_min_delta_bps).clamp(fee_rt / 5, (scar_rt * 4) / 5) { return false; }
@@ -1222,7 +1248,33 @@ impl OnlineAdaptiveGovernor {
         let _ = crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(snap.wave_observables(), side, btc_snr)?;
         let (drift_bps, ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
         let fee_rt = self.active_maker_rt_fee_bps();
-        let kin_bonus = ((bonus * (fee_rt as f64) * crate::alpha_3factor::PHI).round() as i64).max(0);
+        let is_multilot = self
+            .compute_slot_entry_lots_v48(slot_idx, side, wallet_usdt_1e8, snap, 1_000)
+            .0
+            >= 2;
+        let qstruct_kin_bonus = if is_multilot && s_iceberg <= 0.0 {
+            let vac_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, snap);
+            let q_ml = crate::types::compute_multilot_q_struct_c1(
+                LotQty(2),
+                0.0,
+                ofi * dir_s,
+                tfi * dir_s,
+                vac_l2_l3,
+            );
+            let s_qml = crate::wave_elliott::hermite_smoothstep_c1(
+                q_ml,
+                crate::alpha_3factor::INV_PHI_SQ,
+                crate::alpha_3factor::INV_PHI,
+            );
+            ((self.psi_health() * s_qml * (fee_rt as f64) * crate::alpha_3factor::INV_PHI_CUBE)
+                .round() as i64)
+                .max(0)
+        } else {
+            0
+        };
+        let kin_bonus = ((bonus * (fee_rt as f64) * crate::alpha_3factor::PHI).round() as i64)
+            .max(0)
+            .saturating_add(qstruct_kin_bonus);
         if let Ok((ek, emin)) = self.evaluate_kinematic_energy_surface(slot_idx, side, drift_bps, ext_bps, signed_geom, signed_snr) {
             return Ok((ek.saturating_add(kin_bonus), emin));
         }
@@ -1772,9 +1824,19 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, candidate_snap) {
             return Err(LastVetoCode::KinematicSurfaceOrCadence);
         }
-        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+        let is_follower = slot_idx > 0 && candidate_snap.symbol_id != btc_leader_snap.symbol_id;
+        let btc_w3_aligned = crate::alpha_3factor::compute_btc_leader_aligned_score(
             side,
             candidate_snap,
+            btc_leader_snap,
+            if is_follower { epps_corr } else { 0.0 },
+            btc_lead_aligned_override,
+        );
+        if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
+            side,
+            candidate_snap,
+            btc_w3_aligned,
+            self.psi_health(),
             self.eq_vol_5m_bps[slot_idx],
             taker_pm,
             fees,
@@ -1978,9 +2040,19 @@ impl OnlineAdaptiveGovernor {
         }
         let taker_pm = self.slot_taker_prob_permille(slot_idx, side);
         let fees = self.active_fee_schedule();
-        if crate::alpha_3factor::is_opposing_impulse_wave3_hazard_dynamic(
+        let is_follower = slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id;
+        let btc_w3_aligned = crate::alpha_3factor::compute_btc_leader_aligned_score(
             side,
             snap,
+            btc_leader_snap,
+            if is_follower { epps_corr } else { 0.0 },
+            btc_lead_aligned_override,
+        );
+        if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
+            side,
+            snap,
+            btc_w3_aligned,
+            self.psi_health(),
             self.eq_vol_5m_bps[slot_idx],
             taker_pm,
             fees,
@@ -2211,7 +2283,8 @@ impl OnlineAdaptiveGovernor {
             .round() as i64;
         let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
         let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
-        let base_ev = spec.evaluate_pilar2_asymmetry_ev_with_flow_sbps(
+        let vacuum_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, snap);
+        let base_ev = spec.evaluate_pilar2_asymmetry_ev_with_multilot_flow_sbps(
             allocated_lots,
             entry_px,
             snap.realized_vol_5m,
@@ -2223,7 +2296,9 @@ impl OnlineAdaptiveGovernor {
             side,
             self.active_fee_schedule(),
             ofi_aligned,
+            tfi_aligned,
             btc_aligned,
+            vacuum_l2_l3,
         )?;
         let ev_damped = ((base_ev as f64) * (1.0 - crate::alpha_3factor::PHI * s_iceberg)).round() as i64;
         (ev_damped > 0).then_some(ev_damped)

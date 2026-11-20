@@ -1,7 +1,7 @@
-name: VORTEX-OMEGA V5.5.1 Constitutional /dev/shm & 4-Binary LTO Gate
+name: VORTEX-OMEGA V5.5.2 Constitutional /dev/shm & 4-Binary LTO Gate
 on:
   push:
-    branches: [ main, "feat/**", "chore/**" ]
+    branches: [ main, "feat/**", "chore/**", "fix/**" ]
   pull_request:
     branches: [ main ]
 jobs:

@@ -893,6 +893,51 @@ impl PairSpec {
         ofi_aligned: f64,
         btc_aligned: f64,
     ) -> bool {
+        self.passes_single_lot_asymmetry_ev_gate_with_multilot_flow(
+            allocated_lots,
+            mid_price,
+            realized_vol_5m,
+            learned_mfe_bps,
+            taker_prob_pm,
+            signed_geom,
+            ob_bull_pm,
+            ob_bear_pm,
+            side,
+            fees,
+            ofi_aligned,
+            ofi_aligned,
+            btc_aligned,
+            0.0,
+        )
+    }
+
+    /// Continuous C1 Pillar-2 EV gate coupling multi-lot (`lots >= 2`) `q_struct` to flow coherence + `L2-L3` vacuum (`V5.5.2`),
+    /// while leaving indivisible `1-lot` (`BTC/ETH`) `GEOM` requirements 100% intact.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::manual_clamp,
+        clippy::suboptimal_flops,
+        clippy::too_many_arguments
+    )]
+    pub fn passes_single_lot_asymmetry_ev_gate_with_multilot_flow(
+        self,
+        allocated_lots: LotQty,
+        mid_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+        ofi_aligned: f64,
+        tfi_aligned: f64,
+        btc_aligned: f64,
+        vacuum_l2_l3: f64,
+    ) -> bool {
         const PHI: f64 = 1.618_033_988_749_895;
         const INV_PHI: f64 = 0.618_033_988_749_895;
         const INV_PHI2: f64 = 0.381_966_011_250_105;
@@ -924,7 +969,13 @@ impl PairSpec {
                 Side::Ask => (ob_bear_pm, ob_bull_pm),
             };
             let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
-            let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
+            let q_struct = compute_multilot_q_struct_c1(
+                allocated_lots,
+                (h_geom * ob_ratio).clamp(0.0, PHI),
+                ofi_aligned,
+                tfi_aligned,
+                vacuum_l2_l3,
+            );
             let learned_f = modulate_learned_mfe_by_diffusive_regime_sbps(
                 learned_mfe_bps,
                 realized_vol_5m,
@@ -932,7 +983,12 @@ impl PairSpec {
             )
             .max(0) as f64;
             let diff_cap = INV_PHI2 * (realized_vol_5m.raw().max(0) as f64);
-            let base_mfe = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
+            let base_mfe_raw = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
+            let base_mfe = coupled_c1_effective_mfe_raw(
+                ScaledBps(base_mfe_raw.round() as i64),
+                ScaledBps(diff_cap.round() as i64),
+                BoundedScore::new_clamped(q_struct),
+            ) as f64;
             let runner_gain = 1.0 + INV_PHI2 * h_geom + INV_PHI3 * (ob_ratio - 1.0);
             let mfe_split_net = base_mfe * runner_gain - c_mkr_rt;
             let min_mfe_split = INV_PHI3 * c_mkr_rt.max(100.0);
@@ -959,7 +1015,14 @@ impl PairSpec {
             Side::Ask => (ob_bear_pm, ob_bull_pm),
         };
         let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
-        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get());
+        let q_geom_1l = h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get();
+        let q_struct = BoundedScore::new_clamped(compute_multilot_q_struct_c1(
+            allocated_lots,
+            q_geom_1l,
+            ofi_aligned,
+            tfi_aligned,
+            vacuum_l2_l3,
+        ));
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
@@ -1048,6 +1111,47 @@ impl PairSpec {
         ofi_aligned: f64,
         btc_aligned: f64,
     ) -> Option<i64> {
+        self.evaluate_pilar2_asymmetry_ev_with_multilot_flow_sbps(
+            allocated_lots,
+            entry_px,
+            realized_vol_5m,
+            learned_mfe_bps,
+            taker_prob_pm,
+            signed_geom,
+            ob_bull_pm,
+            ob_bear_pm,
+            side,
+            fees,
+            ofi_aligned,
+            ofi_aligned,
+            btc_aligned,
+            0.0,
+        )
+    }
+
+    /// Coherent V5.5.2 Pillar-2 ex-ante net Expected Value (`ScaledBps`) unlocking multi-lot (`lots >= 2`) `q_struct`
+    /// via `max(q_geom_ob, INV_PHI * S_3(min(ofi_al, tfi_al); INV_PHI_SQ, INV_PHI) + INV_PHI_SQ * vacuum_l2_l3)`,
+    /// while preserving `1-lot` (`BTC/ETH`) `GEOM` selectivity 100% intact.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+    pub fn evaluate_pilar2_asymmetry_ev_with_multilot_flow_sbps(
+        self,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+        ofi_aligned: f64,
+        tfi_aligned: f64,
+        btc_aligned: f64,
+        vacuum_l2_l3: f64,
+    ) -> Option<i64> {
         const PHI: f64 = 1.618_033_988_749_895;
         const PHI_SQ: f64 = 2.618_033_988_749_895;
         const INV_PHI: f64 = 0.618_033_988_749_895;
@@ -1055,10 +1159,10 @@ impl PairSpec {
         const INV_PHI3: f64 = 0.236_067_977_499_79;
         const SQRT_5: f64 = PHI + INV_PHI;
 
-        if !self.passes_single_lot_asymmetry_ev_gate_with_flow(
+        if !self.passes_single_lot_asymmetry_ev_gate_with_multilot_flow(
             allocated_lots, entry_px, realized_vol_5m, learned_mfe_bps,
             taker_prob_pm, signed_geom, ob_bull_pm, ob_bear_pm, side, fees,
-            ofi_aligned, btc_aligned,
+            ofi_aligned, tfi_aligned, btc_aligned, vacuum_l2_l3,
         ) {
             return None;
         }
@@ -1080,7 +1184,13 @@ impl PairSpec {
             let eq_vol = ScaledBps((PHI * (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 as f64)).round() as i64);
             let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
             let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
-            let q_struct = (h_geom * ob_ratio).clamp(0.0, PHI);
+            let q_struct = compute_multilot_q_struct_c1(
+                allocated_lots,
+                (h_geom * ob_ratio).clamp(0.0, PHI),
+                ofi_aligned,
+                tfi_aligned,
+                vacuum_l2_l3,
+            );
             let learned_f = modulate_learned_mfe_by_diffusive_regime_sbps(
                 learned_mfe_bps,
                 realized_vol_5m,
@@ -1088,7 +1198,12 @@ impl PairSpec {
             )
             .max(0) as f64;
             let diff_cap = INV_PHI2 * (realized_vol_5m.raw().max(0) as f64);
-            let base_mfe = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
+            let base_mfe_raw = learned_f.min(diff_cap) + h_geom * (learned_f - learned_f.min(diff_cap));
+            let base_mfe = coupled_c1_effective_mfe_raw(
+                ScaledBps(base_mfe_raw.round() as i64),
+                ScaledBps(diff_cap.round() as i64),
+                BoundedScore::new_clamped(q_struct),
+            ) as f64;
             let runner_gain = 1.0 + INV_PHI2 * h_geom + INV_PHI3 * (ob_ratio - 1.0);
             let mfe_split_net = base_mfe * runner_gain - c_mkr;
             let wald_sl_net = INV_PHI * srv_sl + c_tkr + INV_PHI2 * (tau_tick.raw() as f64);
@@ -1103,7 +1218,14 @@ impl PairSpec {
         let vol_f = (realized_vol_5m.raw().max(0)) as f64;
         let u_g = ((g_clamped - INV_PHI3) / (0.854_101_966_249_685 - INV_PHI3)).clamp(0.0, 1.0);
         let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
-        let q_struct = BoundedScore::new_clamped(h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get());
+        let q_geom_1l = h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get();
+        let q_struct = BoundedScore::new_clamped(compute_multilot_q_struct_c1(
+            allocated_lots,
+            q_geom_1l,
+            ofi_aligned,
+            tfi_aligned,
+            vacuum_l2_l3,
+        ));
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
@@ -1213,6 +1335,46 @@ mod single_lot_ev_v49_tests {
             .is_none()
         );
     }
+}
+
+/// Multi-lot (`allocated_lots.0 >= 2`) structural quality `q_struct` (`C1`, `V5.5.2`):
+/// `max(q_geom_ob, INV_PHI * S_3(min(ofi_al, tfi_al); INV_PHI_SQ, INV_PHI) + INV_PHI_SQ * vacuum_l2_l3)`,
+/// leaving indivisible `1-lot` (`BTC/ETH`) `q_geom_ob` 100% intact.
+#[inline]
+#[must_use]
+#[allow(clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn compute_multilot_q_struct_c1(
+    allocated_lots: LotQty,
+    q_geom_ob: f64,
+    ofi_aligned: f64,
+    tfi_aligned: f64,
+    vacuum_l2_l3: f64,
+) -> f64 {
+    const PHI_M: f64 = 1.618_033_988_749_895;
+    const INV_PHI_M: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_M: f64 = 0.381_966_011_250_105;
+    let q_base = if q_geom_ob.is_finite() {
+        q_geom_ob.clamp(0.0, PHI_M)
+    } else {
+        0.0
+    };
+    if allocated_lots.0 < 2 {
+        return q_base;
+    }
+    let flow_min = if ofi_aligned.is_finite() && tfi_aligned.is_finite() {
+        ofi_aligned.min(tfi_aligned)
+    } else {
+        0.0
+    };
+    let u = ((flow_min - INV_PHI2_M) / (INV_PHI_M - INV_PHI2_M)).clamp(0.0, 1.0);
+    let s_flow = u * u * (3.0 - 2.0 * u);
+    let vac = if vacuum_l2_l3.is_finite() {
+        vacuum_l2_l3.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let q_flow_vac = INV_PHI_M * s_flow + INV_PHI2_M * vac;
+    q_base.max(q_flow_vac).clamp(0.0, PHI_M)
 }
 
 #[inline]
