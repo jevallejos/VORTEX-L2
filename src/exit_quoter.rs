@@ -1321,7 +1321,7 @@ pub fn compute_canonical_exit_quote_omega_v55(
         };
         let sigma_1m_open_sbps = (eff_open_vol_sbps as f64) / SQRT_5;
         let deep_bailout_floor = -((live_sl_sbps - c_tkr).max(PHI * c_mkr_scale));
-        let b_floor_sbps = if worst_mae_bps <= mae_trig_bps && p_cont < INV_PHI_SQ {
+        let b_floor_sbps = if worst_mae_bps <= mae_trig_bps && cur_gross_bps < mae_trig_bps && p_cont < INV_PHI_SQ && eff_flow_slow > -INV_PHI_CUBE {
             deep_bailout_floor
         } else {
             -((PHI * c_mkr_scale).max(INV_PHI_SQ * sigma_1m_open_sbps))
