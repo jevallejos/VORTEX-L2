@@ -752,16 +752,47 @@ pub fn step_12_slot_daemon_tick(
             let _ = rt.btc_lead_memory.observe_slot_snapshot(k_idx, &cached_snaps[k_idx], tick_ws_rtt_us);
         }
     }
+    let mut mfe_learned_updated = false;
     for k_idx in 0..MAX_ACTIVE_PAIRS {
+        if let Some(mk_pk) = rt.markout_rings[k_idx].take_uncensored_fill_peak_sbps() {
+            let prev_mfe = engines[k_idx].learned_mfe_bps;
+            engines[k_idx].observe_markout_ring_favorable_peak(mk_pk);
+            if engines[k_idx].learned_mfe_bps > prev_mfe {
+                mfe_learned_updated = true;
+            }
+        }
+        let pk_60s = rt.markout_rings[k_idx].last_resolved_60s_fill_peak_sbps();
         if let Some((mk_side, mk_fav_60s)) = rt.markout_rings[k_idx].take_resolved_60s_fill_markout() {
             let _ = gov.observe_markout_60s_continuation(
                 k_idx,
                 mk_side,
-                engines[k_idx].last_closed_mfe_bps,
+                engines[k_idx].last_closed_mfe_bps.max(pk_60s),
                 mk_fav_60s,
                 cached_snaps[k_idx].realized_vol_5m,
             );
         }
+        if let Some((cf_side, cf_peak, cf_fav_60s)) =
+            rt.markout_rings[k_idx].take_counterfactual_abort_learning()
+        {
+            let prev_mfe = engines[k_idx].learned_mfe_bps;
+            engines[k_idx].observe_counterfactual_abort_mfe(cf_peak);
+            let _ = gov.observe_counterfactual_abort_continuation_v558(
+                k_idx,
+                cf_side,
+                cf_peak,
+                cf_fav_60s,
+                cached_snaps[k_idx].realized_vol_5m,
+            );
+            if engines[k_idx].learned_mfe_bps > prev_mfe {
+                mfe_learned_updated = true;
+            }
+        }
+    }
+    if mfe_learned_updated {
+        let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
+            ts_ns: now_ns.0,
+            learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(engines),
+        });
     }
     let fees = gov.active_fee_schedule();
     let live_eq = rt.wallet_1e8.max(ledger.current_equity_1e8());
@@ -988,7 +1019,9 @@ pub fn step_12_slot_daemon_tick(
                 if rt.slot_rpc_inflight[s_idx] && !block_new_entries { continue; }
                 let elapsed_ns = now_ns.0.saturating_sub(resting_since_ts.0);
                 let total_chase_ns = now_ns.0.saturating_sub(entry_forensics[s_idx].armed_ts_ns);
-                let base_chase_ns = gov.max_total_entry_chase_ns(s_idx, snap.realized_vol_5m);
+                let raw_base_chase_ns = gov.max_total_entry_chase_ns(s_idx, snap.realized_vol_5m);
+                let hwk_prec_mult = rt.markout_rings[s_idx].hawkes_abort_precision_patience_mult_c1();
+                let base_chase_ns = ((raw_base_chase_ns as f64) * hwk_prec_mult).round() as i64;
                 let dt_s = ((elapsed_ns.max(5_000_000) as f64) * 1e-9).max(0.05);
                 let hwk_lam = compute_resting_l1_hawkes_lambda_v531(
                     evt_dil,
@@ -1283,12 +1316,45 @@ pub fn step_12_slot_daemon_tick(
                         } else { rt.sl_needs_sync[s_idx] = false; }
                     }
                     if let Some(quote) = engines[s_idx].compute_canonical_exit_quote(&snap) {
+                        let (prev_def_locked, prev_ax_lots) = match engines[s_idx].state {
+                            OrderLifecycleState::PositionOpenMakerExit {
+                                defensive_floor_locked,
+                                active_exit_lots,
+                                ..
+                            } => (defensive_floor_locked, active_exit_lots),
+                            _ => (false, LotQty(0)),
+                        };
                         engines[s_idx].last_closed_wald_pct = engines[s_idx].last_closed_wald_pct.max(quote.wald_pct);
-                        if quote.defensive_lock_active { engines[s_idx].latch_defensive_floor_if_needed(true); }
-                        else if let OrderLifecycleState::PositionOpenMakerExit { ref mut defensive_floor_locked, .. } = engines[s_idx].state { *defensive_floor_locked = false; }
+                        if quote.defensive_lock_active {
+                            engines[s_idx].latch_defensive_floor_if_needed(true);
+                        } else if let OrderLifecycleState::PositionOpenMakerExit { ref mut defensive_floor_locked, .. } = engines[s_idx].state {
+                            *defensive_floor_locked = false;
+                        }
+                        if let OrderLifecycleState::PositionOpenMakerExit {
+                            active_exit_role: ref mut ax_r,
+                            active_exit_price: ref mut ax_p,
+                            active_exit_lots: ref mut ax_l,
+                            ..
+                        } = engines[s_idx].state
+                        {
+                            *ax_r = quote.role;
+                            *ax_p = quote.target_price;
+                            *ax_l = quote.order_lots;
+                        }
                         engines[s_idx].last_exit_sub_reason = quote.sub_reason;
                         let (ws_rtt_us, ws_quota_rem) = crate::execution_fsm::read_live_ws_pulse();
-                        let (preempt_peg, next_sync_delay_ns) = compute_exit_sync_schedule_elastic(&quote, resting_exit_price, avg_price_ticks, ws_rtt_us, ws_quota_rem);
+                        let (base_preempt, next_sync_delay_ns) = compute_exit_sync_schedule_elastic(&quote, resting_exit_price, avg_price_ticks, ws_rtt_us, ws_quota_rem);
+                        let unlocked_outward = prev_def_locked
+                            && !quote.defensive_lock_active
+                            && resting_exit_price.0 > 0
+                            && resting_exit_price != quote.target_price;
+                        let lots_split_changed = resting_exit_price.0 > 0
+                            && prev_ax_lots.0 > 0
+                            && prev_ax_lots != quote.order_lots;
+                        let preempt_peg = base_preempt || unlocked_outward || lots_split_changed;
+                        if unlocked_outward || lots_split_changed {
+                            engines[s_idx].next_peg_allowed_ts_ns = 0;
+                        }
                         if !rt.slot_rpc_inflight[s_idx] && (preempt_peg || now_ns.0 >= engines[s_idx].next_peg_allowed_ts_ns) && now_ns.0.saturating_sub(*last_rest_dispatch_ns) >= 55_000_000 {
                             *last_rest_dispatch_ns = now_ns.0;
                             engines[s_idx].next_peg_allowed_ts_ns = now_ns.0 + next_sync_delay_ns;
@@ -1713,12 +1779,43 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
                             mid_now, snap.ts_local_ns, gov.active_fee_schedule().maker_fee_bps.raw(),
                         );
                         if let Some(mk_pk) = rt.markout_rings[s_idx].take_uncensored_fill_peak_sbps() {
+                            let prev_mfe = engines[s_idx].learned_mfe_bps;
                             engines[s_idx].observe_markout_ring_favorable_peak(mk_pk);
+                            if engines[s_idx].learned_mfe_bps > prev_mfe {
+                                let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
+                                    ts_ns: now_ns.0,
+                                    learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
+                                });
+                            }
                         }
+                        let pk_60s = rt.markout_rings[s_idx].last_resolved_60s_fill_peak_sbps();
                         if let Some((mk_side, mk_fav_60s)) = rt.markout_rings[s_idx].take_resolved_60s_fill_markout() {
                             let _ = gov.observe_markout_60s_continuation(
-                                s_idx, mk_side, engines[s_idx].last_closed_mfe_bps, mk_fav_60s, snap.realized_vol_5m,
+                                s_idx,
+                                mk_side,
+                                engines[s_idx].last_closed_mfe_bps.max(pk_60s),
+                                mk_fav_60s,
+                                snap.realized_vol_5m,
                             );
+                        }
+                        if let Some((cf_side, cf_peak, cf_fav_60s)) =
+                            rt.markout_rings[s_idx].take_counterfactual_abort_learning()
+                        {
+                            let prev_mfe = engines[s_idx].learned_mfe_bps;
+                            engines[s_idx].observe_counterfactual_abort_mfe(cf_peak);
+                            let _ = gov.observe_counterfactual_abort_continuation_v558(
+                                s_idx,
+                                cf_side,
+                                cf_peak,
+                                cf_fav_60s,
+                                snap.realized_vol_5m,
+                            );
+                            if engines[s_idx].learned_mfe_bps > prev_mfe {
+                                let _ = vault_tx.try_send(VaultIoCommand::SaveMfePlasticity {
+                                    ts_ns: now_ns.0,
+                                    learned_mfe_bps: SlotExecutionEngine::extract_12_slot_mfe_array(&engines),
+                                });
+                            }
                         }
                         gov.observe_market_price(s_idx, &snap);
                     }

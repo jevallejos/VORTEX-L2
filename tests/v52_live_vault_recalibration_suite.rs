@@ -4430,3 +4430,175 @@ fn test_v553_full_forensic_audit_seals_f01_to_f16() {
     ];
     assert_eq!(web_ctx.verify_csrf_header(&good_hdrs), Ok(()));
 }
+
+#[test]
+fn test_v558_deadzone_win_unlock_divisible_t1_rescue_anti_spiral_ewma_and_counterfactual_abort_learning() {
+    let fees = vortex_rs::fee_cadence_beta::FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_240_000_000_000_000_i64;
+
+    // 1) Dead-zone elimination (+2.68..+3.21 bps): ETH Ask locked at 401 sbps unlocks and amends outward at +2.85 bps!
+    let eth_spec = vortex_rs::types::APPROVED_SPECS[1];
+    let en_eth = vortex_rs::types::PriceTicks(161_870);
+    let z_eth = vortex_rs::execution_fsm::defensive_zero_loss_maker_exit_price_with_fees(
+        vortex_rs::types::Side::Ask,
+        en_eth,
+        fees,
+    );
+    let mid_285 = vortex_rs::types::PriceTicks(161_824); // +2.84 bps favorable (inside old +2.68..+4.01 dead-zone!)
+    let mut eth_snap = mk_vault_snap(1, mid_285.0, 3_200, -0.48, -0.68, -0.35, t0 + 50_000_000_000);
+    eth_snap.bids[0].price = mid_285;
+    eth_snap.asks[0].price = vortex_rs::types::PriceTicks(mid_285.0 + 1);
+    let eth_ctx = vortex_rs::exit_quoter::OpenExitContext {
+        slot_idx: 1,
+        side: vortex_rs::types::Side::Ask,
+        avg_price_ticks: en_eth,
+        peak_favorable_price: mid_285,
+        worst_adverse_price: vortex_rs::types::PriceTicks(161_942),
+        initial_lots: vortex_rs::types::LotQty(1),
+        open_lots: vortex_rs::types::LotQty(1),
+        tranche1_harvested: false,
+        tranche1_lots: vortex_rs::types::LotQty(0),
+        tranche1_exit_price: vortex_rs::types::PriceTicks(0),
+        defensive_floor_locked: true,
+        active_exit_price: z_eth,
+        structural_tp_price: vortex_rs::types::PriceTicks(161_700),
+        resting_exit_price: z_eth,
+        sl_trigger_price: vortex_rs::types::PriceTicks(162_900),
+        opened_ts: vortex_rs::types::TimestampNs(t0),
+        learned_mfe_bps: 1_050,
+        learned_t1_permille: 500,
+        learned_ir_x100: 33,
+        learned_ret_std_bps: 200,
+        intrinsic_tau_mkt_s: 300,
+        last_eff_sl_ticks: vortex_rs::types::PriceTicks(162_550),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 284,
+        last_closed_mae_bps: -444,
+        active_fees: fees,
+        learned_taker_prob_pm: 57,
+    };
+    let kin_recov = vortex_rs::exit_quoter::ShadowRunnerKinematics {
+        flow_ema_fast: -0.54,
+        flow_ema_slow: -0.50,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_eth_opt = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega(&eth_ctx, kin_recov, &eth_snap);
+    assert!(q_eth_opt.is_some());
+    let Some(q_eth) = q_eth_opt else { return };
+    assert!(!q_eth.defensive_lock_active && q_eth.target_price.0 < z_eth.0);
+    assert!(vortex_rs::bybit_gateway::should_repeg_resting_exit_tp(
+        eth_spec,
+        vortex_rs::types::Side::Ask,
+        mid_285,
+        z_eth,
+        vortex_rs::types::LotQty(1),
+        q_eth.target_price,
+        vortex_rs::types::LotQty(1),
+        false,
+        284,
+        fees,
+    ));
+
+    // 2) Divisible rebound (LINK 26L, slow=-0.02, OFI=+0.52) splits Tranche 1 instead of 100% scratch exit:
+    let en_link = vortex_rs::types::PriceTicks(8_354);
+    let z_link = vortex_rs::execution_fsm::defensive_zero_loss_maker_exit_price_with_fees(
+        vortex_rs::types::Side::Bid,
+        en_link,
+        fees,
+    );
+    let link_snap = mk_vault_snap(9, 8_350, 3_200, 0.52, 0.20, 0.18, t0 + 90_000_000_000);
+    let mut link_ctx = eth_ctx;
+    link_ctx.slot_idx = 9;
+    link_ctx.side = vortex_rs::types::Side::Bid;
+    link_ctx.avg_price_ticks = en_link;
+    link_ctx.peak_favorable_price = en_link;
+    link_ctx.worst_adverse_price = vortex_rs::types::PriceTicks(8_234);
+    link_ctx.initial_lots = vortex_rs::types::LotQty(26);
+    link_ctx.open_lots = vortex_rs::types::LotQty(26);
+    link_ctx.active_exit_price = z_link;
+    link_ctx.resting_exit_price = z_link;
+    link_ctx.structural_tp_price = vortex_rs::types::PriceTicks(8_412);
+    link_ctx.sl_trigger_price = vortex_rs::types::PriceTicks(8_180);
+    link_ctx.last_eff_sl_ticks = vortex_rs::types::PriceTicks(8_210);
+    link_ctx.learned_mfe_bps = 686;
+    let kin_link = vortex_rs::exit_quoter::ShadowRunnerKinematics {
+        flow_ema_fast: 0.28,
+        flow_ema_slow: -0.02,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let q_link_opt = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega(&link_ctx, kin_link, &link_snap);
+    assert!(q_link_opt.is_some_and(|q| {
+        q.role == vortex_rs::exit_quoter::ExitOrderRole::Tranche1Harvest50
+            && q.target_price == z_link
+            && q.order_lots.0 < 26
+    }));
+
+    // 3) Anti-spiral EWMA on 3 censored scratches + MFE floor >= round(PHI * 400) = 647 (AVAX 676 fix):
+    let mut gov = vortex_rs::execution_fsm::OnlineAdaptiveGovernor::new();
+    let w_neutral = eth_snap.wave_observables();
+    for (k, mfe_sbps) in [(1_i64, 657_i64), (2, 500), (3, 420)] {
+        gov.observe_closed_trade_with_regime_v51(
+            1,
+            vortex_rs::types::Side::Ask,
+            en_eth,
+            vortex_rs::types::ScaledBps(k),
+            vortex_rs::types::ScaledBps(mfe_sbps),
+            true,
+            w_neutral,
+            1.0,
+            vortex_rs::types::TimestampNs(t0 + k * 60_000_000_000),
+        );
+    }
+    let (eth_ewma_after_3scr, _, _) = gov.slot_direction_diagnostics(1, vortex_rs::types::Side::Ask);
+    assert!(eth_ewma_after_3scr >= 165);
+    let mut eng_avax = vortex_rs::execution_fsm::SlotExecutionEngine::new(3);
+    eng_avax.learned_mfe_bps = 680;
+    eng_avax.open_vol_5m_bps = vortex_rs::types::ScaledBps(1_800);
+    eng_avax.last_closed_mfe_bps = 459;
+    eng_avax.last_exit_sub_reason = vortex_rs::exit_quoter::ExitSubReason::AdverseScratchEscape;
+    eng_avax.observe_censored_close_mfe_plasticity_with_ext(vortex_rs::types::Side::Bid, 459, 0, true);
+    assert!(eng_avax.learned_mfe_bps >= 647);
+
+    // 4) Pre-T1 markout keeps cont_ratio == 1000; clean +60s abort counterfactual learns MFE & cont_ratio:
+    assert_eq!(
+        gov.observe_markout_60s_continuation(3, vortex_rs::types::Side::Bid, 350, 150, vortex_rs::types::ScaledBps(3_600)),
+        1_000
+    );
+    let mut ring = vortex_rs::markout_tracker::SlotMarkoutRing::new();
+    for k in 0..6_i64 {
+        let ta = t0 + k * 70_000_000_000;
+        ring.arm_abort_probe_v49(
+            vortex_rs::types::Side::Bid,
+            vortex_rs::types::PriceTicks(10_000),
+            vortex_rs::lob_shm::LastVetoCode::HawkesStoikovQueueAbort,
+            vortex_rs::types::TimestampNs(ta),
+            vortex_rs::types::TimestampNs(ta + 1_000_000_000),
+            vortex_rs::types::LotQty(200),
+            vortex_rs::types::LotQty(40),
+        );
+        ring.step_clock(vortex_rs::types::PriceTicks(10_002), vortex_rs::types::TimestampNs(ta + 1_300_000_000), 200);
+        ring.step_clock(vortex_rs::types::PriceTicks(10_040), vortex_rs::types::TimestampNs(ta + 2_200_000_000), 200);
+        ring.step_clock(vortex_rs::types::PriceTicks(10_095), vortex_rs::types::TimestampNs(ta + 6_500_000_000), 200);
+        ring.step_clock(vortex_rs::types::PriceTicks(10_140), vortex_rs::types::TimestampNs(ta + 17_000_000_000), 200);
+        ring.step_clock(vortex_rs::types::PriceTicks(10_120), vortex_rs::types::TimestampNs(ta + 62_000_000_000), 200);
+    }
+    let cf_opt = ring.take_counterfactual_abort_learning();
+    assert!(cf_opt.is_some());
+    if let Some((cf_side, cf_peak, cf_fav60)) = cf_opt {
+        let mut eng_cold = vortex_rs::execution_fsm::SlotExecutionEngine::new(6);
+        assert_eq!(eng_cold.learned_mfe_bps, 680);
+        eng_cold.observe_counterfactual_abort_mfe(cf_peak);
+        assert!(eng_cold.learned_mfe_bps > 730);
+        let next_cr = gov.observe_counterfactual_abort_continuation_v558(
+            6,
+            cf_side,
+            cf_peak,
+            cf_fav60,
+            vortex_rs::types::ScaledBps(3_600),
+        );
+        assert!(next_cr > 1_080);
+    }
+    assert!(ring.hawkes_abort_precision_patience_mult_c1() > 1.15);
+}

@@ -945,7 +945,8 @@ pub fn compute_reversible_defensive_state_c1(
     let p_taker = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
     let ir_pos = (ir_x100.clamp(0, 100) as f64) * 1e-2;
     let phi_unlock = (INV_PHI * (1.0 + INV_PHI_SQ * p_taker) / (1.0 + INV_PHI_CUBE * ir_pos)).clamp(INV_PHI_SQ, PHI);
-    let recov_s3 = hermite_s3_unit(cur_gross_bps.raw() as f64, 0.0, (win_floor_bps.raw().max(100)) as f64);
+    let green_span = (INV_PHI * (win_floor_bps.raw().max(100) as f64)).max(100.0);
+    let recov_s3 = hermite_s3_unit(cur_gross_bps.raw() as f64, 0.0, green_span);
     let eff_unlock = phi_unlock * (1.0 - INV_PHI_CUBE * recov_s3);
     (signed_flow_slow.get() < eff_unlock, false)
 }
@@ -1183,12 +1184,19 @@ pub fn compute_canonical_exit_quote_omega_v55(
     } else { ctx.ratchet_locked_gross_bps };
     let ratchet_pullback = eff_ratchet_bps >= win_floor_bps
         && ((own_flow <= -0.5 * INV_PHI_CUBE) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < INV_PHI_CUBE));
-    let shadow_crest_snap = best_mfe_bps >= fee_rt * 2 && cur_gross_bps >= zero_loss_bps && s_prop < 0.18 && flow_accel < -0.005;
+    let crest_mfe_req = if !ctx.tranche1_harvested && ctx.open_lots.0 == 1 && cur_gross_bps >= win_floor_bps {
+        (PHI * c_mkr_scale).round() as i64
+    } else {
+        fee_rt * 2
+    };
+    let shadow_crest_snap = best_mfe_bps >= crest_mfe_req && cur_gross_bps >= zero_loss_bps && s_prop < 0.18 && flow_accel < -0.005;
     let q_floor_px = enforce_maker_bbo_bound(ctx.side, zero_loss_px, snap);
     let eff_t1_pm_def = compute_wave_dynamic_t1_permille(ctx.learned_t1_permille, ctx.side, snap, kin.in_scar_debt);
     let def_runner_split_t1 = if !ctx.tranche1_harvested
         && ctx.defensive_floor_locked
-        && eff_flow_slow >= 0.0
+        && !climax_harvest
+        && !opposing_wave3_escape
+        && (eff_flow_slow >= -INV_PHI_FIFTH || own_flow >= INV_PHI_CUBE)
         && can_split_runner_legs(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def)
     {
         defensive_lock_active = true;
@@ -1387,7 +1395,7 @@ pub fn compute_canonical_exit_quote_omega_v55(
         } else if let Some(t1_lots) = def_runner_split_t1 {
             let opp_w3 = opposing_wave3_escape || opp_w3_confirmed;
             let pi_reb = compute_rebound_probability_pi_c1(ctx.side, snap, v55.zeta_tox);
-            if pi_reb >= INV_PHI_SQ && !opp_w3 && !climax_harvest {
+            if pi_reb >= INV_PHI_CUBE && !opp_w3 && !climax_harvest {
                 return Some(CanonicalExitQuote {
                     role: ExitOrderRole::Tranche1Harvest50,
                     target_price: q_floor_px,

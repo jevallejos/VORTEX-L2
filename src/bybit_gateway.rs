@@ -260,8 +260,8 @@ pub const fn should_repeg_resting_exit_tp_with_open_lots(
         Ok(b) if b.0 > 0 => b.0,
         _ => 1,
     };
-    let safe_outward_buf = if rt_eff / 3 > tau_tick_sbps {
-        rt_eff / 3
+    let safe_outward_buf = if rt_eff / 5 > tau_tick_sbps {
+        rt_eff / 5
     } else {
         tau_tick_sbps
     };

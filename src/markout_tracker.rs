@@ -226,6 +226,8 @@ struct PendingMarkoutProbe {
     rem_q_lots: LotQty,
     vol5m_at_fill: ScaledBps,
     c_rt_mkr: ScaledBps,
+    peak_fav_sbps: i64,
+    worst_adv_sbps: i64,
     curve: MarkoutCurve5hBps,
 }
 
@@ -246,6 +248,8 @@ impl PendingMarkoutProbe {
             rem_q_lots: LotQty(0),
             vol5m_at_fill: ScaledBps(0),
             c_rt_mkr: ScaledBps(400),
+            peak_fav_sbps: 0,
+            worst_adv_sbps: 0,
             curve: MarkoutCurve5hBps {
                 samples_bps: [0; MARKOUT_HORIZONS_V49],
                 resolved_mask: 0,
@@ -270,6 +274,8 @@ pub struct SlotMarkoutRing {
     ewma_markout_60s_bps: i64,
     pending_uncensored_peak_sbps: i64,
     pending_resolved_60s_fill: Option<(Side, i64)>,
+    last_resolved_60s_peak_sbps: i64,
+    pending_counterfactual_abort: Option<(Side, i64, i64)>,
     tp_abort_count: u64,
     resolved_abort_count: u64,
     veto_tp_counts: [u32; VETO_CODE_CARDINALITY],
@@ -308,6 +314,8 @@ impl SlotMarkoutRing {
             ewma_markout_60s_bps: 0,
             pending_uncensored_peak_sbps: 0,
             pending_resolved_60s_fill: None,
+            last_resolved_60s_peak_sbps: 0,
+            pending_counterfactual_abort: None,
             tp_abort_count: 0,
             resolved_abort_count: 0,
             veto_tp_counts: [0; VETO_CODE_CARDINALITY],
@@ -408,6 +416,8 @@ impl SlotMarkoutRing {
             rem_q_lots: LotQty(0),
             vol5m_at_fill,
             c_rt_mkr: eff_c_rt,
+            peak_fav_sbps: 0,
+            worst_adv_sbps: 0,
             curve,
         };
     }
@@ -460,6 +470,8 @@ impl SlotMarkoutRing {
             rem_q_lots,
             vol5m_at_fill: ScaledBps(0),
             c_rt_mkr: ScaledBps((self.last_maker_fee_bps.max(0).saturating_mul(2)).max(100)),
+            peak_fav_sbps: 0,
+            worst_adv_sbps: 0,
             curve: MarkoutCurve5hBps::default(),
         };
     }
@@ -478,11 +490,18 @@ impl SlotMarkoutRing {
             }
             let dt = now_ns.0.saturating_sub(slot.t0_ns);
             let denom = slot.ref_price.0.max(1);
-            if !slot.is_abort_probe && dt >= 0 && dt <= MARKOUT_HORIZONS_V49_NS[MARKOUT_HORIZONS_V49 - 1] {
+            if dt >= 0 && dt <= MARKOUT_HORIZONS_V49_NS[MARKOUT_HORIZONS_V49 - 1] {
                 let live_fav = ((mid_now.0 - slot.ref_price.0) * slot.side.sign_i64())
                     .saturating_mul(1_000_000)
                     / denom;
-                if live_fav > self.pending_uncensored_peak_sbps {
+                if live_fav > slot.peak_fav_sbps {
+                    slot.peak_fav_sbps = live_fav;
+                }
+                let live_adv = (-live_fav).max(0);
+                if live_adv > slot.worst_adv_sbps {
+                    slot.worst_adv_sbps = live_adv;
+                }
+                if !slot.is_abort_probe && live_fav > self.pending_uncensored_peak_sbps {
                     self.pending_uncensored_peak_sbps = live_fav;
                 }
             }
@@ -517,7 +536,14 @@ impl SlotMarkoutRing {
                             self.ewma_markout_15s_bps = ((1_000 - LVR_EWMA_ETA_PM) * self.ewma_markout_15s_bps + LVR_EWMA_ETA_PM * slot.curve.samples_bps[3]) / 1_000;
                         } else if h_idx == 4 {
                             self.ewma_markout_60s_bps = ((1_000 - LVR_EWMA_ETA_PM) * self.ewma_markout_60s_bps + LVR_EWMA_ETA_PM * slot.curve.samples_bps[4]) / 1_000;
-                            self.pending_resolved_60s_fill = Some((slot.side, slot.curve.samples_bps[4].max(0)));
+                            let fav_60s_eff = slot
+                                .curve
+                                .samples_bps[4]
+                                .max((slot.peak_fav_sbps * 618) / 1_000)
+                                .max(0);
+                            self.last_resolved_60s_peak_sbps =
+                                slot.peak_fav_sbps.max(slot.curve.samples_bps[4]).max(0);
+                            self.pending_resolved_60s_fill = Some((slot.side, fav_60s_eff));
                         }
                         if slot.t0_ns >= self.last_fill_t0_ns {
                             self.last_fill_curve = slot.curve;
@@ -545,6 +571,23 @@ impl SlotMarkoutRing {
             }
             if slot.curve.resolved_mask == MARKOUT_MASK_60S {
                 if slot.is_abort_probe {
+                    let max_adv_15s = slot.curve.samples_bps[0]
+                        .max(slot.curve.samples_bps[1])
+                        .max(slot.curve.samples_bps[2])
+                        .max(slot.curve.samples_bps[3]);
+                    let c_rt = slot.c_rt_mkr.raw().max(100);
+                    let min_cf_mfe = (PHI_MK * (c_rt as f64)).round() as i64;
+                    if slot.veto_code != (LastVetoCode::WarmupOrLock as u8)
+                        && max_adv_15s <= fee_bar
+                        && slot.worst_adv_sbps <= c_rt
+                        && slot.peak_fav_sbps >= min_cf_mfe
+                    {
+                        let fav_60s_cf = (-slot.curve.samples_bps[4])
+                            .max((slot.peak_fav_sbps * 618) / 1_000)
+                            .max(0);
+                        self.pending_counterfactual_abort =
+                            Some((slot.side, slot.peak_fav_sbps, fav_60s_cf));
+                    }
                     Self::push_completed_abort(slot, fee_bar, &mut self.completed_aborts, &mut self.abort_read_idx, &mut self.abort_write_idx);
                 }
                 slot.active = false;
@@ -688,6 +731,37 @@ impl SlotMarkoutRing {
     #[inline]
     pub fn take_resolved_60s_fill_markout(&mut self) -> Option<(Side, i64)> {
         self.pending_resolved_60s_fill.take()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn last_resolved_60s_fill_peak_sbps(&self) -> i64 {
+        self.last_resolved_60s_peak_sbps
+    }
+
+    #[inline]
+    pub fn take_counterfactual_abort_learning(&mut self) -> Option<(Side, i64, i64)> {
+        self.pending_counterfactual_abort.take()
+    }
+
+    /// Empirical Bayes `C1` L1 queue-patience multiplier in `[INV_PHI_MK, PHI_MK]` driven by `+15s`
+    /// counterfactual precision of `HawkesStoikovQueueAbort` (`V5.5.8`; `1.0` for `< 4` resolved samples).
+    #[inline]
+    #[must_use]
+    #[allow(clippy::suboptimal_flops)]
+    pub fn hawkes_abort_precision_patience_mult_c1(&self) -> f64 {
+        let (tp, res) = self.veto_precision_counts(LastVetoCode::HawkesStoikovQueueAbort);
+        if res < 4 {
+            return 1.0;
+        }
+        let prec = (f64::from(tp) + PHI_MK) / (f64::from(res) + 2.0 * PHI_MK);
+        let s_n = crate::wave_elliott::hermite_smoothstep_c1(f64::from(res), 3.0, 8.0);
+        let s_over_abort =
+            crate::wave_elliott::hermite_smoothstep_c1(INV_PHI_MK - prec, 0.0, INV_PHI_SQ_MK);
+        let s_high_tox =
+            crate::wave_elliott::hermite_smoothstep_c1(prec - INV_PHI_MK, 0.0, INV_PHI_CUBE_MK);
+        let delta = INV_PHI_SQ_MK * s_over_abort - INV_PHI_CUBE_MK * s_high_tox;
+        (1.0 + s_n * delta).clamp(INV_PHI_MK, PHI_MK)
     }
 
     #[inline]

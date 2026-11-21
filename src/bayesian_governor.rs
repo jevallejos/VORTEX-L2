@@ -250,9 +250,53 @@ impl OnlineAdaptiveGovernor {
             return crate::governor_plasticity::DEFAULT_CONT_RATIO_X1000;
         }
         let fee_rt = self.active_maker_rt_fee_bps();
+        if mfe_sbps.max(markout_60s_fav_sbps) < (fee_rt * 11) / 10 {
+            return self.plasticity.slot_cont_ratio_x1000(slot_idx, side);
+        }
         let eff_vol = ScaledBps(vol_5m.raw().max(self.eq_vol_5m_bps[slot_idx]).max(1_200));
         let t1_floor_sbps = crate::exit_quoter::compute_elastic_offensive_win_floor_bps(fee_rt, eff_vol).raw();
         self.plasticity.observe_continuation_sample(slot_idx, side, mfe_sbps, markout_60s_fav_sbps, t1_floor_sbps)
+    }
+
+    /// Counterfactual `+60s` continuation self-learning from clean non-toxic queue aborts (`V5.5.8`).
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn observe_counterfactual_abort_continuation_v558(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        cf_peak_sbps: i64,
+        cf_fav_60s_sbps: i64,
+        vol_5m: ScaledBps,
+    ) -> i64 {
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return crate::governor_plasticity::DEFAULT_CONT_RATIO_X1000;
+        }
+        let d = Self::dir_idx(side);
+        let cur_cr = self.plasticity.cont_ratio_x1000[slot_idx][d];
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let eff_vol = ScaledBps(vol_5m.raw().max(self.eq_vol_5m_bps[slot_idx]).max(1_200));
+        let t1_floor = crate::exit_quoter::compute_elastic_offensive_win_floor_bps(fee_rt, eff_vol)
+            .raw()
+            .max(100);
+        if cf_peak_sbps < t1_floor || cf_fav_60s_sbps < t1_floor {
+            return cur_cr;
+        }
+        let obs_x1000 = (((cf_peak_sbps.max(cf_fav_60s_sbps) as i128) * 1_000) / (t1_floor as i128))
+            .clamp(
+                crate::governor_plasticity::MIN_CONT_RATIO_X1000 as i128,
+                crate::governor_plasticity::MAX_CONT_RATIO_X1000 as i128,
+            ) as i64;
+        if obs_x1000 > cur_cr {
+            let next_cr = ((910 * cur_cr + 90 * obs_x1000) / 1_000).clamp(
+                crate::governor_plasticity::MIN_CONT_RATIO_X1000,
+                crate::governor_plasticity::MAX_CONT_RATIO_X1000,
+            );
+            self.plasticity.cont_ratio_x1000[slot_idx][d] = next_cr;
+            next_cr
+        } else {
+            cur_cr
+        }
     }
 
     #[inline]
@@ -887,10 +931,37 @@ impl OnlineAdaptiveGovernor {
             self.eq_vol_5m_bps[slot_idx],
         );
         let prev_mean = self.ewma_net_bps_x100[slot_idx][d].clamp(-100_000, 100_000);
-        let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
-        self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d].clamp(100, 100_000_000) * 80 + diff.saturating_mul(diff).min(25_000_000) * 20) / 100).max(2_500);
-        self.ewma_net_bps_x100[slot_idx][d] = ((prev_mean * 75 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 25) / 100).clamp(-100_000, 100_000);
-        self.portfolio_ewma_net_bps_x100 = ((self.portfolio_ewma_net_bps_x100.clamp(-100_000, 100_000) * 764 + net_scaled_bps.raw().clamp(-100_000, 100_000) * 236) / 1_000).clamp(-100_000, 100_000);
+        let is_censored_scratch =
+            is_maker_exit && net_scaled_bps.raw() >= 0 && net_scaled_bps.raw() < fee_rt / 4;
+        if is_censored_scratch {
+            let mfe_net_disc = ((eff_mfe.raw().saturating_sub(fee_rt)).max(0).saturating_mul(382)) / 1_000;
+            let eff_scr_net = net_scaled_bps.raw().max(mfe_net_disc).clamp(0, 100_000);
+            let diff = eff_scr_net.saturating_sub(prev_mean);
+            self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d].clamp(100, 100_000_000) * 953
+                + diff.saturating_mul(diff).min(25_000_000) * 47)
+                / 1_000)
+                .max(2_500);
+            self.ewma_net_bps_x100[slot_idx][d] =
+                ((prev_mean * 941 + eff_scr_net * 59) / 1_000).clamp(-100_000, 100_000);
+            self.portfolio_ewma_net_bps_x100 = ((self.portfolio_ewma_net_bps_x100.clamp(-100_000, 100_000) * 944
+                + eff_scr_net * 56)
+                / 1_000)
+                .clamp(-100_000, 100_000);
+        } else {
+            let diff = net_scaled_bps.raw().saturating_sub(prev_mean);
+            self.ewma_var_bps2[slot_idx][d] = ((self.ewma_var_bps2[slot_idx][d].clamp(100, 100_000_000) * 80
+                + diff.saturating_mul(diff).min(25_000_000) * 20)
+                / 100)
+                .max(2_500);
+            self.ewma_net_bps_x100[slot_idx][d] = ((prev_mean * 75
+                + net_scaled_bps.raw().clamp(-100_000, 100_000) * 25)
+                / 100)
+                .clamp(-100_000, 100_000);
+            self.portfolio_ewma_net_bps_x100 = ((self.portfolio_ewma_net_bps_x100.clamp(-100_000, 100_000) * 764
+                + net_scaled_bps.raw().clamp(-100_000, 100_000) * 236)
+                / 1_000)
+                .clamp(-100_000, 100_000);
+        }
         let _ = self.recompute_psi_health_in_place();
         if ts_ns.0 > 0 {
             self.sync_global_debt_clock_and_decay(slot_idx, d, entry_price, ts_ns.0);

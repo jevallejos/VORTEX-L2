@@ -664,6 +664,17 @@ impl SlotExecutionEngine {
         }
     }
 
+    /// Counterfactual MFE self-learning from clean favorable-miss queue aborts resolved to `+60s` (`V5.5.8`).
+    #[inline]
+    pub fn observe_counterfactual_abort_mfe(&mut self, cf_peak_sbps: i64) {
+        let eff_rt = self.active_maker_rt_fee_bps().max(100);
+        let cap_sbps = 12_i64.saturating_mul(eff_rt);
+        let bounded = cf_peak_sbps.min(cap_sbps);
+        if bounded > self.learned_mfe_bps {
+            self.learned_mfe_bps = (910 * self.learned_mfe_bps + 90 * bounded) / 1_000;
+        }
+    }
+
     /// Right-censoring-aware MFE plasticity helper for vault rehydration & closed-trade accounting (V5.5.4).
     #[inline]
     pub fn observe_mfe_sample_uncensored(
@@ -810,7 +821,7 @@ impl SlotExecutionEngine {
             if s_cool <= 0.0 {
                 return;
             }
-            let floor_dn = m_km.max(eff_rt + 40);
+            let floor_dn = m_km.max(offensive_floor_sbps);
             let eff_sample = ((self.learned_mfe_bps as f64)
                 - s_cool * ((self.learned_mfe_bps - floor_dn).max(0) as f64))
                 .round() as i64;
@@ -2618,7 +2629,15 @@ impl SlotExecutionEngine {
         let tox_pct = (48.0 + 34.0 * s3).round() as i64;
         self.wald_sprt.contraction_pct = self.wald_sprt.contraction_pct.max(tox_pct).clamp(48, 82);
         self.last_closed_wald_pct = self.last_closed_wald_pct.max(self.wald_sprt.contraction_pct);
-        self.latch_defensive_floor_if_needed(true);
+        let ref_m_px = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { avg_price_ticks.0 };
+        let cur_g_sbps = ((ref_m_px - avg_price_ticks.0)
+            .saturating_mul(side.sign_i64())
+            .saturating_mul(1_000_000))
+            / avg_price_ticks.0.max(1);
+        let min_tox_latch_dip = -((PHI_TX * (self.active_maker_rt_fee_bps() as f64)).round() as i64);
+        if zeta_tox >= 1.0 || cur_g_sbps <= min_tox_latch_dip {
+            self.latch_defensive_floor_if_needed(true);
+        }
         zeta_tox
     }
 
