@@ -266,7 +266,23 @@ impl OnlineAdaptiveGovernor {
     #[allow(clippy::cast_precision_loss)]
     fn recompute_psi_health_in_place(&mut self) -> f64 {
         let p_tkr = (self.plasticity.portfolio_taker_prob_permille().clamp(5, 950) as f64) * 1e-3;
-        let ewma_bps = self.portfolio_ewma_net_bps();
+        let fast_ewma_bps = self.portfolio_ewma_net_bps();
+        let mut cell_sum_x100 = 0_i64;
+        for row in &self.ewma_net_bps_x100 {
+            for &v in row {
+                cell_sum_x100 = cell_sum_x100.saturating_add(v);
+            }
+        }
+        let cell_mean_bps = (cell_sum_x100 as f64) / ((MAX_ACTIVE_PAIRS * 2 * 100) as f64);
+        let r_cap = (1.0 - self.last_daily_loss_used_ratio.clamp(0.0, 1.0))
+            * (1.0 - self.last_epoch_loss_5u_ratio.clamp(0.0, 1.0));
+        let w_res = crate::alpha_3factor::INV_PHI
+            * crate::wave_elliott::hermite_smoothstep_c1(
+                r_cap,
+                crate::alpha_3factor::INV_PHI_SQ,
+                crate::alpha_3factor::INV_PHI,
+            );
+        let ewma_bps = (1.0 - w_res) * fast_ewma_bps + w_res * fast_ewma_bps.max(cell_mean_bps);
         let fee_rt_bps = (self.active_maker_rt_fee_bps().max(100) as f64) / 100.0;
         let psi = crate::governor_plasticity::compute_psi_health_c1(
             p_tkr,
