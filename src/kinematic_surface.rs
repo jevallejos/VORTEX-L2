@@ -284,6 +284,94 @@ pub fn evaluate_kinematic_surface_core(
     )
 }
 
+/// Continuous C1 tick-lattice relaxation `s_lat_kin` in `[0.0, 1.0]` for coarse-tick multi-lot pairs (`V5.5.10`, H-05).
+/// Identically `0.0` on fine-tick (`eta_lat <= INV_PHI_SQ`), 1-lot, negative-tape, or spoofed books.
+#[inline]
+#[must_use]
+pub fn compute_lattice_kinematic_relaxation_c1(
+    eta_lat: f64,
+    ofi_al: f64,
+    tfi_al: f64,
+    spoof_d: f64,
+    is_multilot: bool,
+) -> f64 {
+    if !is_multilot
+        || !eta_lat.is_finite()
+        || !ofi_al.is_finite()
+        || !tfi_al.is_finite()
+        || tfi_al < 0.0
+    {
+        return 0.0;
+    }
+    let sp = if spoof_d.is_finite() { spoof_d.clamp(0.0, 1.0) } else { 1.0 };
+    let s_lat = crate::wave_elliott::hermite_smoothstep_c1(
+        eta_lat,
+        crate::alpha_3factor::INV_PHI_SQ,
+        crate::alpha_3factor::PHI,
+    );
+    let s_ofi = crate::wave_elliott::hermite_smoothstep_c1(
+        ofi_al,
+        crate::alpha_3factor::INV_PHI_SQ,
+        crate::alpha_3factor::INV_PHI,
+    );
+    let s_clean = 1.0
+        - crate::wave_elliott::hermite_smoothstep_c1(
+            sp,
+            crate::alpha_3factor::INV_PHI_FOURTH,
+            crate::alpha_3factor::INV_PHI,
+        );
+    (s_lat * s_ofi * s_clean).clamp(0.0, 1.0)
+}
+
+/// Evaluates the C1 Kinematic Free-Energy surface with coarse-tick multi-lot `eta_lat` parity (`V5.5.10`, H-05),
+/// leaving `evaluate_kinematic_surface_with_fees` (`SCAR-LOCK 63/63 x 2,160`) 100% untouched and fabricating zero phantom energy.
+#[inline]
+pub fn evaluate_kinematic_surface_with_lattice_and_fees(
+    side: Side,
+    eq_vol_raw: i64,
+    learned_edge: i64,
+    ir_x100: i64,
+    drift_bps: i64,
+    ext_bps: i64,
+    signed_geom: f64,
+    snr_abs: f64,
+    fees: FeeSchedule,
+    eta_lat: f64,
+    ofi_al: f64,
+    tfi_al: f64,
+    spoof_d: f64,
+    is_multilot: bool,
+) -> Result<(i64, i64), &'static str> {
+    let s_lat_kin = compute_lattice_kinematic_relaxation_c1(eta_lat, ofi_al, tfi_al, spoof_d, is_multilot);
+    if s_lat_kin <= 1e-9 || !snr_abs.is_finite() || !signed_geom.is_finite() {
+        return evaluate_kinematic_surface_with_fees(
+            side, eq_vol_raw, learned_edge, ir_x100, drift_bps, ext_bps, signed_geom, snr_abs, fees,
+        );
+    }
+    let base_min_geom = if snr_abs > 0.58 {
+        (0.106 - (snr_abs - 0.58) * 0.85).clamp(0.02, 0.15)
+    } else if snr_abs >= 0.50 {
+        (0.15 - (snr_abs - 0.50) * 0.55).clamp(0.05, 0.15)
+    } else {
+        0.15
+    };
+    let eff_min_geom = (1.0 - s_lat_kin) * base_min_geom - crate::alpha_3factor::INV_PHI_FOURTH * s_lat_kin;
+    if signed_geom < eff_min_geom {
+        return Err("VETO_LOW_L2_GEOM_VACUUM (<min_geom)");
+    }
+    evaluate_kinematic_surface_with_fees(
+        side,
+        eq_vol_raw,
+        learned_edge,
+        ir_x100,
+        drift_bps,
+        ext_bps,
+        signed_geom.max(base_min_geom),
+        snr_abs,
+        fees,
+    )
+}
+
 #[inline]
 pub fn evaluate_preflight_hysteresis_with_fees(
     side: Side,
@@ -402,6 +490,15 @@ pub fn parse_historical_trade_scar_tuple(val: &serde_json::Value, min_exclusive_
     let net_sc = ScaledBps((val.get("net_bps").and_then(serde_json::Value::as_f64)? * 100.0).round() as i64);
     let mkr = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(net_sc.raw() >= -50);
     Some(((ts_ns, slot_idx, d_u8), (en_t, net_sc, mkr)))
+}
+
+#[must_use]
+pub fn parse_historical_trade_mfe_sbps(val: &serde_json::Value) -> Option<ScaledBps> {
+    let mfe_bps = val.get("mfe_bps").and_then(serde_json::Value::as_f64)?;
+    if !mfe_bps.is_finite() || mfe_bps < 0.0 {
+        return None;
+    }
+    Some(ScaledBps((mfe_bps * 100.0).round() as i64))
 }
 
 #[must_use]

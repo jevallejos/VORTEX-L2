@@ -237,6 +237,7 @@ pub enum VaultIoCommand {
     SaveEmaPrewarm(Box<EmaPrewarmPayload>),
     SaveObPlasticity { ts_ns: i64, bull_pm: [i64; 12], bear_pm: [i64; 12] },
     SaveMfePlasticity { ts_ns: i64, learned_mfe_bps: [i64; 12] },
+    SaveGovernorScar { ts_ns: i64, gov: Box<OnlineAdaptiveGovernor> },
     LatchTotalLossHalt {
         ts_ns: i64,
         anchor_equity_1e8: i64,
@@ -546,7 +547,7 @@ pub fn persist_total_loss_halt_to_path_atomic(
     }
     let payload = serde_json::json!({
         "event": "TOTAL_LOSS_SHIELD_5USDT_HALT",
-        "version": "5.5.3",
+        "version": "5.5.10",
         "ts_ns": ts_ns,
         "anchor_equity_1e8": anchor_equity_1e8,
         "current_equity_1e8": current_equity_1e8,
@@ -600,6 +601,10 @@ fn handle_vault_io_cmd(
         }
         VaultIoCommand::SaveMfePlasticity { ts_ns, learned_mfe_bps } => {
             let _ = save_mfe_plasticity_to_path_atomic(Path::new(MFE_PLASTICITY_VAULT_PATH), ts_ns, &learned_mfe_bps);
+        }
+        VaultIoCommand::SaveGovernorScar { ts_ns, gov } => {
+            let scar_line = gov.to_scar_snapshot_json(TimestampNs(ts_ns)).to_string();
+            let _ = append_jsonl_line_sync(Path::new(SCAR_MEMORY_VAULT_PATH), &scar_line);
         }
         VaultIoCommand::LatchTotalLossHalt {
             ts_ns,

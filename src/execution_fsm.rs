@@ -813,11 +813,18 @@ impl SlotExecutionEngine {
             } else {
                 ScaledBps::MIN_REQUIRED_VOL_5M_BPS.raw()
             }) as f64;
-            let s_cool = crate::wave_elliott::hermite_smoothstep_c1(
+            let s_cool_vol = crate::wave_elliott::hermite_smoothstep_c1(
                 PHI_MFE * eq_vol_f - open_v_f,
                 0.0,
                 eq_vol_f,
             );
+            let sigma_1m_f = (open_v_f / 2.236_067_977_499_79).max(eff_rt as f64);
+            let s_cool_excess = crate::wave_elliott::hermite_smoothstep_c1(
+                (self.learned_mfe_bps as f64) / sigma_1m_f,
+                1.0,
+                PHI_MFE * PHI_MFE,
+            );
+            let s_cool = s_cool_vol.max(s_cool_excess);
             if s_cool <= 0.0 {
                 return;
             }
@@ -1572,6 +1579,9 @@ impl SlotExecutionEngine {
         self.realized_legs_fee_1e8 = self.realized_legs_fee_1e8.saturating_add(fee1);
         self.partial_harvest_legs = self.partial_harvest_legs.saturating_add(1);
         self.tranche1_harvests_count = self.tranche1_harvests_count.saturating_add(1);
+        if self.realized_partial_net_1e8 > 0 {
+            self.house_money_runner_unlocked = true;
+        }
         if was_defensive_locked {
             self.house_money_runner_unlocked = true;
             self.wald_sprt.exhaustion_unwind_active = false;
@@ -1749,6 +1759,9 @@ impl SlotExecutionEngine {
         self.partial_harvest_legs = self.partial_harvest_legs.saturating_add(1);
         if !t1_already || self.tranche1_harvests_count == 0 {
             self.tranche1_harvests_count = self.tranche1_harvests_count.max(1);
+            if self.realized_partial_net_1e8 > 0 {
+                self.house_money_runner_unlocked = true;
+            }
             if was_def_locked {
                 self.house_money_runner_unlocked = true;
                 self.wald_sprt.exhaustion_unwind_active = false;
@@ -4119,5 +4132,44 @@ mod v51_f3_diffusive_sl_floor_tests {
         let fl_diff = compute_diffusive_sl_floor_bps_v51(ScaledBps(2_983), ScaledBps(418), 50, 0.0, ScaledBps(200), ScaledBps(400), ScaledBps(140), WaveObservables::default(), Side::Ask);
         let fl_tox = compute_diffusive_sl_floor_bps_v51(ScaledBps(2_983), ScaledBps(418), 50, 2.40, ScaledBps(0), ScaledBps(400), ScaledBps(140), w_opp, Side::Ask);
         assert!(fl_diff.raw() >= 1_800 && fl_tox.raw() <= 1_200);
+    }
+}
+
+#[cfg(test)]
+mod v5510_turno2_fsm_tests {
+    use super::*;
+    use crate::lob_shm::BookLevel;
+
+    #[test]
+    fn test_v5510_h08_offensive_t1_unlocks_house_money_and_m4_symmetric_mfe_cooling() {
+        let mut eng = SlotExecutionEngine::new(5);
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[5].symbol_id;
+        snap.realized_vol_5m = ScaledBps(4_800);
+        snap.ts_local_ns = TimestampNs(1_795_000_000_000_000_000);
+        snap.bids[0] = BookLevel { price: PriceTicks(8_500), qty: LotQty(400) };
+        snap.asks[0] = BookLevel { price: PriceTicks(8_501), qty: LotQty(320) };
+        snap.refresh_deep_l1_l5_totals();
+        snap.mark_price = PriceTicks(8_500);
+        snap.last_trade_price = PriceTicks(8_500);
+        snap.factor_ofi = BoundedScore::new_clamped(0.65);
+        snap.factor_tfi = BoundedScore::new_clamped(0.62);
+        snap.factor_geom = BoundedScore::new_clamped(0.35);
+
+        let verdict = SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, target_excursion_scaled_bps: ScaledBps(1_200) };
+        assert!(eng.try_arm_maker_entry(&snap, verdict, LotQty(18)).is_ok());
+        assert!(eng.on_maker_entry_filled(TimestampNs(1_795_000_000_050_000_000)).is_ok());
+        assert!(!eng.house_money_runner_unlocked);
+        let t1_px = PriceTicks(8_505);
+        assert!(eng.record_tranche1_harvest(t1_px));
+        assert!(eng.house_money_runner_unlocked, "T1 ofensivo rentable debe activar house_money_runner_unlocked");
+
+        let mut eth_eng = SlotExecutionEngine::new(1);
+        eth_eng.learned_mfe_bps = 1_146;
+        eth_eng.open_vol_5m_bps = ScaledBps(2_200);
+        eth_eng.last_closed_mfe_bps = 420;
+        eth_eng.last_exit_sub_reason = ExitSubReason::AdverseScratchEscape;
+        eth_eng.observe_censored_close_mfe_plasticity_with_ext(Side::Bid, 420, 0, true);
+        assert!(eth_eng.learned_mfe_bps < 1_146 && eth_eng.learned_mfe_bps >= 647);
     }
 }

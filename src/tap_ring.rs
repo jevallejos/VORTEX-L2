@@ -82,14 +82,38 @@ const VETOED_CANDIDATES: [VetoedCandidate; 3] = [
 pub fn prune_expired_parquet_segment(data_dir: &Path, parquet_seq: u64) {
     if parquet_seq > MAX_PARQUET_RING_FILES {
         let expired_seq = parquet_seq - MAX_PARQUET_RING_FILES;
+        let archive_dir = data_dir.join("archive");
         for cand in [
             data_dir.join(format!("vortex_l2_segment_{expired_seq:06}.parquet")),
             data_dir.join(format!("vortex_l2_segment_{expired_seq:09}.parquet")),
         ] {
             if cand.exists()
-                && crate::par2_archiver::archive_parquet_segment_file(&cand, &data_dir.join("archive")).is_ok()
+                && crate::par2_archiver::archive_parquet_segment_file(&cand, &archive_dir).is_ok()
             {
                 let _ = fs::remove_file(&cand);
+            }
+        }
+        if parquet_seq.is_multiple_of(64) {
+            if let Ok(entries) = fs::read_dir(data_dir) {
+                for ent in entries.flatten() {
+                    let p_ent = ent.path();
+                    let Some(fname) = p_ent.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let Some(num_s) = fname
+                        .strip_prefix("vortex_l2_segment_")
+                        .and_then(|s| s.strip_suffix(".parquet"))
+                    else {
+                        continue;
+                    };
+                    if let Ok(seg_num) = num_s.parse::<u64>() {
+                        if seg_num <= expired_seq
+                            && crate::par2_archiver::archive_parquet_segment_file(&p_ent, &archive_dir).is_ok()
+                        {
+                            let _ = fs::remove_file(&p_ent);
+                        }
+                    }
+                }
             }
         }
     } else if parquet_seq == 0 {

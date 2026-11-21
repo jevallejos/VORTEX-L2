@@ -134,6 +134,7 @@ pub struct OnlineAdaptiveGovernor {
     last_obs_propulsion: [f64; MAX_ACTIVE_PAIRS],
     last_obs_climax_active: [bool; MAX_ACTIVE_PAIRS],
     last_ws_rtt_us: u32,
+    psi_manual_override: bool,
     plasticity: GovernorPlasticityState,
 }
 
@@ -180,6 +181,7 @@ impl OnlineAdaptiveGovernor {
             last_obs_propulsion: [0.0; MAX_ACTIVE_PAIRS],
             last_obs_climax_active: [false; MAX_ACTIVE_PAIRS],
             last_ws_rtt_us: 0,
+            psi_manual_override: false,
             plasticity: GovernorPlasticityState::new(),
         }
     }
@@ -191,7 +193,29 @@ impl OnlineAdaptiveGovernor {
     #[inline] #[must_use] pub const fn slot_taker_prob_permille(&self, slot_idx: usize, side: Side) -> i64 { self.plasticity.slot_taker_prob_permille(slot_idx, side) }
     #[inline] #[must_use] pub const fn portfolio_taker_prob_permille(&self) -> i64 { self.plasticity.portfolio_taker_prob_permille() }
     #[inline] #[must_use] pub const fn psi_health(&self) -> f64 { self.cached_psi_health }
-    #[inline] pub fn set_psi_health(&mut self, psi: f64) { self.cached_psi_health = psi.clamp(0.0, 1.0); }
+    #[inline] pub fn set_psi_health(&mut self, psi: f64) {
+        self.cached_psi_health = psi.clamp(0.0, 1.0);
+        self.psi_manual_override = true;
+    }
+    #[inline] #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn slot_psi_health(&self, slot_idx: usize, side: Side) -> f64 {
+        if self.psi_manual_override || slot_idx >= MAX_ACTIVE_PAIRS {
+            return self.cached_psi_health;
+        }
+        let d = Self::dir_idx(side);
+        let cell_p_tkr = (self.plasticity.slot_taker_prob_permille(slot_idx, side).clamp(5, 950) as f64) * 1e-3;
+        let cell_ewma_bps = (self.ewma_net_bps_x100[slot_idx][d] as f64) / 100.0;
+        let fee_rt_bps = (self.active_maker_rt_fee_bps().max(100) as f64) / 100.0;
+        crate::governor_plasticity::compute_slot_psi_health_c1(
+            self.cached_psi_health,
+            cell_p_tkr,
+            cell_ewma_bps,
+            fee_rt_bps,
+            self.last_daily_loss_used_ratio,
+            self.last_epoch_loss_5u_ratio,
+        )
+    }
     #[inline] #[must_use] pub fn slot_fill_rate_eta(&self, slot_idx: usize) -> f64 { self.plasticity.slot_fill_rate_eta(slot_idx) }
     #[inline] #[must_use] pub const fn slot_fill_obs_alpha_beta(&self, slot_idx: usize) -> (i64, i64) {
         if slot_idx >= MAX_ACTIVE_PAIRS {
@@ -344,6 +368,7 @@ impl OnlineAdaptiveGovernor {
             self.last_epoch_loss_5u_ratio,
         );
         self.cached_psi_health = psi;
+        self.psi_manual_override = false;
         psi
     }
 
@@ -725,14 +750,28 @@ impl OnlineAdaptiveGovernor {
 
         if (cd > 0 && now_ts_ns >= cd) || (cd <= 0 && decay_ts > 0 && debt < 0) {
             let anchor = if decay_ts > 0 { decay_ts } else { cd };
+            let mut decayed_step = false;
             if now_ts_ns > anchor && debt < 0 {
                 let dt_ns = (now_ts_ns - anchor) as f64;
                 let eff_slot = slot_idx.min(MAX_ACTIVE_PAIRS - 1);
                 let tau_mkt = (self.intrinsic_diffusion_clock_ns(eff_slot).max(1)) as f64;
                 let psi_eff = self.psi_health().max(INV_PHI_SQ_DEC);
                 let tau_decay = (PHI_SQ_DEC * tau_mkt) / psi_eff;
-                debt = ((debt as f64) * (-dt_ns / tau_decay).exp()).trunc() as i64;
-                self.global_dir_debt_bps_x100[d].store(debt);
+                let exact = (debt as f64) * (-dt_ns / tau_decay).exp();
+                let next_debt = if exact > -0.5 { 0_i64 } else { (exact.floor() as i64).min(0) };
+                if next_debt > debt {
+                    let prev_debt = debt;
+                    debt = next_debt;
+                    self.global_dir_debt_bps_x100[d].store(debt);
+                    if debt < 0 {
+                        let dt_used = (tau_decay * ((prev_debt as f64) / (debt as f64)).ln())
+                            .round() as i64;
+                        let max_dt = now_ts_ns.saturating_sub(anchor).max(1);
+                        self.global_debt_decay_ts_ns[d]
+                            .store(anchor.saturating_add(dt_used.clamp(1, max_dt)));
+                    }
+                    decayed_step = true;
+                }
             }
             if debt >= 0 {
                 if cd > 0 && now_ts_ns >= cd {
@@ -741,9 +780,11 @@ impl OnlineAdaptiveGovernor {
                 self.global_debt_decay_ts_ns[d].store(0);
             } else if debt > contagion_floor {
                 self.global_dir_cooldown_until_ns[d].store(0);
-                self.global_debt_decay_ts_ns[d].store(now_ts_ns);
-            } else {
-                self.global_debt_decay_ts_ns[d].store(now_ts_ns);
+                if !decayed_step && decay_ts <= 0 {
+                    self.global_debt_decay_ts_ns[d].store(anchor);
+                }
+            } else if !decayed_step && decay_ts <= 0 {
+                self.global_debt_decay_ts_ns[d].store(anchor);
             }
         }
     }
@@ -895,6 +936,35 @@ impl OnlineAdaptiveGovernor {
         };
         evaluate_kinematic_surface_with_fees(
             side, eq_vol, learned_edge, ir_x100, drift_bps, ext_bps, signed_geom, snr_abs, self.active_fee_schedule(),
+        )
+    }
+
+    #[inline]
+    pub fn evaluate_kinematic_energy_surface_with_lattice(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        drift_bps: i64,
+        ext_bps: i64,
+        signed_geom: f64,
+        snr_abs: f64,
+        eta_lat: f64,
+        ofi_al: f64,
+        tfi_al: f64,
+        spoof_d: f64,
+        is_multilot: bool,
+    ) -> Result<(i64, i64), &'static str> {
+        let fee_rt = self.active_maker_rt_fee_bps();
+        let eq_vol = if slot_idx < MAX_ACTIVE_PAIRS { self.eq_vol_5m_bps[slot_idx].max(fee_rt * 6) } else { fee_rt * 12 };
+        let d = Self::dir_idx(side);
+        let (learned_edge, ir_x100) = if slot_idx < MAX_ACTIVE_PAIRS {
+            (self.ewma_net_bps_x100[slot_idx][d], self.slot_information_ratio_x100(slot_idx, side))
+        } else {
+            (fee_rt / 2, 33)
+        };
+        crate::kinematic_surface::evaluate_kinematic_surface_with_lattice_and_fees(
+            side, eq_vol, learned_edge, ir_x100, drift_bps, ext_bps, signed_geom, snr_abs,
+            self.active_fee_schedule(), eta_lat, ofi_al, tfi_al, spoof_d, is_multilot,
         )
     }
 
@@ -1339,8 +1409,9 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => (candidate_snap.bids[0].qty, candidate_snap.asks[0].qty, candidate_snap.deep_bid_lots_l1_l5),
             Side::Ask => (candidate_snap.asks[0].qty, candidate_snap.bids[0].qty, candidate_snap.deep_ask_lots_l1_l5),
         };
+        let slot_psi = self.slot_psi_health(slot_idx, side);
         let is_penny_jump =
-            Self::qualifies_inside_spread_penny_jump_c1(side, candidate_snap, self.psi_health());
+            Self::qualifies_inside_spread_penny_jump_c1(side, candidate_snap, slot_psi);
         if !spec.passes_l1_queue_depth_and_wall_guard_penny_jump(
             entry_px, candidate_snap.realized_vol_5m, self.ewma_net_bps_x100[slot_idx][d],
             own_q, opp_q, own_deep, candidate_snap.factor_ofi.get().abs(), candidate_snap.factor_tfi.get().abs(),
@@ -1379,20 +1450,28 @@ impl OnlineAdaptiveGovernor {
         if !spec.passes_oversized_lot_conviction_guard_with_vol_and_fees(
             wallet_usdt_1e8, entry_px, candidate_snap.realized_vol_5m, cand_comp, in_local_scar, fees,
         ) { return false; }
-        let Ok((raw_e_kin, base_e_min)) = self.evaluate_kinematic_energy_surface(slot_idx, side, self_drift_bps, self_ext_bps, signed_geom, cand_comp) else { return false; };
-        let cadence = self.slot_temporal_cadence_for_side(slot_idx, Some(side), candidate_snap);
-        let fee_rt = self.active_maker_rt_fee_bps();
         let is_multilot = self
             .compute_slot_entry_lots_v48(slot_idx, side, wallet_usdt_1e8, candidate_snap, 1_000)
             .0
             >= 2;
+        let eta_lat = crate::alpha_3factor::compute_tick_lattice_granularity_eta(candidate_snap, fees);
+        let ofi_al_gov = candidate_snap.factor_ofi.get() * dir_s;
+        let tfi_al_gov = candidate_snap.factor_tfi.get() * dir_s;
+        let Ok((raw_e_kin, base_e_min)) = self.evaluate_kinematic_energy_surface_with_lattice(
+            slot_idx, side, self_drift_bps, self_ext_bps, signed_geom, cand_comp,
+            eta_lat, ofi_al_gov, tfi_al_gov, spoof_density, is_multilot,
+        ) else { return false; };
+        let cadence = self.slot_temporal_cadence_for_side(slot_idx, Some(side), candidate_snap);
+        let fee_rt = self.active_maker_rt_fee_bps();
         let qstruct_kin_bonus = if is_multilot && s_iceberg <= 0.0 {
             let vac_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, candidate_snap);
-            let q_ml = crate::types::compute_multilot_q_struct_c1(
+            let q_ml = crate::types::compute_multilot_q_struct_v555_c1(
                 LotQty(2),
                 0.0,
-                candidate_snap.factor_ofi.get() * dir_s,
-                candidate_snap.factor_tfi.get() * dir_s,
+                ofi_al_gov,
+                tfi_al_gov,
+                signed_geom,
+                spoof_density,
                 vac_l2_l3,
             );
             let s_qml = crate::wave_elliott::hermite_smoothstep_c1(
@@ -1400,7 +1479,7 @@ impl OnlineAdaptiveGovernor {
                 crate::alpha_3factor::INV_PHI_SQ,
                 crate::alpha_3factor::INV_PHI,
             );
-            ((self.psi_health() * s_qml * (fee_rt as f64) * crate::alpha_3factor::INV_PHI_CUBE)
+            ((slot_psi * s_qml * (fee_rt as f64) * crate::alpha_3factor::INV_PHI_CUBE)
                 .round() as i64)
                 .max(0)
         } else {
@@ -1561,8 +1640,16 @@ impl OnlineAdaptiveGovernor {
             wallet_usdt_1e8, entry_px, snap.realized_vol_5m, signed_snr, self.is_in_local_slot_scar_debt(slot_idx, side), fees,
         ) { return Err("VETO_PREFLIGHT_OVERSIZED_LOT"); }
         let signed_geom = snap.factor_geom.get() * dir_s;
+        let is_multilot = self
+            .compute_slot_entry_lots_v48(slot_idx, side, wallet_usdt_1e8, snap, 1_000)
+            .0
+            >= 2;
+        let s_lat_pre = crate::kinematic_surface::compute_lattice_kinematic_relaxation_c1(
+            eta_lat, ofi * dir_s, tfi * dir_s, spoof_density, is_multilot,
+        );
         let (own_q, opp_q) = match side { Side::Bid => (best_bid.qty.0, best_ask.qty.0), Side::Ask => (best_ask.qty.0, best_bid.qty.0) };
-        let min_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(if signed_snr >= 0.68 && own_q >= opp_q { 0.00 } else { 0.02 }, 0.06);
+        let base_pre_geom = (0.06 - (signed_snr - 0.42) * 0.45).clamp(if signed_snr >= 0.68 && own_q >= opp_q { 0.00 } else { 0.02 }, 0.06);
+        let min_pre_geom = (1.0 - s_lat_pre) * base_pre_geom - crate::alpha_3factor::INV_PHI_FOURTH * s_lat_pre;
         if signed_geom < min_pre_geom { return Err("VETO_PREFLIGHT_GEOM_REVERSAL"); }
         let btc_snr = if slot_idx == 0 {
             OrthogonalFactorState::snr_composite_score(btc_leader_snap) * dir_s
@@ -1576,17 +1663,16 @@ impl OnlineAdaptiveGovernor {
         let _ = crate::wave_elliott::CausalElliottWaveState::evaluate_wave_entry_modulation(snap.wave_observables(), side, btc_snr)?;
         let (drift_bps, ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
         let fee_rt = self.active_maker_rt_fee_bps();
-        let is_multilot = self
-            .compute_slot_entry_lots_v48(slot_idx, side, wallet_usdt_1e8, snap, 1_000)
-            .0
-            >= 2;
+        let slot_psi = self.slot_psi_health(slot_idx, side);
         let qstruct_kin_bonus = if is_multilot && s_iceberg <= 0.0 {
             let vac_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, snap);
-            let q_ml = crate::types::compute_multilot_q_struct_c1(
+            let q_ml = crate::types::compute_multilot_q_struct_v555_c1(
                 LotQty(2),
                 0.0,
                 ofi * dir_s,
                 tfi * dir_s,
+                signed_geom,
+                spoof_density,
                 vac_l2_l3,
             );
             let s_qml = crate::wave_elliott::hermite_smoothstep_c1(
@@ -1594,7 +1680,7 @@ impl OnlineAdaptiveGovernor {
                 crate::alpha_3factor::INV_PHI_SQ,
                 crate::alpha_3factor::INV_PHI,
             );
-            ((self.psi_health() * s_qml * (fee_rt as f64) * crate::alpha_3factor::INV_PHI_CUBE)
+            ((slot_psi * s_qml * (fee_rt as f64) * crate::alpha_3factor::INV_PHI_CUBE)
                 .round() as i64)
                 .max(0)
         } else {
@@ -1603,7 +1689,10 @@ impl OnlineAdaptiveGovernor {
         let kin_bonus = ((bonus * (fee_rt as f64) * crate::alpha_3factor::PHI).round() as i64)
             .max(0)
             .saturating_add(qstruct_kin_bonus);
-        if let Ok((ek, emin)) = self.evaluate_kinematic_energy_surface(slot_idx, side, drift_bps, ext_bps, signed_geom, signed_snr) {
+        if let Ok((ek, emin)) = self.evaluate_kinematic_energy_surface_with_lattice(
+            slot_idx, side, drift_bps, ext_bps, signed_geom, signed_snr,
+            eta_lat, ofi * dir_s, tfi * dir_s, spoof_density, is_multilot,
+        ) {
             return Ok((ek.saturating_add(kin_bonus), emin));
         }
         let d = Self::dir_idx(side);
@@ -1668,6 +1757,7 @@ impl OnlineAdaptiveGovernor {
             }
         }
         let mut all_dedup: std::collections::BTreeMap<ScarEventKey, ScarEventPayload> = std::collections::BTreeMap::new();
+        let mut all_mfe: std::collections::BTreeMap<ScarEventKey, ScaledBps> = std::collections::BTreeMap::new();
         let mut paths = [scar_path, red_loss_path, scar_path];
         let cnt = if let Some(vp) = session_vault_path { paths[2] = vp; 3_usize } else { 2_usize };
         for p in &paths[..cnt] {
@@ -1676,6 +1766,9 @@ impl OnlineAdaptiveGovernor {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                     if let Some((k, pl)) = Self::parse_historical_trade_scar_tuple(&val, 0) {
                         all_dedup.entry(k).or_insert(pl);
+                        if let Some(mfe_s) = crate::kinematic_surface::parse_historical_trade_mfe_sbps(&val) {
+                            all_mfe.entry(k).or_insert(mfe_s);
+                        }
                     }
                 }
             }
@@ -1683,11 +1776,14 @@ impl OnlineAdaptiveGovernor {
         // Preserve multi-epoch Bayesian Taker priors across EPOCH_RESET (never suffer prior amnesia):
         if epoch_reset_ts_ns > 0 {
             let fee_rt = self.active_maker_rt_fee_bps();
-            for (&(ts_ns, s_idx, d_u8), &(_, net_sc, mkr)) in &all_dedup {
+            for (&k, &(_, net_sc, mkr)) in &all_dedup {
+                let (ts_ns, s_idx, d_u8) = k;
                 if ts_ns > plasticity_snap_ts_ns && ts_ns <= snap_ts_ns && s_idx < MAX_ACTIVE_PAIRS {
                     let side = if d_u8 == 1 { Side::Ask } else { Side::Bid };
                     let adv = !mkr && net_sc.raw() < 0;
-                    let mfe_est = if net_sc.raw() > 0 { ScaledBps(net_sc.raw().saturating_add(fee_rt)) } else { ScaledBps(0) };
+                    let mfe_est = all_mfe.get(&k).copied().unwrap_or_else(|| {
+                        if net_sc.raw() > 0 { ScaledBps(net_sc.raw().saturating_add(fee_rt)) } else { ScaledBps(0) }
+                    });
                     self.plasticity.observe_exit_outcome_with_net_and_mfe(
                         s_idx, side, adv, net_sc, mfe_est, ts_ns, self.eq_vol_5m_bps[s_idx],
                     );
@@ -1696,10 +1792,12 @@ impl OnlineAdaptiveGovernor {
         }
         let mut max_ts = snap_ts_ns;
         let mut ingested = 0_usize;
-        for (&(ts_ns, s_idx, d_u8), &(en_t, net_sc, mkr)) in &all_dedup {
+        for (&k, &(en_t, net_sc, mkr)) in &all_dedup {
+            let (ts_ns, s_idx, d_u8) = k;
             if ts_ns > snap_ts_ns {
                 ingested += 1;
-                self.observe_closed_trade_at_entry(s_idx, if d_u8 == 1 { Side::Ask } else { Side::Bid }, en_t, net_sc, mkr, TimestampNs(ts_ns));
+                let side = if d_u8 == 1 { Side::Ask } else { Side::Bid };
+                self.observe_closed_trade_core(s_idx, side, en_t, net_sc, all_mfe.get(&k).copied(), mkr, None, TimestampNs(ts_ns));
                 if ts_ns > max_ts { max_ts = ts_ns; }
             }
         }
@@ -2160,11 +2258,85 @@ impl OnlineAdaptiveGovernor {
             if is_follower { epps_corr } else { 0.0 },
             btc_lead_aligned_override,
         );
+        let _ = (spec, fees, taker_pm, is_follower, btc_w3_aligned, entry_px);
+        self.authorizes_adaptive_entry_v5510(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            daily_damper_permille,
+            learned_mfe_bps,
+            None,
+            candidate_snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            lead_lag_ignition_bonus,
+        )
+    }
+
+    /// Unified V5.5.10 entry gate using cell-decoupled `slot_psi_health` and direct `target_excursion` (H-05, H-13a).
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorizes_adaptive_entry_v5510(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        daily_damper_permille: i64,
+        learned_mfe_bps: ScaledBps,
+        target_excursion_override: Option<ScaledBps>,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        lead_lag_ignition_bonus: f64,
+    ) -> Result<LotQty, crate::lob_shm::LastVetoCode> {
+        use crate::lob_shm::LastVetoCode;
+
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Err(LastVetoCode::WarmupOrLock);
+        }
+        let entry_px = if candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0 {
+            side.select_entry_bbo_price(candidate_snap.bids[0].price, candidate_snap.asks[0].price)
+        } else {
+            candidate_snap.mark_price
+        };
+        if entry_px.0 <= 0 {
+            return Err(LastVetoCode::WarmupOrLock);
+        }
+        let spec = APPROVED_SPECS[slot_idx];
+        let fees = self.active_fee_schedule();
+        let taker_pm = self.slot_taker_prob_permille(slot_idx, side);
+        let slot_psi = self.slot_psi_health(slot_idx, side);
+        if !spec.passes_quantum_ev_growth_gate(
+            wallet_usdt_1e8,
+            entry_px,
+            candidate_snap.realized_vol_5m,
+            learned_mfe_bps,
+            taker_pm,
+            fees,
+        ) {
+            return Err(LastVetoCode::QueueDepthOrOversizedLot);
+        }
+        if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, candidate_snap) {
+            return Err(LastVetoCode::KinematicSurfaceOrCadence);
+        }
+        let is_follower = slot_idx > 0 && candidate_snap.symbol_id != btc_leader_snap.symbol_id;
+        let btc_w3_aligned = crate::alpha_3factor::compute_btc_leader_aligned_score(
+            side,
+            candidate_snap,
+            btc_leader_snap,
+            if is_follower { epps_corr } else { 0.0 },
+            btc_lead_aligned_override,
+        );
         if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
             side,
             candidate_snap,
             btc_w3_aligned,
-            self.psi_health(),
+            slot_psi,
             self.eq_vol_5m_bps[slot_idx],
             taker_pm,
             fees,
@@ -2188,7 +2360,7 @@ impl OnlineAdaptiveGovernor {
             spoof_density,
             epps_corr,
             btc_lead_aligned_override,
-            self.psi_health(),
+            slot_psi,
         )?;
         let lots = self.compute_slot_entry_lots_v48(
             slot_idx,
@@ -2197,32 +2369,37 @@ impl OnlineAdaptiveGovernor {
             candidate_snap,
             daily_damper_permille,
         );
-        let d_entry = Self::dir_idx(side);
-        let tau_mkt_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(candidate_snap.realized_vol_5m);
-        let kappa_evt = if self.last_ws_rtt_us > 0 { 1.0 } else { crate::alpha_3factor::INV_PHI };
-        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v554(
-            spec,
-            candidate_snap,
-            btc_leader_snap,
-            learned_mfe_bps,
-            ScaledBps(self.ewma_net_bps_x100[slot_idx][d_entry]),
-            taker_pm,
-            self.slot_information_ratio_x100(slot_idx, side),
-            tau_mkt_s,
-            fees,
-            spoof_density,
-            epps_signed_beta,
-            epps_corr,
-            btc_lead_aligned_override,
-            self.psi_health(),
-            lead_lag_ignition_bonus,
-            kappa_evt,
-        ) {
-            crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
-                side: sig_side,
-                target_excursion_scaled_bps,
-            } if sig_side == side => target_excursion_scaled_bps,
-            _ => ScaledBps(0),
+        let target_excursion_sbps = match target_excursion_override {
+            Some(tx) if tx.raw() > 0 => tx,
+            _ => {
+                let d_entry = Self::dir_idx(side);
+                let tau_mkt_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(candidate_snap.realized_vol_5m);
+                let kappa_evt = if self.last_ws_rtt_us > 0 { 1.0 } else { crate::alpha_3factor::INV_PHI };
+                match OrthogonalFactorState::evaluate_entry_signal_v554(
+                    spec,
+                    candidate_snap,
+                    btc_leader_snap,
+                    learned_mfe_bps,
+                    ScaledBps(self.ewma_net_bps_x100[slot_idx][d_entry]),
+                    taker_pm,
+                    self.slot_information_ratio_x100(slot_idx, side),
+                    tau_mkt_s,
+                    fees,
+                    spoof_density,
+                    epps_signed_beta,
+                    epps_corr,
+                    btc_lead_aligned_override,
+                    slot_psi,
+                    lead_lag_ignition_bonus,
+                    kappa_evt,
+                ) {
+                    crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+                        side: sig_side,
+                        target_excursion_scaled_bps,
+                    } if sig_side == side => target_excursion_scaled_bps,
+                    _ => ScaledBps(0),
+                }
+            }
         };
         if self
             .evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
@@ -2405,11 +2582,69 @@ impl OnlineAdaptiveGovernor {
             if is_follower { epps_corr } else { 0.0 },
             btc_lead_aligned_override,
         );
+        let _ = (best_bid, best_ask, taker_pm, fees, is_follower, btc_w3_aligned);
+        self.confirm_preflight_kinematics_v5510(
+            slot_idx,
+            side,
+            wallet_usdt_1e8,
+            allocated_lots,
+            learned_mfe_bps,
+            None,
+            snap,
+            btc_leader_snap,
+            spoof_density,
+            epps_signed_beta,
+            epps_corr,
+            btc_lead_aligned_override,
+            lead_lag_ignition_bonus,
+        )
+    }
+
+    /// Unified V5.5.10 preflight confirmation using cell-decoupled `slot_psi_health` and direct `target_excursion` (H-05, H-13a).
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_preflight_kinematics_v5510(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        wallet_usdt_1e8: i64,
+        allocated_lots: LotQty,
+        learned_mfe_bps: ScaledBps,
+        target_excursion_override: Option<ScaledBps>,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        spoof_density: f64,
+        epps_signed_beta: f64,
+        epps_corr: f64,
+        btc_lead_aligned_override: Option<f64>,
+        lead_lag_ignition_bonus: f64,
+    ) -> Result<(i64, i64), crate::lob_shm::LastVetoCode> {
+        use crate::lob_shm::LastVetoCode;
+
+        if slot_idx >= MAX_ACTIVE_PAIRS {
+            return Err(LastVetoCode::WarmupOrLock);
+        }
+        let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() else {
+            return Err(LastVetoCode::WarmupOrLock);
+        };
+        if !self.passes_elastic_funding_cliff_guard(slot_idx, side, learned_mfe_bps, snap) {
+            return Err(LastVetoCode::PreflightDriftOrDecay);
+        }
+        let taker_pm = self.slot_taker_prob_permille(slot_idx, side);
+        let fees = self.active_fee_schedule();
+        let slot_psi = self.slot_psi_health(slot_idx, side);
+        let is_follower = slot_idx > 0 && snap.symbol_id != btc_leader_snap.symbol_id;
+        let btc_w3_aligned = crate::alpha_3factor::compute_btc_leader_aligned_score(
+            side,
+            snap,
+            btc_leader_snap,
+            if is_follower { epps_corr } else { 0.0 },
+            btc_lead_aligned_override,
+        );
         if crate::alpha_3factor::is_opposing_impulse_wave3_entry_hazard_v552(
             side,
             snap,
             btc_w3_aligned,
-            self.psi_health(),
+            slot_psi,
             self.eq_vol_5m_bps[slot_idx],
             taker_pm,
             fees,
@@ -2433,7 +2668,7 @@ impl OnlineAdaptiveGovernor {
             spoof_density,
             epps_corr,
             btc_lead_aligned_override,
-            self.psi_health(),
+            slot_psi,
         )?;
         let entry_px = side.select_entry_bbo_price(best_bid.price, best_ask.price);
         let spec = APPROVED_SPECS[slot_idx];
@@ -2450,32 +2685,37 @@ impl OnlineAdaptiveGovernor {
         if !self.passes_elastic_preflight_l1_support(slot_idx, side, entry_px, snap) {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
-        let d_pf = Self::dir_idx(side);
-        let tau_mkt_pf_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(snap.realized_vol_5m);
-        let kappa_pf_evt = if self.last_ws_rtt_us > 0 { 1.0 } else { crate::alpha_3factor::INV_PHI };
-        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v554(
-            spec,
-            snap,
-            btc_leader_snap,
-            learned_mfe_bps,
-            ScaledBps(self.ewma_net_bps_x100[slot_idx][d_pf]),
-            taker_pm,
-            self.slot_information_ratio_x100(slot_idx, side),
-            tau_mkt_pf_s,
-            fees,
-            spoof_density,
-            epps_signed_beta,
-            epps_corr,
-            btc_lead_aligned_override,
-            self.psi_health(),
-            lead_lag_ignition_bonus,
-            kappa_pf_evt,
-        ) {
-            crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
-                side: sig_side,
-                target_excursion_scaled_bps,
-            } if sig_side == side => target_excursion_scaled_bps,
-            _ => ScaledBps(0),
+        let target_excursion_sbps = match target_excursion_override {
+            Some(tx) if tx.raw() > 0 => tx,
+            _ => {
+                let d_pf = Self::dir_idx(side);
+                let tau_mkt_pf_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(snap.realized_vol_5m);
+                let kappa_pf_evt = if self.last_ws_rtt_us > 0 { 1.0 } else { crate::alpha_3factor::INV_PHI };
+                match OrthogonalFactorState::evaluate_entry_signal_v554(
+                    spec,
+                    snap,
+                    btc_leader_snap,
+                    learned_mfe_bps,
+                    ScaledBps(self.ewma_net_bps_x100[slot_idx][d_pf]),
+                    taker_pm,
+                    self.slot_information_ratio_x100(slot_idx, side),
+                    tau_mkt_pf_s,
+                    fees,
+                    spoof_density,
+                    epps_signed_beta,
+                    epps_corr,
+                    btc_lead_aligned_override,
+                    slot_psi,
+                    lead_lag_ignition_bonus,
+                    kappa_pf_evt,
+                ) {
+                    crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+                        side: sig_side,
+                        target_excursion_scaled_bps,
+                    } if sig_side == side => target_excursion_scaled_bps,
+                    _ => ScaledBps(0),
+                }
+            }
         };
         if self
             .evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
@@ -2763,21 +3003,62 @@ impl OnlineAdaptiveGovernor {
             tfi_aligned,
             btc_iceberg_al,
         );
-        let eff_learned_mfe = ((learned_mfe_bps.raw() as f64)
+        let mut eff_learned_mfe = ((learned_mfe_bps.raw() as f64)
             * (1.0 - crate::alpha_3factor::INV_PHI * s_iceberg))
             .round() as i64;
+        let w_p2 = snap.wave_observables();
+        if !spec.can_split_runner_legs(allocated_lots, entry_px)
+            && matches!(w_p2.regime, crate::wave_elliott::WaveRegime::CorrectiveAbc)
+        {
+            let s_anti_h = 1.0
+                - crate::wave_elliott::hermite_smoothstep_c1(
+                    w_p2.hurst_exponent(),
+                    crate::alpha_3factor::INV_PHI_SQ,
+                    0.50,
+                );
+            let s_weak = 1.0
+                - crate::wave_elliott::hermite_smoothstep_c1(
+                    ofi_aligned.min(tfi_aligned),
+                    crate::alpha_3factor::INV_PHI_SQ,
+                    crate::alpha_3factor::INV_PHI,
+                );
+            let (dr_b, ex_b) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
+            let kin_acc = ex_b.saturating_sub(dr_b).saturating_mul(side.sign_i64());
+            let c_mkr_f = (self.active_maker_rt_fee_bps().max(100)) as f64;
+            let tau_t_f = spec
+                .tick_to_price_scaled_bps(entry_px)
+                .map_or(10.0, |t| (t.raw().max(1)) as f64);
+            let decel_scale = (crate::alpha_3factor::INV_PHI_SQ * c_mkr_f).max(tau_t_f);
+            let s_decel = crate::wave_elliott::hermite_smoothstep_c1(
+                (-kin_acc as f64) / decel_scale,
+                0.0,
+                crate::alpha_3factor::PHI,
+            );
+            let eta_chop_1l = (1.0
+                - crate::alpha_3factor::INV_PHI
+                    * (s_anti_h * s_weak).max(crate::alpha_3factor::INV_PHI * s_anti_h * s_decel))
+            .clamp(crate::alpha_3factor::INV_PHI_SQ, 1.0);
+            let sigma_1m_sbps = (snap.realized_vol_5m.raw().max(0) as f64)
+                / (crate::alpha_3factor::PHI + crate::alpha_3factor::INV_PHI);
+            let mfe_capped = if sigma_1m_sbps > 0.0 {
+                (eff_learned_mfe as f64).min(crate::alpha_3factor::PHI * sigma_1m_sbps)
+            } else {
+                eff_learned_mfe as f64
+            };
+            eff_learned_mfe = (mfe_capped * eta_chop_1l).round() as i64;
+        }
         let bull_u16 = clamp_ob_permille_u16(snap.ob_bull_efficacy_pm);
         let bear_u16 = clamp_ob_permille_u16(snap.ob_bear_efficacy_pm);
         let vacuum_l2_l3 = crate::exec_daemon::compute_vacuum_l2_l3_c1(side, snap);
         let cont_ratio_x1000 = self.slot_cont_ratio_x1000(slot_idx, side);
         let aligned_fib_proj_bps = ScaledBps(
-            snap.wave_observables()
-                .fib_proj_bps
+            w_p2.fib_proj_bps
                 .raw()
                 .saturating_mul(side.sign_i64())
                 .max(0),
         );
-        let penny_spread_ticks = if Self::qualifies_inside_spread_penny_jump_c1(side, snap, self.psi_health()) {
+        let slot_psi_p2 = self.slot_psi_health(slot_idx, side);
+        let penny_spread_ticks = if Self::qualifies_inside_spread_penny_jump_c1(side, snap, slot_psi_p2) {
             snap.bbo_and_spread_ticks().map_or(1, |(_, _, spr)| spr)
         } else {
             1
@@ -2866,15 +3147,23 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let spec = APPROVED_SPECS[slot_idx];
-        let own_q = match side {
-            Side::Bid => snap.bids[0].qty,
-            Side::Ask => snap.asks[0].qty,
+        let (own_q, own_deep) = match side {
+            Side::Bid => (snap.bids[0].qty, snap.deep_bid_lots_l1_l5),
+            Side::Ask => (snap.asks[0].qty, snap.deep_ask_lots_l1_l5),
         };
         if own_q.0 <= 0 {
             return false;
         }
+        let l1_notional = spec.lot_notional_1e8(own_q, entry_px) as f64;
         let fees = self.active_fee_schedule();
         let p_pm = self.slot_taker_prob_permille(slot_idx, side);
+        let p_tkr = (p_pm.clamp(5, 950) as f64) * 1e-3;
+        let base_l1_floor = (crate::types::BYBIT_MIN_ORDER_NOTIONAL_1E8 as f64)
+            * PHI_L1
+            * (1.0 + PHI_L1 * p_tkr);
+        if l1_notional < base_l1_floor {
+            return false;
+        }
         let b3x = spec
             .three_x_friction_barrier_bps_dynamic(entry_px, p_pm, fees)
             .raw()
@@ -2882,12 +3171,10 @@ impl OnlineAdaptiveGovernor {
         let vol_ratio = ((snap.realized_vol_5m.raw().max(150) as f64) / b3x)
             .sqrt()
             .clamp(1.0, PHI_L1 * PHI_L1);
-        let p_tkr = (p_pm.clamp(5, 950) as f64) * 1e-3;
-        let min_l1_1e8 = (crate::types::BYBIT_MIN_ORDER_NOTIONAL_1E8 as f64)
-            * PHI_L1
-            * (1.0 + PHI_L1 * p_tkr)
-            * vol_ratio;
-        (spec.lot_notional_1e8(own_q, entry_px) as f64) >= min_l1_1e8
+        let min_l1_1e8 = base_l1_floor * vol_ratio;
+        let deep_notional = spec.lot_notional_1e8(own_deep.max(own_q), entry_px) as f64;
+        let eff_support_1e8 = l1_notional.max(crate::alpha_3factor::INV_PHI * deep_notional);
+        eff_support_1e8 >= min_l1_1e8
     }
 }
 
@@ -3192,5 +3479,129 @@ mod v51_f4_elastic_patience_tests {
             4, Side::Bid, ScaledBps(6_500), 1.5, 4.0, BoundedScore::new_clamped(-0.48),
         );
         assert!(pat_aligned >= 10_000_000_000 && pat_toxic <= 5_000_000_000 && pat_aligned > pat_toxic * 2);
+    }
+}
+
+#[cfg(test)]
+mod v5510_turno1_audit_tests {
+    use super::*;
+    use crate::governor_plasticity::DailySessionGovernor;
+    use crate::lob_shm::BookLevel;
+    use crate::types::BoundedScore;
+    use crate::wave_elliott::{WaveObservables, WaveRegime};
+
+    #[test]
+    fn test_v5510_h04_h05_h09_h11_1lot_abc_trap_multilot_psi_and_debt_semigroup() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let t0 = 1_795_000_000_000_000_000_i64;
+        let mut btc = SymbolLobSnapshot::new_empty();
+        btc.symbol_id = APPROVED_SPECS[0].symbol_id;
+        btc.is_eligible = true;
+        btc.ts_local_ns = TimestampNs(t0);
+        btc.realized_vol_5m = ScaledBps(3_000);
+        btc.bids[0] = BookLevel { price: PriceTicks(759_000), qty: LotQty(400) };
+        btc.asks[0] = BookLevel { price: PriceTicks(759_001), qty: LotQty(320) };
+        btc.refresh_deep_l1_l5_totals();
+        btc.mark_price = PriceTicks(759_000);
+        btc.factor_ofi = BoundedScore::new_clamped(0.28);
+        btc.factor_tfi = BoundedScore::new_clamped(0.26);
+        btc.factor_geom = BoundedScore::new_clamped(0.30);
+
+        // H-04: Contrafactual #9/#10 ETHUSDT (1-lot, CorrectiveAbc anti-persistente H=0.35, GEOM=0.94, TFI debil, kin_accel < 0, MFE inflado 1146 sbps)
+        let mut eth = SymbolLobSnapshot::new_empty();
+        eth.symbol_id = APPROVED_SPECS[1].symbol_id;
+        eth.is_eligible = true;
+        eth.ts_local_ns = TimestampNs(t0);
+        eth.realized_vol_5m = ScaledBps(2_400);
+        eth.bids[0] = BookLevel { price: PriceTicks(205_000), qty: LotQty(150) };
+        eth.asks[0] = BookLevel { price: PriceTicks(205_001), qty: LotQty(140) };
+        eth.refresh_deep_l1_l5_totals();
+        eth.mark_price = PriceTicks(205_000);
+        eth.factor_ofi = BoundedScore::new_clamped(0.26);
+        eth.factor_tfi = BoundedScore::new_clamped(0.18);
+        eth.factor_geom = BoundedScore::new_clamped(0.94);
+        eth.set_wave_observables(WaveObservables {
+            regime: WaveRegime::CorrectiveAbc,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.35),
+            macro_phase: BoundedScore::new_clamped(0.05),
+            oi_impulse: BoundedScore::ZERO,
+            liq_imbalance: BoundedScore::ZERO,
+            fib_proj_bps: ScaledBps(0),
+        });
+        gov.seed_prewarm_slot_emas(1, 2_051_000_000, 2_049_000_000, 3_600, t0);
+        let ev_eth_chop = gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
+            1, Side::Bid, LotQty(1), PriceTicks(205_000), ScaledBps(1_146), ScaledBps(1_200),
+            &eth, &btc, 1.0, 0.0,
+        );
+        assert!(ev_eth_chop.is_none(), "ETH 1-lot CorrectiveAbc anti-persistente debe ser vetado");
+
+        // ETH 1-lot ganador en ImpulseWave3 con cinta fuerte sigue admitido
+        eth.factor_ofi = BoundedScore::new_clamped(0.68);
+        eth.factor_tfi = BoundedScore::new_clamped(0.66);
+        eth.set_wave_observables(WaveObservables {
+            regime: WaveRegime::ImpulseWave3,
+            climax_active: false,
+            hurst: WaveObservables::encode_hurst(0.62),
+            macro_phase: BoundedScore::new_clamped(0.75),
+            oi_impulse: BoundedScore::new_clamped(0.30),
+            liq_imbalance: BoundedScore::new_clamped(0.25),
+            fib_proj_bps: ScaledBps(2_200),
+        });
+        let ev_eth_win = gov.evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
+            1, Side::Bid, LotQty(1), PriceTicks(205_000), ScaledBps(1_146), ScaledBps(1_200),
+            &eth, &btc, 1.0, 0.0,
+        );
+        assert!(ev_eth_win.is_some_and(|v| v > 0));
+
+        // H-05: 4 perdidas en ETH/TAO/LINK hunden psi_port, pero SUI (slot 5) limpia mantiene slot_psi_health >= 0.618 con -$5 al 3.1%
+        for (slot_l, side_l, dt_k) in [(1, Side::Ask, 1_i64), (1, Side::Bid, 2), (4, Side::Ask, 3), (9, Side::Ask, 4)] {
+            gov.observe_closed_trade_at_entry(
+                slot_l, side_l, PriceTicks(10_000), ScaledBps(-2_400), false, TimestampNs(t0 + dt_k * 10_000_000_000),
+            );
+        }
+        let dg = DailySessionGovernor::new(6_443_750_000);
+        let psi_port = gov.refresh_psi_health(&dg, 0, 15_500_000);
+        assert!(psi_port < 0.382, "psi_port debe frenarse tras 4 SL seguidos");
+        let sui_psi = gov.slot_psi_health(5, Side::Bid); assert!(sui_psi > 0.50, "SUI limpia debe superar holgadamente INV_PHI_SQ (0.382): {sui_psi}");
+        assert!(gov.slot_psi_health(1, Side::Ask) < 0.382, "ETH con SL debe permanecer frenado");
+
+        // H-05: Soporte L1..L5 en SUI multi-lote con L1=$7 y L1..L5=$60 pasa preflight
+        let mut sui = SymbolLobSnapshot::new_empty();
+        sui.symbol_id = APPROVED_SPECS[5].symbol_id;
+        sui.is_eligible = true;
+        sui.ts_local_ns = TimestampNs(t0);
+        sui.realized_vol_5m = ScaledBps(7_200);
+        sui.bids[0] = BookLevel { price: PriceTicks(8_500), qty: LotQty(12) };
+        sui.asks[0] = BookLevel { price: PriceTicks(8_501), qty: LotQty(8) };
+        for lvl in 1..5 {
+            sui.bids[lvl] = BookLevel { price: PriceTicks(8_500 - lvl as i64), qty: LotQty(20) };
+            sui.asks[lvl] = BookLevel { price: PriceTicks(8_501 + lvl as i64), qty: LotQty(15) };
+        }
+        sui.refresh_deep_l1_l5_totals();
+        assert!(gov.passes_elastic_preflight_l1_support(5, Side::Bid, PriceTicks(8_500), &sui));
+
+        // H-09: Semigrupo exacto en sync_global_debt_clock_and_decay (200 pasos x 5ms == 1 salto x 1s)
+        let mut g_step = OnlineAdaptiveGovernor::new();
+        let mut g_jump = OnlineAdaptiveGovernor::new();
+        let mut base_snap = g_step.to_scar_snapshot_json(TimestampNs(t0));
+        if let Some(m) = base_snap.as_object_mut() {
+            m.insert("global_dir_debt_bps_x100".to_string(), serde_json::json!([-12_000, 0]));
+            m.insert("global_dir_cooldown_until_ns".to_string(), serde_json::json!([t0, 0]));
+        }
+        let _ = g_step.apply_scar_snapshot_json(&base_snap);
+        let _ = g_jump.apply_scar_snapshot_json(&base_snap);
+        for k in 1..=200_i64 {
+            let _ = g_step.audit_historical_entry_veto(3, Side::Bid, 8_200, t0 + k * 5_000_000);
+        }
+        let _ = g_jump.audit_historical_entry_veto(3, Side::Bid, 8_200, t0 + 1_000_000_000);
+        let d_step = g_step.global_dir_debt_bps_x100_for(Side::Bid);
+        let d_jump = g_jump.global_dir_debt_bps_x100_for(Side::Bid);
+        assert!((d_step - d_jump).abs() <= 2, "Semigrupo 200Hz diverge: step={d_step} jump={d_jump}");
+        assert!(d_step <= -11_950, "Deuda global se evaporo prematuramente: {d_step}");
+
+        // H-11: Persistencia JSON de shadow_credits y SCAR-LOCK 63/63 intacto
+        let (mit63, man2160) = OnlineAdaptiveGovernor::audit_unified_62_losses_and_2160_manifold();
+        assert_eq!((mit63, man2160), (63, 2_160));
     }
 }

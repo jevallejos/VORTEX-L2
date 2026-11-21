@@ -361,6 +361,14 @@ impl GovernorPlasticityState {
             "cont_ratio_x1000".to_string(),
             serde_json::json!(self.cont_ratio_x1000),
         );
+        map.insert(
+            "shadow_credits".to_string(),
+            serde_json::json!(self.shadow_credits),
+        );
+        map.insert(
+            "last_credit_ts_ns".to_string(),
+            serde_json::json!(self.last_credit_ts_ns),
+        );
     }
 
     pub fn apply_from_scar_json(&mut self, val: &serde_json::Value) {
@@ -442,6 +450,29 @@ impl GovernorPlasticityState {
                 } else {
                     (*cell).clamp(MIN_CONT_RATIO_X1000, MAX_CONT_RATIO_X1000)
                 };
+            }
+        }
+        self.shadow_credits = [[0; 2]; MAX_ACTIVE_PAIRS];
+        if let Some(rows_sc) = val.get("shadow_credits").and_then(|v| v.as_array()) {
+            for (s, r) in rows_sc.iter().take(MAX_ACTIVE_PAIRS).enumerate() {
+                if let Some(cols) = r.as_array() {
+                    for (d, c) in cols.iter().take(2).enumerate() {
+                        if let Some(n) = c.as_u64() {
+                            self.shadow_credits[s][d] = n.min(u64::from(SHADOW_CREDITS_REQUIRED)) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        self.last_credit_ts_ns = [[0; 2]; MAX_ACTIVE_PAIRS];
+        crate::kinematic_surface::extract_matrix_i64_12x2(
+            val,
+            "last_credit_ts_ns",
+            &mut self.last_credit_ts_ns,
+        );
+        for row in &mut self.last_credit_ts_ns {
+            for cell in row.iter_mut() {
+                *cell = (*cell).max(0);
             }
         }
     }
@@ -1200,6 +1231,48 @@ pub fn compute_psi_health_c1(
             INV_PHI_H,
         );
     (f_tox * f_ewma * f_daily * f_epoch).clamp(0.0, 1.0)
+}
+
+/// Cell-decoupled operational health `psi_slot` in `[0.0, 1.0]` (`V5.5.10`, H-05):
+/// prevents isolated losses on 1-lot/scarred slots from starving clean multi-lot altcoins
+/// while keeping the daily-stop and -$5.00 epoch centrifugal brake strictly enforced.
+#[inline]
+#[must_use]
+pub fn compute_slot_psi_health_c1(
+    portfolio_psi: f64,
+    cell_taker_prob: f64,
+    cell_ewma_net_bps: f64,
+    fee_rt_mkr_bps: f64,
+    daily_loss_used_ratio: f64,
+    epoch_loss_5u_ratio: f64,
+) -> f64 {
+    const INV_PHI_H: f64 = 0.618_033_988_749_895;
+    const INV_PHI_SQ_H: f64 = 0.381_966_011_250_105;
+    let psi_port = if portfolio_psi.is_finite() {
+        portfolio_psi.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let psi_cell = compute_psi_health_c1(
+        cell_taker_prob,
+        cell_ewma_net_bps,
+        fee_rt_mkr_bps,
+        daily_loss_used_ratio,
+        epoch_loss_5u_ratio,
+    );
+    let psi_budget = (1.0
+        - crate::wave_elliott::hermite_smoothstep_c1(
+            daily_loss_used_ratio,
+            INV_PHI_SQ_H,
+            INV_PHI_H,
+        ))
+        * (1.0
+            - crate::wave_elliott::hermite_smoothstep_c1(
+                epoch_loss_5u_ratio,
+                INV_PHI_SQ_H,
+                INV_PHI_H,
+            ));
+    psi_port.max(INV_PHI_H * psi_cell * psi_budget).clamp(0.0, 1.0)
 }
 
 /// Smooth `C1` pre-limit lot damper `1.0 - INV_PHI_SQ * S_3(epoch_loss_5u_ratio; INV_PHI, 1.0)` (V5.4.2 M5).

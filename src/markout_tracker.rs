@@ -26,6 +26,7 @@ pub const VETO_CODE_CARDINALITY: usize = 13;
 
 const PROBE_RING_CAP: usize = 12;
 const DRAIN_ABORT_CAP: usize = 8;
+const PENDING_LEARN_RING_CAP: usize = 4;
 const LVR_EWMA_ETA_PM: i64 = 125;
 
 const PHI_MK: f64 = 1.618_033_988_749_895;
@@ -273,9 +274,13 @@ pub struct SlotMarkoutRing {
     ewma_markout_15s_bps: i64,
     ewma_markout_60s_bps: i64,
     pending_uncensored_peak_sbps: i64,
-    pending_resolved_60s_fill: Option<(Side, i64)>,
+    pending_resolved_60s_fills: [(Side, i64, i64); PENDING_LEARN_RING_CAP],
+    resolved_60s_read_idx: usize,
+    resolved_60s_write_idx: usize,
     last_resolved_60s_peak_sbps: i64,
-    pending_counterfactual_abort: Option<(Side, i64, i64)>,
+    pending_cf_aborts: [(Side, i64, i64); PENDING_LEARN_RING_CAP],
+    cf_abort_read_idx: usize,
+    cf_abort_write_idx: usize,
     tp_abort_count: u64,
     resolved_abort_count: u64,
     veto_tp_counts: [u32; VETO_CODE_CARDINALITY],
@@ -313,9 +318,13 @@ impl SlotMarkoutRing {
             ewma_markout_15s_bps: 0,
             ewma_markout_60s_bps: 0,
             pending_uncensored_peak_sbps: 0,
-            pending_resolved_60s_fill: None,
+            pending_resolved_60s_fills: [(Side::Bid, 0, 0); PENDING_LEARN_RING_CAP],
+            resolved_60s_read_idx: 0,
+            resolved_60s_write_idx: 0,
             last_resolved_60s_peak_sbps: 0,
-            pending_counterfactual_abort: None,
+            pending_cf_aborts: [(Side::Bid, 0, 0); PENDING_LEARN_RING_CAP],
+            cf_abort_read_idx: 0,
+            cf_abort_write_idx: 0,
             tp_abort_count: 0,
             resolved_abort_count: 0,
             veto_tp_counts: [0; VETO_CODE_CARDINALITY],
@@ -541,9 +550,14 @@ impl SlotMarkoutRing {
                                 .samples_bps[4]
                                 .max((slot.peak_fav_sbps * 618) / 1_000)
                                 .max(0);
-                            self.last_resolved_60s_peak_sbps =
-                                slot.peak_fav_sbps.max(slot.curve.samples_bps[4]).max(0);
-                            self.pending_resolved_60s_fill = Some((slot.side, fav_60s_eff));
+                            let peak_60s_item = slot.peak_fav_sbps.max(slot.curve.samples_bps[4]).max(0);
+                            self.last_resolved_60s_peak_sbps = peak_60s_item;
+                            let r_pos = self.resolved_60s_write_idx % PENDING_LEARN_RING_CAP;
+                            self.pending_resolved_60s_fills[r_pos] = (slot.side, peak_60s_item, fav_60s_eff);
+                            self.resolved_60s_write_idx = self.resolved_60s_write_idx.wrapping_add(1);
+                            if self.resolved_60s_write_idx.wrapping_sub(self.resolved_60s_read_idx) > PENDING_LEARN_RING_CAP {
+                                self.resolved_60s_read_idx = self.resolved_60s_write_idx.wrapping_sub(PENDING_LEARN_RING_CAP);
+                            }
                         }
                         if slot.t0_ns >= self.last_fill_t0_ns {
                             self.last_fill_curve = slot.curve;
@@ -585,8 +599,12 @@ impl SlotMarkoutRing {
                         let fav_60s_cf = (-slot.curve.samples_bps[4])
                             .max((slot.peak_fav_sbps * 618) / 1_000)
                             .max(0);
-                        self.pending_counterfactual_abort =
-                            Some((slot.side, slot.peak_fav_sbps, fav_60s_cf));
+                        let cf_pos = self.cf_abort_write_idx % PENDING_LEARN_RING_CAP;
+                        self.pending_cf_aborts[cf_pos] = (slot.side, slot.peak_fav_sbps, fav_60s_cf);
+                        self.cf_abort_write_idx = self.cf_abort_write_idx.wrapping_add(1);
+                        if self.cf_abort_write_idx.wrapping_sub(self.cf_abort_read_idx) > PENDING_LEARN_RING_CAP {
+                            self.cf_abort_read_idx = self.cf_abort_write_idx.wrapping_sub(PENDING_LEARN_RING_CAP);
+                        }
                     }
                     Self::push_completed_abort(slot, fee_bar, &mut self.completed_aborts, &mut self.abort_read_idx, &mut self.abort_write_idx);
                 }
@@ -729,8 +747,21 @@ impl SlotMarkoutRing {
     }
 
     #[inline]
+    pub fn take_resolved_60s_fill_with_peak(&mut self) -> Option<(Side, i64, i64)> {
+        if self.resolved_60s_read_idx == self.resolved_60s_write_idx {
+            return None;
+        }
+        let pos = self.resolved_60s_read_idx % PENDING_LEARN_RING_CAP;
+        self.resolved_60s_read_idx = self.resolved_60s_read_idx.wrapping_add(1);
+        let item = self.pending_resolved_60s_fills[pos];
+        self.last_resolved_60s_peak_sbps = item.1;
+        Some(item)
+    }
+
+    #[inline]
     pub fn take_resolved_60s_fill_markout(&mut self) -> Option<(Side, i64)> {
-        self.pending_resolved_60s_fill.take()
+        let (side, _peak, fav_60s) = self.take_resolved_60s_fill_with_peak()?;
+        Some((side, fav_60s))
     }
 
     #[inline]
@@ -741,7 +772,63 @@ impl SlotMarkoutRing {
 
     #[inline]
     pub fn take_counterfactual_abort_learning(&mut self) -> Option<(Side, i64, i64)> {
-        self.pending_counterfactual_abort.take()
+        if self.cf_abort_read_idx == self.cf_abort_write_idx {
+            return None;
+        }
+        let pos = self.cf_abort_read_idx % PENDING_LEARN_RING_CAP;
+        self.cf_abort_read_idx = self.cf_abort_read_idx.wrapping_add(1);
+        Some(self.pending_cf_aborts[pos])
+    }
+
+    #[inline]
+    pub fn hydrate_veto_precision_counts(&mut self, veto: LastVetoCode, tp_count: u32, resolved_count: u32) {
+        let idx = veto as usize;
+        if idx < VETO_CODE_CARDINALITY {
+            let eff_res = resolved_count.max(tp_count);
+            self.veto_tp_counts[idx] = self.veto_tp_counts[idx].saturating_add(tp_count);
+            self.veto_resolved_counts[idx] = self.veto_resolved_counts[idx].saturating_add(eff_res);
+            self.tp_abort_count = self.tp_abort_count.saturating_add(u64::from(tp_count));
+            self.resolved_abort_count = self.resolved_abort_count.saturating_add(u64::from(eff_res));
+        }
+    }
+
+    /// Rehydrates per-veto `+15s` abort precision counts from `vortex_queue_aborts.jsonl` across restarts (`V5.5.10`, H-11).
+    pub fn rehydrate_aborts_from_jsonl_path<const N: usize>(
+        rings: &mut [Self; N],
+        path: &std::path::Path,
+    ) -> usize {
+        use std::io::{BufRead, BufReader};
+        let Ok(file) = std::fs::File::open(path) else {
+            return 0;
+        };
+        let mut hydrated = 0_usize;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(s_idx) = v
+                .get("slot_idx")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|u| usize::try_from(u).ok())
+                .filter(|&i| i < N)
+            else {
+                continue;
+            };
+            let code_u8 = v
+                .get("veto_code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|u| u8::try_from(u).ok())
+                .unwrap_or(0);
+            let veto = LastVetoCode::from_code(code_u8);
+            let is_tp = v
+                .get("true_positive")
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| v.get("is_true_positive").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false);
+            rings[s_idx].hydrate_veto_precision_counts(veto, u32::from(is_tp), 1);
+            hydrated = hydrated.saturating_add(1);
+        }
+        hydrated
     }
 
     /// Empirical Bayes `C1` L1 queue-patience multiplier in `[INV_PHI_MK, PHI_MK]` driven by `+15s`
@@ -878,5 +965,40 @@ mod tests {
         };
         let z_avax1 = glosten_milgrom_toxicity_zeta_diffusive(avax1, ScaledBps(400), ScaledBps(3_490));
         assert!(z_avax1 > 1.2);
+    }
+}
+
+#[cfg(test)]
+mod v5510_turno2_markout_tests {
+    use super::*;
+
+    #[test]
+    fn test_v5510_h11_static_fifo_rings_and_veto_precision_rehydration() {
+        let mut ring = SlotMarkoutRing::new();
+        let t0 = 1_795_000_000_000_000_000_i64;
+        ring.arm_fill_probe_with_vol(Side::Bid, PriceTicks(10_000), PriceTicks(10_000), TimestampNs(t0), ScaledBps(4_000), ScaledBps(400));
+        ring.arm_fill_probe_with_vol(Side::Ask, PriceTicks(10_000), PriceTicks(10_000), TimestampNs(t0 + 1_000_000_000), ScaledBps(4_000), ScaledBps(400));
+        ring.step_clock(PriceTicks(10_020), TimestampNs(t0 + 5_000_000_000), 200);
+        ring.step_clock(PriceTicks(10_010), TimestampNs(t0 + 62_000_000_000), 200);
+        let first = ring.take_resolved_60s_fill_with_peak();
+        let second = ring.take_resolved_60s_fill_with_peak();
+        assert!(first.is_some() && second.is_some(), "Ambos probes +60s deben preservarse en FIFO sin sobreescritura");
+        assert!(ring.take_resolved_60s_fill_with_peak().is_none());
+
+        let tmp = std::env::temp_dir().join(format!("vortex_h11_aborts_{}.jsonl", std::process::id()));
+        let lines = concat!(
+            "{\"slot_idx\":5,\"veto_code\":12,\"true_positive\":false}\n",
+            "{\"slot_idx\":5,\"veto_code\":12,\"true_positive\":false}\n",
+            "{\"slot_idx\":5,\"veto_code\":12,\"true_positive\":false}\n",
+            "{\"slot_idx\":5,\"veto_code\":12,\"true_positive\":false}\n",
+            "{\"slot_idx\":5,\"veto_code\":12,\"true_positive\":false}\n",
+            "{\"slot_idx\":5,\"veto_code\":12,\"true_positive\":false}\n"
+        );
+        let _ = std::fs::write(&tmp, lines);
+        let mut rings = [SlotMarkoutRing::new(); 12];
+        let count = SlotMarkoutRing::rehydrate_aborts_from_jsonl_path(&mut rings, &tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(count, 6);
+        assert!(rings[5].hawkes_abort_precision_patience_mult_c1() > 1.10, "Sobre-aborto rehidratado debe expandir paciencia Hawkes");
     }
 }

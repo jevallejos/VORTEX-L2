@@ -399,12 +399,25 @@ impl BybitV5LiveClient {
         let k = self.api_key.clone();
         let s = self.api_secret.clone();
         if let Some(ws_rc) = self.ws_trade.execute_ws_op(&k, &s, WsMutationOp::Create, "order.create", recv_ms, &arg_obj) {
+            if ws_rc != 0 && ws_rc != 110_072 && ws_rc != 110_017 {
+                println!(
+                    "{}\u{1f7e0} [BYBIT V5 WS ORDER REJECTED] {} {} qty={} @ {} (ro={} rc={}){}",
+                    ANSI_ORANGE, sym, side_str, spec.format_lot_qty_str(qty), spec.format_price_ticks_str(price), reduce_only, ws_rc, ANSI_RESET
+                );
+            }
             return if ws_rc == 110_072 { 0 } else { ws_rc };
         }
-        let rc = self
-            .post_v5("/v5/order/create", &arg_obj.to_string())
-            .and_then(|v| v.get("retCode")?.as_i64())
-            .unwrap_or(-1);
+        let Some(resp) = self.post_v5("/v5/order/create", &arg_obj.to_string()) else {
+            return -1;
+        };
+        let rc = resp.get("retCode").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if rc != 0 && rc != 110_072 && rc != 110_017 {
+            let rmsg = resp.get("retMsg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            println!(
+                "{}\u{1f7e0} [BYBIT V5 REST ORDER REJECTED] {} {} qty={} @ {} (ro={} rc={} msg={}){}",
+                ANSI_ORANGE, sym, side_str, spec.format_lot_qty_str(qty), spec.format_price_ticks_str(price), reduce_only, rc, rmsg, ANSI_RESET
+            );
+        }
         if rc == 110_072 { 0 } else { rc }
     }
 
@@ -540,18 +553,31 @@ impl BybitV5LiveClient {
         if sl_ticks.0 <= 0 {
             return false;
         }
+        let sym = spec.symbol_id.name();
+        let sl_str = spec.format_price_ticks_str(sl_ticks);
         let body = serde_json::json!({
             "category": "linear",
-            "symbol": spec.symbol_id.name(),
-            "stopLoss": spec.format_price_ticks_str(sl_ticks),
+            "symbol": sym,
+            "stopLoss": sl_str,
             "slTriggerBy": "MarkPrice",
             "tpslMode": "Full",
             "positionIdx": 0,
         })
         .to_string();
-        self.post_v5("/v5/position/trading-stop", &body)
-            .and_then(|v| v.get("retCode")?.as_i64())
-            .is_some_and(|rc| rc == 0 || rc == 34_040)
+        let Some(resp) = self.post_v5("/v5/position/trading-stop", &body) else {
+            return false;
+        };
+        let rc = resp.get("retCode").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if rc == 0 || rc == 34_040 {
+            true
+        } else {
+            let rmsg = resp.get("retMsg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            println!(
+                "{}\u{1f7e0} [BYBIT V5 SL REJECTED] {} sl={} (rc={} msg={}){}",
+                ANSI_ORANGE, sym, sl_str, rc, rmsg, ANSI_RESET
+            );
+            false
+        }
     }
 
     pub fn place_post_only_order(

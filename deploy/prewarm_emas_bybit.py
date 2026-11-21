@@ -39,7 +39,7 @@ def fetch_1m_klines(symbol: str, limit: int = 90) -> list:
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=1&limit={limit}"
     for attempt in range(3):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/5.5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "vortex-omega-prewarm/5.5.10"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             rows = data.get("result", {}).get("list", [])

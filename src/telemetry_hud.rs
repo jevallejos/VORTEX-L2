@@ -954,7 +954,13 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
             verd_col = format!("{ANSI_YELLOW}\u{1f7e1} QUEUE_L1_WAIT {ANSI_RESET}");
         } else if snap.sequence_id > 0 {
             let mid_px = PriceTicks(i64::midpoint(snap.bids[0].price.0.max(1), snap.asks[0].price.0.max(1)));
-            let q_ok = spec.passes_quantum_ev_growth_gate(w_est, mid_px, snap.realized_vol_5m, ScaledBps((fee_rt * 17) / 10), 50, fees);
+            let hud_mfe_sbps = std::fs::read_to_string(crate::vault_io::MFE_PLASTICITY_VAULT_PATH)
+                .ok()
+                .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+                .and_then(|v| v.get("learned_mfe_bps")?.as_array()?.get(s_idx)?.as_i64())
+                .filter(|&m| m >= 400)
+                .unwrap_or((fee_rt * 17) / 10);
+            let q_ok = spec.passes_quantum_ev_growth_gate(w_est, mid_px, snap.realized_vol_5m, ScaledBps(hud_mfe_sbps), 50, fees);
             let vc = LastVetoCode::from_code(tel.last_veto_code);
             if halt_active {
                 row_col = ANSI_RED;
@@ -969,7 +975,7 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
                     format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}")
                 };
             } else if vc != LastVetoCode::None {
-                if !q_ok {
+                if !q_ok && vc == LastVetoCode::QueueDepthOrOversizedLot {
                     verd_col = format!("{ANSI_GRAY}\u{26aa} QUANTUM_EV    {ANSI_RESET}");
                 } else if vc == LastVetoCode::SpoofingVeto {
                     row_col = ANSI_ORANGE;
@@ -980,7 +986,7 @@ pub fn render_live_hud(arena: &crate::lob_shm::ReadOnlyShmArena) {
             } else {
                 let beta_hud = OrthogonalFactorState::epps_btc_lead_lag_beta(s_idx, &snap, &btc_snap);
                 match OrthogonalFactorState::evaluate_entry_signal_v46(
-                    spec, &snap, &btc_snap, ScaledBps((fee_rt * 17) / 10), ScaledBps(fee_rt / 2), 50, fees, 0.0, beta_hud,
+                    spec, &snap, &btc_snap, ScaledBps(hud_mfe_sbps), ScaledBps(fee_rt / 2), 50, fees, 0.0, beta_hud,
                 ) {
                     SignalVerdict::SpoofingVeto => {
                         row_col = ANSI_ORANGE;

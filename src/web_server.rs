@@ -395,9 +395,18 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
                         let n_bps = v.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                         let f_bps = v.get("fee_bps").and_then(serde_json::Value::as_f64).unwrap_or(4.0);
                         let sub_r = v.get("exit_sub_reason").and_then(serde_json::Value::as_str).unwrap_or("");
-                        if v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true) { mk += 1; }
+                        let mkr = v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                        let legs = v
+                            .get("legs_consolidated")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(1)
+                            .max(1);
+                        if mkr { mk += 1; }
                         if let Some(r) = v.get("ws_rtt_us").and_then(serde_json::Value::as_u64) { rtt = r; }
-                        if is_partial_harvest_sub_reason_str(sub_r) && n_bps < 1.00 {
+                        let is_part = (is_partial_harvest_sub_reason_str(sub_r)
+                            || (legs >= 2 && mkr && n_bps >= -0.50))
+                            && n_bps < 1.00;
+                        if is_part {
                             pt += 1;
                         } else if n_bps >= 1.00 {
                             wn += 1;
@@ -460,14 +469,14 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             let p_side = if tel.side_code == 1 { Side::Ask } else { Side::Bid };
             let ref_t = if snap.mark_price.0 > 0 { snap.mark_price.0 } else { tel.avg_price_ticks };
             if tel.open_lots > 0 {
-                let (gross_1e8, est_fee_1e8, _, _) = spec.compute_leg_pnl_and_fee_1e8(
+                let (net_1e8, _, _, _) = spec.compute_leg_pnl_and_fee_1e8(
                     p_side,
                     crate::types::LotQty(tel.open_lots),
                     crate::types::PriceTicks(tel.avg_price_ticks),
                     crate::types::PriceTicks(ref_t),
                     fees.round_trip_maker_exit_bps(),
                 );
-                open_mtm_upl_1e8 = open_mtm_upl_1e8.saturating_add(gross_1e8.saturating_sub(est_fee_1e8));
+                open_mtm_upl_1e8 = open_mtm_upl_1e8.saturating_add(net_1e8);
             }
             let g_bps = ((ref_t - tel.avg_price_ticks) * p_side.sign_i64()).saturating_mul(1_000_000) / tel.avg_price_ticks.max(1);
             upl_bps = ((g_bps - fee_rt) as f64) / 100.0;
@@ -574,6 +583,7 @@ pub fn build_live_state_json(ctx: &VortexWebContext) -> serde_json::Value {
             "summary": shield_5u_summary,
         },
         "semaphore_4_4": {
+            "gate1_ok": g1, "gate2_ok": g2, "gate3_ok": g3, "gate4_ok": g4,
             "oos_520_ok": g1, "vault_70_ok": g2, "maker_80_ok": g3, "sample_25_ok": g4,
             "passed": u8::from(g1) + u8::from(g2) + u8::from(g3) + u8::from(g4),
         },
@@ -632,7 +642,10 @@ pub fn query_recent_trades_json(ctx: &VortexWebContext, limit: usize) -> serde_j
                     .unwrap_or("MakerExit")
                     .to_string();
                 let n_bps = obj.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                let is_part = is_partial_harvest_sub_reason_str(&sub_r) && n_bps < 1.00;
+                let mkr = obj.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let is_part = (is_partial_harvest_sub_reason_str(&sub_r)
+                    || (legs >= 2 && mkr && n_bps >= -0.50))
+                    && n_bps < 1.00;
                 let reason_display = format_trade_reason_with_legs(&sub_r, legs);
                 obj.insert("is_partial_harvest".to_string(), serde_json::json!(is_part));
                 obj.insert("exit_reason_display".to_string(), serde_json::json!(reason_display));
@@ -1122,6 +1135,74 @@ mod tests {
         assert!(tr_body.contains("\"is_partial_harvest\":true"));
         let (_, _, st_with_tr) = dispatch_http_request(&ctx, "GET", "/api/state", &[], "");
         assert!(st_with_tr.contains("\"partials\":1") && st_with_tr.contains("\"wins\":1"));
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod v5510_turno5_web_tests {
+    use super::*;
+    use crate::lob_shm::{MappedShmRegion, SlotTelemetrySnapshot};
+
+    #[test]
+    fn test_v5510_h12a_no_double_fee_deduction_and_h14_partial_badge_parity() {
+        let base = std::env::temp_dir().join(format!("vortex_web_t5_{}", std::process::id()));
+        let vault_dir = base.join("vault");
+        let _ = fs::create_dir_all(&vault_dir);
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("web_t5_h12_h14");
+        let Ok(reg) = MappedShmRegion::open_or_create(&shm_path, true) else {
+            return;
+        };
+        let mut snap = crate::lob_shm::SymbolLobSnapshot::new_empty();
+        snap.symbol_id = APPROVED_SPECS[5].symbol_id;
+        snap.mark_price = crate::types::PriceTicks(8_500);
+        if let Ok(s5) = reg.arena().slot(5) {
+            s5.write_snapshot(&snap);
+        }
+        if let Ok(t5) = reg.arena().telemetry(5) {
+            t5.write_consistent(&SlotTelemetrySnapshot {
+                state_code: 3,
+                side_code: 0,
+                avg_price_ticks: 8_500,
+                open_lots: 100,
+                ..SlotTelemetrySnapshot::default()
+            });
+        }
+        let vault_line = "{\"event\":\"TRADE_CLOSE\",\"symbol\":\"SUIUSDT\",\"side\":\"Bid\",\"net_bps\":0.40,\"fee_bps\":4.00,\"maker_exit\":true,\"legs_consolidated\":2,\"exit_sub_reason\":\"AdverseScratchEscape\",\"net_pnl_1e8\":340000,\"fee_1e8\":3400000}\n";
+        let _ = fs::write(vault_dir.join("vortex_ai_forensic_vault.jsonl"), vault_line);
+
+        let ctx = VortexWebContext::new(VortexWebConfig {
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            shm_path: shm_path.clone(),
+            candle_dir: base.join("candles"),
+            vault_dir: vault_dir.clone(),
+            data_dir: base.clone(),
+            ui_html_path: PathBuf::from("ui/vortex_observatory.html"),
+        });
+        let st = build_live_state_json(&ctx);
+        // H-12a: en break-even exacto (ref == avg = 8500, 100 lotes = $85.00), fee RT Maker VIP0 = 4.00 bps = -$0.034 (NO -$0.068)
+        let (exp_net_1e8, _, _, _) = APPROVED_SPECS[5].compute_leg_pnl_and_fee_1e8(
+            Side::Bid,
+            crate::types::LotQty(100),
+            crate::types::PriceTicks(8_500),
+            crate::types::PriceTicks(8_500),
+            FeeSchedule::VIP0_DEFAULT.round_trip_maker_exit_bps(),
+        );
+        let loss_1e8 = st["total_loss_shield"]["loss_1e8"].as_i64().unwrap_or(0);
+        let exp_loss_1e8 = (-exp_net_1e8) - 340_000;
+        assert_eq!(
+            loss_1e8, exp_loss_1e8,
+            "open_mtm_upl_1e8 no debe restar fees dos veces: got={loss_1e8} exp={exp_loss_1e8}"
+        );
+        // H-14: legs>=2 && maker && net_bps >= -0.50 cuenta como PARTIAL y expone gate1_ok..gate4_ok
+        assert_eq!(st["ledger"]["partials"].as_u64(), Some(1));
+        assert!(st["semaphore_4_4"].get("gate1_ok").is_some());
+        assert!(st["semaphore_4_4"].get("gate4_ok").is_some());
+        let tr = query_recent_trades_json(&ctx, 10);
+        assert_eq!(tr["trades"][0]["is_partial_harvest"].as_bool(), Some(true));
+
+        let _ = fs::remove_file(&shm_path);
         let _ = fs::remove_dir_all(&base);
     }
 }

@@ -272,8 +272,16 @@ pub const fn should_repeg_resting_exit_tp_with_open_lots(
     } else {
         tau_tick_sbps
     };
+    let outward_jump_sbps = (diff.saturating_mul(1_000_000)) / denom_mid;
+    let min_unlock_dist_raw = (safe_outward_buf.saturating_mul(618)) / 1_000;
+    let min_unlock_dist = if min_unlock_dist_raw > tau_tick_sbps { min_unlock_dist_raw } else { tau_tick_sbps };
+    let min_unlock_jump = (rt_eff.saturating_mul(618)) / 1_000;
+    let scratch_unlock_jump =
+        !moving_closer && resting_dist_mid_bps >= min_unlock_dist && outward_jump_sbps >= min_unlock_jump;
     let allow_outward = !defensive_lock
-        && (cur_gross_bps < fee_cushion_bps || resting_dist_mid_bps >= safe_outward_buf);
+        && (cur_gross_bps < fee_cushion_bps
+            || resting_dist_mid_bps >= safe_outward_buf
+            || scratch_unlock_jump);
     (moving_closer && diff >= 1 && (defensive_lock || diff >= close_step))
         || (!moving_closer && allow_outward && diff >= amend_step)
 }
@@ -332,6 +340,12 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
                 .and_then(|v| v.as_str())
                 .and_then(|s| spec.parse_price_ticks(s).ok())
                 .unwrap_or(PriceTicks(0));
+            let exec_avg_px = item
+                .get("avgPrice")
+                .and_then(|v| v.as_str())
+                .and_then(|s| spec.parse_price_ticks(s).ok())
+                .filter(|p| p.0 > 0)
+                .unwrap_or(order_px);
             let link_s = item.get("orderLinkId").and_then(|v| v.as_str()).unwrap_or("");
             let (rk, tk) = match status {
                 "Filled" => (WsOrderRank::Terminal, WsTerminalKind::Filled),
@@ -356,10 +370,11 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
             };
             let mut matches_active_entry = !reduce_only && link_s.is_empty();
             let mut matches_active_exit = reduce_only && link_s.is_empty();
+            let mut suppress_dup_exit = false;
             if !link_s.is_empty() {
                 let inc = WsOrderLatticeState {
                     rank: rk,
-                    price_ticks: order_px,
+                    price_ticks: if reduce_only && exec_avg_px.0 > 0 { exec_avg_px } else { order_px },
                     total_lots: LotQty(0),
                     cum_exec_lots: cum_exec_q,
                     terminal_kind: tk,
@@ -370,10 +385,13 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
                         matches_active_entry = true;
                         tr.entry_lattice = tr.entry_lattice.join(inc);
                     } else if reduce_only && tr.exit_link_id == link_s {
-                        matches_active_exit = true;
+                        let was_terminal = tr.exit_lattice.rank == WsOrderRank::Terminal;
+                        let prev_exec = tr.exit_lattice.cum_exec_lots.0;
                         tr.exit_lattice = tr.exit_lattice.join(inc);
-                        if rk == WsOrderRank::Terminal {
-                            tr.exit_link_id.clear();
+                        if was_terminal && cum_exec_q.0 <= prev_exec {
+                            suppress_dup_exit = true;
+                        } else {
+                            matches_active_exit = true;
                         }
                     } else if !reduce_only && tr.entry_link_id.is_empty() {
                         matches_active_entry = true;
@@ -383,7 +401,8 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
                 }
             }
             if reduce_only {
-                if matches_active_exit
+                if !suppress_dup_exit
+                    && matches_active_exit
                     && (rk == WsOrderRank::Terminal
                         || rk == WsOrderRank::PartialFill
                         || cum_exec_q.0 > 0)
@@ -430,6 +449,23 @@ pub fn parse_ws_private_frame(txt: &str, evt_tx: &SyncSender<GatewayEvent>) {
             }
         }
     }
+}
+
+/// Returns the last WS-confirmed exit execution price stored in the slot's join-semilattice (`V5.5.10`, H-03).
+#[inline]
+#[must_use]
+pub fn last_ws_exit_exec_price_ticks(slot_idx: usize) -> PriceTicks {
+    if slot_idx >= crate::lob_shm::MAX_ACTIVE_PAIRS {
+        return PriceTicks(0);
+    }
+    global_ws_trackers()
+        .lock()
+        .map_or(PriceTicks(0), |trks| trks[slot_idx].exit_lattice.price_ticks)
+}
+
+#[inline]
+fn emit_gateway_event_reliable(evt_tx: &SyncSender<GatewayEvent>, evt: GatewayEvent) {
+    let _ = evt_tx.send(evt);
 }
 
 pub fn process_gateway_command(
@@ -570,7 +606,7 @@ pub fn process_gateway_command(
                 }
                 Some((false, ..)) => {
                     if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
-                    let _ = evt_tx.try_send(GatewayEvent::EntryAborted { slot_idx, side, aborted_price });
+                    emit_gateway_event_reliable(evt_tx, GatewayEvent::EntryAborted { slot_idx, side, aborted_price });
                 }
                 None => {
                     let _ = evt_tx.try_send(GatewayEvent::EntryOrderVanished { slot_idx });
@@ -614,7 +650,7 @@ pub fn process_gateway_command(
         }
         GatewayCommand::EnforceStopLoss { slot_idx, sl_price } => {
             let verified = client.set_position_trading_stop(APPROVED_SPECS[slot_idx], sl_price);
-            let _ = evt_tx.try_send(GatewayEvent::StopLossSynced { slot_idx, sl_price, verified });
+            emit_gateway_event_reliable(evt_tx, GatewayEvent::StopLossSynced { slot_idx, sl_price, verified });
         }
         GatewayCommand::EmergencyFlattenSlot { slot_idx, open_side, open_lots, backup_sl } => {
             let spec = APPROVED_SPECS[slot_idx];
@@ -628,7 +664,7 @@ pub fn process_gateway_command(
                 Some((false, ..)) => {
                     if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
                     let closed_pnl_payload = client.query_closed_pnl_raw(sym, recent_start_ms);
-                    let _ = evt_tx.try_send(GatewayEvent::SlotClosedDetected { slot_idx, vac_level: 1, closed_pnl_payload });
+                    emit_gateway_event_reliable(evt_tx, GatewayEvent::SlotClosedDetected { slot_idx, vac_level: 1, closed_pnl_payload });
                     return;
                 }
                 Some((true, sz_s, r_side, _)) => (r_side, spec.parse_lot_qty(&sz_s).max(LotQty(1))),
@@ -647,7 +683,7 @@ pub fn process_gateway_command(
             if let Some((false, ..)) = client.query_open_position_verified(sym) {
                 if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
                 let closed_pnl_payload = client.query_closed_pnl_raw(sym, recent_start_ms);
-                let _ = evt_tx.try_send(GatewayEvent::SlotClosedDetected { slot_idx, vac_level: 1, closed_pnl_payload });
+                emit_gateway_event_reliable(evt_tx, GatewayEvent::SlotClosedDetected { slot_idx, vac_level: 1, closed_pnl_payload });
             } else {
                 let _ = evt_tx.try_send(GatewayEvent::StopLossSynced { slot_idx, sl_price: backup_sl, verified: false });
             }
@@ -677,7 +713,7 @@ pub fn process_gateway_command(
                 let opened_ms = (opened_ts_ns / 1_000_000).max(0);
                 let start_ms = opened_ms.saturating_sub(5_000);
                 let closed_pnl_payload = client.query_closed_pnl_raw(sym, start_ms);
-                let _ = evt_tx.try_send(GatewayEvent::SlotClosedDetected { slot_idx, vac_level, closed_pnl_payload });
+                emit_gateway_event_reliable(evt_tx, GatewayEvent::SlotClosedDetected { slot_idx, vac_level, closed_pnl_payload });
                 return;
             }
             let verified_avg = parse_verified_avg_price_ticks(spec, r_side, &avg_s).ok();
@@ -698,8 +734,8 @@ pub fn process_gateway_command(
             };
             let eff_target_px = if live_mid_px.0 > 0 {
                 match r_side {
-                    Side::Bid => PriceTicks(target_px.0.max(live_mid_px.0)),
-                    Side::Ask => PriceTicks(target_px.0.min(live_mid_px.0.saturating_add(1)).max(1)),
+                    Side::Bid => PriceTicks(target_px.0.max(live_mid_px.0.saturating_add(1))),
+                    Side::Ask => PriceTicks(target_px.0.min(live_mid_px.0).max(1)),
                 }
             } else {
                 target_px
@@ -723,16 +759,21 @@ pub fn process_gateway_command(
                 OrderLinkRole::Runner2
             };
             if resting_tp.0 == 0 {
-                if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].exit_link_id.clear(); }
+                if let Ok(mut trks) = global_ws_trackers().lock() {
+                    if trks[slot_idx].exit_lattice.rank != WsOrderRank::Terminal {
+                        trks[slot_idx].exit_link_id.clear();
+                    }
+                }
             }
+            let mut reduce_only_position_gone = false;
             let active_resting_tp = if should_repeg {
-                let (cur_ex_link, cur_ex_exec) = if let Ok(trks) = global_ws_trackers().lock() {
+                let (cur_ex_link, cur_ex_exec, cur_ex_rank) = if let Ok(trks) = global_ws_trackers().lock() {
                     let tr = &trks[slot_idx];
-                    (tr.exit_link_id.clone(), tr.exit_lattice.cum_exec_lots)
+                    (tr.exit_link_id.clone(), tr.exit_lattice.cum_exec_lots, tr.exit_lattice.rank)
                 } else {
-                    (String::new(), LotQty(0))
+                    (String::new(), LotQty(0), WsOrderRank::Terminal)
                 };
-                if resting_tp.0 > 0 && !cur_ex_link.is_empty() {
+                if resting_tp.0 > 0 && !cur_ex_link.is_empty() && cur_ex_rank != WsOrderRank::Terminal {
                     if client.authorizes_ws_mutation(WsMutationOp::Amend, defensive_lock) {
                         let am_tot = compute_amend_total_lots(cur_ex_exec, eff_lots);
                         if client.amend_order_ws_or_rest(spec, &cur_ex_link, eff_target_px, am_tot, None) == 0 {
@@ -759,6 +800,9 @@ pub fn process_gateway_command(
                             let rc = client.place_order_ws_or_rest(
                                 spec, r_side.opposite(), eff_target_px, eff_lots, None, true, &new_ex_link, post_only,
                             );
+                            if rc == 110_017 {
+                                reduce_only_position_gone = true;
+                            }
                             if rc == 0 { eff_target_px } else { PriceTicks(0) }
                         } else {
                             resting_tp
@@ -786,6 +830,9 @@ pub fn process_gateway_command(
                     let rc = client.place_order_ws_or_rest(
                         spec, r_side.opposite(), eff_target_px, eff_lots, None, true, &new_ex_link, post_only,
                     );
+                    if rc == 110_017 {
+                        reduce_only_position_gone = true;
+                    }
                     if rc == 0 { eff_target_px } else { PriceTicks(0) }
                 } else {
                     resting_tp
@@ -793,7 +840,21 @@ pub fn process_gateway_command(
             } else {
                 resting_tp
             };
-            let _ = evt_tx.try_send(GatewayEvent::SlotStillOpenSynced {
+            if reduce_only_position_gone {
+                if let Some((false, ..)) = client.query_open_position_verified(sym) {
+                    if let Ok(mut trks) = global_ws_trackers().lock() { trks[slot_idx].advance_cycle(); }
+                    let _ = client.cancel_all_symbol_orders(sym);
+                    let opened_ms = (opened_ts_ns / 1_000_000).max(0);
+                    let start_ms = opened_ms.saturating_sub(5_000);
+                    let closed_pnl_payload = client.query_closed_pnl_raw(sym, start_ms);
+                    emit_gateway_event_reliable(
+                        evt_tx,
+                        GatewayEvent::SlotClosedDetected { slot_idx, vac_level, closed_pnl_payload },
+                    );
+                    return;
+                }
+            }
+            emit_gateway_event_reliable(evt_tx, GatewayEvent::SlotStillOpenSynced {
                 slot_idx, real_side: r_side, verified_avg, real_lots, active_resting_tp,
             });
         }
@@ -889,6 +950,7 @@ fn spawn_private_ws_listener(evt_tx: SyncSender<GatewayEvent>) {
 #[derive(Debug)]
 pub struct BybitAsyncGateway {
     cmd_tx: SyncSender<GatewayCommand>,
+    maint_tx: Option<SyncSender<GatewayCommand>>,
     evt_rx: Receiver<GatewayEvent>,
 }
 
@@ -899,6 +961,16 @@ impl BybitAsyncGateway {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<GatewayCommand>(GATEWAY_CMD_CAP);
         let (evt_tx, evt_rx) = mpsc::sync_channel::<GatewayEvent>(GATEWAY_EVT_CAP);
         let evt_ws = evt_tx.clone();
+        let maint_tx = BybitV5LiveClient::from_env_if_enabled(enabled).map(|mut maint_client| {
+            let (mtx, mrx) = mpsc::sync_channel::<GatewayCommand>(16);
+            let evt_maint = evt_tx.clone();
+            thread::spawn(move || {
+                while let Ok(m_cmd) = mrx.recv() {
+                    process_gateway_command(&mut maint_client, m_cmd, &evt_maint);
+                }
+            });
+            mtx
+        });
         thread::spawn(move || {
             client.enable_ws_trade_from_env();
             let mut last_hb_ns = crate::types::now_epoch_ns().0;
@@ -922,12 +994,17 @@ impl BybitAsyncGateway {
             }
         });
         spawn_private_ws_listener(evt_ws);
-        Some(Self { cmd_tx, evt_rx })
+        Some(Self { cmd_tx, maint_tx, evt_rx })
     }
 
     #[inline]
     #[must_use]
     pub fn try_send(&self, cmd: GatewayCommand) -> bool {
+        if matches!(cmd, GatewayCommand::SyncWallet | GatewayCommand::RefreshHandshake { .. }) {
+            if let Some(ref mtx) = self.maint_tx {
+                return mtx.try_send(cmd).is_ok();
+            }
+        }
         self.cmd_tx.try_send(cmd).is_ok()
     }
 
@@ -1073,5 +1150,56 @@ mod tests {
         ));
         let hs = run_daemon_startup_handshake(false, TimestampNs(1_794_700_000_000_000_000));
         assert!(!hs.synced_from_exchange && hs.instruments.is_slot_tradable(0));
+    }
+}
+
+#[cfg(test)]
+mod v5510_turno3a_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn test_v5510_h02_scratch_outward_unlock_and_h03_ws_exit_terminal_dedup() {
+        let eth_spec = APPROVED_SPECS[1];
+        let fees = FeeSchedule::VIP0_DEFAULT;
+        // H-02: ETH Bid @ 200_000, scratch resting @ 200_084 (+4.20 bps), cur mid @ 200_070 (+3.50 bps, dist=+0.70bp < 0.80bp),
+        // desbloqueo outward hacia WIN 200_160 (+8.00 bps, salto=+3.80 bps >= 2.00 bps) debe permitirse
+        assert!(
+            should_repeg_resting_exit_tp_with_open_lots(
+                eth_spec, Side::Bid, PriceTicks(200_070), PriceTicks(200_084), LotQty(1),
+                PriceTicks(200_160), LotQty(1), false, 350, fees, LotQty(1),
+            ),
+            "Desbloqueo outward desde scratch hacia WIN debe permitirse con holgura >= 1 tick"
+        );
+        // Pero si el mid ya toco el resting_tp (dist=0), no debe perseguir outward
+        assert!(
+            !should_repeg_resting_exit_tp_with_open_lots(
+                eth_spec, Side::Bid, PriceTicks(200_084), PriceTicks(200_084), LotQty(1),
+                PriceTicks(200_160), LotQty(1), false, 420, fees, LotQty(1),
+            ),
+            "Si el mid ya alcanzo resting_tp no debe arrebatar el fill"
+        );
+
+        // H-03: deduplicacion de frame terminal duplicado + preservacion de avgPrice en exit_lattice
+        let slot_idx = 5_usize;
+        let test_link = "vx-test3a-s05-c000001-T1001";
+        if let Ok(mut trks) = global_ws_trackers().lock() {
+            trks[slot_idx].exit_link_id = test_link.to_string();
+            trks[slot_idx].exit_lattice = WsOrderLatticeState::new_dispatched(PriceTicks(8_505), LotQty(6));
+        }
+        let (tx, rx) = mpsc::sync_channel::<GatewayEvent>(8);
+        let frame = format!(
+            "{{\"topic\":\"order\",\"data\":[{{\"symbol\":\"SUIUSDT\",\"side\":\"Sell\",\"orderStatus\":\"Filled\",\"reduceOnly\":true,\"cumExecQty\":\"6\",\"price\":\"0.8505\",\"avgPrice\":\"0.8506\",\"orderLinkId\":\"{test_link}\"}}]}}"
+        );
+        parse_ws_private_frame(&frame, &tx);
+        parse_ws_private_frame(&frame, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GatewayEvent::WsExitOrderUpdated { slot_idx: 5, is_terminal: true, cum_exec_lots: LotQty(6), .. })
+        ));
+        assert!(rx.try_recv().is_err(), "Frame terminal duplicado con mismo orderLinkId debe suprimirse");
+        assert_eq!(last_ws_exit_exec_price_ticks(slot_idx), PriceTicks(8_506));
+        if let Ok(mut trks) = global_ws_trackers().lock() {
+            trks[slot_idx].advance_cycle();
+        }
     }
 }

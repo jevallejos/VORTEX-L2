@@ -66,6 +66,9 @@ pub struct ExecRuntimeState {
     pub btc_lead_memory: BtcLeadLagMemory,
     pub abort_was_favorable_miss: [bool; MAX_ACTIVE_PAIRS],
     pub next_poll_fill_ts_ns: [i64; MAX_ACTIVE_PAIRS],
+    pub rest_harvested_pending_ws: [LotQty; MAX_ACTIVE_PAIRS],
+    pub scar_snapshot_dirty: bool,
+    pub last_scar_persist_ns: i64,
     pub boot_converged: bool,
     pub entry_warmup_until_ns: i64,
     pub drain_flushed_once: bool,
@@ -108,6 +111,9 @@ impl ExecRuntimeState {
             btc_lead_memory: BtcLeadLagMemory::new(),
             abort_was_favorable_miss: [false; MAX_ACTIVE_PAIRS],
             next_poll_fill_ts_ns: [0; MAX_ACTIVE_PAIRS],
+            rest_harvested_pending_ws: [LotQty(0); MAX_ACTIVE_PAIRS],
+            scar_snapshot_dirty: false,
+            last_scar_persist_ns: 0,
             boot_converged: false,
             entry_warmup_until_ns: 0,
             drain_flushed_once: false,
@@ -651,8 +657,38 @@ pub fn handle_gateway_event(
                 engines[slot_idx].sync_to_shm_telemetry(arena);
             }
         }
-        GatewayEvent::EntryOrderVanished { slot_idx } | GatewayEvent::WsEntryOrderTerminated { slot_idx } => {
+        GatewayEvent::EntryOrderVanished { slot_idx } => {
             rt.slot_rpc_inflight[slot_idx] = false;
+            rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
+            rt.queue_flow_ema[slot_idx] = 0.0;
+            let fav_miss = rt.abort_was_favorable_miss[slot_idx];
+            rt.abort_was_favorable_miss[slot_idx] = false;
+            if let OrderLifecycleState::PlacingEntryMaker { side, entry_price, .. }
+            | OrderLifecycleState::RestingEntryQueue { side, entry_price, .. } = engines[slot_idx].state
+            {
+                if rt.abort_cmd_inflight[slot_idx] {
+                    rt.abort_cmd_inflight[slot_idx] = false;
+                    gov.observe_entry_abort_with_context(slot_idx, side, entry_price, now_ns, fav_miss, !fav_miss);
+                    let veto = if rt.last_abort_veto[slot_idx] != LastVetoCode::None {
+                        rt.last_abort_veto[slot_idx]
+                    } else {
+                        LastVetoCode::HawkesStoikovQueueAbort
+                    };
+                    rt.markout_rings[slot_idx].arm_abort_probe_v49(side, entry_price, veto, TimestampNs(entry_forensics[slot_idx].armed_ts_ns.max(1)), now_ns, rt.init_q_ahead[slot_idx], rt.cur_q_ahead[slot_idx]);
+                    rt.last_abort_veto[slot_idx] = LastVetoCode::None;
+                    arena.exec_abort_count.fetch_add(1, Ordering::Relaxed);
+                }
+                engines[slot_idx].state = OrderLifecycleState::Idle;
+                engines[slot_idx].sync_to_shm_telemetry(arena);
+            }
+        }
+        GatewayEvent::WsEntryOrderTerminated { slot_idx } => {
+            if rt.slot_rpc_inflight[slot_idx] && !rt.abort_cmd_inflight[slot_idx] {
+                return;
+            }
+            if rt.abort_cmd_inflight[slot_idx] {
+                rt.slot_rpc_inflight[slot_idx] = false;
+            }
             rt.verified_exchange_sl[slot_idx] = PriceTicks(0);
             rt.queue_flow_ema[slot_idx] = 0.0;
             let fav_miss = rt.abort_was_favorable_miss[slot_idx];
@@ -683,6 +719,7 @@ pub fn handle_gateway_event(
             rt.slot_rpc_inflight[slot_idx] = false;
             rt.abort_cmd_inflight[slot_idx] = false;
             rt.abort_was_favorable_miss[slot_idx] = false;
+            rt.rest_harvested_pending_ws[slot_idx] = LotQty(0);
             rt.queue_flow_ema[slot_idx] = 0.0;
             if matches!(engines[slot_idx].state, OrderLifecycleState::PlacingEntryMaker { .. } | OrderLifecycleState::RestingEntryQueue { .. }) {
                 gov.clear_abort_streak(slot_idx, real_side);
@@ -863,6 +900,8 @@ pub fn handle_gateway_event(
                 }
             }
             if partial_delta.0 > 0 && real_lots.0 > 0 {
+                rt.rest_harvested_pending_ws[slot_idx] =
+                    LotQty(rt.rest_harvested_pending_ws[slot_idx].0.saturating_add(partial_delta.0));
                 let prev_hm = engines[slot_idx].house_money_runner_unlocked;
                 engines[slot_idx].record_live_partial_harvest_synced(partial_delta, ref_exit_px);
                 if !prev_hm && engines[slot_idx].house_money_runner_unlocked {
@@ -872,6 +911,12 @@ pub fn handle_gateway_event(
             if active_resting_tp.0 > 0 && active_resting_tp != prev_rest_tp {
                 engines[slot_idx].exit_peg_attempts = engines[slot_idx].exit_peg_attempts.saturating_add(1);
             }
+            let state_changed = partial_delta.0 > 0
+                || real_lots != prev_open_lots
+                || eff_init != initial_lots
+                || active_resting_tp != prev_rest_tp
+                || t1_done != tranche1_harvested
+                || verified_avg.is_some_and(|v| v != avg_price_ticks);
             if let OrderLifecycleState::PositionOpenMakerExit {
                 initial_lots: ref mut in_l, open_lots: ref mut op_l, tranche1_harvested: ref mut t1_h,
                 tranche1_lots: ref mut t1_l, tranche1_exit_price: ref mut t1_px, resting_exit_price: ref mut rx_p, ..
@@ -890,7 +935,9 @@ pub fn handle_gateway_event(
                 }
                 *rx_p = active_resting_tp;
             }
-            dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
+            if state_changed {
+                dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
+            }
             engines[slot_idx].sync_to_shm_telemetry(arena);
         }
         GatewayEvent::SlotClosedDetected { slot_idx, vac_level, closed_pnl_payload } => {
@@ -898,6 +945,7 @@ pub fn handle_gateway_event(
             rt.sl_needs_sync[slot_idx] = false;
             rt.emergency_flatten_sl[slot_idx] = None;
             rt.sl_adverse_breach_since_ns[slot_idx] = 0;
+            rt.rest_harvested_pending_ws[slot_idx] = LotQty(0);
             let Some(step_action) = resolve_live_closed_position_step(
                 &mut engines[slot_idx], &cached_snaps[slot_idx], closed_pnl_payload.as_ref(), vac_level, &mut rt.idx_lag, now_ns.0,
             ) else {
@@ -1132,51 +1180,60 @@ pub fn handle_gateway_event(
                 let mut open_lots = prev_open_lots;
                 let mut tranche1_harvested = prev_t1_harvested;
                 let mut defensive_floor_locked = prev_def_locked;
-                if is_terminal && cum_exec_lots.0 > 0 && cum_exec_lots.0 < prev_open_lots.0 {
-                    let fill_px_hint = if resting_price.0 > 0 {
-                        resting_price
-                    } else if prev_rx_px.0 > 0 {
-                        prev_rx_px
-                    } else if prev_ax_px.0 > 0 {
-                        prev_ax_px
-                    } else {
-                        defensive_zero_loss_maker_exit_price_with_fees(
-                            side,
-                            avg_price_ticks,
-                            engines[slot_idx].active_fees,
-                        )
-                    };
-                    let rem_after = LotQty((prev_open_lots.0 - cum_exec_lots.0).max(1));
-                    engines[slot_idx].record_live_partial_harvest_synced(cum_exec_lots, fill_px_hint);
-                    if let OrderLifecycleState::PositionOpenMakerExit {
-                        open_lots: ref mut op_l,
-                        tranche1_harvested: ref mut t1_h,
-                        tranche1_lots: ref mut t1_l,
-                        tranche1_exit_price: ref mut t1_px,
-                        defensive_floor_locked: ref mut df_l,
-                        active_exit_role: ref mut ax_r,
-                        active_exit_lots: ref mut ax_l,
-                        ..
-                    } = engines[slot_idx].state
-                    {
-                        *op_l = rem_after;
-                        if !prev_t1_harvested {
-                            *t1_h = true;
-                            *t1_l = cum_exec_lots;
-                            *t1_px = fill_px_hint;
+                if is_terminal && cum_exec_lots.0 > 0 {
+                    let absorbed_by_rest = cum_exec_lots.0.min(rt.rest_harvested_pending_ws[slot_idx].0.max(0));
+                    rt.rest_harvested_pending_ws[slot_idx] =
+                        LotQty(rt.rest_harvested_pending_ws[slot_idx].0.saturating_sub(absorbed_by_rest));
+                    let net_ws_delta = LotQty(cum_exec_lots.0.saturating_sub(absorbed_by_rest));
+                    if net_ws_delta.0 > 0 && net_ws_delta.0 < prev_open_lots.0 {
+                        let ws_exec_px = crate::bybit_gateway::last_ws_exit_exec_price_ticks(slot_idx);
+                        let fill_px_hint = if resting_price.0 > 0 {
+                            resting_price
+                        } else if ws_exec_px.0 > 0 {
+                            ws_exec_px
+                        } else if prev_rx_px.0 > 0 {
+                            prev_rx_px
+                        } else if prev_ax_px.0 > 0 {
+                            prev_ax_px
+                        } else {
+                            defensive_zero_loss_maker_exit_price_with_fees(
+                                side,
+                                avg_price_ticks,
+                                engines[slot_idx].active_fees,
+                            )
+                        };
+                        let rem_after = LotQty((prev_open_lots.0 - net_ws_delta.0).max(1));
+                        engines[slot_idx].record_live_partial_harvest_synced(net_ws_delta, fill_px_hint);
+                        if let OrderLifecycleState::PositionOpenMakerExit {
+                            open_lots: ref mut op_l,
+                            tranche1_harvested: ref mut t1_h,
+                            tranche1_lots: ref mut t1_l,
+                            tranche1_exit_price: ref mut t1_px,
+                            defensive_floor_locked: ref mut df_l,
+                            active_exit_role: ref mut ax_r,
+                            active_exit_lots: ref mut ax_l,
+                            ..
+                        } = engines[slot_idx].state
+                        {
+                            *op_l = rem_after;
+                            if !prev_t1_harvested {
+                                *t1_h = true;
+                                *t1_l = net_ws_delta;
+                                *t1_px = fill_px_hint;
+                            }
+                            *ax_r = crate::exit_quoter::ExitOrderRole::LvdbsDeepSurf50;
+                            *ax_l = rem_after;
+                            defensive_floor_locked = *df_l;
                         }
-                        *ax_r = crate::exit_quoter::ExitOrderRole::LvdbsDeepSurf50;
-                        *ax_l = rem_after;
-                        defensive_floor_locked = *df_l;
+                        open_lots = rem_after;
+                        tranche1_harvested = true;
+                        if engines[slot_idx].house_money_runner_unlocked
+                            || engines[slot_idx].realized_partial_net_1e8 > 0
+                        {
+                            rt.sl_needs_sync[slot_idx] = true;
+                        }
+                        dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
                     }
-                    open_lots = rem_after;
-                    tranche1_harvested = true;
-                    if engines[slot_idx].house_money_runner_unlocked
-                        || engines[slot_idx].realized_partial_net_1e8 > 0
-                    {
-                        rt.sl_needs_sync[slot_idx] = true;
-                    }
-                    dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
                 }
                 if let OrderLifecycleState::PositionOpenMakerExit {
                     resting_exit_price: ref mut rx_p,
@@ -1917,5 +1974,108 @@ mod v49_runtime_telemetry_tests {
             }
         }
         assert!(got_abort && got_dg && got_plast);
+    }
+}
+
+#[cfg(test)]
+mod v5510_turno3b_handlers_tests {
+    use super::*;
+    use crate::lob_shm::MappedShmRegion;
+    use std::sync::mpsc;
+
+    #[test]
+    fn test_v5510_h03_ws_rest_partial_harvest_idempotency_and_h07_inflight_ws_term_guard() {
+        let shm_path = MappedShmRegion::ephemeral_self_test_path("turno3b_h03_h07");
+        let Ok(reg) = MappedShmRegion::open_or_create(&shm_path, true) else {
+            return;
+        };
+        let arena = reg.arena();
+        let mut rt = ExecRuntimeState::new();
+        let cached_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
+        let entry_forensics = [SlotForensicEntrySnapshot::default(); MAX_ACTIVE_PAIRS];
+        let mut engines = SlotExecutionEngine::new_12_slot_array();
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let mut ledger = ParitySyncLedger::new(DEFAULT_WALLET_EQUITY_1E8);
+        let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(16);
+        let (vault_tx, _vault_rx) = mpsc::sync_channel::<VaultIoCommand>(32);
+        let now_ns = TimestampNs(1_795_000_000_000_000_000);
+
+        // H-07: WsEntryOrderTerminated durante RepegEntry en vuelo (slot_rpc_inflight=true, abort_cmd_inflight=false) no debe resetear FSM a Idle
+        engines[5].state = OrderLifecycleState::RestingEntryQueue {
+            side: Side::Bid,
+            entry_price: PriceTicks(8_500),
+            qty: LotQty(10),
+            target_excursion: ScaledBps(900),
+            sl_trigger_price: PriceTicks(8_400),
+            resting_since_ts: now_ns,
+        };
+        rt.slot_rpc_inflight[5] = true;
+        rt.abort_cmd_inflight[5] = false;
+        handle_gateway_event(
+            GatewayEvent::WsEntryOrderTerminated { slot_idx: 5 },
+            now_ns, None, &mut rt, &cached_snaps, &entry_forensics,
+            &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
+        );
+        assert!(rt.slot_rpc_inflight[5], "WsEntryOrderTerminated tardio no debe borrar slot_rpc_inflight durante Repeg");
+        assert!(matches!(engines[5].state, OrderLifecycleState::RestingEntryQueue { .. }));
+
+        // H-03: SlotStillOpenSynced (10 -> 6 lotes tras T1=4) seguido por WsExitOrderUpdated(cum=4) no debe restar 4 dos veces
+        rt.slot_rpc_inflight[5] = false;
+        engines[5].state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(8_500),
+            avg_price_ticks: PriceTicks(8_500),
+            peak_favorable_price: PriceTicks(8_505),
+            worst_adverse_price: PriceTicks(8_500),
+            initial_lots: LotQty(10),
+            open_lots: LotQty(10),
+            tranche1_harvested: false,
+            tranche1_lots: LotQty(0),
+            tranche1_exit_price: PriceTicks(0),
+            defensive_floor_locked: false,
+            active_exit_role: crate::exit_quoter::ExitOrderRole::Tranche1Harvest50,
+            active_exit_price: PriceTicks(8_505),
+            active_exit_lots: LotQty(4),
+            structural_tp_price: PriceTicks(8_520),
+            resting_exit_price: PriceTicks(8_505),
+            sl_trigger_price: PriceTicks(8_400),
+            opened_ts: now_ns,
+        };
+        handle_gateway_event(
+            GatewayEvent::SlotStillOpenSynced {
+                slot_idx: 5,
+                real_side: Side::Bid,
+                verified_avg: Some(PriceTicks(8_500)),
+                real_lots: LotQty(6),
+                active_resting_tp: PriceTicks(8_520),
+            },
+            now_ns, None, &mut rt, &cached_snaps, &entry_forensics,
+            &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
+        );
+        handle_gateway_event(
+            GatewayEvent::WsExitOrderUpdated {
+                slot_idx: 5,
+                is_terminal: true,
+                cum_exec_lots: LotQty(4),
+                resting_price: PriceTicks(0),
+            },
+            now_ns, None, &mut rt, &cached_snaps, &entry_forensics,
+            &mut engines, &mut gov, &mut ledger, arena, &tg_tx, &vault_tx,
+        );
+        let open_check = match engines[5].state {
+            OrderLifecycleState::PositionOpenMakerExit { open_lots, tranche1_harvested, .. } => {
+                Some((open_lots, tranche1_harvested))
+            }
+            OrderLifecycleState::Idle
+            | OrderLifecycleState::PlacingEntryMaker { .. }
+            | OrderLifecycleState::RestingEntryQueue { .. } => None,
+        };
+        assert_eq!(
+            open_check,
+            Some((LotQty(6), true)),
+            "Posicion debe permanecer abierta con 6 lotes sin doble conteo WS+REST"
+        );
+        assert!(!engines[5].tranche2_harvested, "No debe disparar falsamente tranche2_harvested");
+        let _ = std::fs::remove_file(&shm_path);
     }
 }

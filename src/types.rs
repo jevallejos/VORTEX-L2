@@ -1172,7 +1172,7 @@ impl PairSpec {
             let min_ev_split = (INV_PHI3 * INV_PHI3 * INV_PHI) * c_mkr_rt.max(100.0);
             return ((p_mkr * mfe_split_net) - ((p_tkr * wald_sl_net) / tail_shield)) >= min_ev_split;
         }
-        let (s_prop, s_support) = compute_single_lot_flow_btc_propulsion_c1(ofi_aligned, btc_aligned);
+        let (s_prop, s_support) = compute_single_lot_flow_btc_propulsion_c1_with_tfi(ofi_aligned, tfi_aligned, btc_aligned);
         let b3x_f = (self.three_x_friction_barrier_bps_dynamic(mid_price, taker_prob_pm, fees).raw().max(300)) as f64;
         let eq_vol_f = (PHI_SQ * b3x_f).max(3_200.0);
         let vol_f = (realized_vol_5m.raw().max(0)) as f64;
@@ -1484,7 +1484,7 @@ impl PairSpec {
             return (ev_sbps > 0).then_some(ev_sbps);
         }
 
-        let (s_prop, s_support) = compute_single_lot_flow_btc_propulsion_c1(ofi_aligned, btc_aligned);
+        let (s_prop, s_support) = compute_single_lot_flow_btc_propulsion_c1_with_tfi(ofi_aligned, tfi_aligned, btc_aligned);
         let b3x_f = (self.three_x_friction_barrier_bps_dynamic(entry_px, taker_prob_pm, fees).raw().max(300)) as f64;
         let eq_vol_f = (PHI_SQ * b3x_f).max(3_200.0);
         let vol_f = (realized_vol_5m.raw().max(0)) as f64;
@@ -1536,7 +1536,7 @@ impl PairSpec {
             return None;
         }
         let eff_learned_mfe = coupled_c1_effective_mfe_for_lot_raw(eff_mfe, dyn_target, q_struct, false, s_prop);
-        let mkr_net = (INV_PHI + INV_PHI2 * q_struct_raw.clamp(0.0, PHI)) * (eff_learned_mfe.max(0) as f64) - c_mkr;
+        let mkr_net = (INV_PHI + INV_PHI2 * q_struct_raw.clamp(0.0, 1.0)) * (eff_learned_mfe.max(0) as f64) - c_mkr;
         let sl_all_in = (diff_sl.raw().max(0) as f64) + c_tkr + INV_PHI2 * (tau_tick.raw() as f64);
         let ev_sbps = ((1.0 - p_t) * mkr_net - p_t * sl_all_in + penny_credit).round() as i64;
         (ev_sbps > 0).then_some(ev_sbps)
@@ -1734,6 +1734,30 @@ pub fn compute_single_lot_flow_btc_propulsion_c1(
     let s_prop = BoundedScore::new_clamped(s_ofi * s_btc);
     let support_mix = INV_PHI_C1 * ofi_aligned + INV_PHI2_C1 * btc_aligned;
     let s_support = BoundedScore::new_clamped(s3(support_mix, INV_PHI3_C1, INV_PHI2_C1));
+    (s_prop, s_support)
+}
+
+/// Continuous C1 single-lot propulsion and tape-coupled support `(s_prop, s_support_eff)` (`V5.5.10`, H-04).
+/// Modulates `s_support` by `INV_PHI2 + INV_PHI * S_3(tfi_aligned; 0.0, INV_PHI4)` so weak/absent
+/// aggressive tape cannot ride static book `GEOM` into 1-lot anti-persistent chop.
+#[inline]
+#[must_use]
+#[allow(clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn compute_single_lot_flow_btc_propulsion_c1_with_tfi(
+    ofi_aligned: f64,
+    tfi_aligned: f64,
+    btc_aligned: f64,
+) -> (BoundedScore, BoundedScore) {
+    const INV_PHI_C1: f64 = 0.618_033_988_749_895;
+    const INV_PHI2_C1: f64 = 0.381_966_011_250_105;
+    const INV_PHI4_C1: f64 = 0.145_898_033_750_315;
+    let (s_prop, s_support_raw) = compute_single_lot_flow_btc_propulsion_c1(ofi_aligned, btc_aligned);
+    let tfi_c = if tfi_aligned.is_finite() { tfi_aligned } else { 0.0 };
+    let u_t = (tfi_c / INV_PHI4_C1).clamp(0.0, 1.0);
+    let s_tfi = u_t * u_t * (3.0 - 2.0 * u_t);
+    let s_support = BoundedScore::new_clamped(
+        s_support_raw.get() * (INV_PHI2_C1 + INV_PHI_C1 * s_tfi),
+    );
     (s_prop, s_support)
 }
 
