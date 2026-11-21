@@ -469,7 +469,11 @@ fn finalize_and_emit_live_close_core(
     let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
     let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
     let lots_s = spec.format_lot_qty_str(summary.closed_lots);
-    let is_part = matches!(engines[s_idx].last_exit_sub_reason, ExitSubReason::Tranche1Harvest50) && net_f < 1.00;
+    let is_part = (matches!(
+        engines[s_idx].last_exit_sub_reason,
+        ExitSubReason::Tranche1Harvest50 | ExitSubReason::Tranche2HarvestPhi
+    ) || (summary.legs_consolidated >= 2 && summary.is_maker_exit && net_f >= -0.50))
+        && net_f < 1.00;
     let (col, icon, lbl) = classify_trade_badge(net_f, is_part);
     println!(
         "{}{} [TRADE CLOSE \u{2014} {}] {} {:?} qty={} ({}L) | {}.{:04} -> {}.{:04} | Net: {:+.2} bps ({:+.4} USDT) | Hold: {}s{}",
@@ -835,7 +839,8 @@ pub fn handle_gateway_event(
         GatewayEvent::SlotStillOpenSynced { slot_idx, real_side, verified_avg, real_lots, active_resting_tp } => {
             rt.slot_rpc_inflight[slot_idx] = false;
             let OrderLifecycleState::PositionOpenMakerExit {
-                side, avg_price_ticks, initial_lots, open_lots: prev_open_lots, tranche1_harvested, resting_exit_price: prev_rest_tp, ..
+                side, avg_price_ticks, initial_lots, open_lots: prev_open_lots, tranche1_harvested,
+                active_exit_price: prev_ax_tp, resting_exit_price: prev_rest_tp, ..
             } = engines[slot_idx].state else { return; };
             if real_side == side {
                 if let Some(v_avg) = verified_avg { engines[slot_idx].sync_open_avg_price_ticks(v_avg); }
@@ -843,6 +848,8 @@ pub fn handle_gateway_event(
             let eff_init = initial_lots.max(real_lots);
             let ref_exit_px = if prev_rest_tp.0 > 0 {
                 prev_rest_tp
+            } else if prev_ax_tp.0 > 0 {
+                prev_ax_tp
             } else {
                 defensive_zero_loss_maker_exit_price_with_fees(side, avg_price_ticks, engines[slot_idx].active_fees)
             };
@@ -1113,13 +1120,64 @@ pub fn handle_gateway_event(
             if let OrderLifecycleState::PositionOpenMakerExit {
                 side,
                 avg_price_ticks,
-                open_lots,
-                tranche1_harvested,
-                defensive_floor_locked,
+                open_lots: prev_open_lots,
+                tranche1_harvested: prev_t1_harvested,
+                defensive_floor_locked: prev_def_locked,
+                active_exit_price: prev_ax_px,
+                resting_exit_price: prev_rx_px,
                 opened_ts,
                 ..
             } = engines[slot_idx].state
             {
+                let mut open_lots = prev_open_lots;
+                let mut tranche1_harvested = prev_t1_harvested;
+                let mut defensive_floor_locked = prev_def_locked;
+                if is_terminal && cum_exec_lots.0 > 0 && cum_exec_lots.0 < prev_open_lots.0 {
+                    let fill_px_hint = if resting_price.0 > 0 {
+                        resting_price
+                    } else if prev_rx_px.0 > 0 {
+                        prev_rx_px
+                    } else if prev_ax_px.0 > 0 {
+                        prev_ax_px
+                    } else {
+                        defensive_zero_loss_maker_exit_price_with_fees(
+                            side,
+                            avg_price_ticks,
+                            engines[slot_idx].active_fees,
+                        )
+                    };
+                    let rem_after = LotQty((prev_open_lots.0 - cum_exec_lots.0).max(1));
+                    engines[slot_idx].record_live_partial_harvest_synced(cum_exec_lots, fill_px_hint);
+                    if let OrderLifecycleState::PositionOpenMakerExit {
+                        open_lots: ref mut op_l,
+                        tranche1_harvested: ref mut t1_h,
+                        tranche1_lots: ref mut t1_l,
+                        tranche1_exit_price: ref mut t1_px,
+                        defensive_floor_locked: ref mut df_l,
+                        active_exit_role: ref mut ax_r,
+                        active_exit_lots: ref mut ax_l,
+                        ..
+                    } = engines[slot_idx].state
+                    {
+                        *op_l = rem_after;
+                        if !prev_t1_harvested {
+                            *t1_h = true;
+                            *t1_l = cum_exec_lots;
+                            *t1_px = fill_px_hint;
+                        }
+                        *ax_r = crate::exit_quoter::ExitOrderRole::LvdbsDeepSurf50;
+                        *ax_l = rem_after;
+                        defensive_floor_locked = *df_l;
+                    }
+                    open_lots = rem_after;
+                    tranche1_harvested = true;
+                    if engines[slot_idx].house_money_runner_unlocked
+                        || engines[slot_idx].realized_partial_net_1e8 > 0
+                    {
+                        rt.sl_needs_sync[slot_idx] = true;
+                    }
+                    dispatch_open_positions_state(engines, entry_forensics, Some(vault_tx));
+                }
                 if let OrderLifecycleState::PositionOpenMakerExit {
                     resting_exit_price: ref mut rx_p,
                     ..

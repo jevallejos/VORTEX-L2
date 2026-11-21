@@ -432,6 +432,28 @@ pub fn can_split_runner_legs(
         && compute_tranche1_split_lots_core(slot_idx, open_lots, exit_price, t1_permille).is_some()
 }
 
+/// Exact 2-leg (`Tranche 1 + House-Money Runner`) notional feasibility (`open_lots >= 2 * full_leg_lots`, `V5.5.9`).
+#[inline]
+#[must_use]
+pub fn can_split_two_runner_legs(
+    slot_idx: usize,
+    open_lots: LotQty,
+    exit_price: PriceTicks,
+    t1_permille: i64,
+) -> bool {
+    if open_lots.0 < 2 || exit_price.0 <= 0 {
+        return false;
+    }
+    let spec = APPROVED_SPECS[slot_idx.min(MAX_ACTIVE_PAIRS - 1)];
+    let one_lot_1e8 = spec.lot_notional_1e8(LotQty(1), exit_price);
+    if one_lot_1e8 <= 0 {
+        return false;
+    }
+    let full_leg_lots = ((SPLIT_LEG_MIN_NOTIONAL_1E8 + one_lot_1e8 - 1) / one_lot_1e8).max(1);
+    open_lots.0 >= full_leg_lots.saturating_mul(2)
+        && compute_tranche1_split_lots_core(slot_idx, open_lots, exit_price, t1_permille).is_some()
+}
+
 /// Exact consolidated House-Money Stop-Loss floor `PriceTicks` where residual net risk across
 /// remaining `T2 + T3` (`rem_lots`) against realized `T1` net profit (`realized_partial_net_1e8`) is `<= 0`.
 #[inline]
@@ -1182,8 +1204,18 @@ pub fn compute_canonical_exit_quote_omega_v55(
     let eff_ratchet_bps = if best_mfe_bps >= (fee_rt * 139) / 100 {
         ctx.ratchet_locked_gross_bps.max(fee_rt + ((best_mfe_bps - fee_rt) * 72) / 100).max(win_floor_bps)
     } else { ctx.ratchet_locked_gross_bps };
+    let runner_guard_flow = if ctx.tranche1_harvested
+        && v55.house_money_runner_unlocked
+        && !kin.chandelier_armed
+        && best_mfe_bps < fee_rt * 3
+    {
+        own_flow.max(INV_PHI * eff_flow_slow)
+    } else {
+        own_flow
+    };
     let ratchet_pullback = eff_ratchet_bps >= win_floor_bps
-        && ((own_flow <= -0.5 * INV_PHI_CUBE) || (cur_gross_bps <= eff_ratchet_bps + 40 && own_flow < INV_PHI_CUBE));
+        && ((runner_guard_flow <= -0.5 * INV_PHI_CUBE)
+            || (cur_gross_bps <= eff_ratchet_bps + 40 && runner_guard_flow < INV_PHI_CUBE));
     let crest_mfe_req = if !ctx.tranche1_harvested && ctx.open_lots.0 == 1 && cur_gross_bps >= win_floor_bps {
         (PHI * c_mkr_scale).round() as i64
     } else {
@@ -1192,12 +1224,15 @@ pub fn compute_canonical_exit_quote_omega_v55(
     let shadow_crest_snap = best_mfe_bps >= crest_mfe_req && cur_gross_bps >= zero_loss_bps && s_prop < 0.18 && flow_accel < -0.005;
     let q_floor_px = enforce_maker_bbo_bound(ctx.side, zero_loss_px, snap);
     let eff_t1_pm_def = compute_wave_dynamic_t1_permille(ctx.learned_t1_permille, ctx.side, snap, kin.in_scar_debt);
+    let can_def_split = can_split_runner_legs(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def)
+        || (own_flow >= INV_PHI_SQ
+            && can_split_two_runner_legs(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def));
     let def_runner_split_t1 = if !ctx.tranche1_harvested
         && ctx.defensive_floor_locked
         && !climax_harvest
         && !opposing_wave3_escape
         && (eff_flow_slow >= -INV_PHI_FIFTH || own_flow >= INV_PHI_CUBE)
-        && can_split_runner_legs(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def)
+        && can_def_split
     {
         defensive_lock_active = true;
         compute_tranche1_split_lots_core(ctx.slot_idx, ctx.open_lots, q_floor_px, eff_t1_pm_def)
@@ -1213,13 +1248,56 @@ pub fn compute_canonical_exit_quote_omega_v55(
         && (!defensive_lock_active || (!still_locked && signed_flow_slow.get() >= INV_PHI_FIFTH))
     {
         let sigma_1m_cur = (snap.realized_vol_5m.raw().max(0) as f64) / SQRT_5;
+        let state_mae_t1 = ((ctx.worst_adverse_price.0 - ctx.avg_price_ticks.0)
+            .saturating_mul(d_sign)
+            .saturating_mul(1_000_000))
+            / avg_denom;
+        let worst_mae_t1 = ctx.last_closed_mae_bps.min(state_mae_t1).min(cur_gross_bps);
+        let z_t1_clean = if v55.zeta_tox.is_finite() { v55.zeta_tox.max(0.0) } else { 0.0 };
         let raw_t1_px = if defensive_lock_active {
-            zero_loss_px
+            if !still_locked
+                && !live_deep_underwater
+                && worst_mae_t1 > mae_trig_bps
+                && cur_gross_bps > zero_loss_bps
+                && z_t1_clean < INV_PHI_SQ
+                && eff_flow_slow >= INV_PHI_CUBE
+            {
+                let u_t1_stag = hermite_s3_unit(hold_s_f / def_horizon_s.max(1.0), 1.0, PHI)
+                    * (1.0 - INV_PHI_SQ * hermite_s3_unit(eff_flow_slow, INV_PHI_CUBE, INV_PHI));
+                let span_t1 = (win_floor_bps - zero_loss_bps).max(0) as f64;
+                let stag_t1_bps = win_floor_bps - ((u_t1_stag * span_t1).round() as i64);
+                if stag_t1_bps <= zero_loss_bps {
+                    zero_loss_px
+                } else {
+                    dynamic_maker_floor_price(ctx.side, ctx.avg_price_ticks, ScaledBps(stag_t1_bps))
+                }
+            } else {
+                zero_loss_px
+            }
         } else {
             let urgency = (INV_PHI - INV_PHI_FIFTH * own_flow.clamp(0.0, 1.0) * (1.0 + ir_norm)).clamp(0.50, INV_PHI);
             let base_t1_px = elastic_offensive_win_maker_exit_price(ctx.side, ctx.avg_price_ticks, fee_rt, snap.realized_vol_5m, urgency);
-            if s_prop > 0.0 && sigma_1m_cur > c_mkr_scale && flow_accel > INV_PHI_FOURTH {
-                let s_t1_accel = hermite_s3_unit(flow_accel, INV_PHI_FOURTH, INV_PHI_SQ);
+            let cold_seed_f = ((fee_rt * 17) / 10) as f64;
+            let s_learned_t1 = hermite_s3_unit(
+                ctx.learned_mfe_bps as f64,
+                cold_seed_f,
+                PHI_SQ * c_mkr_scale,
+            )
+            .max(hermite_s3_unit(
+                (v55.cont_ratio_x1000 as f64) * 1e-3,
+                1.0,
+                PHI,
+            ));
+            let sustained_t1_drive = if s_learned_t1 > 0.0
+                && !matches!(w_obs.regime, WaveRegime::ImpulseWave3)
+            {
+                INV_PHI_SQ * s_learned_t1 * own_flow.min(eff_flow_slow)
+            } else {
+                0.0
+            };
+            let drive_t1 = flow_accel.max(sustained_t1_drive);
+            if s_prop > 0.0 && sigma_1m_cur > c_mkr_scale && drive_t1 > INV_PHI_FOURTH {
+                let s_t1_accel = hermite_s3_unit(drive_t1, INV_PHI_FOURTH, INV_PHI_SQ);
                 let s_t1_prop = hermite_s3_unit(s_prop, INV_PHI_CUBE, INV_PHI);
                 let s_t1_vol = hermite_s3_unit(sigma_1m_cur, c_mkr_scale, PHI_SQ * c_mkr_scale);
                 let s_t1_mfe = hermite_s3_unit(projected_mfe_bps as f64, PHI * c_mkr_scale, PHI_SQ * c_mkr_scale);
@@ -1564,7 +1642,7 @@ pub fn compute_canonical_exit_quote_omega_v55(
         && v55.tranche1_harvests_count == 1
         && ctx.tranche1_harvested
         && !v55.tranche2_harvested
-        && ctx.open_lots.0 >= 3
+        && ctx.open_lots.0 >= 2
     {
         let raw_t1_gross = if ctx.tranche1_exit_price.0 > 0 {
             ((ctx.tranche1_exit_price.0 - ctx.avg_price_ticks.0)
@@ -1600,8 +1678,23 @@ pub fn compute_canonical_exit_quote_omega_v55(
         );
         let struct_tick_gap = (ext_struct_px.0 - base_t2_px.0).saturating_mul(d_sign);
         let struct_sbps_gap = (struct_tick_gap.saturating_mul(1_000_000)) / avg_denom;
+        let cold_mfe_seed = (fee_rt * 17) / 10;
+        let non_w3_proven_regime = matches!(
+            w_obs.regime,
+            WaveRegime::CorrectiveAbc | WaveRegime::CorrectiveWave4 | WaveRegime::ImpulseWave5
+        ) && lvdbs_vac_level < 2
+            && ctx.learned_mfe_bps > cold_mfe_seed
+            && s_run >= INV_PHI_CUBE;
+        let kappa_eff_t2 = if non_w3_proven_regime {
+            let mfe_over_t1 = (learned_struct_sbps as f64) / (t1_gross_sbps.max(100) as f64);
+            (v55.cont_ratio_x1000 as f64) * 1e-3
+                + INV_PHI_SQ * hermite_s3_unit(mfe_over_t1, PHI, PHI_SQ)
+        } else {
+            (v55.cont_ratio_x1000 as f64) * 1e-3
+        };
         let cont_ready = v55.cont_ratio_x1000 > 1_000
-            || ctx.learned_mfe_bps >= base_phi_t2_sbps.saturating_add(min_ext_sbps);
+            || ctx.learned_mfe_bps >= base_phi_t2_sbps.saturating_add(min_ext_sbps)
+            || kappa_eff_t2 > 1.0;
         if t1_was_offensive && cont_ready && struct_tick_gap >= 2 && struct_sbps_gap >= min_ext_sbps {
             let full_ext_px = pick_more_ambitious_tp(ctx.side, ext_struct_px, target_price);
             let full_ext_sbps = ((full_ext_px.0 - ctx.avg_price_ticks.0)

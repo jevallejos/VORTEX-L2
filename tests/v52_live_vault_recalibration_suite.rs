@@ -4602,3 +4602,335 @@ fn test_v558_deadzone_win_unlock_divisible_t1_rescue_anti_spiral_ewma_and_counte
     }
     assert!(ring.hawkes_abort_precision_patience_mult_c1() > 1.15);
 }
+#[test]
+fn test_v559_ws_partial_t1_runner_preservation_2leg_split_penny_spread_and_c1_t2_unlock() {
+    use std::sync::mpsc;
+    let fees = vortex_rs::fee_cadence_beta::FeeSchedule::VIP0_DEFAULT;
+    let t0 = 1_795_250_000_000_000_000_i64;
+
+    // 1) Live WS Private `WsExitOrderUpdated` partial fill (`T1 = 13/26L`) preserves Runner at structural TP (no T1-price dump & 0 double count):
+    let shm_p = vortex_rs::lob_shm::MappedShmRegion::ephemeral_self_test_path("v559_ws_t1_runner");
+    let shm_res = vortex_rs::lob_shm::MappedShmRegion::open_or_create(&shm_p, true);
+    assert!(shm_res.is_ok());
+    let Ok(shm_reg) = shm_res else { return };
+
+    let mut engines = vortex_rs::execution_fsm::SlotExecutionEngine::new_12_slot_array();
+    let mut gov = vortex_rs::execution_fsm::OnlineAdaptiveGovernor::new();
+    let mut ledger = vortex_rs::forensic_parquet::ParitySyncLedger::new(6_450_060_000);
+    let mut rt = vortex_rs::exec_gateway_handlers::ExecRuntimeState::new();
+    let entry_f = [vortex_rs::telemetry_hud::SlotForensicEntrySnapshot::default();
+        vortex_rs::lob_shm::MAX_ACTIVE_PAIRS];
+    let mut snaps = [vortex_rs::lob_shm::SymbolLobSnapshot::new_empty();
+        vortex_rs::lob_shm::MAX_ACTIVE_PAIRS];
+    snaps[9] = mk_vault_snap(9, 8_358, 4_200, 0.62, 0.70, 0.45, t0 + 12_000_000_000);
+    snaps[0] = mk_vault_snap(0, 562_830, 3_600, 0.66, 0.78, 0.40, t0 + 12_000_000_000);
+
+    let v_link = vortex_rs::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
+        side: vortex_rs::types::Side::Bid,
+        target_excursion_scaled_bps: vortex_rs::types::ScaledBps(2_400),
+    };
+    assert!(engines[9]
+        .try_arm_maker_entry(&snaps[9], v_link, vortex_rs::types::LotQty(26))
+        .is_ok());
+    assert!(engines[9]
+        .on_maker_entry_filled_verified(
+            vortex_rs::types::TimestampNs(t0),
+            Some(vortex_rs::types::Side::Bid),
+            Some(vortex_rs::types::PriceTicks(8_354)),
+            Some(vortex_rs::types::LotQty(26)),
+        )
+        .is_ok());
+    let q_init_opt = engines[9].compute_canonical_exit_quote(&snaps[9]);
+    assert!(q_init_opt.is_some());
+    let Some(q_init) = q_init_opt else { return };
+    assert_eq!(q_init.role, vortex_rs::exit_quoter::ExitOrderRole::Tranche1Harvest50);
+    let t1_px = q_init.target_price;
+    let t1_lots = q_init.order_lots;
+    if let vortex_rs::execution_fsm::OrderLifecycleState::PositionOpenMakerExit {
+        resting_exit_price: ref mut rx_p,
+        active_exit_price: ref mut ax_p,
+        active_exit_lots: ref mut ax_l,
+        ..
+    } = engines[9].state
+    {
+        *rx_p = t1_px;
+        *ax_p = t1_px;
+        *ax_l = t1_lots;
+    }
+
+    let (tg_tx, _tg_rx) = mpsc::sync_channel::<String>(8);
+    let (vault_tx, _vault_rx) = mpsc::sync_channel::<vortex_rs::vault_io::VaultIoCommand>(16);
+    vortex_rs::exec_gateway_handlers::handle_gateway_event(
+        vortex_rs::bybit_gateway::GatewayEvent::WsExitOrderUpdated {
+            slot_idx: 9,
+            is_terminal: true,
+            cum_exec_lots: t1_lots,
+            resting_price: vortex_rs::types::PriceTicks(0),
+        },
+        vortex_rs::types::TimestampNs(t0 + 12_000_000_000),
+        None,
+        &mut rt,
+        &snaps,
+        &entry_f,
+        &mut engines,
+        &mut gov,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert_eq!(engines[9].tranche1_harvests_count, 1);
+    assert!(rt.sl_needs_sync[9]);
+    let rem_expected = vortex_rs::types::LotQty(26 - t1_lots.0);
+    assert!(matches!(
+        engines[9].state,
+        vortex_rs::execution_fsm::OrderLifecycleState::PositionOpenMakerExit {
+            open_lots,
+            tranche1_harvested: true,
+            tranche1_exit_price,
+            ..
+        } if open_lots == rem_expected && tranche1_exit_price == t1_px
+    ));
+    let q_runner_opt = engines[9].compute_canonical_exit_quote(&snaps[9]);
+    assert!(q_runner_opt.is_some_and(|q| q.target_price.0 >= t1_px.0 + 15 && q.order_lots == rem_expected));
+
+    let pnl_after_ws = engines[9].realized_partial_net_1e8;
+    vortex_rs::exec_gateway_handlers::handle_gateway_event(
+        vortex_rs::bybit_gateway::GatewayEvent::SlotStillOpenSynced {
+            slot_idx: 9,
+            real_side: vortex_rs::types::Side::Bid,
+            verified_avg: Some(vortex_rs::types::PriceTicks(8_354)),
+            real_lots: rem_expected,
+            active_resting_tp: vortex_rs::types::PriceTicks(8_500),
+        },
+        vortex_rs::types::TimestampNs(t0 + 12_200_000_000),
+        None,
+        &mut rt,
+        &snaps,
+        &entry_f,
+        &mut engines,
+        &mut gov,
+        &mut ledger,
+        shm_reg.arena(),
+        &tg_tx,
+        &vault_tx,
+    );
+    assert_eq!(engines[9].tranche1_harvests_count, 1);
+    assert_eq!(engines[9].realized_partial_net_1e8, pnl_after_ws);
+
+    // 2) Exact 2-leg split feasibility (`TAO 10L`, `SOL 2L`, `LTC 4L`) & `Full <-> Split` gateway repeg (`2L -> 1L`):
+    assert!(vortex_rs::exit_quoter::can_split_two_runner_legs(
+        4, vortex_rs::types::LotQty(10), vortex_rs::types::PriceTicks(16_920), 500
+    ));
+    assert!(vortex_rs::exit_quoter::can_split_two_runner_legs(
+        2, vortex_rs::types::LotQty(2), vortex_rs::types::PriceTicks(6_605), 500
+    ));
+    assert!(vortex_rs::exit_quoter::can_split_two_runner_legs(
+        11, vortex_rs::types::LotQty(4), vortex_rs::types::PriceTicks(3_855), 500
+    ));
+    assert!(!vortex_rs::exit_quoter::can_split_two_runner_legs(
+        5, vortex_rs::types::LotQty(6), vortex_rs::types::PriceTicks(6_024), 500
+    ));
+    assert!(vortex_rs::bybit_gateway::should_repeg_resting_exit_tp_with_open_lots(
+        vortex_rs::types::APPROVED_SPECS[2],
+        vortex_rs::types::Side::Bid,
+        vortex_rs::types::PriceTicks(6_610),
+        vortex_rs::types::PriceTicks(6_640),
+        vortex_rs::types::LotQty(2),
+        vortex_rs::types::PriceTicks(6_640),
+        vortex_rs::types::LotQty(1),
+        false,
+        80,
+        fees,
+        vortex_rs::types::LotQty(2),
+    ));
+    assert!(!vortex_rs::bybit_gateway::should_repeg_resting_exit_tp_with_open_lots(
+        vortex_rs::types::APPROVED_SPECS[3],
+        vortex_rs::types::Side::Bid,
+        vortex_rs::types::PriceTicks(6_155),
+        vortex_rs::types::PriceTicks(6_190),
+        vortex_rs::types::LotQty(6),
+        vortex_rs::types::PriceTicks(6_190),
+        vortex_rs::types::LotQty(5),
+        false,
+        80,
+        fees,
+        vortex_rs::types::LotQty(12),
+    ));
+
+    // 3) Sustained C1 `T1` expansion, House-Money 5ms flicker immunity & CorrectiveAbc C1 `Tranche 2` unlock:
+    let mut tao_abc = mk_vault_snap(4, 16_924, 5_600, 0.66, 0.70, 0.48, t0 + 18_000_000_000);
+    tao_abc.set_wave_observables(vortex_rs::wave_elliott::WaveObservables {
+        regime: vortex_rs::wave_elliott::WaveRegime::CorrectiveAbc,
+        climax_active: false,
+        hurst: vortex_rs::wave_elliott::WaveObservables::encode_hurst(0.58),
+        macro_phase: vortex_rs::types::BoundedScore::new_clamped(0.35),
+        oi_impulse: vortex_rs::types::BoundedScore::ZERO,
+        liq_imbalance: vortex_rs::types::BoundedScore::ZERO,
+        fib_proj_bps: vortex_rs::types::ScaledBps(0),
+    });
+    let tao_ctx_t1 = vortex_rs::exit_quoter::OpenExitContext {
+        slot_idx: 4,
+        side: vortex_rs::types::Side::Bid,
+        avg_price_ticks: vortex_rs::types::PriceTicks(16_920),
+        peak_favorable_price: vortex_rs::types::PriceTicks(16_925),
+        worst_adverse_price: vortex_rs::types::PriceTicks(16_915),
+        initial_lots: vortex_rs::types::LotQty(14),
+        open_lots: vortex_rs::types::LotQty(14),
+        tranche1_harvested: false,
+        tranche1_lots: vortex_rs::types::LotQty(0),
+        tranche1_exit_price: vortex_rs::types::PriceTicks(0),
+        defensive_floor_locked: false,
+        active_exit_price: vortex_rs::types::PriceTicks(16_929),
+        structural_tp_price: vortex_rs::types::PriceTicks(16_958),
+        resting_exit_price: vortex_rs::types::PriceTicks(16_929),
+        sl_trigger_price: vortex_rs::types::PriceTicks(16_620),
+        opened_ts: vortex_rs::types::TimestampNs(t0),
+        learned_mfe_bps: 980,
+        learned_t1_permille: 500,
+        learned_ir_x100: 35,
+        learned_ret_std_bps: 200,
+        intrinsic_tau_mkt_s: 240,
+        last_eff_sl_ticks: vortex_rs::types::PriceTicks(16_620),
+        ratchet_locked_gross_bps: 0,
+        last_closed_mfe_bps: 30,
+        last_closed_mae_bps: -30,
+        active_fees: fees,
+        learned_taker_prob_pm: 68,
+    };
+    let kin_sustained = vortex_rs::exit_quoter::ShadowRunnerKinematics {
+        flow_ema_fast: 0.62,
+        flow_ema_slow: 0.60,
+        in_scar_debt: false,
+        chandelier_armed: false,
+    };
+    let base_win1_tao = vortex_rs::exit_quoter::elastic_offensive_win_maker_exit_price(
+        vortex_rs::types::Side::Bid,
+        vortex_rs::types::PriceTicks(16_920),
+        400,
+        tao_abc.realized_vol_5m,
+        0.55,
+    );
+    let q_tao_t1 = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega(
+        &tao_ctx_t1,
+        kin_sustained,
+        &tao_abc,
+    );
+    assert!(q_tao_t1.is_some_and(|q| {
+        q.role == vortex_rs::exit_quoter::ExitOrderRole::Tranche1Harvest50
+            && q.target_price.0 > base_win1_tao.0
+    }));
+
+    let mut tao_ctx_t2 = tao_ctx_t1;
+    tao_ctx_t2.tranche1_harvested = true;
+    tao_ctx_t2.tranche1_lots = vortex_rs::types::LotQty(6);
+    tao_ctx_t2.tranche1_exit_price = vortex_rs::types::PriceTicks(16_929);
+    tao_ctx_t2.open_lots = vortex_rs::types::LotQty(8);
+    tao_ctx_t2.learned_mfe_bps = 939;
+    let v55_tao = vortex_rs::exit_quoter::CascadeAndAgingContextV55 {
+        tranche1_harvests_count: 1,
+        tranche2_harvested: false,
+        harvested_legs: 1,
+        psi_health: 0.92,
+        cont_ratio_x1000: 995,
+        last_peak_favorable_ts_ns: t0 + 18_000_000_000,
+        zeta_tox: 0.05,
+        house_money_runner_unlocked: true,
+    };
+    let q_tao_t2 = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v55(
+        &tao_ctx_t2,
+        kin_sustained,
+        v55_tao,
+        &tao_abc,
+        tao_abc.realized_vol_5m,
+        None,
+        0,
+        70_000,
+    );
+    assert!(q_tao_t2.is_some_and(|q| q.role == vortex_rs::exit_quoter::ExitOrderRole::Tranche2HarvestPhi));
+
+    let mut flicker_snap = tao_abc;
+    flicker_snap.bids[0].price = vortex_rs::types::PriceTicks(16_929);
+    flicker_snap.asks[0].price = vortex_rs::types::PriceTicks(16_930);
+    flicker_snap.factor_ofi = vortex_rs::types::BoundedScore::new_clamped(-0.25);
+    flicker_snap.factor_tfi = vortex_rs::types::BoundedScore::new_clamped(-0.15);
+    let mut tao_hm_runner = tao_ctx_t2;
+    tao_hm_runner.peak_favorable_price = vortex_rs::types::PriceTicks(16_930);
+    tao_hm_runner.ratchet_locked_gross_bps = 540;
+    tao_hm_runner.last_closed_mfe_bps = 591;
+    let q_hm_hold = vortex_rs::exit_quoter::compute_canonical_exit_quote_omega_v55(
+        &tao_hm_runner,
+        vortex_rs::exit_quoter::ShadowRunnerKinematics {
+            flow_ema_fast: 0.42,
+            flow_ema_slow: 0.48,
+            in_scar_debt: false,
+            chandelier_armed: false,
+        },
+        v55_tao,
+        &flicker_snap,
+        tao_abc.realized_vol_5m,
+        None,
+        0,
+        70_000,
+    );
+    assert!(q_hm_hold.is_some_and(|q| {
+        !q.defensive_lock_active
+            && q.sub_reason != vortex_rs::exit_quoter::ExitSubReason::ConvexMfeRatchetLock
+    }));
+
+    // 4) Wide-tick Penny-Jump spread room (`ORDI SPR=2`) & `EventClock` wide-tick lattice spoof immunity (`WIF`):
+    let mut ordi_pj = mk_vault_snap(6, 2_348, 4_200, 0.74, 0.76, 0.52, t0);
+    ordi_pj.bids[0].price = vortex_rs::types::PriceTicks(2_348);
+    ordi_pj.asks[0].price = vortex_rs::types::PriceTicks(2_350);
+    let v_ordi_ok = vortex_rs::alpha_3factor::OrthogonalFactorState::evaluate_entry_signal_v554(
+        vortex_rs::types::APPROVED_SPECS[6],
+        &ordi_pj,
+        &snaps[0],
+        vortex_rs::types::ScaledBps(820),
+        vortex_rs::types::ScaledBps(200),
+        50,
+        35,
+        200.0,
+        fees,
+        0.0,
+        1.0,
+        0.80,
+        Some(0.65),
+        0.95,
+        0.0,
+        1.0,
+    );
+    assert!(matches!(
+        v_ordi_ok,
+        vortex_rs::alpha_3factor::SignalVerdict::AuthorizeMakerEntry { side: vortex_rs::types::Side::Bid, .. }
+    ));
+    let v_ordi_low_psi = vortex_rs::alpha_3factor::OrthogonalFactorState::evaluate_entry_signal_v554(
+        vortex_rs::types::APPROVED_SPECS[6],
+        &ordi_pj,
+        &snaps[0],
+        vortex_rs::types::ScaledBps(820),
+        vortex_rs::types::ScaledBps(200),
+        50,
+        35,
+        200.0,
+        fees,
+        0.0,
+        1.0,
+        0.80,
+        Some(0.65),
+        0.10,
+        0.0,
+        1.0,
+    );
+    assert_eq!(v_ordi_low_psi, vortex_rs::alpha_3factor::SignalVerdict::NeutralNoAction);
+
+    let wif_wide = mk_vault_snap(8, 1_138, 4_200, 0.72, 0.02, 0.45, t0 + 1_000_000_000);
+    let mut clk_wif = vortex_rs::alpha_3factor::EventClockAlphaModulator::new();
+    let _ = clk_wif.step_event_clock_and_spoof_with_snap(&wif_wide, fees);
+    let mut wif_wide2 = wif_wide;
+    wif_wide2.ts_local_ns = vortex_rs::types::TimestampNs(t0 + 3_000_000_000);
+    let _ = clk_wif.step_event_clock_and_spoof_with_snap(&wif_wide2, fees);
+    assert!(clk_wif.spoofing_density() < 0.05);
+
+    drop(shm_reg);
+}

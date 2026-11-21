@@ -334,10 +334,11 @@ pub fn format_telegram_close_message(
     let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
     let pnl_usdt = (summary.net_pnl_1e8 as f64) / 100_000_000.0;
     let qty_s = spec.format_lot_qty_str(summary.closed_lots);
-    let is_partial = matches!(
+    let is_partial = (matches!(
         sub_reason,
         ExitSubReason::Tranche1Harvest50 | ExitSubReason::Tranche2HarvestPhi
-    ) && net_bps_f < 1.00;
+    ) || (summary.legs_consolidated >= 2 && summary.is_maker_exit && net_bps_f >= -0.50))
+        && net_bps_f < 1.00;
     let (_, icon, lbl) = classify_trade_badge(net_bps_f, is_partial);
     format!(
         concat!(
@@ -1103,10 +1104,10 @@ pub fn evaluate_capital_scaling_semaphore_from_rows(
     for v in rows {
         let ts = v.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
         let u_day = DailySessionGovernor::utc_day_from_ns(TimestampNs(ts));
-        let is_v48 = matches!(
-            v.get("schema").and_then(serde_json::Value::as_str),
-            Some("V4.8" | "V4.9" | "V5.0" | "V5.1" | "V5.2" | "V5.3" | "V5.3.1" | "V5.3.2" | "V5.4" | "V5.4.1" | "V5.4.2" | "V5.5" | "V5.5.1" | "V5.5.2" | "V5.5.3")
-        );
+        let is_v48 = v
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s == "V4.8" || s == "V4.9" || s.starts_with("V5."));
         match v.get("event").and_then(serde_json::Value::as_str) {
             Some("EPOCH_RESET") => {
                 v48_trades = 0; v48_maker_closes = 0; v48_profit_1e8 = 0; v48_loss_1e8 = 0; catastrophic_breaches = 0;
@@ -1394,7 +1395,7 @@ pub fn render_trades_and_executive_dashboard() {
                         .max(1);
                     let mkr = v.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
                     if mkr { maker_closes += 1; }
-                    let is_partial = is_partial_harvest_sub_reason_str(sub_r) && n_bps < 1.00;
+                    let is_partial = (is_partial_harvest_sub_reason_str(sub_r) || (legs >= 2 && mkr && n_bps >= -0.50)) && n_bps < 1.00;
                     if is_partial { partials += 1; } else if n_bps >= 1.00 { wins += 1; } else if n_bps >= -0.50 { scratches += 1; } else { losses += 1; }
                     cum_gross += g_bps; cum_fee += f_bps; cum_net += n_bps;
                     sum_mfe += mfe; sum_mae += mae; sum_hold_s += (hold_ms as f64) / 1_000.0;

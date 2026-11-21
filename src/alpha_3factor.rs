@@ -773,8 +773,25 @@ impl OrthogonalFactorState {
                 .expected_round_trip_cost_bps_dynamic(mid_ticks, taker_prob_pm, fees)
                 .raw()
                 .max(50);
-            let max_elastic_spread_bps = (snap.realized_vol_5m.raw() / 24).clamp(rt_cost / 2, rt_cost);
-            if spread_scaled_bps > max_elastic_spread_bps {
+            let base_max_spread_bps = (snap.realized_vol_5m.raw() / 24).clamp(rt_cost / 2, rt_cost);
+            let dir_p = if snap.factor_ofi.get() >= 0.0 { 1.0 } else { -1.0 };
+            let prop_pj = INV_PHI * (snap.factor_ofi.get() * dir_p)
+                + INV_PHI_SQ * (snap.factor_tfi.get() * dir_p);
+            let s_psi_pj = crate::wave_elliott::hermite_smoothstep_c1(psi_health, INV_PHI_SQ, INV_PHI);
+            let s_prop_pj = crate::wave_elliott::hermite_smoothstep_c1(prop_pj, INV_PHI_SQ, INV_PHI);
+            let sp_clean_pj = if spoof_density.is_finite() {
+                1.0 - spoof_density.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let p_tkr_pj = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+            let s_tox_pj = 1.0 - crate::wave_elliott::hermite_smoothstep_c1(p_tkr_pj, INV_PHI_FOURTH, INV_PHI_SQ);
+            let s_pj = s_psi_pj * s_prop_pj * sp_clean_pj * s_tox_pj;
+            let sigma_1m_sbps = (snap.realized_vol_5m.raw().max(0) as f64) / (PHI + INV_PHI);
+            let pj_room_sbps = (s_pj
+                * (PHI * (raw_tick_bps.raw().max(1) as f64)).max(INV_PHI_SQ * sigma_1m_sbps))
+                .round() as i64;
+            if spread_scaled_bps > base_max_spread_bps.saturating_add(pj_room_sbps) {
                 return SignalVerdict::NeutralNoAction;
             }
         }
@@ -996,8 +1013,41 @@ impl OrthogonalFactorState {
         } else {
             raw_vol
         };
-        let flow_boost = (0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs()) * (1.0 - INV_PHI_SQ * s_iceberg);
-        let expected_excursion = ScaledBps(((eff_composite_abs * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
+        let base_flow_boost =
+            (0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs()) * (1.0 - INV_PHI_SQ * s_iceberg);
+        let base_expected_raw = ((eff_composite_abs * eff_vol * base_flow_boost).round() as i64)
+            .saturating_add(lead_lag_adj_bps);
+        let fric_b_f = fric_barrier.raw().max(100) as f64;
+        let s_vol_comp =
+            1.0 - crate::wave_elliott::hermite_smoothstep_c1(raw_vol / fric_b_f, PHI, PHI_SQ);
+        let expected_excursion = if base_expected_raw < fric_barrier.raw() && s_vol_comp > 0.0 {
+            let phi_min_al = ofi_al.min(tfi_al);
+            let ir_pos = (learned_ir_x100.clamp(0, 120) as f64) * 1e-2;
+            let mfe_over_bar = (learned_mfe_bps.raw().max(0) as f64) / fric_b_f;
+            let s_coh_flow = crate::wave_elliott::hermite_smoothstep_c1(
+                phi_min_al,
+                f64::midpoint(INV_PHI, INV_PHI_SQ),
+                1.0 - INV_PHI_CUBE,
+            );
+            let s_mfe_reach =
+                crate::wave_elliott::hermite_smoothstep_c1(mfe_over_bar, INV_PHI_SQ, INV_PHI);
+            let s_psi_boost =
+                crate::wave_elliott::hermite_smoothstep_c1(psi_health, INV_PHI_SQ, INV_PHI);
+            let coh_lift = INV_PHI_CUBE
+                * s_vol_comp
+                * s_coh_flow
+                * s_mfe_reach
+                * s_psi_boost
+                * (1.0 + INV_PHI_SQ * ir_pos)
+                * (1.0 - sp_c)
+                * (1.0 - s_iceberg);
+            let lifted_boost = base_flow_boost + coh_lift * (1.0 - INV_PHI_SQ * s_iceberg);
+            let lifted_raw = ((eff_composite_abs * eff_vol * lifted_boost).round() as i64)
+                .saturating_add(lead_lag_adj_bps);
+            ScaledBps(base_expected_raw.max(lifted_raw.min(fric_barrier.raw())))
+        } else {
+            ScaledBps(base_expected_raw)
+        };
         let penny_edge = penny_jump_edge_c1(spread_ticks, raw_tick_bps.raw() as f64, spoof_density);
         let projected_excursion =
             ScaledBps(expected_excursion.raw().saturating_add(penny_edge.round() as i64));
@@ -1263,6 +1313,32 @@ impl EventClockAlphaModulator {
     }
     #[inline]
     pub fn step_event_clock_and_spoof(&mut self, real_ts_ns: TimestampNs, ofi: BoundedScore, tfi: BoundedScore) -> TimestampNs {
+        self.step_event_clock_and_spoof_with_lattice(real_ts_ns, ofi, tfi, 0.0)
+    }
+
+    #[inline]
+    pub fn step_event_clock_and_spoof_with_snap(
+        &mut self,
+        snap: &SymbolLobSnapshot,
+        fees: FeeSchedule,
+    ) -> TimestampNs {
+        let eta_lat = compute_tick_lattice_granularity_eta(snap, fees);
+        self.step_event_clock_and_spoof_with_lattice(
+            snap.ts_local_ns,
+            snap.factor_ofi,
+            snap.factor_tfi,
+            eta_lat,
+        )
+    }
+
+    #[inline]
+    fn step_event_clock_and_spoof_with_lattice(
+        &mut self,
+        real_ts_ns: TimestampNs,
+        ofi: BoundedScore,
+        tfi: BoundedScore,
+        eta_lat: f64,
+    ) -> TimestampNs {
         if real_ts_ns.0 <= 0 { return real_ts_ns; }
         if self.last_real_ts_ns <= 0 || real_ts_ns.0 < self.last_real_ts_ns {
             self.last_real_ts_ns = real_ts_ns.0;
@@ -1274,12 +1350,23 @@ impl EventClockAlphaModulator {
         let dt_s = ((dt_ns as f64) * 1e-9).clamp(1e-6, 30.0);
         self.fast_ewma_events = self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
         self.eq_ewma_events = self.eq_ewma_events * (-dt_s / V45_EQ_RATE_TAU_SECS).exp() + 1.0;
+        let kappa_evt = self.event_clock_dilation();
         let ofi_f = ofi.get();
         let tfi_f = tfi.get();
-        let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05) || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08) { 1.0 } else { 0.0 };
+        let i_spoof = if ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05 {
+            1.0
+        } else if ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08 {
+            if (ofi_f * tfi_f) < 0.0 || eta_lat <= 0.0 {
+                1.0
+            } else {
+                evaluate_silent_tape_spoof_weight_c1(eta_lat, kappa_evt)
+            }
+        } else {
+            0.0
+        };
         let alpha_sp = 1.0 - (-dt_s / V45_SPOOF_TAU_SECS).exp();
         self.spoof_density_ewma = ((1.0 - alpha_sp) * self.spoof_density_ewma + alpha_sp * i_spoof).clamp(0.0, 1.0);
-        self.virtual_clock_ns = self.virtual_clock_ns.saturating_add((((dt_ns as f64) * self.event_clock_dilation()).round() as i64).max(1));
+        self.virtual_clock_ns = self.virtual_clock_ns.saturating_add((((dt_ns as f64) * kappa_evt).round() as i64).max(1));
         self.last_real_ts_ns = real_ts_ns.0;
         TimestampNs(self.virtual_clock_ns)
     }

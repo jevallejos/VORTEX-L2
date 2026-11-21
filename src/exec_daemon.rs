@@ -1765,9 +1765,8 @@ pub fn run_autonomous_12_slot_daemon(arena: &VortexShmArena, live_capital: bool)
                     cached_snaps[s_idx] = snap;
                     if snap.sequence_id != last_seq[s_idx] {
                         last_seq[s_idx] = snap.sequence_id;
-                        let _ = rt.spoof_clocks[s_idx].step_event_clock_and_spoof(
-                            snap.ts_local_ns, snap.factor_ofi, snap.factor_tfi,
-                        );
+                        let _ = rt.spoof_clocks[s_idx]
+                            .step_event_clock_and_spoof_with_snap(&snap, gov.active_fee_schedule());
                         let mid_now = PriceTicks(i64::midpoint(
                             snap.bids[0].price.0.max(1), snap.asks[0].price.0.max(1),
                         ));

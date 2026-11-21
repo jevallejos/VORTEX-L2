@@ -196,10 +196,15 @@ pub const fn should_repeg_resting_exit_tp(
     cur_gross_bps: i64,
     fees: FeeSchedule,
 ) -> bool {
-    let inferred_open = LotQty(if eff_lots.0 > 1 {
-        eff_lots.0.saturating_add(1)
+    let max_leg = if resting_qty.0 > eff_lots.0 {
+        resting_qty.0
     } else {
         eff_lots.0
+    };
+    let inferred_open = LotQty(if max_leg > 1 {
+        max_leg.saturating_add(1)
+    } else {
+        max_leg
     });
     should_repeg_resting_exit_tp_with_open_lots(
         spec,
@@ -232,10 +237,12 @@ pub const fn should_repeg_resting_exit_tp_with_open_lots(
     fees: FeeSchedule,
     open_lots: LotQty,
 ) -> bool {
+    let split_mode_changed = (resting_qty.0 == open_lots.0) != (eff_lots.0 == open_lots.0);
     if resting_tp.0 <= 0
         || resting_qty.0 <= 0
         || eff_lots.0 <= 0
         || resting_qty.0 > open_lots.0
+        || split_mode_changed
         || resting_qty.0.abs_diff(eff_lots.0) > 1
     {
         return true;

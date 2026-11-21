@@ -269,6 +269,10 @@ impl BybitV5LiveClient {
                     if let Ok(pt) = spec.parse_price_ticks(px_s) {
                         exit_info = (pt, spec.parse_lot_qty(qt_s));
                     }
+                } else if let Some(oid) = item.get("orderId").and_then(|v| v.as_str()) {
+                    if !oid.is_empty() {
+                        orphan_entry_ids.push(oid.to_string());
+                    }
                 }
             } else if let Some(oid) = item.get("orderId").and_then(|v| v.as_str()) {
                 if !oid.is_empty() {
