@@ -274,14 +274,22 @@ impl OnlineAdaptiveGovernor {
             }
         }
         let cell_mean_bps = (cell_sum_x100 as f64) / ((MAX_ACTIVE_PAIRS * 2 * 100) as f64);
+        let live_ratios_armed =
+            self.last_daily_loss_used_ratio > 0.0 || self.last_epoch_loss_5u_ratio > 0.0;
         let r_cap = (1.0 - self.last_daily_loss_used_ratio.clamp(0.0, 1.0))
             * (1.0 - self.last_epoch_loss_5u_ratio.clamp(0.0, 1.0));
-        let w_res = crate::alpha_3factor::INV_PHI
-            * crate::wave_elliott::hermite_smoothstep_c1(
-                r_cap,
-                crate::alpha_3factor::INV_PHI_SQ,
-                crate::alpha_3factor::INV_PHI,
-            );
+        let s_tox_ok = 1.0 - crate::wave_elliott::hermite_smoothstep_c1(p_tkr, 0.065, 0.105);
+        let w_res = if live_ratios_armed {
+            crate::alpha_3factor::INV_PHI
+                * s_tox_ok
+                * crate::wave_elliott::hermite_smoothstep_c1(
+                    r_cap,
+                    crate::alpha_3factor::INV_PHI_SQ,
+                    crate::alpha_3factor::INV_PHI,
+                )
+        } else {
+            0.0
+        };
         let ewma_bps = (1.0 - w_res) * fast_ewma_bps + w_res * fast_ewma_bps.max(cell_mean_bps);
         let fee_rt_bps = (self.active_maker_rt_fee_bps().max(100) as f64) / 100.0;
         let psi = crate::governor_plasticity::compute_psi_health_c1(
