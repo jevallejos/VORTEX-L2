@@ -1320,7 +1320,12 @@ pub fn compute_canonical_exit_quote_omega_v55(
             snap.realized_vol_5m.raw().max(0)
         };
         let sigma_1m_open_sbps = (eff_open_vol_sbps as f64) / SQRT_5;
-        let b_floor_sbps = -((PHI * c_mkr_scale).max(INV_PHI_SQ * sigma_1m_open_sbps));
+        let deep_bailout_floor = -((live_sl_sbps - c_tkr).max(PHI * c_mkr_scale));
+        let b_floor_sbps = if worst_mae_bps <= mae_trig_bps && p_cont < INV_PHI_SQ {
+            deep_bailout_floor
+        } else {
+            -((PHI * c_mkr_scale).max(INV_PHI_SQ * sigma_1m_open_sbps))
+        };
         let base_bailout_band = hermite_s3_unit(cur_g, PHI * b_floor_sbps, b_floor_sbps);
         let aligned_fast = if has_live_kin {
             BoundedScore::new_clamped(kin.flow_ema_fast * dir_s).get()

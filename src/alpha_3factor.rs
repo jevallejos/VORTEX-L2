@@ -1554,11 +1554,14 @@ pub fn passes_elastic_geom_and_macro_impulse_guard_with_health(
         btc_lead_aligned_override,
     );
     let w_obs = snap.wave_observables();
-    if is_opposing_impulse_wave3_entry_hazard_v552(
+    let tau_mkt_guard_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(snap.realized_vol_5m);
+    if is_opposing_impulse_wave3_entry_hazard_v554(
         side,
         snap,
         btc_w3_aligned,
         psi_health,
+        0.0,
+        tau_mkt_guard_s,
         0,
         50,
         FeeSchedule::VIP0_DEFAULT,
