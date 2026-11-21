@@ -18,6 +18,7 @@ const INV_PHI: f64 = 0.618_033_988_749_895;
 const INV_PHI_SQ: f64 = 0.381_966_011_250_105;
 const INV_PHI_CUBE: f64 = 0.236_067_977_499_790;
 const INV_PHI_FOURTH: f64 = 0.145_898_033_750_315;
+const INV_PHI_FIFTH: f64 = 0.090_169_943_749_474;
 pub const STALE_IMPULSE_WAVE3_PHASE_FLOOR: f64 = INV_PHI + INV_PHI_FOURTH * INV_PHI_FOURTH;
 const GP_STRICT_HI: f64 = 0.650;
 const GP_CENTER: f64 = f64::midpoint(INV_PHI, GP_STRICT_HI);
@@ -329,6 +330,8 @@ pub struct CausalElliottWaveState {
     last_liq_ts_ns: i64,
     last_tick_ts_ns: i64,
     last_vol_5m: ScaledBps,
+    /// Self-learned intrinsic pivot cadence of the pair (EWMA of inter-pivot seconds, `0.0` = cold).
+    ewma_pivot_interval_s: f64,
     cached_obs: WaveObservables,
 }
 
@@ -368,6 +371,7 @@ impl CausalElliottWaveState {
             last_liq_ts_ns: 0,
             last_tick_ts_ns: 0,
             last_vol_5m: ScaledBps(0),
+            ewma_pivot_interval_s: 0.0,
             cached_obs: WaveObservables {
                 regime: WaveRegime::NeutralWarmup,
                 climax_active: false,
@@ -472,12 +476,34 @@ impl CausalElliottWaveState {
     #[inline]
     fn push_pivot(&mut self, pivot: WavePivot) {
         let len = self.pivot_len as usize;
+        let prev_ts = self.last_extreme_pivot_ts_ns().0;
+        if prev_ts > 0 && pivot.ts_ns.0 > prev_ts {
+            let dt_s = ((pivot.ts_ns.0 - prev_ts) as f64) * 1e-9;
+            self.ewma_pivot_interval_s = if self.ewma_pivot_interval_s > 0.0 {
+                self.ewma_pivot_interval_s + INV_PHI_CUBE * (dt_s - self.ewma_pivot_interval_s)
+            } else {
+                dt_s
+            };
+        }
         if len < 6 {
             self.pivots[len] = pivot;
             self.pivot_len += 1;
         } else {
-            for i in 0..5 { self.pivots[i] = self.pivots[i + 1]; }
+            self.pivots.copy_within(1.., 0);
             self.pivots[5] = pivot;
+        }
+    }
+
+    /// Self-learned intrinsic time scale of the pair (seconds): the EWMA inter-pivot cadence,
+    /// bounded `C0` inside `[tau_mkt * INV_PHI_SQ, tau_mkt * PHI_CU]`; falls back to `tau_mkt` when cold.
+    #[inline]
+    #[must_use]
+    pub fn intrinsic_pivot_scale_secs(&self, tau_mkt_s: f64) -> f64 {
+        let tau = if tau_mkt_s.is_finite() && tau_mkt_s > 0.0 { tau_mkt_s } else { FLOW_TAU_SECS };
+        if self.ewma_pivot_interval_s.is_finite() && self.ewma_pivot_interval_s > 0.0 {
+            self.ewma_pivot_interval_s.clamp(tau * INV_PHI_SQ, tau * PHI_CU)
+        } else {
+            tau
         }
     }
 
@@ -683,6 +709,12 @@ impl CausalElliottWaveState {
                 phase = 0.30 * f64::from(self.zig_dir);
             }
         }
+        if !matches!(regime, WaveRegime::ImpulseWave3 | WaveRegime::ClimaxExhaustion) {
+            let pivot_age_s = self.last_extreme_pivot_age_secs(self.last_tick_ts_ns);
+            let tau_mkt_s = Self::endogenous_tau_mkt_secs(self.last_vol_5m);
+            let scale_s = self.intrinsic_pivot_scale_secs(tau_mkt_s);
+            phase *= compute_stale_macro_phase_attenuation_c1(pivot_age_s, scale_s);
+        }
         let obs = WaveObservables {
             regime, climax_active, hurst: WaveObservables::encode_hurst(hurst_val),
             macro_phase: BoundedScore::new_clamped(phase), oi_impulse: self.cached_obs.oi_impulse,
@@ -844,45 +876,49 @@ impl CausalElliottWaveState {
                 }
             }
             WaveRegime::ImpulseWave3 => {
-                if signed_phase > 0.15 {
-                    let h_val = obs.hurst_exponent();
-                    let h_bonus = ((h_val - 0.52) * 0.08).clamp(0.0, 0.015);
-                    let gp_res = obs.golden_pocket_resonance(side);
-                    let sniper_gp = gp_res >= 0.85 && h_val >= 0.54;
-                    let gp_snr_bonus = if h_val >= 0.52 { 0.010 * gp_res } else { 0.0 };
-                    Ok(WaveEntryModulation {
-                        snr_threshold_delta: (-0.015 - h_bonus - gp_snr_bonus).clamp(-0.038, -0.010),
-                        def_horizon_permille_mult: if sniper_gp { 1_180 + (70.0 * gp_res).round() as i64 } else { 1_180 },
-                        tranche1_permille_delta: if sniper_gp { -60 - (25.0 * gp_res).round() as i64 } else { -60 },
-                        fib_target_bps: ScaledBps(aligned_fib),
-                    })
-                } else if signed_phase < -0.15 && btc_signed_snr < 0.20 {
-                    let s_fresh =
-                        hermite_smoothstep_c1(-signed_phase, STALE_IMPULSE_WAVE3_PHASE_FLOOR, 0.68);
-                    let eff_mult = INV_PHI + INV_PHI_SQ * s_fresh;
-                    Ok(WaveEntryModulation {
-                        snr_threshold_delta: 0.045 * eff_mult,
-                        def_horizon_permille_mult: 1_000 - ((180.0 * eff_mult).round() as i64),
-                        tranche1_permille_delta: (90.0 * eff_mult).round() as i64,
-                        fib_target_bps: ScaledBps(0),
-                    })
-                } else {
-                    Ok(WaveEntryModulation { snr_threshold_delta: 0.010, def_horizon_permille_mult: 1_000, tranche1_permille_delta: 0, fib_target_bps: ScaledBps(aligned_fib) })
-                }
+                let w_pos = hermite_smoothstep_c1(signed_phase, INV_PHI_FIFTH, INV_PHI_CUBE);
+                let s_btc_unsup =
+                    1.0 - hermite_smoothstep_c1(btc_signed_snr, INV_PHI_FOURTH, INV_PHI_CUBE);
+                let w_neg =
+                    hermite_smoothstep_c1(-signed_phase, INV_PHI_FIFTH, INV_PHI_CUBE) * s_btc_unsup;
+                let h_val = obs.hurst_exponent();
+                let h_bonus = ((h_val - 0.52) * 0.08).clamp(0.0, 0.015);
+                let gp_res = obs.golden_pocket_resonance(side);
+                let sniper_gp = gp_res >= 0.85 && h_val >= 0.54;
+                let gp_snr_bonus = if h_val >= 0.52 { 0.010 * gp_res } else { 0.0 };
+                let pos = WaveEntryModulation {
+                    snr_threshold_delta: (-0.015 - h_bonus - gp_snr_bonus).clamp(-0.038, -0.010),
+                    def_horizon_permille_mult: if sniper_gp { 1_180 + (70.0 * gp_res).round() as i64 } else { 1_180 },
+                    tranche1_permille_delta: if sniper_gp { -60 - (25.0 * gp_res).round() as i64 } else { -60 },
+                    fib_target_bps: ScaledBps(aligned_fib),
+                };
+                let s_fresh =
+                    hermite_smoothstep_c1(-signed_phase, STALE_IMPULSE_WAVE3_PHASE_FLOOR, 0.68);
+                let eff_mult = INV_PHI + INV_PHI_SQ * s_fresh;
+                let neg = WaveEntryModulation {
+                    snr_threshold_delta: 0.045 * eff_mult,
+                    def_horizon_permille_mult: 1_000 - ((180.0 * eff_mult).round() as i64),
+                    tranche1_permille_delta: (90.0 * eff_mult).round() as i64,
+                    fib_target_bps: ScaledBps(0),
+                };
+                let neutral = WaveEntryModulation { snr_threshold_delta: 0.010, def_horizon_permille_mult: 1_000, tranche1_permille_delta: 0, fib_target_bps: ScaledBps(aligned_fib) };
+                Ok(blend_wave_modulation_c1(pos, neg, neutral, w_pos, w_neg))
             }
             WaveRegime::ImpulseWave5 => {
-                if signed_phase > 0.15 {
-                    Ok(WaveEntryModulation { snr_threshold_delta: -0.008, def_horizon_permille_mult: 1_050, tranche1_permille_delta: 40, fib_target_bps: ScaledBps(aligned_fib) })
-                } else if signed_phase < -0.15 {
-                    Ok(WaveEntryModulation { snr_threshold_delta: 0.025, def_horizon_permille_mult: 860, tranche1_permille_delta: 80, fib_target_bps: ScaledBps(0) })
-                } else {
-                    Ok(WaveEntryModulation { snr_threshold_delta: 0.0, def_horizon_permille_mult: 1_000, tranche1_permille_delta: 20, fib_target_bps: ScaledBps(aligned_fib) })
-                }
+                let w_pos = hermite_smoothstep_c1(signed_phase, INV_PHI_FIFTH, INV_PHI_CUBE);
+                let w_neg = hermite_smoothstep_c1(-signed_phase, INV_PHI_FIFTH, INV_PHI_CUBE);
+                let pos = WaveEntryModulation { snr_threshold_delta: -0.008, def_horizon_permille_mult: 1_050, tranche1_permille_delta: 40, fib_target_bps: ScaledBps(aligned_fib) };
+                let neg = WaveEntryModulation { snr_threshold_delta: 0.025, def_horizon_permille_mult: 860, tranche1_permille_delta: 80, fib_target_bps: ScaledBps(0) };
+                let neutral = WaveEntryModulation { snr_threshold_delta: 0.0, def_horizon_permille_mult: 1_000, tranche1_permille_delta: 20, fib_target_bps: ScaledBps(aligned_fib) };
+                Ok(blend_wave_modulation_c1(pos, neg, neutral, w_pos, w_neg))
             }
-            WaveRegime::CorrectiveWave4 => Ok(WaveEntryModulation {
-                snr_threshold_delta: if signed_phase >= 0.0 { 0.005 } else { 0.020 },
-                def_horizon_permille_mult: 900, tranche1_permille_delta: 50, fib_target_bps: ScaledBps(0),
-            }),
+            WaveRegime::CorrectiveWave4 => {
+                let w_neg = hermite_smoothstep_c1(-signed_phase, -INV_PHI_FIFTH, INV_PHI_FIFTH);
+                Ok(WaveEntryModulation {
+                    snr_threshold_delta: 0.005 + 0.015 * w_neg,
+                    def_horizon_permille_mult: 900, tranche1_permille_delta: 50, fib_target_bps: ScaledBps(0),
+                })
+            }
             WaveRegime::CorrectiveAbc => {
                 let s_neg_phase = hermite_smoothstep_c1(-signed_phase, 0.0, INV_PHI_FOURTH);
                 let s_phase_headwind =
@@ -919,6 +955,45 @@ pub fn compute_impulse_wave3_age_decay_c1(pivot_age_s: f64, tau_mkt_s: f64) -> f
     }
     let age_ratio = pivot_age_s / tau_mkt_s.max(1.0);
     hermite_smoothstep_c1(age_ratio, INV_PHI_CUBE, PHI)
+}
+
+/// Continuous `C1` stale-structure multiplier in `[INV_PHI_SQ, 1.0]` applied to `macro_phase`
+/// (`V5.5.5`): the longer the pair goes without a fresh extreme pivot relative to its
+/// self-learned intrinsic scale, the more the macro bias fades (never below `INV_PHI_SQ`).
+#[inline]
+#[must_use]
+pub fn compute_stale_macro_phase_attenuation_c1(pivot_age_s: f64, intrinsic_scale_s: f64) -> f64 {
+    if !pivot_age_s.is_finite()
+        || pivot_age_s <= 0.0
+        || !intrinsic_scale_s.is_finite()
+        || intrinsic_scale_s <= 0.0
+    {
+        return 1.0;
+    }
+    let age_ratio = pivot_age_s / intrinsic_scale_s.max(1.0);
+    1.0 - INV_PHI * hermite_smoothstep_c1(age_ratio, PHI, PHI_CU)
+}
+
+/// `C1` convex blend of three wave modulations with weights `w_pos`, `w_neg` (`w_pos + w_neg <= 1`).
+#[inline]
+fn blend_wave_modulation_c1(
+    pos: WaveEntryModulation,
+    neg: WaveEntryModulation,
+    neutral: WaveEntryModulation,
+    w_pos: f64,
+    w_neg: f64,
+) -> WaveEntryModulation {
+    let wp = w_pos.clamp(0.0, 1.0);
+    let wn = w_neg.clamp(0.0, 1.0 - wp);
+    let wz = 1.0 - wp - wn;
+    let mix = |a: f64, b: f64, c: f64| wp * a + wn * b + wz * c;
+    let mix_i = |a: i64, b: i64, c: i64| mix(a as f64, b as f64, c as f64).round() as i64;
+    WaveEntryModulation {
+        snr_threshold_delta: mix(pos.snr_threshold_delta, neg.snr_threshold_delta, neutral.snr_threshold_delta),
+        def_horizon_permille_mult: mix_i(pos.def_horizon_permille_mult, neg.def_horizon_permille_mult, neutral.def_horizon_permille_mult),
+        tranche1_permille_delta: mix_i(pos.tranche1_permille_delta, neg.tranche1_permille_delta, neutral.tranche1_permille_delta),
+        fib_target_bps: ScaledBps(mix_i(pos.fib_target_bps.raw(), neg.fib_target_bps.raw(), neutral.fib_target_bps.raw())),
+    }
 }
 
 /// Cubic Hermite C1 smoothstep `S_3(u) = u^2 * (3 - 2u)` with zero slope at both boundaries.

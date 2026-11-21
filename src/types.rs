@@ -1062,6 +1062,47 @@ impl PairSpec {
         target_excursion_scaled_bps: ScaledBps,
         aligned_fib_proj_bps: ScaledBps,
     ) -> bool {
+        self.passes_single_lot_asymmetry_ev_gate_v555(
+            allocated_lots, mid_price, realized_vol_5m, learned_mfe_bps,
+            taker_prob_pm, signed_geom, ob_bull_pm, ob_bear_pm, side, fees,
+            ofi_aligned, tfi_aligned, btc_aligned, vacuum_l2_l3,
+            cont_ratio_x1000, target_excursion_scaled_bps, aligned_fib_proj_bps,
+            1.0,
+        )
+    }
+
+    /// `V5.5.5 B-02` Pillar-2 EV gate: identical to `V5.5.3` but multi-lot `q_struct` couples pre-print
+    /// `OFI+GEOM` anticipation through `compute_multilot_q_struct_v555_c1(.., signed_geom, spoof_density, ..)`.
+    /// `spoof_density >= INV_PHI_SQ` (e.g. the neutral `1.0` used by `_v553`) reproduces `V5.5.3` exactly.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::manual_clamp,
+        clippy::suboptimal_flops,
+        clippy::too_many_arguments
+    )]
+    pub fn passes_single_lot_asymmetry_ev_gate_v555(
+        self,
+        allocated_lots: LotQty,
+        mid_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+        ofi_aligned: f64,
+        tfi_aligned: f64,
+        btc_aligned: f64,
+        vacuum_l2_l3: f64,
+        cont_ratio_x1000: i64,
+        target_excursion_scaled_bps: ScaledBps,
+        aligned_fib_proj_bps: ScaledBps,
+        spoof_density: f64,
+    ) -> bool {
         const PHI: f64 = 1.618_033_988_749_895;
         const PHI_SQ: f64 = 2.618_033_988_749_895;
         const INV_PHI: f64 = 0.618_033_988_749_895;
@@ -1095,11 +1136,13 @@ impl PairSpec {
                 Side::Ask => (ob_bear_pm, ob_bull_pm),
             };
             let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
-            let q_struct = compute_multilot_q_struct_c1(
+            let q_struct = compute_multilot_q_struct_v555_c1(
                 allocated_lots,
                 (h_geom * ob_ratio).clamp(0.0, PHI),
                 ofi_aligned,
                 tfi_aligned,
+                g_clamped,
+                spoof_density,
                 vacuum_l2_l3,
             );
             let learned_f = modulate_learned_mfe_by_diffusive_regime_sbps(
@@ -1143,13 +1186,16 @@ impl PairSpec {
         };
         let ob_ratio = (f64::from(al_raw.max(382)) / f64::from(op_raw.max(382))).clamp(INV_PHI, PHI);
         let q_geom_1l = h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get();
-        let q_struct = BoundedScore::new_clamped(compute_multilot_q_struct_c1(
+        let q_struct_raw = compute_multilot_q_struct_v555_c1(
             allocated_lots,
             q_geom_1l,
             ofi_aligned,
             tfi_aligned,
+            g_clamped,
+            spoof_density,
             vacuum_l2_l3,
-        ));
+        );
+        let q_struct = BoundedScore::new_clamped(q_struct_raw);
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
@@ -1325,6 +1371,45 @@ impl PairSpec {
         target_excursion_scaled_bps: ScaledBps,
         aligned_fib_proj_bps: ScaledBps,
     ) -> Option<i64> {
+        self.evaluate_pilar2_asymmetry_ev_v555_sbps(
+            allocated_lots, entry_px, realized_vol_5m, learned_mfe_bps,
+            taker_prob_pm, signed_geom, ob_bull_pm, ob_bear_pm, side, fees,
+            ofi_aligned, tfi_aligned, btc_aligned, vacuum_l2_l3,
+            cont_ratio_x1000, target_excursion_scaled_bps, aligned_fib_proj_bps,
+            1.0, 1, 0.0,
+        )
+    }
+
+    /// `V5.5.5` Pillar-2 ex-ante net EV (`ScaledBps`): `V5.5.3` + B-02 pre-print `q_struct` (`signed_geom`,
+    /// `spoof_density`), untruncated `q_struct.clamp(0, PHI)` in the maker-gain term, and B-04b Inside-Spread
+    /// Penny-Jump passive credit `pilar2_penny_jump_credit_c1(penny_spread_ticks, tau_tick, p_taker, fill_rate_est, spoof)`
+    /// added only after every `V5.5.3` gate has passed (`penny_spread_ticks <= 1` => credit `0`, `V05` intact).
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::suboptimal_flops, clippy::too_many_arguments)]
+    pub fn evaluate_pilar2_asymmetry_ev_v555_sbps(
+        self,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        learned_mfe_bps: i64,
+        taker_prob_pm: i64,
+        signed_geom: f64,
+        ob_bull_pm: u16,
+        ob_bear_pm: u16,
+        side: Side,
+        fees: FeeSchedule,
+        ofi_aligned: f64,
+        tfi_aligned: f64,
+        btc_aligned: f64,
+        vacuum_l2_l3: f64,
+        cont_ratio_x1000: i64,
+        target_excursion_scaled_bps: ScaledBps,
+        aligned_fib_proj_bps: ScaledBps,
+        spoof_density: f64,
+        penny_spread_ticks: i64,
+        fill_rate_est: f64,
+    ) -> Option<i64> {
         const PHI: f64 = 1.618_033_988_749_895;
         const PHI_SQ: f64 = 2.618_033_988_749_895;
         const INV_PHI: f64 = 0.618_033_988_749_895;
@@ -1332,17 +1417,25 @@ impl PairSpec {
         const INV_PHI3: f64 = 0.236_067_977_499_79;
         const SQRT_5: f64 = PHI + INV_PHI;
 
-        if !self.passes_single_lot_asymmetry_ev_gate_v553(
+        if !self.passes_single_lot_asymmetry_ev_gate_v555(
             allocated_lots, entry_px, realized_vol_5m, learned_mfe_bps,
             taker_prob_pm, signed_geom, ob_bull_pm, ob_bear_pm, side, fees,
             ofi_aligned, tfi_aligned, btc_aligned, vacuum_l2_l3,
             cont_ratio_x1000, target_excursion_scaled_bps, aligned_fib_proj_bps,
+            spoof_density,
         ) {
             return None;
         }
         let Ok(tau_tick) = self.tick_to_price_scaled_bps(entry_px) else {
             return None;
         };
+        let penny_credit = pilar2_penny_jump_credit_c1(
+            penny_spread_ticks,
+            tau_tick.raw() as f64,
+            taker_prob_pm,
+            fill_rate_est,
+            spoof_density,
+        );
         let p_t = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
         let c_mkr = fees.round_trip_maker_exit_bps().raw() as f64;
         let c_tkr = (fees.round_trip_taker_exit_bps().raw().max(50)) as f64;
@@ -1358,11 +1451,13 @@ impl PairSpec {
             let eq_vol = ScaledBps((PHI * (ScaledBps::MIN_REQUIRED_VOL_5M_BPS.0 as f64)).round() as i64);
             let u_g = ((g_clamped - INV_PHI3) / (1.0 - INV_PHI3)).clamp(0.0, 1.0);
             let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
-            let q_struct = compute_multilot_q_struct_c1(
+            let q_struct = compute_multilot_q_struct_v555_c1(
                 allocated_lots,
                 (h_geom * ob_ratio).clamp(0.0, PHI),
                 ofi_aligned,
                 tfi_aligned,
+                g_clamped,
+                spoof_density,
                 vacuum_l2_l3,
             );
             let learned_f = modulate_learned_mfe_by_diffusive_regime_sbps(
@@ -1385,7 +1480,7 @@ impl PairSpec {
             let mfe_split_net = base_mfe * runner_gain - c_mkr;
             let wald_sl_net = INV_PHI * srv_sl + c_tkr + INV_PHI2 * (tau_tick.raw() as f64);
             let tail_shield = (1.0 + PHI * q_struct + (ob_ratio - 1.0).max(0.0)).max(INV_PHI);
-            let ev_sbps = (((1.0 - p_t) * mfe_split_net) - ((p_t * wald_sl_net) / tail_shield)).round() as i64;
+            let ev_sbps = (((1.0 - p_t) * mfe_split_net) - ((p_t * wald_sl_net) / tail_shield) + penny_credit).round() as i64;
             return (ev_sbps > 0).then_some(ev_sbps);
         }
 
@@ -1396,13 +1491,16 @@ impl PairSpec {
         let u_g = ((g_clamped - INV_PHI3) / (0.854_101_966_249_685 - INV_PHI3)).clamp(0.0, 1.0);
         let h_geom = u_g * u_g * (3.0 - 2.0 * u_g);
         let q_geom_1l = h_geom * (INV_PHI + INV_PHI2 * ob_ratio) * s_support.get();
-        let q_struct = BoundedScore::new_clamped(compute_multilot_q_struct_c1(
+        let q_struct_raw = compute_multilot_q_struct_v555_c1(
             allocated_lots,
             q_geom_1l,
             ofi_aligned,
             tfi_aligned,
+            g_clamped,
+            spoof_density,
             vacuum_l2_l3,
-        ));
+        );
+        let q_struct = BoundedScore::new_clamped(q_struct_raw);
         let u_v = ((g_clamped - INV_PHI3) / (INV_PHI2 - INV_PHI3)).clamp(0.0, 1.0);
         let h_vol = u_v * u_v * (3.0 - 2.0 * u_v);
         let mfe_f = (learned_mfe_bps.max(100)) as f64;
@@ -1438,9 +1536,9 @@ impl PairSpec {
             return None;
         }
         let eff_learned_mfe = coupled_c1_effective_mfe_for_lot_raw(eff_mfe, dyn_target, q_struct, false, s_prop);
-        let mkr_net = (INV_PHI + INV_PHI2 * q_struct.get().clamp(0.0, 1.0)) * (eff_learned_mfe.max(0) as f64) - c_mkr;
+        let mkr_net = (INV_PHI + INV_PHI2 * q_struct_raw.clamp(0.0, PHI)) * (eff_learned_mfe.max(0) as f64) - c_mkr;
         let sl_all_in = (diff_sl.raw().max(0) as f64) + c_tkr + INV_PHI2 * (tau_tick.raw() as f64);
-        let ev_sbps = ((1.0 - p_t) * mkr_net - p_t * sl_all_in).round() as i64;
+        let ev_sbps = ((1.0 - p_t) * mkr_net - p_t * sl_all_in + penny_credit).round() as i64;
         (ev_sbps > 0).then_some(ev_sbps)
     }
 }
@@ -1527,6 +1625,67 @@ pub fn compute_multilot_q_struct_c1(
     tfi_aligned: f64,
     vacuum_l2_l3: f64,
 ) -> f64 {
+    compute_multilot_q_struct_v555_c1(allocated_lots, q_geom_ob, ofi_aligned, tfi_aligned, 0.0, 0.0, vacuum_l2_l3)
+}
+
+/// `V5.5.5 B-04b` Pillar-2 Inside-Spread Penny-Jump passive capture credit (`ScaledBps` as `f64`):
+/// `penny_jump_edge_c1(spr, tau_tick, spoof) * (1 - p_taker) * fill_rate_est`
+/// `= INV_PHI * min(spr - 1, 3) * tau_tick * (1 - S_3(spoof; INV_PHI_CUBE, INV_PHI)) * (1 - p_taker) * fill_rate_est`.
+/// Exactly `0.0` when `spread_ticks <= 1` (`V05 NYQUIST_TICK_LATTICE` intact).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn pilar2_penny_jump_credit_c1(
+    spread_ticks: i64,
+    tau_tick_sbps: f64,
+    taker_prob_pm: i64,
+    fill_rate_est: f64,
+    spoof_density: f64,
+) -> f64 {
+    let fill = if fill_rate_est.is_finite() { fill_rate_est.clamp(0.0, 1.0) } else { 0.0 };
+    let p_t = (taker_prob_pm.clamp(5, 950) as f64) * 1e-3;
+    (crate::alpha_3factor::penny_jump_edge_c1(spread_ticks, tau_tick_sbps, spoof_density) * (1.0 - p_t) * fill).max(0.0)
+}
+
+/// Pre-print OFI+GEOM coherence (`V5.5.5 B-02`, `C1`, range `[0, 1]`):
+/// `S_3(ofi; INV_PHI, 1 - INV_PHI_CUBE) * S_3(geom; INV_PHI_SQ, INV_PHI)
+///  * S_3(tfi; -INV_PHI_FIFTH, 0) * (1 - S_3(spoof; INV_PHI_FOURTH, INV_PHI_SQ))`.
+/// Exactly `0.0` when `geom <= INV_PHI_SQ`, `tfi <= -INV_PHI_FIFTH`, `ofi <= INV_PHI` or `spoof >= INV_PHI_SQ`.
+#[inline]
+#[must_use]
+pub fn compute_preprint_coherence_c1(
+    ofi_aligned: f64,
+    geom_aligned: f64,
+    tfi_aligned: f64,
+    spoof_density: f64,
+) -> f64 {
+    use crate::alpha_3factor::{INV_PHI, INV_PHI_CUBE, INV_PHI_FIFTH, INV_PHI_FOURTH, INV_PHI_SQ};
+    use crate::wave_elliott::hermite_smoothstep_c1 as s3;
+    if !(ofi_aligned.is_finite() && geom_aligned.is_finite() && tfi_aligned.is_finite()) {
+        return 0.0;
+    }
+    let sp = if spoof_density.is_finite() { spoof_density.clamp(0.0, 1.0) } else { 1.0 };
+    s3(ofi_aligned, INV_PHI, 1.0 - INV_PHI_CUBE)
+        * s3(geom_aligned, INV_PHI_SQ, INV_PHI)
+        * s3(tfi_aligned, -INV_PHI_FIFTH, 0.0)
+        * (1.0 - s3(sp, INV_PHI_FOURTH, INV_PHI_SQ))
+}
+
+/// `V5.5.5 B-02` multi-lot `q_struct` with pre-print OFI+GEOM anticipation:
+/// `flow_coh = max(min(ofi_al, tfi_al), preprint_coh)` feeds `INV_PHI * S_3(flow_coh; INV_PHI_SQ, INV_PHI)`.
+/// `geom_aligned = 0.0` reproduces `compute_multilot_q_struct_c1` bit-for-bit; `1-lot` stays `q_geom_ob`.
+#[inline]
+#[must_use]
+#[allow(clippy::manual_clamp, clippy::suboptimal_flops)]
+pub fn compute_multilot_q_struct_v555_c1(
+    allocated_lots: LotQty,
+    q_geom_ob: f64,
+    ofi_aligned: f64,
+    tfi_aligned: f64,
+    geom_aligned: f64,
+    spoof_density: f64,
+    vacuum_l2_l3: f64,
+) -> f64 {
     const PHI_M: f64 = 1.618_033_988_749_895;
     const INV_PHI_M: f64 = 0.618_033_988_749_895;
     const INV_PHI2_M: f64 = 0.381_966_011_250_105;
@@ -1543,7 +1702,9 @@ pub fn compute_multilot_q_struct_c1(
     } else {
         0.0
     };
-    let u = ((flow_min - INV_PHI2_M) / (INV_PHI_M - INV_PHI2_M)).clamp(0.0, 1.0);
+    let preprint_coh = compute_preprint_coherence_c1(ofi_aligned, geom_aligned, tfi_aligned, spoof_density);
+    let flow_coh = flow_min.max(preprint_coh);
+    let u = ((flow_coh - INV_PHI2_M) / (INV_PHI_M - INV_PHI2_M)).clamp(0.0, 1.0);
     let s_flow = u * u * (3.0 - 2.0 * u);
     let vac = if vacuum_l2_l3.is_finite() {
         vacuum_l2_l3.clamp(0.0, 1.0)

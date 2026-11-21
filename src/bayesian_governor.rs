@@ -2122,7 +2122,7 @@ impl OnlineAdaptiveGovernor {
             _ => ScaledBps(0),
         };
         if self
-            .evaluate_slot_pilar2_ex_ante_ev_with_leader_v553_sbps(
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
                 slot_idx,
                 side,
                 lots,
@@ -2132,6 +2132,7 @@ impl OnlineAdaptiveGovernor {
                 candidate_snap,
                 btc_leader_snap,
                 epps_signed_beta,
+                spoof_density,
             )
             .is_none()
         {
@@ -2369,7 +2370,7 @@ impl OnlineAdaptiveGovernor {
             _ => ScaledBps(0),
         };
         if self
-            .evaluate_slot_pilar2_ex_ante_ev_with_leader_v553_sbps(
+            .evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
                 slot_idx,
                 side,
                 allocated_lots,
@@ -2379,6 +2380,7 @@ impl OnlineAdaptiveGovernor {
                 snap,
                 btc_leader_snap,
                 epps_signed_beta,
+                spoof_density,
             )
             .is_none()
         {
@@ -2595,6 +2597,43 @@ impl OnlineAdaptiveGovernor {
         btc_leader_snap: &SymbolLobSnapshot,
         epps_signed_beta: f64,
     ) -> Option<i64> {
+        self.evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
+            slot_idx,
+            side,
+            allocated_lots,
+            entry_px,
+            learned_mfe_bps,
+            target_excursion_scaled_bps,
+            snap,
+            btc_leader_snap,
+            epps_signed_beta,
+            1.0,
+        )
+    }
+
+    /// `V5.5.5` slot Pillar-2 EV: `V5.5.3` + B-02 pre-print `OFI+GEOM` `q_struct` (live `spoof_density`) and
+    /// B-04b Inside-Spread Penny-Jump passive credit (only when `qualifies_inside_spread_penny_jump_c1`, i.e. `SPR >= 2`).
+    /// `spoof_density = 1.0` (neutral, used by `_v553`) reproduces `V5.5.3` exactly.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        clippy::too_many_arguments
+    )]
+    pub fn evaluate_slot_pilar2_ex_ante_ev_with_leader_v555_sbps(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        allocated_lots: LotQty,
+        entry_px: PriceTicks,
+        learned_mfe_bps: ScaledBps,
+        target_excursion_scaled_bps: ScaledBps,
+        snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        epps_signed_beta: f64,
+        spoof_density: f64,
+    ) -> Option<i64> {
         if slot_idx >= MAX_ACTIVE_PAIRS || entry_px.0 <= 0 {
             return None;
         }
@@ -2630,7 +2669,12 @@ impl OnlineAdaptiveGovernor {
                 .saturating_mul(side.sign_i64())
                 .max(0),
         );
-        let base_ev = spec.evaluate_pilar2_asymmetry_ev_v553_sbps(
+        let penny_spread_ticks = if Self::qualifies_inside_spread_penny_jump_c1(side, snap, self.psi_health()) {
+            snap.bbo_and_spread_ticks().map_or(1, |(_, _, spr)| spr)
+        } else {
+            1
+        };
+        let base_ev = spec.evaluate_pilar2_asymmetry_ev_v555_sbps(
             allocated_lots,
             entry_px,
             snap.realized_vol_5m,
@@ -2648,6 +2692,9 @@ impl OnlineAdaptiveGovernor {
             cont_ratio_x1000,
             target_excursion_scaled_bps,
             aligned_fib_proj_bps,
+            spoof_density,
+            penny_spread_ticks,
+            self.slot_fill_rate_eta(slot_idx),
         )?;
         let ev_damped = ((base_ev as f64) * (1.0 - crate::alpha_3factor::PHI * s_iceberg)).round() as i64;
         (ev_damped > 0).then_some(ev_damped)

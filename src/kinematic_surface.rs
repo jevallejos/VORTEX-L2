@@ -531,7 +531,9 @@ pub fn evaluate_moallemi_stoikov_queue_shield_with_beta(
         tracker.excitation *= (-HAWKES_BETA_DECAY_PER_S * dt_s).exp();
         let ofi_f = snap.factor_ofi.get();
         let tfi_f = snap.factor_tfi.get();
-        let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05) || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08) {
+        let i_spoof = if (ofi_f.abs() >= 0.35 && (ofi_f * tfi_f) < -0.05)
+            || (ofi_f.abs() > 0.55 && tfi_f.abs() < 0.08 && ofi_f * snap.factor_geom.get() <= 0.0)
+        {
             1.0
         } else {
             0.0
@@ -561,14 +563,34 @@ pub fn evaluate_moallemi_stoikov_queue_shield_with_beta(
     let eff_adv_ticks = (1.0 - foq_w) * adverse_micro_ticks + foq_w * (0.5 * (1.0 - deep_skew)).clamp(0.0, 1.0);
     let eff_exc = tracker.excitation * (1.0 - HAWKES_INV_PHI * foq_w);
     let eff_q_floor = q_ratio.max(0.12 + 0.38 * foq_w);
-    let moallemi_toxicity = 0.45 * eff_exc * (0.25 / eff_q_floor)
+    let (v_prio, s_align) = moallemi_yuan_priority_alignment_c1(
+        q_ratio,
+        own_flow,
+        dir_s * snap.factor_ofi.get(),
+        tracker.spoof_density_ewma,
+    );
+    let w_tail = 1.0
+        - crate::wave_elliott::hermite_smoothstep_c1(
+            q_ratio,
+            crate::alpha_3factor::INV_PHI_CUBE,
+            crate::alpha_3factor::INV_PHI_SQ,
+        );
+    let prio_relief = crate::alpha_3factor::INV_PHI * v_prio * s_align * w_tail;
+    let m_hyp = 0.25 / eff_q_floor;
+    let m_eff = m_hyp - (m_hyp - 1.0).max(0.0) * prio_relief;
+    let moallemi_toxicity = 0.45 * eff_exc * m_eff
         + 0.55 * (-eff_skew).max(0.0)
         + btc_drag
         - 0.50 * own_flow.max(0.0);
     let crit_tail_sweep = init_q_ahead.0 > 0
         && q_ratio < 0.15
         && eff_exc >= HAWKES_INV_PHI * (1.0 + HAWKES_PHI * foq_w);
-    let stoikov_collapse = (eff_skew <= -0.68 && own_flow < 0.15) || (eff_adv_ticks >= 0.75 && own_flow < 0.20);
+    let collapse_relief = s_align
+        * w_tail
+        * crate::wave_elliott::hermite_smoothstep_c1(own_flow, 0.0, crate::alpha_3factor::INV_PHI_CUBE);
+    let skew_c = eff_skew * (1.0 - collapse_relief);
+    let adv_c = eff_adv_ticks * (1.0 - collapse_relief);
+    let stoikov_collapse = (skew_c <= -0.68 && own_flow < 0.15) || (adv_c >= 0.75 && own_flow < 0.20);
     let abort_now = crit_tail_sweep
         || stoikov_collapse
         || moallemi_toxicity >= HAWKES_INV_PHI
@@ -581,6 +603,32 @@ pub fn evaluate_moallemi_stoikov_queue_shield_with_beta(
                 tracker.spoof_density_ewma,
             ));
     QueueShieldVerdict { abort_now, stoikov_skew, adverse_micro_ticks, hawkes_lambda_ratio, moallemi_toxicity }
+}
+
+/// Moallemi-Yuan queue-priority value and flow alignment (`V5.5.5 B-03`, `C1`):
+/// `v_prio = clamp(1 - q_ratio, 0, 1)`,
+/// `s_align = S_3(own_flow; -INV_PHI_FOURTH, INV_PHI_SQ) * S_3(ofi_aligned; 0, INV_PHI_SQ)
+///  * (1 - S_3(spoof_ewma; INV_PHI_CUBE, INV_PHI))`.
+/// `s_align == 0` whenever `own_flow <= -INV_PHI_FOURTH` or `ofi_aligned <= 0` (shield keeps full rigor).
+#[inline]
+#[must_use]
+pub fn moallemi_yuan_priority_alignment_c1(
+    q_ratio: f64,
+    own_flow: f64,
+    ofi_aligned: f64,
+    spoof_density_ewma: f64,
+) -> (f64, f64) {
+    use crate::alpha_3factor::{INV_PHI, INV_PHI_CUBE, INV_PHI_FOURTH, INV_PHI_SQ};
+    use crate::wave_elliott::hermite_smoothstep_c1 as s3;
+    let v_prio = if q_ratio.is_finite() { (1.0 - q_ratio).clamp(0.0, 1.0) } else { 0.0 };
+    if !(own_flow.is_finite() && ofi_aligned.is_finite()) {
+        return (v_prio, 0.0);
+    }
+    let sp = if spoof_density_ewma.is_finite() { spoof_density_ewma.clamp(0.0, 1.0) } else { 1.0 };
+    let s_align = s3(own_flow, -INV_PHI_FOURTH, INV_PHI_SQ)
+        * s3(ofi_aligned, 0.0, INV_PHI_SQ)
+        * (1.0 - s3(sp, INV_PHI_CUBE, INV_PHI));
+    (v_prio, s_align.clamp(0.0, 1.0))
 }
 
 #[inline]

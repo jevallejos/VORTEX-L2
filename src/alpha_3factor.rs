@@ -191,7 +191,18 @@ impl OrthogonalFactorState {
         let q_ref = self.learned_trade_lots.max(PHI * floor_lots).max(PHI);
         let kappa_spatial = INV_PHI * (self.learned_l1_depth_lots.max(0.0) * q_ref).sqrt();
         let kappa_flow = INV_PHI_SQ * self.learned_flow_lots.max(0.0) + INV_PHI * q_ref;
-        kappa_spatial.max(kappa_flow).max(PHI * floor_lots) * (1.0 + INV_PHI * self.spoof_density_ewma)
+        let kappa_rigid = kappa_spatial.max(kappa_flow);
+        // V5.5.5 B-05: once the endogenous flow has converged beyond its cold seed, blend the
+        // spatial (depth) and flow priors geometrically; spoofed books keep the spatial prior.
+        let s_spoof = crate::wave_elliott::hermite_smoothstep_c1(self.spoof_density_ewma, INV_PHI_CUBE, INV_PHI);
+        let w_sp = INV_PHI.mul_add(s_spoof, INV_PHI_SQ).clamp(0.0, 1.0);
+        let kappa_blend = kappa_flow.max(floor_lots).powf(1.0 - w_sp)
+            * kappa_rigid.max(floor_lots).powf(w_sp);
+        let (init_lots, _) = Self::flow_prior_bounds(snap);
+        let flow_ratio = self.learned_flow_lots.max(0.0) / init_lots.max(floor_lots).max(f64::EPSILON);
+        let w_warm = crate::wave_elliott::hermite_smoothstep_c1(flow_ratio, 1.0, PHI_SQ);
+        let kappa_eff = kappa_rigid.powf(1.0 - w_warm) * kappa_blend.max(f64::EPSILON).powf(w_warm);
+        kappa_eff.max(PHI * floor_lots) * (1.0 + INV_PHI * self.spoof_density_ewma)
     }
 
     #[inline]
@@ -212,7 +223,7 @@ impl OrthogonalFactorState {
 
     #[inline]
     #[must_use]
-    fn compute_book_geometry(snap: &SymbolLobSnapshot) -> BoundedScore {
+    fn compute_book_geometry(snap: &SymbolLobSnapshot, ofi_score: f64, spoof_density: f64) -> BoundedScore {
         let (mut bid_mass, mut ask_mass) = (0.0_f64, 0.0_f64);
         for i in 0..GEOM_DEPTH {
             let decay = 1.0 / ((i + 1) as f64);
@@ -228,7 +239,8 @@ impl OrthogonalFactorState {
         } else {
             1.0
         };
-        let geom_raw = ((bid_mass - ask_mass) / (bid_mass + ask_mass + 1e-6)) / spread_ticks.sqrt().max(1.0);
+        let imbalance = (bid_mass - ask_mass) / (bid_mass + ask_mass + 1e-6);
+        let geom_raw = imbalance / spread_geom_divisor_c1(spread_ticks, ofi_score * imbalance.signum(), spoof_density);
         BoundedScore::new_clamped(geom_raw)
     }
 
@@ -330,7 +342,7 @@ impl OrthogonalFactorState {
                 );
             }
             self.last_ofi = BoundedScore::ZERO;
-            self.last_geom = Self::compute_book_geometry(snap);
+            self.last_geom = Self::compute_book_geometry(snap, 0.0, self.spoof_density_ewma);
             snap.factor_ofi = self.last_ofi;
             snap.factor_tfi = self.last_tfi;
             snap.factor_geom = self.last_geom;
@@ -423,7 +435,7 @@ impl OrthogonalFactorState {
             (self.tfi_buy_accum - self.tfi_sell_accum)
                 / (self.tfi_buy_accum + self.tfi_sell_accum + tfi_prior),
         );
-        self.last_geom = Self::compute_book_geometry(snap);
+        self.last_geom = Self::compute_book_geometry(snap, self.last_ofi.get(), self.spoof_density_ewma);
         if dt_s > 0.0 {
             self.fast_ewma_events =
                 self.fast_ewma_events * (-dt_s / V45_FAST_RATE_TAU_SECS).exp() + 1.0;
@@ -986,8 +998,11 @@ impl OrthogonalFactorState {
         };
         let flow_boost = (0.54 + 0.12 * tfi.abs() + 0.08 * geom.abs()) * (1.0 - INV_PHI_SQ * s_iceberg);
         let expected_excursion = ScaledBps(((eff_composite_abs * eff_vol * flow_boost).round() as i64).saturating_add(lead_lag_adj_bps));
-        if expected_excursion.raw() >= fric_barrier.raw() {
-            SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps: expected_excursion }
+        let penny_edge = penny_jump_edge_c1(spread_ticks, raw_tick_bps.raw() as f64, spoof_density);
+        let projected_excursion =
+            ScaledBps(expected_excursion.raw().saturating_add(penny_edge.round() as i64));
+        if projected_excursion.raw() >= fric_barrier.raw() {
+            SignalVerdict::AuthorizeMakerEntry { side, target_excursion_scaled_bps: projected_excursion }
         } else {
             SignalVerdict::NeutralNoAction
         }
@@ -1630,6 +1645,37 @@ pub fn passes_elastic_geom_and_macro_impulse_guard_with_health(
         return Err(crate::lob_shm::LastVetoCode::SpoofingVeto);
     }
     Ok(())
+}
+
+/// Spoof-aware `C1` GEOM spread divisor (`V5.5.5 B-04a`):
+/// `1 + (sqrt(spr) - 1) * (INV_PHI_SQ + INV_PHI * (1 - w_relief))`, with
+/// `w_relief = (1 - S_3(spoof; INV_PHI_CUBE, INV_PHI)) * S_3(ofi_aligned; 0, INV_PHI_SQ)`.
+/// Identical to `sqrt(spr)` when `spr == 1`, the book is spoofed, or OFI does not push aligned.
+#[inline]
+#[must_use]
+pub fn spread_geom_divisor_c1(spread_ticks: f64, ofi_aligned: f64, spoof_density: f64) -> f64 {
+    let spr = if spread_ticks.is_finite() { spread_ticks.max(1.0) } else { 1.0 };
+    let sp = if spoof_density.is_finite() { spoof_density.clamp(0.0, 1.0) } else { 1.0 };
+    let ofi = if ofi_aligned.is_finite() { ofi_aligned } else { 0.0 };
+    let s_spoof = crate::wave_elliott::hermite_smoothstep_c1(sp, INV_PHI_CUBE, INV_PHI);
+    let s_align = crate::wave_elliott::hermite_smoothstep_c1(ofi, 0.0, INV_PHI_SQ);
+    let w_relief = (1.0 - s_spoof) * s_align;
+    let k_spr = INV_PHI.mul_add(1.0 - w_relief, INV_PHI_SQ).clamp(INV_PHI_SQ, 1.0);
+    (spr.sqrt() - 1.0).mul_add(k_spr, 1.0).max(1.0)
+}
+
+/// Inside-Spread Penny-Jump passive edge in `ScaledBps` (`V5.5.5 B-04a`):
+/// `INV_PHI * min(spr - 1, 3) * tau_tick * (1 - S_3(spoof; INV_PHI_CUBE, INV_PHI))`; `0.0` when `spr <= 1`.
+#[inline]
+#[must_use]
+pub fn penny_jump_edge_c1(spread_ticks: i64, tau_tick_sbps: f64, spoof_density: f64) -> f64 {
+    if spread_ticks <= 1 || !tau_tick_sbps.is_finite() || tau_tick_sbps <= 0.0 {
+        return 0.0;
+    }
+    let sp = if spoof_density.is_finite() { spoof_density.clamp(0.0, 1.0) } else { 1.0 };
+    let jump_ticks = (spread_ticks - 1).min(3) as f64;
+    INV_PHI * jump_ticks * tau_tick_sbps
+        * (1.0 - crate::wave_elliott::hermite_smoothstep_c1(sp, INV_PHI_CUBE, INV_PHI))
 }
 
 /// Dimensionless tick-lattice granularity `eta_lat = tau_tick_sbps / max(c_mkr_rt_sbps, 1)` (`V5.5.3`).
@@ -3021,6 +3067,47 @@ pub fn passes_elastic_anti_spoof_ofi_guard(
             )
 }
 
+/// Self-learned `CorrectiveAbc` macro-reversal relief `r_rev` in `[0.0, 1 - INV_PHI_CUBE]` (`V5.5.5 B-01b`):
+/// `(1 - INV_PHI_CUBE) * psi_health * S_3(rho_own; INV_PHI_SQ, INV_PHI) * S_3(min(ofi_al, tfi_al); INV_PHI_SQ, INV_PHI)
+/// * (1 - s_opp_ob_wall) * (1 - s_ice)`, where `rho_own = ob_own / (ob_own + max(ob_opp, 382))`
+/// is `0.0` without an own Order Block. Used as `s_macro_neg_eff = s_macro_neg * (1 - r_rev)`.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_corrective_abc_macro_reversal_relief_c1(
+    psi_health: f64,
+    ob_align_pm: i64,
+    ob_opp_pm: i64,
+    ofi_aligned: f64,
+    tfi_aligned: f64,
+    s_opp_ob_wall: f64,
+    s_ice: f64,
+) -> f64 {
+    if !psi_health.is_finite()
+        || psi_health <= 0.0
+        || !ofi_aligned.is_finite()
+        || !tfi_aligned.is_finite()
+        || !s_opp_ob_wall.is_finite()
+        || !s_ice.is_finite()
+        || ob_align_pm <= 0
+    {
+        return 0.0;
+    }
+    let own = ob_align_pm as f64;
+    let opp = ob_opp_pm.max(382) as f64;
+    let rho_own = (own / (own + opp)).clamp(0.0, 1.0);
+    let s_rho = crate::wave_elliott::hermite_smoothstep_c1(rho_own, INV_PHI_SQ, INV_PHI);
+    let s_flow =
+        crate::wave_elliott::hermite_smoothstep_c1(ofi_aligned.min(tfi_aligned), INV_PHI_SQ, INV_PHI);
+    ((1.0 - INV_PHI_CUBE)
+        * psi_health.clamp(0.0, 1.0)
+        * s_rho
+        * s_flow
+        * (1.0 - s_opp_ob_wall.clamp(0.0, 1.0))
+        * (1.0 - s_ice.clamp(0.0, 1.0)))
+        .clamp(0.0, 1.0 - INV_PHI_CUBE)
+}
+
 /// Continuous `C1` `CorrectiveAbc` fractal + physical `reach_bps` Order-Block threat `chi_threat` + tick-L2 Hurst (`0.65..0.80`) surface in `[0.0, 1.0]` (`V5.5.2`).
 #[inline]
 #[must_use]
@@ -3088,7 +3175,18 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
     };
     let s_ob = crate::wave_elliott::hermite_smoothstep_c1(rho_ob, INV_PHI_SQ, INV_PHI);
     let s_ob_eff = (s_ob * (1.0 - s_opp_wall)).max(s_own_wall);
-    let s_adv_macro = crate::wave_elliott::hermite_smoothstep_c1(-aligned_macro, 0.0, INV_PHI);
+    let r_rev = compute_corrective_abc_macro_reversal_relief_c1(
+        psi_health,
+        ob_align_pm,
+        ob_opp_pm,
+        ofi_aligned,
+        tfi_aligned,
+        s_opp_wall,
+        s_iceberg_pen,
+    );
+    let s_rev_keep = 1.0 - r_rev;
+    let s_adv_macro =
+        crate::wave_elliott::hermite_smoothstep_c1(-aligned_macro, 0.0, INV_PHI) * s_rev_keep;
     let macro_floor = -INV_PHI_CUBE * (0.50 + s_ob_eff + s_sync);
     let s_pos_m = crate::wave_elliott::hermite_smoothstep_c1(aligned_macro, INV_PHI_CUBE, INV_PHI);
     let base_h_crit = 0.50 + INV_PHI_CUBE * s_ob_eff + INV_PHI_FIFTH * s_pos_m
@@ -3110,12 +3208,13 @@ pub fn evaluate_corrective_abc_fractal_penalty_with_health_c1_dynamic(
         -INV_PHI_SQ - aligned_macro,
         -0.023_144,
         0.016_856,
-    ) * (1.0 - s_btc_backing);
+    ) * (1.0 - s_btc_backing)
+        * s_rev_keep;
     let pen_macro = crate::wave_elliott::hermite_smoothstep_c1(
         macro_floor - aligned_macro,
         -0.023_144,
         0.016_856,
-    );
+    ) * s_rev_keep;
     let pen_hurst = crate::wave_elliott::hermite_smoothstep_c1(
         wave.hurst_exponent() - h_crit,
         -0.023_144,
