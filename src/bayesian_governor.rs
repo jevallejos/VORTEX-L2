@@ -1073,7 +1073,8 @@ impl OnlineAdaptiveGovernor {
                 let px_1e4 = i64::midpoint(best_bid.price.0, best_ask.price.0).saturating_mul(10_000);
                 let s_drift = (((fast_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4).saturating_mul(d_sign);
                 let lead_impulse = (((px_1e4 - slow_1e4).saturating_mul(1_000_000)) / slow_1e4).saturating_mul(d_sign).saturating_sub(s_drift);
-                if sym_sl_tot >= 1 && (signed_ofi < 0.34 || lead_impulse < 0) { return Err("VETO_SYMBOL_CROSS_SCAR_WEAK_IMPULSE"); }
+                let strong_healthy_ofi = signed_ofi >= 0.50 && s_drift >= 0 && snap.factor_tfi.get() * side.sign_f64() >= 0.0;
+                if sym_sl_tot >= 1 && (signed_ofi < 0.34 || (lead_impulse < 0 && !strong_healthy_ofi)) { return Err("VETO_SYMBOL_CROSS_SCAR_WEAK_IMPULSE"); }
                 let low_vol_decel = snap.realized_vol_5m.raw() < 2_500 || (snap.realized_vol_5m.raw() < 3_000 && signed_ofi < 0.35);
                 if s_drift > 0 && lead_impulse < -15 && (low_vol_decel || btc_signed_snr < 0.08) {
                     return Err("VETO_FOLLOWER_DECEL_UNDER_COMPRESSION");
@@ -1324,7 +1325,9 @@ impl OnlineAdaptiveGovernor {
         let global_penalty = if global_debt_bps < -2_000.0 { ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14) } else { 0.0 };
         let staircase_penalty = if win_s >= 2.0 { 0.03 * (win_s - 1.0) } else { 0.0 };
         let ir_adj = (self.slot_information_ratio_x100(slot_idx, side) as f64 / 2_000.0).clamp(-0.04, 0.05);
-        if in_scar && candidate_snap.factor_tfi.get().abs() < (if in_local_scar { 0.45 } else { 0.38 }) { return false; }
+        let preprint_ok = !in_local_scar && crate::types::compute_preprint_coherence_c1(candidate_snap.factor_ofi.get() * dir_s, signed_geom, candidate_snap.factor_tfi.get() * dir_s, spoof_density) > 0.0;
+        let req_tfi_abs = if in_local_scar { 0.45 } else if preprint_ok { 0.0 } else { 0.38 };
+        if in_scar && candidate_snap.factor_tfi.get().abs() < req_tfi_abs { return false; }
         if self.sl_streak[slot_idx][d] >= 1 && self.ewma_net_bps_x100[slot_idx][d] <= -800 && cand_comp < 0.72 { return false; }
         let beta_sign = if beta_c >= 0.0 { 1.0 } else { -1.0 };
         let btc_signed_snr = if slot_idx == 0 {
@@ -2100,13 +2103,17 @@ impl OnlineAdaptiveGovernor {
             daily_damper_permille,
         );
         let d_entry = Self::dir_idx(side);
-        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v55(
+        let tau_mkt_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(candidate_snap.realized_vol_5m);
+        let kappa_evt = if self.last_ws_rtt_us > 0 { 1.0 } else { crate::alpha_3factor::INV_PHI };
+        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v554(
             spec,
             candidate_snap,
             btc_leader_snap,
             learned_mfe_bps,
             ScaledBps(self.ewma_net_bps_x100[slot_idx][d_entry]),
             taker_pm,
+            self.slot_information_ratio_x100(slot_idx, side),
+            tau_mkt_s,
             fees,
             spoof_density,
             epps_signed_beta,
@@ -2114,6 +2121,7 @@ impl OnlineAdaptiveGovernor {
             btc_lead_aligned_override,
             self.psi_health(),
             lead_lag_ignition_bonus,
+            kappa_evt,
         ) {
             crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
                 side: sig_side,
@@ -2348,13 +2356,17 @@ impl OnlineAdaptiveGovernor {
             return Err(LastVetoCode::QueueDepthOrOversizedLot);
         }
         let d_pf = Self::dir_idx(side);
-        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v55(
+        let tau_mkt_pf_s = crate::wave_elliott::CausalElliottWaveState::endogenous_tau_mkt_secs(snap.realized_vol_5m);
+        let kappa_pf_evt = if self.last_ws_rtt_us > 0 { 1.0 } else { crate::alpha_3factor::INV_PHI };
+        let target_excursion_sbps = match OrthogonalFactorState::evaluate_entry_signal_v554(
             spec,
             snap,
             btc_leader_snap,
             learned_mfe_bps,
             ScaledBps(self.ewma_net_bps_x100[slot_idx][d_pf]),
             taker_pm,
+            self.slot_information_ratio_x100(slot_idx, side),
+            tau_mkt_pf_s,
             fees,
             spoof_density,
             epps_signed_beta,
@@ -2362,6 +2374,7 @@ impl OnlineAdaptiveGovernor {
             btc_lead_aligned_override,
             self.psi_health(),
             lead_lag_ignition_bonus,
+            kappa_pf_evt,
         ) {
             crate::alpha_3factor::SignalVerdict::AuthorizeMakerEntry {
                 side: sig_side,
